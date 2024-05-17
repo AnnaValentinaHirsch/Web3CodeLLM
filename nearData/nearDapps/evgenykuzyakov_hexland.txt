@@ -1,0 +1,1404 @@
+*GitHub Repository "evgenykuzyakov/hexland"*
+
+'''--- contract/Cargo.toml ---
+[package]
+name = "hexland"
+version = "0.1.1"
+authors = ["Eugene The Dream <ek@proximity.dev>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+near-sdk = "3.1.0"
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "s"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+
+'''
+'''--- contract/build.sh ---
+#!/bin/bash
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/hexland.wasm ./res/
+
+'''
+'''--- contract/src/cell.rs ---
+use crate::*;
+use near_sdk::serde::Serializer;
+
+pub const CELL_SIZE: u32 = 16;
+pub const CELL_SIZE_2: u32 = CELL_SIZE * CELL_SIZE;
+pub const NUM_LEVELS: u8 = 5;
+
+pub const MAX_SIZE: u32 = CELL_SIZE.pow(NUM_LEVELS as u32);
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(crate = "near_sdk::serde")]
+pub struct CellId {
+    pub level: u8,
+    pub x: u32,
+    pub y: u32,
+}
+
+pub fn serialize_array<S, T>(array: &[T], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    T: Serialize,
+{
+    array.serialize(serializer)
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Clone)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Cell {
+    pub nonce: u64,
+    #[serde(serialize_with = "serialize_array")]
+    pub colors: [u32; CELL_SIZE_2 as usize],
+}
+
+impl Default for Cell {
+    fn default() -> Self {
+        Cell {
+            nonce: 0,
+            colors: [0u32; CELL_SIZE_2 as usize],
+        }
+    }
+}
+
+#[derive(BorshSerialize, BorshDeserialize)]
+pub enum VCell {
+    Current(Cell),
+}
+
+impl From<VCell> for Cell {
+    fn from(v: VCell) -> Self {
+        match v {
+            VCell::Current(c) => c,
+        }
+    }
+}
+
+impl From<Cell> for VCell {
+    fn from(c: Cell) -> Self {
+        VCell::Current(c)
+    }
+}
+
+impl Cell {
+    pub fn avg_color(&self) -> u32 {
+        let mut b = 0;
+        let mut g = 0;
+        let mut r = 0;
+        for &c in &self.colors {
+            b += c & 0xff;
+            g += (c & 0xff00) >> 8;
+            r += (c & 0xff0000) >> 16;
+        }
+        ((r >> 8) << 16) | ((g >> 8) << 8) | (b >> 8)
+    }
+}
+
+impl Contract {
+    pub fn internal_unwrap_cell(&self, cell_id: &CellId) -> Cell {
+        self.internal_get_cell(cell_id).expect("Cell is not found")
+    }
+
+    pub fn internal_get_cell(&self, cell_id: &CellId) -> Option<Cell> {
+        self.cells.get(cell_id).map(|o| o.into())
+    }
+
+    pub fn internal_unwrap_cell_or_default(&mut self, cell_id: &CellId) -> Cell {
+        self.internal_get_cell(cell_id).unwrap_or_default()
+    }
+
+    pub fn internal_set_cell(&mut self, cell_id: &CellId, cell: Cell) {
+        self.cells.insert(cell_id, &cell.into());
+    }
+
+    pub fn save_compute_tree(&mut self, mut cell_id: CellId, cell: Cell) {
+        let mut avg_color = cell.avg_color();
+        self.internal_set_cell(&cell_id, cell);
+        for level in 1..NUM_LEVELS {
+            let upper_cell_id = CellId {
+                level,
+                x: cell_id.x / CELL_SIZE,
+                y: cell_id.y / CELL_SIZE,
+            };
+            let mut cell = self.internal_unwrap_cell_or_default(&upper_cell_id);
+            let off_x = cell_id.x - upper_cell_id.x * CELL_SIZE;
+            let off_y = cell_id.y - upper_cell_id.y * CELL_SIZE;
+            let index = (off_y * CELL_SIZE + off_x) as usize;
+            let sub_nonce = ((cell.colors[index] >> 24) + 1) & 0xff;
+            cell.nonce += 1;
+            cell.colors[index] = (sub_nonce << 24) | avg_color;
+            if level + 1 < NUM_LEVELS {
+                avg_color = cell.avg_color();
+            }
+            cell_id = upper_cell_id;
+            self.internal_set_cell(&cell_id, cell);
+        }
+    }
+}
+
+'''
+'''--- contract/src/lib.rs ---
+mod cell;
+mod pixel;
+mod view;
+
+use crate::cell::*;
+
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::LookupMap;
+use near_sdk::json_types::{ValidAccountId, WrappedBalance};
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{env, near_bindgen, AccountId, Balance, BorshStorageKey, PanicOnDefault};
+
+near_sdk::setup_alloc!();
+
+#[derive(BorshSerialize, BorshStorageKey)]
+enum StorageKey {
+    Accounts,
+    Cells,
+}
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Contract {
+    pub accounts: LookupMap<AccountId, Balance>,
+    pub cells: LookupMap<CellId, VCell>,
+}
+
+#[near_bindgen]
+impl Contract {
+    #[init]
+    pub fn new() -> Self {
+        Self {
+            accounts: LookupMap::new(StorageKey::Accounts),
+            cells: LookupMap::new(StorageKey::Cells),
+        }
+    }
+}
+
+'''
+'''--- contract/src/pixel.rs ---
+use crate::*;
+use near_sdk::StorageUsage;
+
+pub const MAX_COLOR: u32 = 256u32.pow(3);
+pub const MIN_STORAGE_BYTES: StorageUsage = 125;
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Pixel {
+    pub x: u32,
+    pub y: u32,
+    pub c: u32,
+}
+
+impl Pixel {
+    pub fn assert_valid(&self) {
+        assert!(self.x < MAX_SIZE);
+        assert!(self.y < MAX_SIZE);
+        assert!(self.c < MAX_COLOR);
+    }
+}
+
+#[near_bindgen]
+impl Contract {
+    #[payable]
+    pub fn draw_json(&mut self, pixels: Vec<Pixel>) {
+        self.internal_draw(pixels);
+    }
+
+    #[payable]
+    pub fn draw_borsh(&mut self, #[serializer(borsh)] pixels: Vec<Pixel>) {
+        self.internal_draw(pixels);
+    }
+}
+
+impl Contract {
+    pub fn internal_draw(&mut self, pixels: Vec<Pixel>) {
+        let initial_storage_usage = env::storage_usage();
+
+        let mut last_cell_id = None;
+        let mut last_cell = None;
+        for pixel in pixels {
+            pixel.assert_valid();
+            let cell_id = CellId {
+                level: 0,
+                x: pixel.x / CELL_SIZE,
+                y: pixel.y / CELL_SIZE,
+            };
+            let off_x = pixel.x - cell_id.x * CELL_SIZE;
+            let off_y = pixel.y - cell_id.y * CELL_SIZE;
+            if Some(&cell_id) != last_cell_id.as_ref() {
+                if let Some(last_cell) = last_cell {
+                    self.save_compute_tree(last_cell_id.unwrap(), last_cell);
+                }
+                last_cell = Some(self.internal_unwrap_cell_or_default(&cell_id));
+                last_cell.as_mut().unwrap().nonce += 1;
+                last_cell_id = Some(cell_id);
+            }
+            last_cell.as_mut().unwrap().colors[(off_y * CELL_SIZE + off_x) as usize] = pixel.c;
+        }
+        if let Some(last_cell) = last_cell {
+            self.save_compute_tree(last_cell_id.unwrap(), last_cell);
+        }
+
+        let final_storage_usage = env::storage_usage();
+        let attached_deposit = env::attached_deposit();
+
+        if initial_storage_usage != final_storage_usage || attached_deposit > 0 {
+            let account_id = env::predecessor_account_id();
+            let mut extra_bytes = final_storage_usage - initial_storage_usage;
+            let mut balance = if let Some(balance) = self.accounts.get(&account_id) {
+                balance
+            } else {
+                extra_bytes += MIN_STORAGE_BYTES;
+                0
+            };
+            balance += attached_deposit;
+            let required_deposit = Balance::from(extra_bytes) * env::storage_byte_cost();
+            assert!(
+                balance >= required_deposit,
+                "Not enough deposit for storage"
+            );
+            balance -= required_deposit;
+            self.accounts.insert(&account_id, &balance);
+        }
+    }
+}
+
+'''
+'''--- contract/src/view.rs ---
+use crate::*;
+
+#[near_bindgen]
+impl Contract {
+    pub fn get_cells_json(&self, cell_ids: Vec<CellId>) -> Vec<Option<Cell>> {
+        self.internal_get_cells(cell_ids)
+    }
+
+    #[result_serializer(borsh)]
+    pub fn get_cells_borsh(&self, #[serializer(borsh)] cell_ids: Vec<CellId>) -> Vec<Option<Cell>> {
+        self.internal_get_cells(cell_ids)
+    }
+
+    pub fn get_storage_balance(&self, account_id: ValidAccountId) -> Option<WrappedBalance> {
+        self.accounts.get(account_id.as_ref()).map(|b| b.into())
+    }
+}
+
+impl Contract {
+    pub fn internal_get_cells(&self, cell_ids: Vec<CellId>) -> Vec<Option<Cell>> {
+        cell_ids
+            .into_iter()
+            .map(|cell_id| self.internal_get_cell(&cell_id))
+            .collect()
+    }
+}
+
+'''
+'''--- frontend/package.json ---
+{
+  "name": "frontend",
+  "version": "0.1.0",
+  "homepage": "hexland",
+  "private": true,
+  "dependencies": {
+    "@testing-library/jest-dom": "^4.2.4",
+    "@testing-library/react": "^9.3.2",
+    "@testing-library/user-event": "^7.1.2",
+    "big.js": "^6.1.1",
+    "bn.js": "^5.1.1",
+    "bootstrap": "^5.1.1",
+    "collections": "^5.1.12",
+    "error-polyfill": "^0.1.2",
+    "local-storage": "^2.0.0",
+    "near-api-js": "^0.37.0",
+    "node-sass": "^4.0.0",
+    "react": "^16.13.1",
+    "react-dom": "^16.13.1",
+    "react-infinite-scroller": "^1.2.4",
+    "react-markdown": "^5.0.3",
+    "react-router-dom": "^5.2.0",
+    "react-scripts": "3.4.0",
+    "react-tooltip": "^4.2.13",
+    "react-uuid": "^1.0.2",
+    "remark-gfm": "^1.0.0",
+    "timeago-react": "^3.0.2",
+    "twgl-base.js": "^4.19.1"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test",
+    "eject": "react-scripts eject",
+    "deploy": "yarn build && gh-pages -d build"
+  },
+  "eslintConfig": {
+    "extends": "react-app"
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  },
+  "devDependencies": {
+    "gh-pages": "^2.2.0",
+    "prettier": "^2.2.1"
+  }
+}
+
+'''
+'''--- frontend/public/index.html ---
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="%PUBLIC_URL%/favicon.png" />
+
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#000000" />
+    <meta
+      name="description"
+      content="Do you even hex?"
+    />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta property="og:image" content="%PUBLIC_URL%/img.png"/>
+    <meta property="og:url" content="%PUBLIC_URL%" />
+    <meta property="og:title" content="Hexland" />
+    <meta property="og:description" content="Do you even hex?" />
+    <link rel="apple-touch-icon" href="%PUBLIC_URL%/favicon.png" />
+    <!--
+      manifest.json provides metadata used when your web app is installed on a
+      user's mobile device or desktop. See https://developers.google.com/web/fundamentals/web-app-manifest/
+    -->
+    <link rel="manifest" href="%PUBLIC_URL%/manifest.json" />
+    <!--
+      Notice the use of %PUBLIC_URL% in the tags above.
+      It will be replaced with the URL of the `public` folder during the build.
+      Only files inside the `public` folder can be referenced from the HTML.
+
+      Unlike "/favicon.ico" or "favicon.ico", "%PUBLIC_URL%/favicon.ico" will
+      work correctly both with client-side routing and a non-root public URL.
+      Learn how to configure a non-root public URL by running `npm run build`.
+    -->
+    <title>Hexland</title>
+  </head>
+  <body>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="root"></div>
+    <!--
+      This HTML file is a template.
+      If you open it directly in the browser, you will see an empty page.
+
+      You can add webfonts, meta tags, or analytics to this file.
+      The build step will place the bundled scripts into the <body> tag.
+
+      To begin the development, run `npm start` or `yarn start`.
+      To create a production bundle, use `npm run build` or `yarn build`.
+    -->
+  </body>
+</html>
+
+'''
+'''--- frontend/public/manifest.json ---
+{
+  "short_name": "Hexland",
+  "name": "Hexland",
+  "icons": [
+    {
+      "src": "favicon.png",
+      "sizes": "256x256",
+      "type": "image/png"
+    }
+  ],
+  "start_url": ".",
+  "display": "standalone",
+  "theme_color": "#000000",
+  "background_color": "#ffffff"
+}
+
+'''
+'''--- frontend/public/robots.txt ---
+# https://www.robotstxt.org/robotstxt.html
+User-agent: *
+Disallow:
+
+'''
+'''--- frontend/src/App.js ---
+import React from 'react';
+import "error-polyfill";
+import 'bootstrap/dist/js/bootstrap.bundle';
+import 'bootstrap/dist/css/bootstrap.min.css';
+import "./App.scss";
+import './gh-fork-ribbon.css';
+import * as nearAPI from 'near-api-js'
+import ls from "local-storage";
+import GlPage from "./pages/GL";
+import Big from "big.js";
+
+const IsMainnet = false; // window.location.hostname === "berry.cards";
+const TestNearConfig = {
+  networkId: 'testnet',
+  nodeUrl: 'https://rpc.testnet.near.org',
+  archivalNodeUrl: 'https://rpc.mainnet.internal.near.org', // https://rpc.testnet.internal.near.org',
+  contractName: 'dev-1633114897352-65032726804099',
+  walletUrl: 'https://wallet.testnet.near.org',
+};
+const MainNearConfig = {
+  networkId: 'mainnet',
+  nodeUrl: 'https://rpc.mainnet.near.org',
+  archivalNodeUrl: 'https://rpc.mainnet.internal.near.org',
+  contractName: 'dev-1633114897352-65032726804099',
+  walletUrl: 'https://wallet.near.org',
+};
+
+export const NearConfig = IsMainnet ? MainNearConfig : TestNearConfig;
+
+export class App extends React.Component {
+  constructor(props) {
+    super(props);
+
+    this._near = {};
+
+    this.state = {
+      connected: false,
+      draw: false,
+      isNavCollapsed: true,
+      account: null,
+      accountBalance: Big(0),
+      color: `#${Math.trunc(Math.random() * 0xffffff).toString(16).padStart(6, "0")}`
+    };
+
+    this._initNear().then(() => {
+      this.setState({
+        signedIn: !!this._near.accountId,
+        signedAccountId: this._near.accountId,
+        connected: true,
+      });
+    });
+  }
+
+  async _initNear() {
+    const keyStore = new nearAPI.keyStores.BrowserLocalStorageKeyStore();
+    const near = await nearAPI.connect(Object.assign({deps: {keyStore}}, NearConfig));
+    // this._near.archivalConnection = nearAPI.Connection.fromConfig({
+    //   networkId: NearConfig.networkId,
+    //   provider: { type: 'JsonRpcProvider', args: { url: NearConfig.archivalNodeUrl } },
+    //   signer: { type: 'InMemorySigner', keyStore }
+    // });
+    this._near.keyStore = keyStore;
+    this._near.near = near;
+
+    this._near.walletConnection = new nearAPI.WalletConnection(near, NearConfig.contractName);
+    this._near.accountId = this._near.walletConnection.getAccountId();
+
+    this._near.account = this._near.walletConnection.account();
+
+    // this._near.berryclub = new nearAPI.Account(this._near.archivalConnection, 'berryclub.ek.near');
+    //
+    this._near.contract = new nearAPI.Contract(this._near.account, NearConfig.contractName, {
+      viewMethods: ['get_cells_json', 'get_storage_balance'],
+      changeMethods: ['draw_json'],
+    });
+
+    if (this._near.accountId) {
+      const balance = Big(await this._near.contract.get_storage_balance({
+        account_id: this._near.accountId
+      }) || "0");
+      this.setState({
+        accountBalance: balance,
+      })
+    }
+
+  }
+
+  async requestSignIn(e) {
+    e && e.preventDefault();
+    const appTitle = '';
+    await this._near.walletConnection.requestSignIn(
+      NearConfig.contractName,
+      appTitle
+    )
+    return false;
+  }
+
+  async logOut() {
+    this._near.walletConnection.signOut();
+    this._near.accountId = null;
+    this.setState({
+      signedIn: !!this._accountId,
+      signedAccountId: this._accountId,
+    })
+  }
+
+  popRequest(c) {
+    const requests = this.state.requests.slice(1);
+    this.setState({
+      requests,
+    }, c);
+  }
+
+  addRequest(r, c) {
+    const requests = this.state.requests.slice(0);
+    requests.push(r);
+    this.setState({
+      requests,
+    }, c);
+  }
+
+  addRecentCard(cardId) {
+    let recentCards = this.state.recentCards.slice(0);
+    const index = recentCards.indexOf(cardId);
+    if (index !== -1) {
+      recentCards.splice(index, 1);
+    }
+    recentCards.unshift(cardId);
+    recentCards = recentCards.slice(0, 5);
+    ls.set(this._near.lsKeyRecentCards, recentCards);
+    this.setState({
+      recentCards
+    })
+  }
+
+  async refreshAllowance() {
+    alert("You're out of access key allowance. Need sign in again to refresh it");
+    await this.logOut();
+    await this.requestSignIn();
+  }
+
+  render() {
+    const passProps = {
+      _near: this._near,
+      setState: (s, c) => this.setState(s, c),
+      refreshAllowance: () => this.refreshAllowance(),
+      state: this.state
+    };
+    const header = !this.state.connected ? (
+      <div>Connecting... <span className="spinner-grow spinner-grow-sm" role="status" aria-hidden="true"></span></div>
+    ) : (this.state.signedIn ? (
+      <div>
+        <button className="btn btn-primary me-2" onClick={() => this.setState({ draw: !this.state.draw})}>{!this.state.draw ? "Scroll mode" : "Draw mode"}</button>
+        {this.state.draw && <>
+          Color:
+          <div className="d-inline-block align-middle">
+            <input className="form-control ms-2 p-0" type="color" id="color" name="color" style={{minWidth: "5em"}}
+                   value={this.state.color} onChange={(e) => this.setState({
+              color: e.target.value
+            })} />
+          </div>
+        </>}
+
+        <div style={{float: "right"}}>
+          <label>
+            Account Balance: {this.state.accountBalance.div(Big(10).pow(24)).toFixed(3)} NEAR
+          </label>
+          <button
+            className="btn btn-outline-secondary ms-2"
+            onClick={() => this.logOut()}>Sign out ({this.state.signedAccountId})</button>
+        </div>
+      </div>
+    ) : (
+      <div>
+        <button
+          className="btn btn-primary"
+          onClick={(e) => this.requestSignIn(e)}>Sign in with NEAR Wallet</button>
+      </div>
+    ));
+
+    return (
+      <div className="App">
+        {header}
+        <a className="github-fork-ribbon right-bottom fixed" href="https://github.com/evgenykuzyakov/hexland" data-ribbon="Fork me on GitHub"
+           title="Fork me on GitHub">Fork me on GitHub</a>
+
+        <GlPage {...passProps}/>
+      </div>
+    )
+  }
+}
+
+'''
+'''--- frontend/src/components/Board.js ---
+import Big from "big.js";
+import {NearConfig} from "../App";
+import ls from "local-storage";
+
+const allCells = {};
+
+const Limit = 16;
+const CellSize = 16;
+const CellSize2 = CellSize * CellSize;
+const NumLevels = 3;
+const MaxNumberLevels = 5;
+const MaxSize = Math.pow(CellSize, MaxNumberLevels);
+export const StartOffsetX = MaxSize / 2;
+export const StartOffsetY = MaxSize / 2;
+
+const RootCellId = {
+  level: NumLevels,
+  x: StartOffsetX / Math.pow(CellSize, NumLevels + 1),
+  y: StartOffsetY / Math.pow(CellSize, NumLevels + 1),
+};
+
+const MinBalance = Big(10).pow(23);
+const DrawGas = Big(100).mul(Big(10).pow(12)).toFixed(0);
+const UnclaimedDefaultColor = 0x333333;
+
+const intToColor = (c) => `#${(c & 0xffffff).toString(16).padStart(6, "0")}`;
+const colorToInt = (c) => parseInt(c.substring(1), 16);
+const s = (c) => JSON.stringify(c);
+const p = (c) => JSON.parse(c);
+const p2c = (p) => ({
+  x: Math.trunc(p.x / CellSize),
+  y: Math.trunc(p.y / CellSize),
+  level: 0,
+});
+
+const BatchOfPixels = 100;
+const BatchTimeout = 250;
+
+const cellKey = (cellIdStr) => `${NearConfig.contractName}:v01:-cell-${cellIdStr}`;
+
+export class Board {
+  constructor(contract, ctx, redraw) {
+    this.contract = contract;
+    this.setState = contract.setState;
+    this.refreshAllowance = contract.refreshAllowance;
+    this.state = contract.state;
+
+    this.ctx = ctx;
+    this.redraw = redraw;
+    this.pixelQueue = [];
+    this.pendingPixels = [];
+    this.pending = {};
+    this.sendQueueTimer = null;
+    this.numFailedTxs = 0;
+
+    this.needRedraw = false;
+
+    this.renderLocal();
+  }
+
+  async fetchCells(cellIds) {
+    const cells = await this.contract.get_cells_json({cell_ids: cellIds});
+    return cellIds.reduce((acc, cellId, i) => {
+      acc[s(cellId)] = cells[i];
+      return acc;
+    }, {})
+  }
+
+  getCell(cellId) {
+    const cellIdStr = s(cellId);
+    if (cellIdStr in allCells) {
+      return allCells[cellIdStr]
+    } else {
+      return allCells[cellIdStr] = ls.get(cellKey(cellIdStr)) || {
+        nonce: 0,
+        colors: new Array(CellSize2).fill(0),
+      }
+    }
+  }
+
+  setCell(cellId, cell) {
+    const cellIdStr = s(cellId);
+    allCells[cellIdStr] = cell;
+    ls.set(cellKey(cellIdStr), cell)
+  }
+
+  internalPaint(cellId, color) {
+    if (!(s(cellId) in allCells)) {
+      const w = Math.pow(CellSize, cellId.level + 1);
+      const x = cellId.x * w - StartOffsetX;
+      const y = cellId.y * w - StartOffsetY;
+      this.ctx.fillStyle = intToColor(color || UnclaimedDefaultColor);
+      this.ctx.fillRect(x, y, w, w);
+      this.needRedraw = true;
+    }
+  }
+
+  internalRender(cellId, cell) {
+    const imageData = this.ctx.createImageData(CellSize, CellSize);
+    const data = imageData.data;
+    let off = 0;
+    for (let i = 0; i < CellSize; ++i) {
+      for (let j = 0; j < CellSize; ++j) {
+        const index = i * CellSize + j;
+        const color = cell.colors[index];
+        data[off++] = (color >> 16) & 0xff;
+        data[off++] = (color >> 8) & 0xff;
+        data[off++] = color & 0xff;
+        data[off++] = 255;
+      }
+    }
+    const w = Math.pow(CellSize, cellId.level + 1);
+    const x = cellId.x * w - StartOffsetX;
+    const y = cellId.y * w - StartOffsetY;
+    this.ctx.putImageData(imageData, x, y);
+    this.needRedraw = true;
+  }
+
+  internalRedraw() {
+    if (this.needRedraw) {
+      this.needRedraw = false;
+      this.redraw();
+    }
+  }
+
+  renderLocal() {
+    const q = [RootCellId];
+    while (q.length > 0) {
+      const cellId = q.splice(0, 1)[0];
+      const cell = this.getCell(cellId);
+      if (cell.nonce > 0) {
+        if (cellId.level === 0) {
+          this.internalRender(cellId, cell);
+        } else {
+          for (let i = 0; i < CellSize; ++i) {
+            for (let j = 0; j < CellSize; ++j) {
+              const index = i * CellSize + j;
+              const newCellId = {
+                level: cellId.level - 1,
+                x: cellId.x * CellSize + j,
+                y: cellId.y * CellSize + i,
+              };
+              this.internalPaint(newCellId, cell.colors[index]);
+              if (cell.colors[index]) {
+                q.push(newCellId);
+              }
+            }
+          }
+        }
+      }
+    }
+    this.internalRedraw();
+  }
+
+  async refreshAccountBalance() {
+    const balance = Big(await this.contract.get_storage_balance({
+      account_id: this.contract.account.accountId
+    }) || "0");
+    this.setState({
+      accountBalance: balance,
+    });
+    return balance;
+  }
+
+  async sendQueue() {
+    this.pixelQueue.sort((a, b) => s(p2c(a)).localeCompare(s(p2c(b))))
+    const pixels = this.pixelQueue.splice(0, BatchOfPixels);
+    this.pendingPixels = pixels;
+
+    const balance = await this.refreshAccountBalance();
+
+    try {
+      await this.contract.draw_json({
+        pixels
+      }, DrawGas, balance.lt(MinBalance) ? "1000000000000000000000000" : "0");
+      this.numFailedTxs = 0;
+    } catch (error) {
+      const msg = error.toString();
+      if (msg.indexOf("does not have enough balance") !== -1) {
+        await this.refreshAllowance();
+        return;
+      }
+      console.log("Failed to send a transaction", error);
+      this.numFailedTxs += 1;
+      if (this.numFailedTxs < 3) {
+        this.pixelQueue = this.pixelQueue.concat(this.pendingPixels);
+        this.pendingPixels = [];
+      } else {
+        this.pendingPixels = [];
+        this.pixelQueue = [];
+      }
+    }
+    try {
+      await this.refreshAccountBalance();
+    } catch (e) {
+      // ignore
+    }
+    this.pendingPixels.forEach((p) => delete this.pending[s(p)]);
+    this.pendingPixels = [];
+  }
+
+  async pingQueue(ready) {
+    if (this.sendQueueTimer) {
+      clearTimeout(this.sendQueueTimer);
+      this.sendQueueTimer = null;
+    }
+
+    if (
+      this.pendingPixels.length === 0 &&
+      (this.pixelQueue.length >= BatchOfPixels || ready)
+    ) {
+      await this.sendQueue();
+    }
+    if (this.pixelQueue.length > 0) {
+      this.sendQueueTimer = setTimeout(async () => {
+        await this.pingQueue(true);
+      }, BatchTimeout);
+    }
+  }
+
+  modifyPixel(p) {
+    const cellId = p2c(p);
+    const cell = this.getCell(cellId);
+    const index = (p.y - cellId.y * CellSize) * CellSize + p.x - cellId.x * CellSize;
+    cell.colors[index] = p.c;
+
+    const x = p.x - StartOffsetX;
+    const y = p.y - StartOffsetY;
+    this.ctx.fillStyle = intToColor(p.c);
+    this.ctx.fillRect(x, y, 1, 1);
+    this.needRedraw = true;
+    setTimeout(() => {
+      this.internalRedraw();
+    }, 100)
+  }
+
+  draw(ab) {
+    const c = colorToInt(this.state.color);
+    const p = {
+      x: StartOffsetX + ab.a,
+      y: StartOffsetY + ab.b,
+      c,
+    };
+    const sp = s(p);
+    if (!(sp in this.pending)) {
+      this.pending[sp] = true;
+      this.pixelQueue.push(p);
+
+      this.modifyPixel(p);
+    }
+
+    this.pingQueue(false);
+  }
+
+  async refreshCells() {
+    const q = [RootCellId];
+    while (q.length > 0) {
+      const cellIds = q.splice(0, Limit);
+      const newCells = await this.fetchCells(cellIds);
+      Object.entries(newCells).forEach(([cellId, cell]) => {
+        if (cell) {
+          cellId = p(cellId);
+          if (cellId.level === 0) {
+            this.internalRender(cellId, cell);
+          } else {
+            let oldCell = this.getCell(cellId);
+            if (cell.nonce !== oldCell.nonce) {
+              for (let i = 0; i < CellSize; ++i) {
+                for (let j = 0; j < CellSize; ++j) {
+                  const index = i * CellSize + j;
+                  const newCellId = {
+                    level: cellId.level - 1,
+                    x: cellId.x * CellSize + j,
+                    y: cellId.y * CellSize + i,
+                  };
+                  this.internalPaint(newCellId, cell.colors[index]);
+                  if (cell.colors[index] !== oldCell.colors[index]) {
+                    q.push(newCellId);
+                  }
+                }
+              }
+            }
+          }
+          this.setCell(cellId, cell);
+        }
+      });
+      this.internalRedraw();
+    }
+  }
+};
+
+'''
+'''--- frontend/src/gh-fork-ribbon.css ---
+/*!
+ * "Fork me on GitHub" CSS ribbon v0.2.3 | MIT License
+ * https://github.com/simonwhitaker/github-fork-ribbon-css
+*/
+
+.github-fork-ribbon {
+  width: 12.1em;
+  height: 12.1em;
+  position: absolute;
+  overflow: hidden;
+  top: 0;
+  right: 0;
+  z-index: 9999;
+  pointer-events: none;
+  font-size: 13px;
+  text-decoration: none;
+  text-indent: -999999px;
+}
+
+.github-fork-ribbon.fixed {
+  position: fixed;
+}
+
+.github-fork-ribbon:hover, .github-fork-ribbon:active {
+  background-color: rgba(0, 0, 0, 0.0);
+}
+
+.github-fork-ribbon:before, .github-fork-ribbon:after {
+  /* The right and left classes determine the side we attach our banner to */
+  position: absolute;
+  display: block;
+  width: 15.38em;
+  height: 1.54em;
+
+  top: 3.23em;
+  right: -3.23em;
+
+  -webkit-box-sizing: content-box;
+  -moz-box-sizing: content-box;
+  box-sizing: content-box;
+
+  -webkit-transform: rotate(45deg);
+  -moz-transform: rotate(45deg);
+  -ms-transform: rotate(45deg);
+  -o-transform: rotate(45deg);
+  transform: rotate(45deg);
+}
+
+.github-fork-ribbon:before {
+  content: "";
+
+  /* Add a bit of padding to give some substance outside the "stitching" */
+  padding: .38em 0;
+
+  /* Set the base colour */
+  background-color: #a00;
+
+  /* Set a gradient: transparent black at the top to almost-transparent black at the bottom */
+  background-image: -webkit-gradient(linear, left top, left bottom, from(rgba(0, 0, 0, 0)), to(rgba(0, 0, 0, 0.15)));
+  background-image: -webkit-linear-gradient(top, rgba(0, 0, 0, 0), rgba(0, 0, 0, 0.15));
+  background-image: -moz-linear-gradient(top, rgba(0, 0, 0, 0), rgba(0, 0, 0, 0.15));
+  background-image: -ms-linear-gradient(top, rgba(0, 0, 0, 0), rgba(0, 0, 0, 0.15));
+  background-image: -o-linear-gradient(top, rgba(0, 0, 0, 0), rgba(0, 0, 0, 0.15));
+  background-image: linear-gradient(to bottom, rgba(0, 0, 0, 0), rgba(0, 0, 0, 0.15));
+
+  /* Add a drop shadow */
+  -webkit-box-shadow: 0 .15em .23em 0 rgba(0, 0, 0, 0.5);
+  -moz-box-shadow: 0 .15em .23em 0 rgba(0, 0, 0, 0.5);
+  box-shadow: 0 .15em .23em 0 rgba(0, 0, 0, 0.5);
+
+  pointer-events: auto;
+}
+
+.github-fork-ribbon:after {
+  /* Set the text from the data-ribbon attribute */
+  content: attr(data-ribbon);
+
+  /* Set the text properties */
+  color: #fff;
+  font: 700 1em "Helvetica Neue", Helvetica, Arial, sans-serif;
+  line-height: 1.54em;
+  text-decoration: none;
+  text-shadow: 0 -.08em rgba(0, 0, 0, 0.5);
+  text-align: center;
+  text-indent: 0;
+
+  /* Set the layout properties */
+  padding: .15em 0;
+  margin: .15em 0;
+
+  /* Add "stitching" effect */
+  border-width: .08em 0;
+  border-style: dotted;
+  border-color: #fff;
+  border-color: rgba(255, 255, 255, 0.7);
+}
+
+.github-fork-ribbon.left-top, .github-fork-ribbon.left-bottom {
+  right: auto;
+  left: 0;
+}
+
+.github-fork-ribbon.left-bottom, .github-fork-ribbon.right-bottom {
+  top: auto;
+  bottom: 0;
+}
+
+.github-fork-ribbon.left-top:before, .github-fork-ribbon.left-top:after, .github-fork-ribbon.left-bottom:before, .github-fork-ribbon.left-bottom:after {
+  right: auto;
+  left: -3.23em;
+}
+
+.github-fork-ribbon.left-bottom:before, .github-fork-ribbon.left-bottom:after, .github-fork-ribbon.right-bottom:before, .github-fork-ribbon.right-bottom:after {
+  top: auto;
+  bottom: 3.23em;
+}
+
+.github-fork-ribbon.left-top:before, .github-fork-ribbon.left-top:after, .github-fork-ribbon.right-bottom:before, .github-fork-ribbon.right-bottom:after {
+  -webkit-transform: rotate(-45deg);
+  -moz-transform: rotate(-45deg);
+  -ms-transform: rotate(-45deg);
+  -o-transform: rotate(-45deg);
+  transform: rotate(-45deg);
+}
+
+'''
+'''--- frontend/src/index.css ---
+
+'''
+'''--- frontend/src/index.js ---
+import React from 'react';
+import ReactDOM from 'react-dom';
+import './index.css';
+import { App } from './App';
+
+ReactDOM.render(<App />, document.getElementById('root'));
+
+'''
+'''--- frontend/src/pages/GL.js ---
+import React, {useEffect, useRef, useState} from 'react';
+import * as twgl from 'twgl-base.js';
+import vs from '../shaders/vs';
+import fs from '../shaders/fs';
+import {Board} from "../components/Board";
+
+const Sq3 = Math.sqrt(3.0) / 2;
+const DxA = Sq3 * 2;
+const DyA = 0;
+const DxB = Sq3;
+const DyB = 1.5;
+
+const InitialZoom = 1;
+const MinZoom = 1 / 4;
+const MaxZoom = 16;
+
+const TexSize = 2048;
+
+let lastMousePos = null;
+let isDrawMode = false;
+let view = {
+  a: 0,
+  b: 0,
+  zoom: InitialZoom,
+  aspect: 1,
+};
+
+function setupRender(berryclub, gl) {
+  const programInfo = twgl.createProgramInfo(gl, [vs, fs])
+
+  const arrays = {
+    a_position: [
+      -Sq3 - Sq3/2, 0.75, 0,
+      Sq3 - Sq3/2, 0.75, 0,
+      0 - Sq3/2, -0.75, 0,
+
+      Sq3 - Sq3/2, 0.75, 0,
+      Sq3 * 2 - Sq3/2, -0.75, 0,
+      0 - Sq3/2, -0.75, 0,
+    ],
+    a_texcoord: [
+      0, 0,
+      1, 0,
+      0, 1,
+
+      1, 0,
+      1, 1,
+      0, 1,
+    ],
+    a_ab: {
+      numComponents: 2, data: [
+        -0.5, -0.5,
+        TexSize - 0.5, -0.5,
+        -0.5, TexSize - 0.5,
+
+        TexSize - 0.5, -0.5,
+        TexSize - 0.5, TexSize - 0.5,
+        -0.5, TexSize - 0.5,
+      ]
+    }
+  };
+  const bufferInfo = twgl.createBufferInfoFromArrays(gl, arrays);
+
+  const canvas = document.createElement('canvas');
+  canvas.width = TexSize;
+  canvas.height = TexSize;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, TexSize, TexSize);
+  // ctx.fillStyle = '#222222';
+  // ctx.fillRect(0, 0, TexSize, TexSize);
+
+  const textures = twgl.createTextures(gl, {
+    fromCanvas: { src: canvas, mag: gl.NEAREST, min: gl.NEAREST, wrap: gl.CLAMP_TO_EDGE },
+  });
+
+  const board = new Board(berryclub, ctx, () => {
+    ctx.fillStyle = 'rgba(0, 0, 0, 0)';
+    ctx.fillRect(0, 0, 1, 1);
+    twgl.setTextureFromElement(gl, textures.fromCanvas, canvas);
+  });
+
+  board.refreshCells();
+  setInterval(() => {
+    board.refreshCells();
+  }, 5000);
+
+  function render(time) {
+    twgl.resizeCanvasToDisplaySize(gl.canvas);
+    twgl.bindFramebufferInfo(gl, null);
+    gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+
+    const uniforms = {
+      resolution: [gl.canvas.width, gl.canvas.height],
+      texSize: [TexSize - 1, TexSize - 1],
+      pos: [view.a, view.b, view.zoom],
+      u_diffuse: textures.fromCanvas,
+    };
+    gl.useProgram(programInfo.program);
+    twgl.setBuffersAndAttributes(gl, programInfo, bufferInfo);
+    twgl.setUniforms(programInfo, uniforms);
+    twgl.drawBufferInfo(gl, bufferInfo);
+
+    requestAnimationFrame(render);
+  }
+  requestAnimationFrame(render);
+
+  return board;
+}
+
+function mouseToAb(e) {
+  const x = e.clientX;
+  const y = e.clientY;
+  const rect = e.target.getBoundingClientRect();
+  const dx = ((x - rect.x) / rect.width - 0.5);
+  const dy = ((y - rect.y) / rect.width - rect.height / rect.width * 0.5);
+  return dxdyToAb(dx, dy);
+}
+
+function dxdyToAb(dx, dy) {
+  const b = dy / DyB;
+  const a = (dx - b * DxB) / DxA;
+  return {
+    a, b,
+  }
+}
+
+function GlPage(props) {
+  const canvasEl = useRef(null);
+  const berryclub = props._near.contract;
+  const [board, setBoard] = useState(null);
+
+  if (berryclub) {
+    berryclub.setState = props.setState;
+    berryclub.refreshAllowance = props.refreshAllowance
+    if (board) {
+      board.state = props.state;
+    }
+  }
+
+  const propsDraw = props.state.draw;
+  useEffect(() => {
+    isDrawMode = propsDraw;
+  }, [propsDraw]);
+
+  useEffect(() => {
+    if (canvasEl.current && berryclub) {
+      console.log("Setup");
+      const ctx = canvasEl.current.getContext('webgl');
+
+      const drawNow = (ab) => {
+        let a = (view.a + ab.a / view.zoom + 0.5) * TexSize - 0.5;
+        let b = (view.b + ab.b / view.zoom + 0.5) * TexSize - 0.5;
+
+        function dist(na, nb) {
+          const cy = ((nb - b) * DyB + (na - a) * DyA);
+          const cx = ((nb - b) * DxB + (na - a) * DxA);
+          return cx * cx + cy * cy;
+        }
+
+        const ta = Math.trunc(a);
+        const tb = Math.trunc(b);
+        let best = null;
+        let minD = 10;
+
+        for (let i = -1; i < 2 ; ++i) {
+          for (let j = -1; j < 2; ++j) {
+            const a = ta + i;
+            const b = tb + j;
+            const d = dist(a, b);
+            if (d < minD + 1e-9) {
+              best = {a, b};
+              minD = d;
+            }
+          }
+        }
+        board.draw(best);
+      }
+
+      const board = setupRender(berryclub, ctx);
+      setBoard(board);
+      canvasEl.current.addEventListener('mousemove', (e) => {
+        const ab = mouseToAb(e);
+        if ((e.buttons & 1) && isDrawMode) {
+          drawNow(ab);
+        } else if (lastMousePos && !isDrawMode) {
+          const da = ab.a - lastMousePos.a;
+          const db = ab.b - lastMousePos.b;
+          view = {
+            a: view.a - da / view.zoom,
+            b: view.b - db / view.zoom,
+            zoom: view.zoom,
+            aspect: view.aspect,
+          };
+        }
+        if (e.buttons & 1) {
+          lastMousePos = ab;
+        } else {
+          lastMousePos = null;
+        }
+      });
+
+      canvasEl.current.addEventListener('mousedown', (e) => {
+        if ((e.buttons & 1) && isDrawMode) {
+          const ab = mouseToAb(e);
+          drawNow(ab);
+        }
+      });
+
+      canvasEl.current.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        const ab = mouseToAb(e);
+
+        const newZoom = Math.min(MaxZoom, Math.max(MinZoom, view.zoom * Math.exp(-e.deltaY * 0.001)));
+        const oa = view.a + ab.a / view.zoom;
+        const ob = view.b + ab.b / view.zoom;
+        const va = oa - ab.a / newZoom;
+        const vb = ob - ab.b / newZoom;
+
+        view = {
+          a: va,
+          b: vb,
+          zoom: newZoom,
+          aspect: view.aspect,
+        };
+
+      });
+
+      const resize = () => {
+        const dpr = window.devicePixelRatio || 1;
+        const bsr = ctx.webkitBackingStorePixelRatio ||
+          ctx.mozBackingStorePixelRatio ||
+          ctx.msBackingStorePixelRatio ||
+          ctx.oBackingStorePixelRatio ||
+          ctx.backingStorePixelRatio || 1;
+
+        const pixelRatio = dpr / bsr;
+        const width  = window.innerWidth || document.documentElement.clientWidth ||
+          document.body.clientWidth;
+        const height = window.innerHeight|| document.documentElement.clientHeight||
+          document.body.clientHeight;
+        canvasEl.current.width = width * pixelRatio;
+        canvasEl.current.height = height * pixelRatio;
+        // ctx.scale(canvasEl.current.width, canvasEl.current.width);
+        view = Object.assign({}, view, {aspect: height / width})
+      };
+
+      window.addEventListener('resize', resize);
+
+      resize();
+
+    }
+  }, [canvasEl, berryclub])
+
+  return (
+    <div>
+      <canvas
+        ref={canvasEl}
+        className="canvas"
+        width={640}
+      />
+    </div>
+  );
+}
+
+export default GlPage;
+
+'''
+'''--- frontend/src/shaders/fs.js ---
+export default `
+precision highp float;
+
+const float Sq3 = sqrt(3.0) / 2.0;
+const mat2 D = mat2(Sq3 * 2.0, Sq3, 0.0, -1.5);
+
+uniform vec3 color;
+uniform sampler2D u_diffuse;
+uniform vec2 texSize;
+
+varying vec2 v_texCoord;
+varying vec2 v_ab;
+
+float d(vec2 p) {
+  vec2 dx = (p - v_ab) * D;
+  return dot(dx, dx);
+}
+
+vec3 mind(vec3 a, vec2 b)
+{
+  float db = d(b); 
+  return mix(vec3(b, db), a, step(a.z, db));
+}
+
+void main() {
+  vec2 fab = floor(v_ab);
+  vec3 best = vec3(fab, d(fab));
+  best = mind(best, fab + vec2(1.0, 0.0));
+  best = mind(best, fab + vec2(0.0, 1.0));
+  best = mind(best, fab + vec2(1.0, 1.0));
+  
+  vec4 diffuseColor = texture2D(u_diffuse, best.xy / texSize);
+  if (diffuseColor.w < 1.0) {
+    discard;
+  }
+  gl_FragColor = diffuseColor;
+}
+`;
+
+'''
+'''--- frontend/src/shaders/vs.js ---
+export default `
+const float Sq3 = sqrt(3.0) / 2.0;
+const mat2 D = mat2(Sq3 * 2.0, Sq3, 0.0, -1.5);
+
+uniform vec2 resolution;
+uniform vec3 pos;
+
+attribute vec4 a_position;
+attribute vec2 a_texcoord;
+attribute vec2 a_ab;
+
+varying vec2 v_texCoord;
+varying vec2 v_ab;
+
+void main() {
+  gl_Position = vec4((a_position.xy - pos.xy * D) * vec2(2.0, 2.0 * resolution.x / resolution.y) * pos.z, a_position.zw);
+  v_texCoord = a_texcoord;
+  v_ab = a_ab;
+}
+`;
+
+'''

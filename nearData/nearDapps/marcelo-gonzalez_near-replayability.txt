@@ -1,0 +1,919 @@
+*GitHub Repository "marcelo-gonzalez/near-replayability"*
+
+'''--- Cargo.toml ---
+[package]
+name = "near-replayability"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.69"
+async-process = "1.6.0"
+clap = { version = "3.1.6", features = ["derive", "env"] }
+sqlx = { version = "0.5", features = [ "runtime-tokio-native-tls", "postgres", "offline" ] }
+dotenv = "0.15.0"
+futures = "0.3"
+log = "0.4.17"
+md5 = "0.7.0"
+near-jsonrpc-client = "0.5.0"
+near-primitives = "0.16.0"
+num_cpus = "1.15.0"
+simple_logger = "4.0.0"
+tokio = "*"
+tracing = "0.1.37"
+'''
+'''--- migrations/20230302214607_init.down.sql ---
+DROP TABLE public.applied_chunks;
+DROP TABLE public.neard_versions;
+DROP TABLE public.epochs;
+DROP TYPE apply_status;
+
+'''
+'''--- migrations/20230302214607_init.up.sql ---
+CREATE TYPE apply_status AS ENUM ('ok', 'failed', 'pending', 'height_missing');
+
+CREATE TABLE public.epochs (
+    height bigint NOT NULL,
+    id text UNIQUE NOT NULL PRIMARY KEY,
+    start_height bigint UNIQUE NOT NULL,
+    end_height bigint UNIQUE NOT NULL,
+    chunks_applied bigint NOT NULL,
+    chunk_application_failures bigint NOT NULL
+);
+
+CREATE INDEX height ON epochs (height);
+CREATE INDEX chunks_applied ON epochs (chunks_applied);
+
+-- the point of this is just to store the smaller 4 bytes in each row of applied_chunks
+CREATE TABLE public.neard_versions (
+    hash integer NOT NULL PRIMARY KEY,
+    version text NOT NULL
+);
+
+CREATE TABLE public.applied_chunks (
+    height bigint NOT NULL,
+    shard_id integer NOT NULL,
+    epoch_id text NOT NULL REFERENCES public.epochs (id),
+    neard_version_hash integer NOT NULL REFERENCES public.neard_versions (hash),
+    status apply_status NOT NULL,
+    job_queued_at timestamp NOT NULL,
+    PRIMARY KEY (height, shard_id, neard_version_hash)
+);
+
+CREATE INDEX block_height ON applied_chunks (height);
+CREATE INDEX epoch_id ON applied_chunks (epoch_id);
+CREATE INDEX apply_status ON applied_chunks (status);
+'''
+'''--- sqlx-data.json ---
+{
+  "db": "PostgreSQL",
+  "0d15e2b57989825851871030d9ee9a3860c12bdeb9ccd0e899bfa89e28058ea8": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Left": [
+          "Int8",
+          "Text",
+          "Int8",
+          "Int8",
+          "Int8",
+          "Int8"
+        ]
+      }
+    },
+    "query": "INSERT INTO epochs (height, id, start_height, end_height, chunks_applied, chunk_application_failures) VALUES ($1, $2, $3, $4, $5, $6)\n            "
+  },
+  "1332e48391351d47e44a62681dbf1eec61576d877733e34837e4e59f17ab1e68": {
+    "describe": {
+      "columns": [
+        {
+          "name": "height",
+          "ordinal": 0,
+          "type_info": "Int8"
+        },
+        {
+          "name": "shard_id",
+          "ordinal": 1,
+          "type_info": "Int4"
+        },
+        {
+          "name": "epoch_id",
+          "ordinal": 2,
+          "type_info": "Text"
+        }
+      ],
+      "nullable": [
+        false,
+        false,
+        false
+      ],
+      "parameters": {
+        "Left": [
+          "Int4"
+        ]
+      }
+    },
+    "query": "\nWITH next_epoch AS\n(\n   SELECT\n      *\n   FROM\n      epochs\n   ORDER BY\n      chunks_applied LIMIT 1\n)\n,\nepoch_heights AS\n(\n   SELECT\n      id AS epoch_id,\n      height AS epoch_height,\n      generate_series(start_height, end_height) AS block_height\n   FROM\n      next_epoch\n)\n,\nepoch_chunks AS\n(\n   SELECT\n      *,\n      generate_series(0, CASE WHEN epoch_height >= 997 THEN 3 ELSE 0 END) AS shard_id\n   FROM\n      epoch_heights\n)\n,\nchunks_to_apply AS\n(\n   INSERT INTO\n      applied_chunks (height, shard_id, epoch_id, neard_version_hash, status, job_queued_at)\n      SELECT\n         block_height,\n         epoch_chunks.shard_id,\n         epoch_chunks.epoch_id,\n         $1,\n         'pending',\n         'now'\n      FROM\n         epoch_chunks\n         LEFT JOIN\n            applied_chunks\n            ON epoch_chunks.block_height = applied_chunks.height\n            AND epoch_chunks.shard_id = applied_chunks.shard_id\n      WHERE\n         applied_chunks.height IS NULL LIMIT 50\n      ON CONFLICT DO NOTHING RETURNING height, shard_id, epoch_id\n)\n,\nepoch_count AS\n(\n   UPDATE\n      epochs\n   SET\n      chunks_applied = new_count.count\n   FROM\n      (\n         SELECT\n            next_epoch.height,\n            next_epoch.chunks_applied + c.count AS count\n         FROM\n            next_epoch\n            CROSS JOIN\n               (\n                  SELECT\n                     COUNT(*)\n                  FROM\n                     chunks_to_apply\n               )\n               c\n      )\n      new_count\n   WHERE\n      epochs.height = new_count.height\n)\nSELECT * FROM chunks_to_apply;\n        "
+  },
+  "964afbffd6fe25e820629c09abfcc385c82826087420413a26fab6a1808e6ffa": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Left": [
+          "Int8",
+          "Text"
+        ]
+      }
+    },
+    "query": "UPDATE epochs SET chunk_application_failures = chunk_application_failures + $1 WHERE id = $2;"
+  },
+  "ad5b0356ed970519009332b0f6630b884344d8f0227bb4525ae25896d4ba3c60": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Left": [
+          "Int8",
+          "Text"
+        ]
+      }
+    },
+    "query": "UPDATE epochs SET chunks_applied = chunks_applied - $1 WHERE id = $2;"
+  },
+  "df481ad62dd6f3c11b9ef28ccffd566fad0dab119556457a268d96819d8209ce": {
+    "describe": {
+      "columns": [
+        {
+          "name": "height",
+          "ordinal": 0,
+          "type_info": "Int8"
+        },
+        {
+          "name": "start_height",
+          "ordinal": 1,
+          "type_info": "Int8"
+        }
+      ],
+      "nullable": [
+        false,
+        false
+      ],
+      "parameters": {
+        "Left": []
+      }
+    },
+    "query": "SELECT height, start_height FROM epochs ORDER BY height ASC LIMIT 1"
+  },
+  "f1308a2967c42e52aeb7309d4320858bdab7ea1224f44573a5bccdfbf03f3433": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Left": [
+          "Int4",
+          "Text"
+        ]
+      }
+    },
+    "query": "INSERT INTO neard_versions (hash, version) VALUES ($1, $2) ON CONFLICT DO NOTHING\n            "
+  }
+}
+'''
+'''--- src/apply_chunks.rs ---
+use anyhow::Context;
+use futures::FutureExt;
+use sqlx::postgres::PgPool;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Instant, SystemTime};
+
+struct NeardPath {
+    path: PathBuf,
+    modified: SystemTime,
+    version: String,
+    version_hash: i32,
+}
+
+impl NeardPath {
+    fn new(path: &Path) -> anyhow::Result<Self> {
+        let m = std::fs::metadata(path)
+            .with_context(|| format!("failed getting file status for {}", path.display()))?;
+
+        let mut ret = Self {
+            path: path.into(),
+            modified: m.modified().context("no system time in file status?")?,
+            version: String::new(),
+            version_hash: 0,
+        };
+        ret.load_version()?;
+        Ok(ret)
+    }
+
+    fn load_version(&mut self) -> anyhow::Result<()> {
+        let output = std::process::Command::new(&self.path)
+            .arg("--version")
+            .output()
+            .with_context(|| format!("failed executing {}", self.path.display()))?;
+        anyhow::ensure!(
+            output.status.success(),
+            "nonzero exit code from {} --version",
+            self.path.display()
+        );
+        let hash = md5::compute(&output.stdout);
+        let version = String::from_utf8(output.stdout)
+            .with_context(|| format!("non utf-8 data from {} --version", self.path.display()))?;
+        self.version = version;
+        self.version_hash = i32::from_le_bytes(hash[..4].try_into().unwrap());
+        Ok(())
+    }
+
+    async fn insert_version(&self, db: &PgPool) -> anyhow::Result<()> {
+        sqlx::query!(
+            "INSERT INTO neard_versions (hash, version) \
+            VALUES ($1, $2) ON CONFLICT DO NOTHING
+            ",
+            self.version_hash,
+            self.version.clone()
+        )
+        .execute(db)
+        .await
+        .context("failed inserting version information to the DB")?;
+        Ok(())
+    }
+
+    async fn reload_and_insert(&mut self, db: &PgPool) -> anyhow::Result<()> {
+        let m = std::fs::metadata(&self.path)
+            .with_context(|| format!("failed getting file status for {}", self.path.display()))?;
+        let modified = m.modified().context("no system time in file status?")?;
+        if modified != self.modified {
+            tracing::warn!(target: "near-replayability", "neard version changed from under us!");
+            self.load_version()?;
+            self.insert_version(db).await?;
+            self.modified = modified;
+        }
+        Ok(())
+    }
+}
+
+#[allow(non_camel_case_types)]
+#[derive(PartialEq, Eq, Clone, Debug, sqlx::Type)]
+#[sqlx(type_name = "apply_status")]
+enum ApplyStatus {
+    ok,
+    failed,
+    pending,
+    height_missing,
+}
+
+#[derive(Clone, Debug)]
+struct Job {
+    epoch_id: String,
+    height: i64,
+    shard_id: i32,
+    status: ApplyStatus,
+}
+
+async fn next_jobs(db: &PgPool, neard_version_hash: i32) -> anyhow::Result<Vec<Job>> {
+    let rows = sqlx::query!(
+        "
+WITH next_epoch AS
+(
+   SELECT
+      *
+   FROM
+      epochs
+   ORDER BY
+      chunks_applied LIMIT 1
+)
+,
+epoch_heights AS
+(
+   SELECT
+      id AS epoch_id,
+      height AS epoch_height,
+      generate_series(start_height, end_height) AS block_height
+   FROM
+      next_epoch
+)
+,
+epoch_chunks AS
+(
+   SELECT
+      *,
+      generate_series(0, CASE WHEN epoch_height >= 997 THEN 3 ELSE 0 END) AS shard_id
+   FROM
+      epoch_heights
+)
+,
+chunks_to_apply AS
+(
+   INSERT INTO
+      applied_chunks (height, shard_id, epoch_id, neard_version_hash, status, job_queued_at)
+      SELECT
+         block_height,
+         epoch_chunks.shard_id,
+         epoch_chunks.epoch_id,
+         $1,
+         'pending',
+         'now'
+      FROM
+         epoch_chunks
+         LEFT JOIN
+            applied_chunks
+            ON epoch_chunks.block_height = applied_chunks.height
+            AND epoch_chunks.shard_id = applied_chunks.shard_id
+      WHERE
+         applied_chunks.height IS NULL LIMIT 50
+      ON CONFLICT DO NOTHING RETURNING height, shard_id, epoch_id
+)
+,
+epoch_count AS
+(
+   UPDATE
+      epochs
+   SET
+      chunks_applied = new_count.count
+   FROM
+      (
+         SELECT
+            next_epoch.height,
+            next_epoch.chunks_applied + c.count AS count
+         FROM
+            next_epoch
+            CROSS JOIN
+               (
+                  SELECT
+                     COUNT(*)
+                  FROM
+                     chunks_to_apply
+               )
+               c
+      )
+      new_count
+   WHERE
+      epochs.height = new_count.height
+)
+SELECT * FROM chunks_to_apply;
+        ",
+        neard_version_hash
+    )
+    .fetch_all(db)
+    .await
+    .context("failed getting new apply jobs")?;
+    Ok(rows
+        .into_iter()
+        .map(|r| Job {
+            height: r.height,
+            shard_id: r.shard_id,
+            epoch_id: r.epoch_id,
+            status: ApplyStatus::pending,
+        })
+        .collect())
+}
+
+async fn update_jobs(
+    db: &PgPool,
+    finished: Vec<Job>,
+    neard_version_hash: i32,
+) -> anyhow::Result<()> {
+    let mut epoch_failures = HashMap::<_, i64>::new();
+    for j in finished.iter() {
+        if j.status == ApplyStatus::failed {
+            *epoch_failures.entry(j.epoch_id.clone()).or_default() += 1;
+        }
+    }
+    let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+        "UPDATE applied_chunks AS a SET
+        status = b.status
+        FROM (",
+    );
+    builder.push_values(finished, |mut b, job| {
+        b.push_bind(job.height)
+            .push_bind(job.shard_id)
+            .push_bind(neard_version_hash)
+            .push_bind(job.status);
+    });
+    builder.push("
+    ) AS b(height, shard_id, neard_version_hash, status)
+    WHERE a.height = b.height AND a.shard_id = b.shard_id AND a.neard_version_hash = b.neard_version_hash;
+    ");
+    let query = builder.build();
+    query
+        .execute(db)
+        .await
+        .context("failed updating applied_chunks rows")?;
+    // there will only be one of these for now
+    for (epoch_id, failures) in epoch_failures {
+        sqlx::query!(
+            "UPDATE epochs SET chunk_application_failures = chunk_application_failures + $1 WHERE id = $2;",
+            failures,
+            epoch_id,
+        )
+        .execute(db)
+        .await
+        .context("failed decrementing epoch table chunks_applied row")?;
+    }
+    Ok(())
+}
+
+async fn delete_jobs(
+    db: &PgPool,
+    still_pending: Vec<Job>,
+    neard_version_hash: i32,
+) -> anyhow::Result<()> {
+    let mut epoch_decrements = HashMap::<_, i64>::new();
+    for j in still_pending.iter() {
+        *epoch_decrements.entry(j.epoch_id.clone()).or_default() += 1;
+    }
+    let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+        "WITH p (height, shard_id, neard_version_hash) AS ( ",
+    );
+    builder.push_values(still_pending, |mut b, job| {
+        b.push_bind(job.height)
+            .push_bind(job.shard_id)
+            .push_bind(neard_version_hash);
+    });
+    builder.push("
+    )
+    DELETE FROM applied_chunks AS a USING p
+    WHERE a.height = p.height AND a.shard_id = p.shard_id AND p.neard_version_hash = p.neard_version_hash;
+    ");
+    let query = builder.build();
+    query
+        .execute(db)
+        .await
+        .context("failed updating applied_chunks rows")?;
+
+    // there will only be one of these for now
+    for (epoch_id, dec) in epoch_decrements {
+        sqlx::query!(
+            "UPDATE epochs SET chunks_applied = chunks_applied - $1 WHERE id = $2;",
+            dec,
+            epoch_id,
+        )
+        .execute(db)
+        .await
+        .context("failed decrementing epoch table chunks_applied row")?;
+    }
+    Ok(())
+}
+
+async fn delete_and_update_jobs(
+    db: &PgPool,
+    jobs: Vec<Job>,
+    neard_version_hash: i32,
+) -> anyhow::Result<()> {
+    let mut still_pending = Vec::new();
+    let mut finished = Vec::new();
+    for j in jobs {
+        if j.status == ApplyStatus::pending {
+            still_pending.push(j);
+        } else {
+            finished.push(j);
+        }
+    }
+    if !still_pending.is_empty() {
+        delete_jobs(db, still_pending, neard_version_hash).await?;
+    }
+    if !finished.is_empty() {
+        update_jobs(db, finished, neard_version_hash).await?;
+    }
+    Ok(())
+}
+
+struct ProcessPool {
+    num_processes: usize,
+}
+
+async fn run_job(
+    neard: &Path,
+    home_dir: &Path,
+    job: &mut Job,
+    no_read_write: bool,
+) -> anyhow::Result<()> {
+    let mut cmd = async_process::Command::new(neard);
+    cmd.arg("--unsafe-fast-startup")
+        .arg("--home")
+        .arg(home_dir)
+        .arg("view-state");
+    if !no_read_write {
+        cmd.arg("--readwrite");
+    }
+    let output = cmd
+        .arg("apply")
+        .arg("--height")
+        .arg(job.height.to_string())
+        .arg("--shard-id")
+        .arg(job.shard_id.to_string())
+        .output()
+        .await
+        .with_context(|| format!("failed executing {} view-state apply", neard.display()))?;
+    if output.status.success() {
+        job.status = ApplyStatus::ok;
+    } else {
+        match String::from_utf8(output.stderr) {
+            Ok(stderr) => {
+                // this is pretty ugly but idk how else to do it for now
+                if stderr.contains("DBNotFoundErr(\"BLOCK HEIGHT:") {
+                    job.status = ApplyStatus::height_missing;
+                } else {
+                    tracing::info!(
+                        "failure at height {} shard_id {}:\n\n{}",
+                        job.height,
+                        job.shard_id,
+                        stderr
+                    );
+                    job.status = ApplyStatus::failed;
+                }
+            }
+            Err(_) => job.status = ApplyStatus::failed,
+        }
+    }
+    Ok(())
+}
+
+impl ProcessPool {
+    fn new(num_processes: usize) -> Self {
+        Self { num_processes }
+    }
+
+    async fn run_jobs(
+        &self,
+        neard: &Path,
+        home_dir: &Path,
+        jobs: &mut [Job],
+        no_read_write: bool,
+        quit: &AtomicBool,
+    ) -> anyhow::Result<bool> {
+        assert!(!jobs.is_empty());
+        let mut processes = Vec::with_capacity(self.num_processes);
+        let mut it = jobs.iter_mut();
+        let mut next_job = it.next();
+        let mut result = Ok(());
+
+        loop {
+            if !quit.load(Ordering::Relaxed)
+                && result.is_ok()
+                && processes.len() < self.num_processes
+            {
+                if let Some(job) = next_job {
+                    processes.push(run_job(neard, home_dir, job, no_read_write).boxed());
+                    next_job = it.next();
+                    continue;
+                }
+            }
+
+            let (output, _, futs) = futures::future::select_all(processes).await;
+            if result.is_ok() && output.is_err() {
+                result = output;
+            }
+            let got_sigint = quit.load(Ordering::Relaxed);
+            // check next_job.is_none() for the special case when num_processes is 1
+            if (next_job.is_none() || got_sigint || result.is_err()) && futs.is_empty() {
+                return result.and(Ok(got_sigint));
+            }
+            processes = futs;
+        }
+    }
+}
+
+pub(crate) async fn apply_chunks(
+    db: &PgPool,
+    neard_path: &Path,
+    home_dir: &Path,
+    num_processes: usize,
+    no_read_write: bool,
+) -> anyhow::Result<()> {
+    let mut neard = NeardPath::new(neard_path)?;
+    neard.insert_version(db).await?;
+
+    let quit = Arc::new(AtomicBool::new(false));
+    let quit2 = quit.clone();
+    let _sig = tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.unwrap();
+        quit2.store(true, Ordering::Relaxed);
+    });
+
+    let pool = ProcessPool::new(num_processes);
+
+    loop {
+        if quit.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        // hopefully nobody will update it without stopping this program first, but check it
+        // to at least catch it earlyish if it happens
+        // TODO: right now we just continue taking undone work with the new neard version.
+        // Should redo old chunks with the new one
+        neard.reload_and_insert(db).await?;
+
+        let mut jobs = next_jobs(db, neard.version_hash).await?;
+        if jobs.is_empty() {
+            tracing::info!(target: "near-replayability", "no more jobs left to do");
+            return Ok(());
+        }
+        let sigint_received = pool
+            .run_jobs(&neard.path, home_dir, &mut jobs, no_read_write, &quit)
+            .await;
+        match sigint_received {
+            Ok(false) => update_jobs(db, jobs, neard.version_hash).await?,
+            Ok(true) => {
+                delete_and_update_jobs(db, jobs, neard.version_hash).await?;
+                return Ok(());
+            }
+            Err(e) => {
+                delete_and_update_jobs(db, jobs, neard.version_hash).await?;
+                return Err(e);
+            }
+        };
+    }
+}
+
+pub(crate) async fn test_parallelism(
+    neard_path: &Path,
+    home_dir: &Path,
+    height: u64,
+    shard_id: u32,
+    total_applies: usize,
+    num_processes: usize,
+) -> anyhow::Result<()> {
+    let mut jobs = vec![
+        Job {
+            height: height.try_into().unwrap(),
+            shard_id: shard_id.try_into().unwrap(),
+            epoch_id: String::from("some_epoch_id"),
+            status: ApplyStatus::pending
+        };
+        total_applies
+    ];
+    let pool = ProcessPool::new(num_processes);
+
+    let quit = Arc::new(AtomicBool::new(false));
+    let quit2 = quit.clone();
+    let _sig = tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.unwrap();
+        quit2.store(true, Ordering::Relaxed);
+    });
+
+    let start = Instant::now();
+    pool.run_jobs(neard_path, home_dir, &mut jobs, true, &quit)
+        .await?;
+    println!("took {:?}", Instant::now() - start);
+    Ok(())
+}
+
+'''
+'''--- src/epoch_info.rs ---
+use anyhow::Context;
+use near_jsonrpc_client::{methods, JsonRpcClient};
+use near_primitives::types::{BlockId, BlockReference, EpochId, EpochReference};
+use near_primitives::views::BlockView;
+use sqlx::postgres::PgPool;
+use std::time::Duration;
+
+async fn find_first_block(
+    client: &JsonRpcClient,
+    start_height: u64,
+    max_height: u64,
+) -> anyhow::Result<BlockView> {
+    let mut height = start_height;
+    loop {
+        match client
+            .call(methods::block::RpcBlockRequest {
+                block_reference: BlockReference::BlockId(BlockId::Height(height)),
+            })
+            .await
+        {
+            Ok(b) => return Ok(b),
+            Err(err) => match err.handler_error() {
+                Some(methods::block::RpcBlockError::UnknownBlock { .. }) => {
+                    if height >= max_height {
+                        anyhow::bail!(
+                            "can't find any block between {} and {}",
+                            start_height,
+                            max_height
+                        );
+                    }
+                    height += 1;
+                    continue;
+                }
+                _ => anyhow::bail!("error fetching block #{}: {:?}", height, err),
+            },
+        };
+    }
+}
+
+pub async fn populate(db: &PgPool, rpc_url: &str, head_height: u64) -> anyhow::Result<()> {
+    let client = JsonRpcClient::connect(rpc_url);
+    let mut start_block =
+        match sqlx::query!("SELECT height, start_height FROM epochs ORDER BY height ASC LIMIT 1")
+            .fetch_one(db)
+            .await
+        {
+            Ok(row) => {
+                // TODO: handle missing rows if they were skipped/removed for some reason
+                if row.height == 1 {
+                    return Ok(());
+                }
+                let block_reference =
+                    BlockReference::BlockId(BlockId::Height(row.start_height.try_into().unwrap()));
+                client
+                    .call(methods::block::RpcBlockRequest { block_reference })
+                    .await
+                    .with_context(|| format!("error fetching block #{}", row.start_height))?
+            }
+            Err(sqlx::Error::RowNotFound) => {
+                let block_reference =
+                    BlockReference::BlockId(BlockId::Height(head_height.try_into().unwrap()));
+                let block = client
+                    .call(methods::block::RpcBlockRequest { block_reference })
+                    .await
+                    .with_context(|| format!("error fetching block #{}", head_height))?;
+                let epoch_info = client
+                    .call(methods::validators::RpcValidatorRequest {
+                        epoch_reference: EpochReference::EpochId(EpochId(block.header.epoch_id)),
+                    })
+                    .await
+                    .with_context(|| {
+                        format!("failed fetching epoch info for block #{}", head_height)
+                    })?;
+
+                find_first_block(&client, epoch_info.epoch_start_height, head_height).await?
+            }
+            Err(e) => return Err(e).context("failed fetching last indexed epoch"),
+        };
+
+    loop {
+        // don't spam too hard
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let prev_epoch_end = client
+            .call(methods::block::RpcBlockRequest {
+                block_reference: BlockReference::BlockId(BlockId::Hash(
+                    start_block.header.prev_hash,
+                )),
+            })
+            .await
+            .with_context(|| format!("error fetching block {}", &start_block.header.prev_hash))?;
+
+        if prev_epoch_end.header.prev_hash == Default::default() {
+            break;
+        }
+        let epoch_info = client
+            .call(methods::validators::RpcValidatorRequest {
+                epoch_reference: EpochReference::BlockId(BlockId::Height(
+                    prev_epoch_end.header.height,
+                )),
+            })
+            .await
+            .with_context(|| {
+                format!(
+                    "failed fetching epoch info for block #{}",
+                    prev_epoch_end.header.height
+                )
+            })?;
+
+        start_block = find_first_block(
+            &client,
+            epoch_info.epoch_start_height,
+            prev_epoch_end.header.height,
+        )
+        .await?;
+
+        tracing::info!(target: "near-replayability", "inserting epoch info #{}", &epoch_info.epoch_height);
+
+        sqlx::query!(
+            "INSERT INTO epochs (height, id, start_height, end_height, chunks_applied, chunk_application_failures) \
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ",
+            i64::try_from(epoch_info.epoch_height).unwrap(),
+            prev_epoch_end.header.epoch_id.to_string(),
+            i64::try_from(start_block.header.height).unwrap(),
+            i64::try_from(prev_epoch_end.header.height).unwrap(),
+            0,
+            0,
+        )
+        .execute(db)
+        .await.context("error inserting epoch info")?;
+    }
+
+    Ok(())
+}
+
+'''
+'''--- src/main.rs ---
+use anyhow::Context;
+use sqlx::postgres::PgPool;
+use std::path::PathBuf;
+
+mod apply_chunks;
+mod epoch_info;
+
+#[derive(clap::Parser)]
+struct RunCmd {
+    #[clap(long)]
+    neard_path: PathBuf,
+    #[clap(long)]
+    home_dir: PathBuf,
+    #[clap(long)]
+    num_processes: Option<usize>,
+    #[clap(long)]
+    no_read_write: bool,
+}
+
+#[derive(clap::Parser)]
+struct TestParallelismCmd {
+    #[clap(long)]
+    neard_path: PathBuf,
+    #[clap(long)]
+    home_dir: PathBuf,
+    #[clap(long)]
+    height: u64,
+    #[clap(long)]
+    shard_id: u32,
+    #[clap(long)]
+    total_applies: usize,
+    #[clap(long)]
+    num_processes: usize,
+}
+
+#[derive(clap::Parser)]
+enum SubCmd {
+    Run(RunCmd),
+    PopulateEpochs,
+    TestParallelism(TestParallelismCmd),
+}
+
+#[derive(clap::Parser)]
+struct Cmd {
+    #[clap(subcommand)]
+    subcommand: SubCmd,
+}
+
+async fn db_connect() -> anyhow::Result<PgPool> {
+    let database_url =
+        std::env::var("DATABASE_URL").context("error reading DATABASE_URL environment variable")?;
+    PgPool::connect(&database_url)
+        .await
+        .with_context(|| format!("Error connecting to {}", database_url))
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    simple_logger::SimpleLogger::new()
+        .with_level(log::LevelFilter::Info)
+        .with_module_level("sqlx::query", log::LevelFilter::Warn)
+        .env()
+        .init()
+        .unwrap();
+
+    dotenv::dotenv().ok();
+
+    let cmd: Cmd = clap::Parser::parse();
+
+    match cmd.subcommand {
+        SubCmd::Run(cmd) => {
+            let num_processes = cmd.num_processes.unwrap_or_else(|| {
+                if cmd.no_read_write {
+                    num_cpus::get()
+                } else {
+                    1
+                }
+            });
+            apply_chunks::apply_chunks(
+                &db_connect().await?,
+                &cmd.neard_path,
+                &cmd.home_dir,
+                num_processes,
+                cmd.no_read_write,
+            )
+            .await
+        }
+        SubCmd::PopulateEpochs => {
+            epoch_info::populate(
+                &db_connect().await?,
+                "https://archival-rpc.mainnet.near.org",
+                85372640,
+            )
+            .await
+        }
+        SubCmd::TestParallelism(cmd) => {
+            apply_chunks::test_parallelism(
+                &cmd.neard_path,
+                &cmd.home_dir,
+                cmd.height,
+                cmd.shard_id,
+                cmd.total_applies,
+                cmd.num_processes,
+            )
+            .await
+        }
+    }
+}
+
+'''

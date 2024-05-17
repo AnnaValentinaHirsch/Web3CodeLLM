@@ -1,0 +1,2763 @@
+*GitHub Repository "NearSocial/social-db"*
+
+'''--- CHANGELOG.md ---
+# `0.12.0`
+
+- Add `get_version` method to return the version of the contract.
+- `set` method to return `SetReturnType` object. It contains `block_height` which is the block height when the data was set in decimal string format.
+
+# `0.11.0`
+
+- Add option to refund unused deposit for `set` method. [#11](https://github.com/NearSocial/social-db/pull/11)
+
+# `0.10.1`
+
+- Refunds deposit on calling `set` if it hasn't been added to an account.
+
+# `0.10.0`
+
+- Remove `1` yoctoNEAR requirement when writing from the matching predecessor. It allows to write under your account with a simple limited access key without requesting the permission first.
+- Introduce Shared Storage Pools. Pools can share available storage bytes to new or existing accounts. The total shared storage may exceed the prepaid storage, but the prepaid storage is still limits the total amount of bytes that can be written by the accounts using this shared pool. It allows optimistically provide storage quotas.
+  - Add `pub fn shared_storage_pool_deposit(&mut self, owner_id: Option<AccountId>)` - requires at least 100N in deposit. This creates a shared storage pool for a given owner_id (or predecessor) with the attached deposit. If the pool already exists for this owner, then the deposit is added to the existing pool.
+  - Add `pub fn share_storage(&mut self, account_id: AccountId, max_bytes: StorageUsage)` that should be called by the pool owner. It will share the storage from the owner's pool with the given account. If the account already has shared storage, then the `max_bytes` should be higher than the existing `max_bytes`.
+  - Add `pub fn get_account_storage(&self, account_id: AccountId) -> Option<StorageView>` that returns the amount of used bytes and the amount of bytes available. It accounts for the shared storage.
+
+# `0.9.0`
+
+- Fix returned values of the trailing `/` for `get` and `keys`.
+- New options for `keys` API: `value_only`. If `true`, only matches keys which value is not a node. It's needed to filter out deleted entries. Since a node can't be deleted right now.
+
+# `0.8.0`
+
+- Ability to delete data by passing `null` leaves.
+- Support for retrieving deleted data with option `return_deleted: true`.
+
+# `0.7.0`
+
+- Add `options` to `get` and `keys` API calls.
+
+# `0.6.0`
+
+- Adding ability to pause a contract and migrate it to a new genesis.
+- Methods for extracting the data based on nodes. Useful for API server implementations.
+
+# `0.5.1`
+
+- Decrease storage requirement to `2000` bytes from `10000` bytes.
+
+# `0.5.0`
+
+- Restrict `**` to be only a suffix.
+- Added `keys` to retrieve matched keys including non-leaf nodes.
+- Limit key length to `256` characters.
+
+# `0.4.0`
+
+- `README.md` and `CHANGELOG.md` are added
+- Added `is_write_permission_granted` to check write permission access.
+
+'''
+'''--- Cargo.toml ---
+[workspace.package]
+version = "0.12.0"
+authors = ["Eugene The Dream"]
+edition = "2018"
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "s"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+
+[workspace]
+members = [
+    "contract",
+    "integration-tests"
+]
+
+'''
+'''--- README.md ---
+# Social DB
+
+## Notes
+
+### Testnet account ID
+
+Deployed at `v1.social08.testnet`
+
+https://explorer.testnet.near.org/accounts/v1.social08.testnet
+
+### Mainnet account ID
+
+Deployed at `social.near`
+
+https://explorer.near.org/accounts/social.near
+
+### About empty keys
+
+If a leaf value was originally string, e.g. `name`
+
+```json
+{
+  "alex.near": {
+    "profile": {
+      "name": "Alex"
+    }
+  }
+}
+```
+
+And later some value was added under `name`, the name will be transformed to a node, and the value
+will be moved to an empty key under this node. E.g. `name/foo = "bar"` is added.
+
+```json
+{
+  "alex.near": {
+    "profile": {
+      "name": {
+        "": "Alex",
+        "foo": "bar"
+      }
+    }
+  }
+}
+```
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md)
+
+## API
+
+### Storing data
+
+The top level keys of the objects should be account IDs under which the data is stored. Those accounts are covering storage for the underlying data.
+
+The predecessor_id or the signer public key should have permission to write under those keys.
+If the predecessor_id matches the top level key, then it can write any data under that key, as long as it has a permission or at least 1 yoctoNEAR is attached.
+
+The attached deposit will be transferred to the first key. If the account doesn't exist, it will be created (the predecessor_id should match).
+
+```rust
+#[payable]
+pub fn set(&mut self, data: Value);
+```
+
+Arguments:
+- `data` is an object to store. The leaf values should be strings or null values. String values will be added, while null values will be deleted.
+
+Examples:
+
+```js
+set({
+  data: {
+    "alex.near": {
+      "profile": {
+        "name": "Alex",
+        "image": {
+          "url": "https://gkfjklgdfjkldfg"
+        }
+      },
+    }
+  }
+})
+
+set({
+  data: {
+    "alex.near": {
+      "graph": {
+        "follow": {
+          "root.near": "",
+          "bob.near": "",
+        }
+      }
+    }
+  }
+})
+```
+
+### Reading data
+
+Returns the data for a list of given key patterns.
+It takes one or more path patterns as arguments, and returns the matching data.
+The path pattern is a string that can contain wildcards.
+For example:
+- `alice.near/profile/**` will match the entire profile data of account `alice.near`.
+- `alice.near/profile/*` will match all the fields of the profile, but not the nested objects.
+- `alice.near/profile/name` will match only the name field of the profile.
+- `*/widget/*` will match all the widgets of all the accounts.
+
+```rust
+pub struct GetOptions {
+    pub with_block_height: Option<bool>,
+    pub with_node_id: Option<bool>,
+    pub return_deleted: Option<bool>,
+}
+
+pub fn get(self, keys: Vec<String>, options: Option<GetOptions>) -> Value;
+```
+
+Arguments:
+- `keys` - an array of key patterns to return.
+- `options` - optional argument to specify options.
+
+Options:
+- `with_block_height` - if true, for every value and a node will add the block height of the data with the key `:block`.
+- `with_node_id` - if true, for every node will add the node index with the key `:node`.
+- `return_deleted` - if true, will include deleted keys with the value `null`.
+
+Returns the aggregated JSON object.
+
+Examples:
+
+```js
+get({keys: ["alex.near/profile/name"]})
+
+get({keys: ["alex.near/profile/name", "root.near/profile/name"]})
+
+get({keys: ["alex.near/profile/name", "alex.near/profile/description"]})
+
+get({keys: ["alex.near/profile/tags/*"]})
+
+get({keys: ["alex.near/profile/**"]})
+
+get({keys: ["*/widget/*"]})
+
+get({keys: ["alex.near/profile/tags/*"], options: {return_deleted: true}})
+```
+
+### Reading keys
+
+The `keys` method allows to get the list of keys that match the path pattern.
+It's useful for querying the data without reading values.
+It also has an additional `options` field that can be used to specify the return type and whether to return deleted keys.
+For example:
+- `alice.near/profile/*` will return the list of all the fields of the profile, but not the nested objects.
+- `*/profile/image/nft` will return the list of all the accounts that have an NFT image in their profile.
+- `alice.near/widget/*` with `return_deleted` option will return the list of all the widget names of the account, including the deleted ones.
+- `alice.near/widget/*` with `return_type` equal to `BlockHeight` will return the list of all the widget names of the account and the value will be the block height when the widget was last updated.
+- Note `**` is not supported by the `keys` method.
+
+```rust
+pub enum KeysReturnType {
+    True,
+    BlockHeight,
+    NodeId,
+}
+
+pub struct KeysOptions {
+    pub return_type: Option<KeysReturnType>,
+    pub return_deleted: Option<bool>,
+    pub values_only: Option<bool>,
+}
+
+pub fn keys(self, keys: Vec<String>, options: Option<KeysOptions>) -> Value;
+```
+
+Arguments:
+- `keys` - an array of key patterns to return.
+- `options` - optional argument to specify options.
+
+Options:
+- `return_type` - if `BlockHeight`, will return the block height of the key instead of `true`, if `NodeId`, will return the node index of the key instead of `true`.
+- `return_deleted` - if true, will include deleted keys.
+- `values_only` - if `true`, only matches keys which value is not a node. It's needed to filter out deleted entries. Since a node can't be deleted right now.
+
+Returns the aggregated JSON object.
+
+Examples:
+
+```js
+keys({keys: ["alex.near/profile/*"]})
+
+keys({keys: ["*/profile/image/nft"]})
+
+keys({keys: ["alex.near/widget/*"], options: {return_deleted: true}})
+
+keys({keys: ["alex.near/widget/*"], options: {return_type: "BlockHeight", values_only: true}})
+```
+
+### Permissions
+
+See https://explorer.testnet.near.org/transactions/3c7h9da1z5Px4JumNDsRaJtCDQaZHG46dsc2SnAj5LHx\
+
+```rust
+#[payable]
+pub fn grant_write_permission(
+    &mut self,
+    predecessor_id: Option<AccountId>,
+    public_key: Option<PublicKey>,
+    keys: Vec<String>,
+);
+```
+
+```rust
+/// Returns true if the permission is granted for a given account ID or a given public_key to
+/// any prefix of the key.
+pub fn is_write_permission_granted(
+    &self,
+    predecessor_id: Option<AccountId>,
+    public_key: Option<PublicKey>,
+    key: String,
+) -> bool;
+```
+
+### Debugging
+
+```bash
+export CONTRACT_ID=v1.social08.testnet
+export ACCOUNT_ID=eugenethedream
+# Full contract data
+near view $CONTRACT_ID get '{"keys":["**"]}'
+# Full account's data
+near view $CONTRACT_ID get '{"keys":["'$ACCOUNT_ID'/**"]}'
+```
+
+'''
+'''--- build_docker.sh ---
+#!/usr/bin/env bash
+
+# Exit script as soon as a command fails.
+set -e
+
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+
+NAME="build_social_db"
+
+if docker ps -a --format '{{.Names}}' | grep -Eq "^${NAME}\$"; then
+    echo "Container exists"
+else
+docker create \
+     --mount type=bind,source=$DIR,target=/host \
+     --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+     --name=$NAME \
+     -w /host \
+     -e RUSTFLAGS='-C link-arg=-s' \
+     -it \
+     nearprotocol/contract-builder \
+     /bin/bash
+fi
+
+docker start $NAME
+docker exec -it $NAME /bin/bash -c "rustup toolchain install 1.69.0; rustup default 1.69.0; rustup target add wasm32-unknown-unknown; cargo build --package contract --target wasm32-unknown-unknown --release"
+
+mkdir -p res
+cp $DIR/target/wasm32-unknown-unknown/release/contract.wasm $DIR/res/social_db_release.wasm
+
+'''
+'''--- build_local.sh ---
+#!/bin/bash
+TARGET="${CARGO_TARGET_DIR:-target}"
+set -e
+
+cd "$(dirname $0)"
+mkdir -p res
+
+rustup target add wasm32-unknown-unknown
+RUSTFLAGS='-C link-arg=-s' cargo build --package contract --target wasm32-unknown-unknown --release
+cp $TARGET/wasm32-unknown-unknown/release/contract.wasm ./res/social_db_local.wasm
+
+'''
+'''--- contract/Cargo.toml ---
+[package]
+name = "contract"
+version = "0.12.0"
+authors = ["Eugene The Dream"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+near-sdk = "=4.0.0-pre.7"
+near-contract-standards = "=4.0.0-pre.7"
+near-sys = "=0.1"
+
+'''
+'''--- contract/src/account.rs ---
+use crate::*;
+use near_contract_standards::storage_management::{
+    StorageBalance, StorageBalanceBounds, StorageManagement,
+};
+use near_sdk::require;
+use std::convert::TryFrom;
+
+pub const MIN_STORAGE_BYTES: StorageUsage = 2000;
+const MIN_STORAGE_BALANCE: Balance = MIN_STORAGE_BYTES as Balance * env::STORAGE_PRICE_PER_BYTE;
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Account {
+    #[serde(with = "u128_dec_format")]
+    pub storage_balance: Balance,
+    pub used_bytes: StorageUsage,
+    /// Tracks all currently active permissions given by this account.
+    #[serde(with = "unordered_map_expensive")]
+    pub permissions: UnorderedMap<PermissionKey, Permission>,
+    #[borsh_skip]
+    pub node_id: NodeId,
+    #[serde(skip)]
+    #[borsh_skip]
+    pub storage_tracker: StorageTracker,
+    /// Optional storage balance donated from one of shared pools.
+    pub shared_storage: Option<AccountSharedStorage>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct PartialAccount {
+    #[serde(with = "u128_dec_format")]
+    pub storage_balance: Balance,
+    pub used_bytes: StorageUsage,
+    pub permissions: Vec<(PermissionKey, Permission)>,
+    pub node_id: NodeId,
+}
+
+#[derive(BorshSerialize, BorshDeserialize)]
+pub enum VAccount {
+    V0(AccountV0),
+    Current(Account),
+}
+
+impl From<VAccount> for Account {
+    fn from(v: VAccount) -> Self {
+        match v {
+            VAccount::V0(v) => v.into(),
+            VAccount::Current(c) => c,
+        }
+    }
+}
+
+impl From<Account> for VAccount {
+    fn from(c: Account) -> Self {
+        VAccount::Current(c)
+    }
+}
+
+impl Account {
+    pub fn new(node_id: NodeId) -> Self {
+        Self {
+            storage_balance: 0,
+            used_bytes: 0,
+            permissions: UnorderedMap::new(StorageKey::Permissions { node_id }),
+            node_id,
+            storage_tracker: Default::default(),
+            shared_storage: None,
+        }
+    }
+
+    fn assert_storage_covered(&self) {
+        let shared_bytes_used = self
+            .shared_storage
+            .as_ref()
+            .map(|s| s.used_bytes)
+            .unwrap_or(0);
+        let storage_balance_needed =
+            Balance::from(self.used_bytes - shared_bytes_used) * env::storage_byte_cost();
+        assert!(
+            storage_balance_needed <= self.storage_balance,
+            "Not enough storage balance"
+        );
+    }
+}
+
+impl Contract {
+    pub fn internal_get_account(&self, account_id: &str) -> Option<Account> {
+        self.root_node
+            .children
+            .get(&account_id.to_string())
+            .map(|v| match v {
+                NodeValue::Node(node_id) => {
+                    let mut account: Account = self.accounts.get(&node_id).unwrap().into();
+                    account.node_id = node_id;
+                    account
+                }
+                _ => env::panic_str("Unexpected account key. The value is not a node."),
+            })
+    }
+
+    pub fn internal_unwrap_account(&self, account_id: &str) -> Account {
+        self.internal_get_account(account_id)
+            .expect("The account doesn't exist")
+    }
+
+    pub fn internal_unwrap_account_or_create(
+        &mut self,
+        account_id: &str,
+        storage_deposit: Balance,
+    ) -> Account {
+        require!(
+            env::is_valid_account_id(account_id.as_bytes()),
+            "Invalid account id"
+        );
+        self.internal_get_account(account_id)
+            .map(|mut a| {
+                a.storage_balance += storage_deposit;
+                a
+            })
+            .unwrap_or_else(|| {
+                self.internal_create_account(account_id, storage_deposit, false);
+                self.internal_unwrap_account(account_id)
+            })
+    }
+
+    pub fn internal_create_account(
+        &mut self,
+        account_id: &str,
+        storage_deposit: Balance,
+        registration_only: bool,
+    ) {
+        let min_balance = self.storage_balance_bounds().min.0;
+        if storage_deposit < min_balance {
+            env::panic_str("The attached deposit is less than the minimum storage balance");
+        }
+
+        let mut account = Account::new(self.create_node_id());
+        if registration_only {
+            let refund = storage_deposit - min_balance;
+            if refund > 0 {
+                Promise::new(env::predecessor_account_id()).transfer(refund);
+            }
+            account.storage_balance = min_balance;
+        } else {
+            account.storage_balance = storage_deposit;
+        }
+
+        self.internal_initial_set_account(account_id, account);
+    }
+
+    pub fn internal_create_account_from_shared_storage(
+        &mut self,
+        account_id: &str,
+        max_bytes: StorageUsage,
+        pool_id: AccountId,
+    ) {
+        let shared_storage = AccountSharedStorage {
+            pool_id,
+            used_bytes: 0,
+            max_bytes,
+        };
+        if shared_storage.max_bytes < MIN_STORAGE_BYTES {
+            env::panic_str("The max bytes is less than the minimum storage required");
+        }
+        let shared_storage_pool = self.internal_unwrap_shared_storage_pool(&shared_storage.pool_id);
+        if shared_storage.available_bytes(&shared_storage_pool) < MIN_STORAGE_BYTES {
+            env::panic_str(
+                "Not enough storage available in the shared storage pool to create an account",
+            );
+        }
+
+        let mut account = Account::new(self.create_node_id());
+        account.shared_storage = Some(shared_storage);
+
+        self.internal_initial_set_account(account_id, account);
+    }
+
+    pub fn internal_initial_set_account(&mut self, account_id: &str, mut account: Account) {
+        account.storage_tracker.start();
+        self.internal_set_node(Node::new(account.node_id, None));
+        self.root_node.block_height = env::block_height();
+        self.root_node
+            .children
+            .insert(&account_id.to_string(), &NodeValue::Node(account.node_id));
+        let mut temp_account = Account::new(account.node_id);
+        temp_account.shared_storage = account.shared_storage.clone();
+        require!(
+            !self.internal_set_account(temp_account),
+            "Internal bug. Account already exists."
+        );
+        account.storage_tracker.stop();
+        self.internal_set_account(account);
+    }
+
+    pub fn internal_set_account(&mut self, mut account: Account) -> bool {
+        if account.storage_tracker.bytes_added > account.storage_tracker.bytes_released {
+            let extra_bytes_used =
+                account.storage_tracker.bytes_added - account.storage_tracker.bytes_released;
+            account.used_bytes += extra_bytes_used;
+            if let Some(shared_storage) = &mut account.shared_storage {
+                let mut shared_storage_pool =
+                    self.internal_unwrap_shared_storage_pool(&shared_storage.pool_id);
+                let pool_bytes = std::cmp::min(
+                    shared_storage.available_bytes(&shared_storage_pool),
+                    extra_bytes_used,
+                );
+                if pool_bytes > 0 {
+                    shared_storage_pool.used_bytes += pool_bytes;
+                    self.internal_set_shared_storage_pool(
+                        &shared_storage.pool_id,
+                        shared_storage_pool,
+                    );
+                    shared_storage.used_bytes += pool_bytes;
+                }
+            }
+            account.assert_storage_covered();
+        } else if account.storage_tracker.bytes_added < account.storage_tracker.bytes_released {
+            let bytes_released =
+                account.storage_tracker.bytes_released - account.storage_tracker.bytes_added;
+            assert!(
+                account.used_bytes >= bytes_released,
+                "Internal storage accounting bug"
+            );
+            if let Some(shared_storage) = &mut account.shared_storage {
+                let pool_bytes = std::cmp::min(shared_storage.used_bytes, bytes_released);
+                if pool_bytes > 0 {
+                    let mut shared_storage_pool =
+                        self.internal_unwrap_shared_storage_pool(&shared_storage.pool_id);
+                    assert!(
+                        shared_storage_pool.used_bytes >= pool_bytes,
+                        "Internal storage accounting bug"
+                    );
+                    shared_storage_pool.used_bytes -= pool_bytes;
+                    self.internal_set_shared_storage_pool(
+                        &shared_storage.pool_id,
+                        shared_storage_pool,
+                    );
+                }
+                shared_storage.used_bytes -= pool_bytes;
+            }
+            account.used_bytes -= bytes_released;
+        }
+        account.storage_tracker.bytes_released = 0;
+        account.storage_tracker.bytes_added = 0;
+        let node_id = account.node_id;
+        self.accounts.insert(&node_id, &account.into()).is_some()
+    }
+
+    pub fn internal_storage_balance_of(&self, account_id: &AccountId) -> Option<StorageBalance> {
+        self.internal_get_account(account_id.as_str())
+            .map(|account| StorageBalance {
+                total: account.storage_balance.into(),
+                available: U128(
+                    account.storage_balance
+                        - Balance::from(
+                            account.used_bytes
+                                - account
+                                    .shared_storage
+                                    .as_ref()
+                                    .map(|s| s.used_bytes)
+                                    .unwrap_or(0),
+                        ) * env::storage_byte_cost(),
+                ),
+            })
+    }
+
+    /// Withdraw storage deposit from the account id to the predecessor account.
+    /// Assumes that predecessor is authorized to withdraw from the account.
+    pub fn internal_storage_withdraw(
+        &mut self,
+        withdraw_from: &AccountId,
+        amount: Option<U128>,
+    ) -> StorageBalance {
+        if let Some(storage_balance) = self.internal_storage_balance_of(&withdraw_from) {
+            let amount = amount.unwrap_or(storage_balance.available).0;
+            if amount > storage_balance.available.0 {
+                env::panic_str("The amount is greater than the available storage balance");
+            }
+            if amount > 0 {
+                let mut account = self.internal_unwrap_account(withdraw_from.as_str());
+                account.storage_balance -= amount;
+                self.internal_set_account(account);
+                Promise::new(env::predecessor_account_id()).transfer(amount);
+            }
+            self.internal_storage_balance_of(&withdraw_from).unwrap()
+        } else {
+            env::panic_str(&format!("The account {} is not registered", &withdraw_from));
+        }
+    }
+}
+
+#[near_bindgen]
+impl StorageManagement for Contract {
+    #[payable]
+    fn storage_deposit(
+        &mut self,
+        account_id: Option<AccountId>,
+        registration_only: Option<bool>,
+    ) -> StorageBalance {
+        self.assert_live();
+        let attached_deposit: Balance = env::attached_deposit();
+        let account_id = account_id
+            .map(|a| a.into())
+            .unwrap_or_else(|| env::predecessor_account_id());
+        let account = self.internal_get_account(account_id.as_str());
+        let registration_only = registration_only.unwrap_or(false);
+        if let Some(mut account) = account {
+            if registration_only && attached_deposit > 0 {
+                Promise::new(env::predecessor_account_id()).transfer(attached_deposit);
+            } else {
+                account.storage_balance += attached_deposit;
+                self.internal_set_account(account);
+            }
+        } else {
+            self.internal_create_account(account_id.as_str(), attached_deposit, registration_only);
+        }
+        self.internal_storage_balance_of(&account_id).unwrap()
+    }
+
+    #[payable]
+    fn storage_withdraw(&mut self, amount: Option<U128>) -> StorageBalance {
+        self.assert_live();
+        assert_one_yocto();
+        let account_id = env::predecessor_account_id();
+        self.internal_storage_withdraw(&account_id, amount)
+    }
+
+    #[allow(unused_variables)]
+    #[payable]
+    fn storage_unregister(&mut self, force: Option<bool>) -> bool {
+        self.assert_live();
+        env::panic_str("The account can't be unregistered");
+    }
+
+    fn storage_balance_bounds(&self) -> StorageBalanceBounds {
+        StorageBalanceBounds {
+            min: U128(MIN_STORAGE_BALANCE),
+            max: None,
+        }
+    }
+
+    fn storage_balance_of(&self, account_id: AccountId) -> Option<StorageBalance> {
+        self.internal_storage_balance_of(&account_id)
+    }
+}
+
+#[near_bindgen]
+impl Contract {
+    /// Returns account information for accounts from a given index up to a given limit.
+    pub fn get_accounts(
+        &self,
+        from_index: Option<u64>,
+        limit: Option<u64>,
+    ) -> Vec<(AccountId, Account)> {
+        let keys = self.root_node.children.keys_as_vector();
+        let values = self.root_node.children.values_as_vector();
+        let from_index = from_index.unwrap_or(0);
+        let limit = limit.unwrap_or(keys.len());
+        (from_index..std::cmp::min(keys.len(), from_index + limit))
+            .map(|index| {
+                let node_id = match values.get(index).unwrap() {
+                    NodeValue::Node(node_id) => node_id,
+                    _ => {
+                        unreachable!();
+                    }
+                };
+                let mut account: Account = self.accounts.get(&node_id).unwrap().into();
+                account.node_id = node_id;
+                (
+                    AccountId::try_from(keys.get(index).unwrap()).unwrap(),
+                    account,
+                )
+            })
+            .collect()
+    }
+
+    pub fn get_account(&self, account_id: AccountId) -> Option<Account> {
+        self.internal_get_account(account_id.as_str())
+    }
+
+    /// Returns the number of accounts
+    pub fn get_account_count(&self) -> u32 {
+        self.root_node.children.len() as _
+    }
+}
+
+'''
+'''--- contract/src/api.rs ---
+use crate::*;
+use near_sdk::require;
+use near_sdk::serde_json::map::Entry;
+use near_sdk::serde_json::{Map, Value};
+use near_sdk::json_types::U64;
+use std::collections::HashSet;
+
+pub const MAX_KEY_LENGTH: usize = 256;
+pub const SEPARATOR: char = '/';
+pub const STAR: &str = "*";
+pub const RECURSIVE_STAR: &str = "**";
+pub const KEY_BLOCK_HEIGHT: &str = ":block";
+pub const KEY_NODE_ID: &str = ":node";
+
+#[derive(Serialize, Deserialize, Default)]
+#[serde(crate = "near_sdk::serde")]
+pub struct GetOptions {
+    pub with_block_height: Option<bool>,
+    pub with_node_id: Option<bool>,
+    pub return_deleted: Option<bool>,
+}
+
+#[derive(Copy, Clone, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub enum KeysReturnType {
+    True,
+    BlockHeight,
+    NodeId,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+#[serde(crate = "near_sdk::serde")]
+pub struct KeysOptions {
+    /// The type of the returned values. By default returns true.
+    pub return_type: Option<KeysReturnType>,
+    /// Whether to match keys for deleted values.
+    pub return_deleted: Option<bool>,
+    /// Whether to match nodes.
+    pub values_only: Option<bool>,
+}
+
+#[derive(Copy, Clone, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct SetReturnType {
+    pub block_height: near_sdk::json_types::U64,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+#[serde(crate = "near_sdk::serde")]
+pub struct SetOptions {
+    pub refund_unused_deposit: Option<bool>,
+}
+
+#[near_bindgen]
+impl Contract {
+    /// ```js
+    ///
+    /// get({keys: [
+    ///   "alex.near/profile/*",
+    ///   "alex.near/profile/**",
+    ///   "alex.near/profile/[name,url,image_url]",
+    ///   "alex.near/profile/url",
+    ///   "alex.near/profile/",
+    ///   "bob.near/profile/*",
+    ///   "alex.near/graph/follow/*",
+    /// ]})
+    /// ```
+    pub fn get(self, keys: Vec<String>, options: Option<GetOptions>) -> Value {
+        let options = options.unwrap_or_default();
+        let mut res: Map<String, Value> = Map::new();
+        for key in keys {
+            let mut path: Vec<&str> = key.split(SEPARATOR).collect();
+            if path.last() == Some(&EMPTY_KEY) {
+                path.pop();
+                if path.last() == Some(&EMPTY_KEY) {
+                    continue;
+                }
+            }
+            if path.is_empty() {
+                continue;
+            }
+            self.recursive_get(&mut res, &self.root_node, &path[..], &options)
+        }
+        json_map_recursive_cleanup(&mut res);
+        Value::Object(res)
+    }
+
+    /// ```js
+    /// Note, recursive match all pattern "**" is not allowed.
+    ///
+    /// keys({keys: [
+    ///   "alex.near/profile/*",
+    ///   "alex.near/profile/*",
+    ///   "alex.near/profile/[name,url,image_url]",
+    ///   "alex.near/profile/url",
+    ///   "alex.near/profile/",
+    ///   "bob.near/profile/*",
+    ///   "alex.near/graph/follow/*",
+    /// ]})
+    /// ```
+    pub fn keys(self, keys: Vec<String>, options: Option<KeysOptions>) -> Value {
+        let options = options.unwrap_or_default();
+        let mut res: Map<String, Value> = Map::new();
+        for key in keys {
+            let mut path: Vec<&str> = key.split(SEPARATOR).collect();
+            if path.last() == Some(&EMPTY_KEY) {
+                path.pop();
+                if path.last() == Some(&EMPTY_KEY) {
+                    continue;
+                }
+            }
+            if path.is_empty() {
+                continue;
+            }
+            self.recursive_keys(&mut res, &self.root_node, &path[..], &options)
+        }
+        json_map_recursive_cleanup(&mut res);
+        Value::Object(res)
+    }
+
+    /// ```js
+    /// user_set({
+    ///   "alex.near": {
+    ///     "graph": "yoloyoloyoloyolo:yoloyoloyoloyoloyo:lo",
+    ///   }
+    /// })
+    ///
+    /// $account_id/badge/$badge_id/metadata
+    /// $account_id/badge/$badge_id/owners/$receiver_id
+    ///
+    /// user_set({
+    ///   "alex.near": {
+    ///     "graph": {
+    ///       "follow": {
+    ///         "root.near": "",
+    ///         "bob.near": "",
+    ///       }
+    ///     }
+    ///   }
+    /// })
+    ///
+    /// When `refund_unused_deposit` is set to `true`, the part of the deposit that covers unused
+    /// storage will be refunded to the caller.
+    ///
+    /// ```
+    #[payable]
+    pub fn set(&mut self, mut data: Value, options: Option<SetOptions>) -> SetReturnType {
+        self.assert_live();
+        let options = options.unwrap_or_default();
+        let predecessor_account_id = env::predecessor_account_id();
+        let mut attached_balance = env::attached_deposit();
+        for (key, value) in data.as_object_mut().expect("Data is not a JSON object") {
+            let mut account = self.internal_unwrap_account_or_create(key, attached_balance);
+            let write_approved = key == predecessor_account_id.as_str();
+            let writable_node_ids = if write_approved {
+                HashSet::new()
+            } else {
+                account.internal_get_writeable_node_ids()
+            };
+            let node = self.internal_unwrap_node(account.node_id);
+            account.storage_tracker.start();
+            self.recursive_set(node, value, write_approved, &writable_node_ids);
+            account.storage_tracker.stop();
+            self.internal_set_account(account);
+
+            if options.refund_unused_deposit.unwrap_or(false) && attached_balance > 0 {
+                // The key is the account id that received the deposit.
+                let account_id: AccountId = key.parse().expect("key is valid account id");
+                if let Some(balance) = self.internal_storage_balance_of(&account_id) {
+                    // We shouldn't refund more than what was deposited in this call.
+                    let refund = std::cmp::min(balance.available.0, attached_balance);
+                    self.internal_storage_withdraw(&account_id, Some(refund.into()));
+                }
+            }
+
+            // First key receives all the deposit.
+            attached_balance = 0;
+        }
+        if attached_balance > 0 {
+            env::panic_str("The attached deposit could not be added to any account");
+        }
+        SetReturnType { block_height: U64(near_sdk::env::block_height()) }
+    }
+}
+
+impl Contract {
+    pub fn recursive_get(
+        &self,
+        res: &mut Map<String, Value>,
+        node: &Node,
+        keys: &[&str],
+        options: &GetOptions,
+    ) {
+        let is_recursive_match_all = keys[0] == RECURSIVE_STAR;
+        if is_recursive_match_all {
+            require!(keys.len() == 1, "'**' pattern can only be used as a suffix")
+        }
+        let matched_entries = if keys[0] == STAR || is_recursive_match_all {
+            node.children.to_vec()
+        } else {
+            let key = keys[0].to_string();
+            if let Some(value) = node.children.get(&key) {
+                vec![(key, value)]
+            } else {
+                vec![]
+            }
+        };
+        if options.with_block_height == Some(true) {
+            res.insert(KEY_BLOCK_HEIGHT.to_string(), node.block_height.into());
+        }
+        if options.with_node_id == Some(true) {
+            res.insert(KEY_NODE_ID.to_string(), node.node_id.into());
+        }
+        for (key, value) in matched_entries {
+            match value {
+                NodeValue::Node(node_id) => {
+                    let inner_node = self.internal_unwrap_node(node_id);
+                    if keys.len() > 1 || is_recursive_match_all {
+                        // Going deeper
+                        let inner_map = json_map_get_inner_object(res, key);
+                        if keys.len() > 1 {
+                            self.recursive_get(inner_map, &inner_node, &keys[1..], options);
+                        }
+                        if is_recursive_match_all {
+                            // Non skipping step in.
+                            self.recursive_get(inner_map, &inner_node, keys, options);
+                        }
+                    } else {
+                        if let Some(node_value) = inner_node.children.get(&EMPTY_KEY.to_string()) {
+                            if options.with_node_id == Some(true) {
+                                let inner_map = json_map_get_inner_object(res, key.clone());
+                                inner_map
+                                    .insert(KEY_NODE_ID.to_string(), inner_node.node_id.into());
+                            }
+                            json_map_set_key(res, key, node_value, &options);
+                        } else {
+                            // mismatch skipping
+                        }
+                    }
+                }
+                node_value => {
+                    if keys.len() == 1 {
+                        json_map_set_key(res, key, node_value, &options);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn recursive_keys(
+        &self,
+        res: &mut Map<String, Value>,
+        node: &Node,
+        keys: &[&str],
+        options: &KeysOptions,
+    ) {
+        let matched_entries = if keys[0] == STAR {
+            node.children.to_vec()
+        } else {
+            let key = keys[0].to_string();
+            if let Some(value) = node.children.get(&key) {
+                vec![(key, value)]
+            } else {
+                vec![]
+            }
+        };
+        for (key, value) in matched_entries {
+            match value {
+                NodeValue::Node(node_id) => {
+                    if keys.len() == 1 {
+                        let value = if options.values_only.unwrap_or(false) {
+                            let inner_node = self.internal_unwrap_node(node_id);
+                            if let Some(node_value) =
+                                inner_node.children.get(&EMPTY_KEY.to_string())
+                            {
+                                if options.return_deleted.unwrap_or(false)
+                                    || !matches!(node_value, NodeValue::DeletedEntry(_))
+                                {
+                                    match options.return_type.unwrap_or(KeysReturnType::True) {
+                                        KeysReturnType::True => true.into(),
+                                        KeysReturnType::BlockHeight => {
+                                            node_value.get_block_height().unwrap().into()
+                                        }
+                                        KeysReturnType::NodeId => node_id.into(),
+                                    }
+                                } else {
+                                    // deleted entry
+                                    continue;
+                                }
+                            } else {
+                                // mismatch skipping
+                                continue;
+                            }
+                        } else {
+                            match options.return_type.unwrap_or(KeysReturnType::True) {
+                                KeysReturnType::True => true.into(),
+                                KeysReturnType::BlockHeight => {
+                                    let inner_node = self.internal_unwrap_node(node_id);
+                                    inner_node.block_height.into()
+                                }
+                                KeysReturnType::NodeId => node_id.into(),
+                            }
+                        };
+                        json_map_set_value(res, key, value);
+                    } else {
+                        let inner_node = self.internal_unwrap_node(node_id);
+                        let inner_map = json_map_get_inner_object(res, key);
+                        self.recursive_keys(inner_map, &inner_node, &keys[1..], options);
+                    }
+                }
+                NodeValue::Value(value_at_height) => {
+                    if keys.len() == 1 {
+                        let value = match options.return_type.unwrap_or(KeysReturnType::True) {
+                            KeysReturnType::True => true.into(),
+                            KeysReturnType::BlockHeight => value_at_height.block_height.into(),
+                            KeysReturnType::NodeId => Value::Null,
+                        };
+                        json_map_set_value(res, key, value);
+                    }
+                }
+                NodeValue::DeletedEntry(block_height) => {
+                    if keys.len() == 1 && options.return_deleted.unwrap_or(false) {
+                        let value = match options.return_type.unwrap_or(KeysReturnType::True) {
+                            KeysReturnType::True => true.into(),
+                            KeysReturnType::BlockHeight => block_height.into(),
+                            KeysReturnType::NodeId => Value::Null,
+                        };
+                        json_map_set_value(res, key, value);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn recursive_set(
+        &mut self,
+        mut node: Node,
+        value: &mut Value,
+        write_approved: bool,
+        writable_node_ids: &HashSet<NodeId>,
+    ) {
+        let write_approved = write_approved || writable_node_ids.contains(&node.node_id);
+        if value.is_string() || value.is_null() {
+            require!(write_approved, ERR_PERMISSION_DENIED);
+            node.set(&EMPTY_KEY.to_string(), value);
+        } else if let Some(obj) = value.as_object_mut() {
+            for (key, value) in obj {
+                assert_key_valid(key.as_str());
+                let node_value = node.children.get(key);
+                match node_value {
+                    None => {
+                        require!(write_approved, ERR_PERMISSION_DENIED);
+                        if value.is_string() || value.is_null() {
+                            node.set(key, value);
+                        } else {
+                            let node_id = self.create_node_id();
+                            node.children.insert(key, &NodeValue::Node(node_id));
+                            self.recursive_set(
+                                Node::new(node_id, None),
+                                value,
+                                write_approved,
+                                writable_node_ids,
+                            );
+                        }
+                    }
+                    Some(NodeValue::Node(node_id)) => {
+                        self.recursive_set(
+                            self.internal_unwrap_node(node_id),
+                            value,
+                            write_approved,
+                            writable_node_ids,
+                        );
+                    }
+                    Some(old_node_value) => {
+                        require!(write_approved, ERR_PERMISSION_DENIED);
+                        if value.is_string() || value.is_null() {
+                            node.set(key, value);
+                        } else {
+                            assert_ne!(
+                                key.as_str(),
+                                EMPTY_KEY,
+                                "The empty key's value should be a string or null"
+                            );
+                            let node_id = self.create_node_id();
+                            node.children.insert(key, &NodeValue::Node(node_id));
+                            self.recursive_set(
+                                Node::new(node_id, Some(old_node_value)),
+                                value,
+                                write_approved,
+                                writable_node_ids,
+                            );
+                        }
+                    }
+                }
+            }
+        } else {
+            env::panic_str("The JSON value is not a string, a null or an object")
+        }
+        self.internal_set_node(node);
+    }
+}
+
+fn json_map_get_inner_object(res: &mut Map<String, Value>, key: String) -> &mut Map<String, Value> {
+    match res.entry(key.clone()) {
+        Entry::Vacant(e) => {
+            e.insert(Value::Object(Map::new()));
+        }
+        Entry::Occupied(mut e) => {
+            if !e.get().is_object() {
+                // Assuming the previous value is a string or null
+                let prev_value = e.insert(Value::Object(Map::new()));
+                e.get_mut()
+                    .as_object_mut()
+                    .unwrap()
+                    .insert(EMPTY_KEY.to_string(), prev_value);
+            }
+        }
+    };
+    res.get_mut(&key).unwrap().as_object_mut().unwrap()
+}
+
+fn json_map_set_value(res: &mut Map<String, Value>, key: String, value: Value) {
+    match res.entry(key) {
+        Entry::Vacant(e) => {
+            e.insert(value);
+        }
+        Entry::Occupied(mut e) => {
+            match e.get_mut() {
+                Value::Object(o) => {
+                    o.insert(EMPTY_KEY.to_string(), value);
+                }
+                _ => {}
+            };
+        }
+    };
+}
+
+fn json_map_set_key(
+    res: &mut Map<String, Value>,
+    key: String,
+    node_value: NodeValue,
+    options: &GetOptions,
+) {
+    match res.entry(key) {
+        Entry::Vacant(e) => {
+            let block_height = node_value.get_block_height();
+            let new_value = if let NodeValue::Value(value_at_height) = node_value {
+                Value::String(value_at_height.value)
+            } else if options.return_deleted == Some(true)
+                && matches!(node_value, NodeValue::DeletedEntry(_))
+            {
+                Value::Null
+            } else {
+                return;
+            };
+            if options.with_block_height == Some(true) {
+                let mut m = Map::new();
+                m.insert(KEY_BLOCK_HEIGHT.to_string(), block_height.unwrap().into());
+                m.insert(EMPTY_KEY.to_string(), new_value);
+
+                e.insert(Value::Object(m));
+            } else {
+                e.insert(new_value);
+            }
+        }
+        Entry::Occupied(mut e) => {
+            match e.get_mut() {
+                Value::Object(o) => {
+                    json_map_set_key(o, EMPTY_KEY.to_string(), node_value, options);
+                }
+                _ => {
+                    // Shouldn't be any changes as the values should match.
+                }
+            };
+        }
+    };
+}
+
+// Returns true if the given map is not empty.
+fn json_map_recursive_cleanup(res: &mut Map<String, Value>) -> bool {
+    let mut num_special_keys = 0;
+    res.retain(|k, v| {
+        if k.starts_with(":") {
+            num_special_keys += 1;
+            return true;
+        }
+        match v {
+            Value::Object(o) => json_map_recursive_cleanup(o),
+            _ => true,
+        }
+    });
+    res.len() > num_special_keys
+}
+
+pub(crate) fn is_key_valid(key: &str) -> bool {
+    if key.len() > MAX_KEY_LENGTH {
+        return false;
+    }
+    for &c in key.as_bytes() {
+        match c {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' => {}
+            b'_' | b'.' | b'-' => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+pub(crate) fn assert_key_valid(key: &str) {
+    assert!(
+        is_key_valid(key),
+        "Key contains invalid character or longer than {}",
+        MAX_KEY_LENGTH
+    );
+}
+
+'''
+'''--- contract/src/legacy.rs ---
+use crate::*;
+
+/// Legacy version of the account, before shared storage pools were introduced.
+#[derive(BorshSerialize, BorshDeserialize, Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct AccountV0 {
+    #[serde(with = "u128_dec_format")]
+    pub storage_balance: Balance,
+    pub used_bytes: StorageUsage,
+    /// Tracks all currently active permissions given by this account.
+    #[serde(with = "unordered_map_expensive")]
+    pub permissions: UnorderedMap<PermissionKey, Permission>,
+}
+
+/// During this migration, we introduce a new field `shared_storage` to the account, which requires
+/// extra bytes of storage. We also increase the storage balance by the storage price per byte.
+impl From<AccountV0> for Account {
+    fn from(c: AccountV0) -> Self {
+        Self {
+            storage_balance: c.storage_balance + env::STORAGE_PRICE_PER_BYTE,
+            used_bytes: c.used_bytes + 1,
+            permissions: c.permissions,
+            node_id: 0,
+            storage_tracker: Default::default(),
+            shared_storage: None,
+        }
+    }
+}
+
+'''
+'''--- contract/src/lib.rs ---
+mod account;
+mod api;
+mod node;
+mod permission;
+mod storage_tracker;
+mod upgrade;
+mod utils;
+mod legacy;
+mod shared_storage;
+
+pub use crate::account::*;
+pub use crate::api::*;
+pub use crate::node::*;
+pub use crate::permission::*;
+pub use crate::shared_storage::*;
+use crate::storage_tracker::*;
+use crate::utils::*;
+use crate::legacy::*;
+
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::{LookupMap, UnorderedMap};
+use near_sdk::json_types::U128;
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{
+    assert_one_yocto, env, near_bindgen, require, AccountId, Balance, BorshStorageKey,
+    PanicOnDefault, Promise, StorageUsage,
+};
+
+#[derive(BorshSerialize, BorshStorageKey)]
+#[allow(unused)]
+enum StorageKey {
+    Account,
+    Nodes,
+    Node { node_id: NodeId },
+    Permissions { node_id: NodeId },
+    SharedStoragePools,
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Copy, Clone)]
+#[serde(crate = "near_sdk::serde")]
+pub enum ContractStatus {
+    Genesis,
+    Live,
+    ReadOnly,
+}
+
+pub type NodeId = u32;
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Contract {
+    pub accounts: LookupMap<NodeId, VAccount>,
+    pub root_node: Node,
+    pub nodes: LookupMap<NodeId, VNode>,
+    pub node_count: NodeId,
+    pub status: ContractStatus,
+    pub shared_storage_pools: LookupMap<AccountId, VSharedStoragePool>,
+}
+
+#[near_bindgen]
+impl Contract {
+    #[init]
+    pub fn new() -> Self {
+        Self {
+            accounts: LookupMap::new(StorageKey::Account),
+            root_node: Node::new(0, None),
+            nodes: LookupMap::new(StorageKey::Nodes),
+            node_count: 1,
+            status: ContractStatus::Genesis,
+            shared_storage_pools: LookupMap::new(StorageKey::SharedStoragePools),
+        }
+    }
+
+    #[private]
+    pub fn set_status(&mut self, status: ContractStatus) {
+        require!(
+            !matches!(status, ContractStatus::Genesis),
+            "The status can't be set to Genesis"
+        );
+        self.status = status;
+    }
+
+    pub fn get_status(&self) -> ContractStatus {
+        self.status
+    }
+}
+
+impl Contract {
+    pub fn create_node_id(&mut self) -> NodeId {
+        let node_id = self.node_count;
+        self.node_count += 1;
+        node_id
+    }
+
+    pub fn assert_live(&self) {
+        require!(
+            matches!(self.status, ContractStatus::Live),
+            "The contract status is not Live"
+        );
+    }
+}
+
+'''
+'''--- contract/src/node.rs ---
+use crate::*;
+use near_sdk::{require, BlockHeight};
+
+pub const EMPTY_KEY: &str = "";
+pub const ERR_PERMISSION_DENIED: &str = "Permission Denied";
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct ValueAtHeight {
+    pub value: String,
+    pub block_height: BlockHeight,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub enum NodeValue {
+    Value(ValueAtHeight),
+    Node(NodeId),
+    DeletedEntry(BlockHeight),
+}
+
+impl NodeValue {
+    pub fn into_current_height(mut self) -> Self {
+        match &mut self {
+            NodeValue::Value(v) => {
+                v.block_height = env::block_height();
+            }
+            NodeValue::Node(_) => {}
+            NodeValue::DeletedEntry(v) => {
+                *v = env::block_height();
+            }
+        };
+        self
+    }
+
+    pub fn get_block_height(&self) -> Option<BlockHeight> {
+        match self {
+            NodeValue::Value(v) => Some(v.block_height),
+            NodeValue::Node(_) => None,
+            NodeValue::DeletedEntry(v) => Some(*v),
+        }
+    }
+}
+
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct Node {
+    #[borsh_skip]
+    pub node_id: NodeId,
+    pub block_height: BlockHeight,
+    pub children: UnorderedMap<String, NodeValue>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct PartialNode {
+    pub node_id: NodeId,
+    pub block_height: BlockHeight,
+    pub children: Vec<(String, NodeValue)>,
+    pub from_index: u32,
+    pub num_children: u32,
+}
+
+#[derive(BorshSerialize, BorshDeserialize)]
+pub enum VNode {
+    Current(Node),
+}
+
+impl From<VNode> for Node {
+    fn from(v: VNode) -> Self {
+        match v {
+            VNode::Current(c) => c,
+        }
+    }
+}
+
+impl From<Node> for VNode {
+    fn from(c: Node) -> Self {
+        VNode::Current(c)
+    }
+}
+
+impl Node {
+    pub fn new(node_id: NodeId, value: Option<NodeValue>) -> Self {
+        let mut children = UnorderedMap::new(StorageKey::Node { node_id });
+        if let Some(value) = value {
+            require!(
+                !matches!(value, NodeValue::Node(_)),
+                "Invariant: empty key value can't be a node"
+            );
+            children.insert(&EMPTY_KEY.to_string(), &value);
+        }
+        Self {
+            node_id,
+            block_height: env::block_height(),
+            children,
+        }
+    }
+
+    pub fn set(&mut self, key: &String, value: &near_sdk::serde_json::Value) {
+        let value = if let Some(s) = value.as_str() {
+            NodeValue::Value(ValueAtHeight {
+                value: s.to_string(),
+                block_height: env::block_height(),
+            })
+        } else if value.is_null() {
+            NodeValue::DeletedEntry(env::block_height())
+        } else {
+            unreachable!("Invariant: value must be a string or null");
+        };
+        let prev_value = self.children.insert(&key, &value);
+        require!(
+            !matches!(prev_value, Some(NodeValue::Node(_))),
+            "Internal error, the replaced value was a node"
+        );
+    }
+}
+
+impl Contract {
+    pub fn internal_get_node(&self, node_id: NodeId) -> Option<Node> {
+        self.nodes.get(&node_id).map(|o| {
+            let mut node: Node = o.into();
+            node.node_id = node_id;
+            node
+        })
+    }
+
+    pub fn internal_unwrap_node(&self, node_id: NodeId) -> Node {
+        self.internal_get_node(node_id).expect("Node is missing")
+    }
+
+    pub fn internal_set_node(&mut self, mut node: Node) {
+        let node_id = node.node_id;
+        node.block_height = env::block_height();
+        self.nodes.insert(&node_id, &node.into());
+    }
+}
+
+#[near_bindgen]
+impl Contract {
+    pub fn get_node_count(&self) -> u32 {
+        self.node_count
+    }
+
+    pub fn get_nodes(
+        &self,
+        from_index: Option<u32>,
+        limit: Option<u32>,
+    ) -> Vec<Option<PartialNode>> {
+        let from_index = from_index.unwrap_or(0);
+        let limit = limit.unwrap_or(self.node_count);
+        (from_index..std::cmp::min(self.node_count, from_index + limit))
+            .map(|node_id| self.get_node(node_id, None, None))
+            .collect()
+    }
+
+    pub fn get_node(
+        &self,
+        node_id: NodeId,
+        from_index: Option<u32>,
+        limit: Option<u32>,
+    ) -> Option<PartialNode> {
+        Some(if node_id == 0 {
+            partial_node_view(&self.root_node, from_index, limit)
+        } else {
+            partial_node_view(&self.internal_get_node(node_id)?, from_index, limit)
+        })
+    }
+}
+
+fn partial_node_view(node: &Node, from_index: Option<u32>, limit: Option<u32>) -> PartialNode {
+    let num_children = node.children.len() as _;
+    let from_index = from_index.unwrap_or(0);
+    let limit = limit.unwrap_or(num_children);
+    let keys = node.children.keys_as_vector();
+    let values = node.children.values_as_vector();
+    let children = (from_index..std::cmp::min(num_children, from_index + limit))
+        .map(|index| {
+            (
+                keys.get(index as _).unwrap(),
+                values.get(index as _).unwrap(),
+            )
+        })
+        .collect();
+    PartialNode {
+        node_id: node.node_id,
+        block_height: node.block_height,
+        children,
+        from_index,
+        num_children,
+    }
+}
+
+'''
+'''--- contract/src/permission.rs ---
+use crate::*;
+use near_sdk::{require, PublicKey};
+use std::collections::HashSet;
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub enum PermissionKey {
+    AccountId(AccountId),
+    SignerPublicKey(PublicKey),
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub enum Permission {
+    Granted(HashSet<NodeId>),
+}
+
+impl Permission {
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Permission::Granted(node_ids) => node_ids.is_empty(),
+        }
+    }
+}
+
+#[near_bindgen]
+impl Contract {
+    #[payable]
+    pub fn grant_write_permission(
+        &mut self,
+        predecessor_id: Option<AccountId>,
+        public_key: Option<PublicKey>,
+        keys: Vec<String>,
+    ) {
+        self.assert_live();
+        let attached_deposit = env::attached_deposit();
+        require!(attached_deposit > 0, "Requires at least 1 yocto");
+        let permission_key = predecessor_id
+            .map(|a| {
+                require!(
+                    public_key.is_none(),
+                    "Can't supply both account_id and a public_key"
+                );
+                PermissionKey::AccountId(a)
+            })
+            .or_else(|| public_key.map(|pk| PermissionKey::SignerPublicKey(pk)))
+            .expect("Neither account_id or public_key is provided");
+        let account_id = env::predecessor_account_id();
+        let mut account =
+            self.internal_unwrap_account_or_create(account_id.as_str(), attached_deposit);
+        let mut permission = account
+            .permissions
+            .get(&permission_key)
+            .unwrap_or_else(|| Permission::Granted(HashSet::new()));
+        match &mut permission {
+            Permission::Granted(node_ids) => {
+                node_ids.extend(keys.into_iter().map(|key| {
+                    account.storage_tracker.start();
+                    let path: Vec<&str> = key.split(SEPARATOR).collect();
+                    require!(!path.is_empty(), "The key is empty");
+                    assert_eq!(
+                        path[0],
+                        account_id.as_str(),
+                        "The path should start with the expected account_id"
+                    );
+                    let mut node = Some(self.internal_unwrap_node(account.node_id));
+                    for &key in &path[1..] {
+                        assert_key_valid(key);
+                        let node_value = node.as_ref().unwrap().children.get(&key.to_string());
+                        match node_value {
+                            None => {
+                                let node_id = self.create_node_id();
+                                node.as_mut()
+                                    .unwrap()
+                                    .children
+                                    .insert(&key.to_string(), &NodeValue::Node(node_id));
+                                self.internal_set_node(
+                                    node.replace(Node::new(node_id, None)).unwrap(),
+                                );
+                            }
+                            Some(NodeValue::Node(node_id)) => {
+                                self.internal_set_node(
+                                    node.replace(self.internal_unwrap_node(node_id)).unwrap(),
+                                );
+                            }
+                            Some(node_value) => {
+                                assert_ne!(
+                                    key, EMPTY_KEY,
+                                    "The empty key's value should be a string"
+                                );
+                                let node_id = self.create_node_id();
+                                node.as_mut()
+                                    .unwrap()
+                                    .children
+                                    .insert(&key.to_string(), &NodeValue::Node(node_id));
+                                self.internal_set_node(
+                                    node.replace(Node::new(node_id, Some(node_value))).unwrap(),
+                                );
+                            }
+                        };
+                    }
+                    let node_id = node.as_ref().unwrap().node_id;
+                    self.internal_set_node(node.unwrap());
+                    account.storage_tracker.stop();
+                    node_id
+                }));
+            }
+        };
+        account.internal_set_permission(&permission_key, permission);
+        self.internal_set_account(account);
+    }
+
+    pub fn debug_get_permissions(&self, account_id: AccountId) -> Vec<(PermissionKey, Permission)> {
+        let account = self.internal_unwrap_account(account_id.as_str());
+        account.permissions.to_vec()
+    }
+
+    /// Returns true if the permission is granted for a given account ID or a given public_key to
+    /// any prefix of the key.
+    pub fn is_write_permission_granted(
+        &self,
+        predecessor_id: Option<AccountId>,
+        public_key: Option<PublicKey>,
+        key: String,
+    ) -> bool {
+        let permission_key = predecessor_id
+            .map(|a| {
+                require!(
+                    public_key.is_none(),
+                    "Can't supply both account_id and a public_key"
+                );
+                PermissionKey::AccountId(a)
+            })
+            .or_else(|| public_key.map(|pk| PermissionKey::SignerPublicKey(pk)))
+            .expect("Neither account_id or public_key is provided");
+
+        let path: Vec<&str> = key.split(SEPARATOR).collect();
+        require!(!path.is_empty(), "The key is empty");
+        let account = if let Some(account) = self.internal_get_account(path[0]) {
+            account
+        } else {
+            return false;
+        };
+        let permission = if let Some(permission) = account.permissions.get(&permission_key) {
+            permission
+        } else {
+            return false;
+        };
+
+        match permission {
+            Permission::Granted(node_ids) => {
+                if node_ids.contains(&account.node_id) {
+                    return true;
+                }
+
+                let mut node = self.internal_unwrap_node(account.node_id);
+
+                for &key in &path[1..] {
+                    let node_value = node.children.get(&key.to_string());
+                    if let Some(NodeValue::Node(node_id)) = node_value {
+                        if node_ids.contains(&node_id) {
+                            return true;
+                        }
+                        node = self.internal_unwrap_node(node_id);
+                    } else {
+                        return false;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+}
+
+impl Account {
+    pub fn internal_get_writeable_node_ids(&self) -> HashSet<NodeId> {
+        let mut res = HashSet::new();
+        if let Some(Permission::Granted(node_ids)) = self
+            .permissions
+            .get(&PermissionKey::AccountId(env::predecessor_account_id()))
+        {
+            res.extend(node_ids)
+        };
+        if let Some(Permission::Granted(node_ids)) = self
+            .permissions
+            .get(&PermissionKey::SignerPublicKey(env::signer_account_pk()))
+        {
+            res.extend(node_ids)
+        };
+        res
+    }
+
+    pub fn internal_set_permission(
+        &mut self,
+        permission_key: &PermissionKey,
+        permission: Permission,
+    ) {
+        self.storage_tracker.start();
+        if permission.is_empty() {
+            self.permissions.remove(permission_key);
+        } else {
+            self.permissions.insert(permission_key, &permission);
+        }
+        self.storage_tracker.stop()
+    }
+}
+
+'''
+'''--- contract/src/shared_storage.rs ---
+use crate::*;
+
+const MINIMUM_SHARED_STORAGE_BALANCE: Balance = 100 * 10u128.pow(24);
+
+#[derive(BorshSerialize, BorshDeserialize)]
+pub enum VSharedStoragePool {
+    Current(SharedStoragePool),
+}
+
+impl From<VSharedStoragePool> for SharedStoragePool {
+    fn from(v: VSharedStoragePool) -> Self {
+        match v {
+            VSharedStoragePool::Current(c) => c,
+        }
+    }
+}
+
+impl From<SharedStoragePool> for VSharedStoragePool {
+    fn from(c: SharedStoragePool) -> Self {
+        VSharedStoragePool::Current(c)
+    }
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct SharedStoragePool {
+    #[serde(with = "u128_dec_format")]
+    pub storage_balance: Balance,
+    pub used_bytes: StorageUsage,
+    /// The sum of the maximum number of bytes of storage that are shared between all accounts.
+    /// This number might be larger than the total number of bytes of storage that are available.
+    pub shared_bytes: StorageUsage,
+}
+
+impl SharedStoragePool {
+    pub fn new() -> Self {
+        Self {
+            storage_balance: 0,
+            used_bytes: 0,
+            shared_bytes: 0,
+        }
+    }
+
+    pub fn available_bytes(&self) -> StorageUsage {
+        let max_bytes = (self.storage_balance / env::storage_byte_cost()) as StorageUsage;
+        max_bytes - self.used_bytes
+    }
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Clone)]
+#[serde(crate = "near_sdk::serde")]
+pub struct AccountSharedStorage {
+    /// The maximum number of bytes of storage from the shared storage pool.
+    pub max_bytes: StorageUsage,
+    /// The amount of storage used by the account from the shared storage pool.
+    pub used_bytes: StorageUsage,
+
+    /// The account ID of the storage pool that donated storage to the account.
+    pub pool_id: AccountId,
+}
+
+impl AccountSharedStorage {
+    pub fn available_bytes(&self, shared_storage_pool: &SharedStoragePool) -> StorageUsage {
+        std::cmp::min(
+            self.max_bytes - self.used_bytes,
+            shared_storage_pool.available_bytes(),
+        )
+    }
+}
+
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct StorageView {
+    pub used_bytes: StorageUsage,
+    pub available_bytes: StorageUsage,
+}
+
+impl Contract {
+    pub fn internal_get_shared_storage_pool(
+        &self,
+        owner_id: &AccountId,
+    ) -> Option<SharedStoragePool> {
+        self.shared_storage_pools.get(&owner_id).map(|p| p.into())
+    }
+
+    pub fn internal_unwrap_shared_storage_pool(&self, owner_id: &AccountId) -> SharedStoragePool {
+        self.internal_get_shared_storage_pool(owner_id)
+            .expect("Shared storage pool not found")
+    }
+
+    pub fn internal_set_shared_storage_pool(
+        &mut self,
+        owner_id: &AccountId,
+        shared_storage_pool: SharedStoragePool,
+    ) {
+        self.shared_storage_pools
+            .insert(&owner_id, &shared_storage_pool.into());
+    }
+}
+
+#[near_bindgen]
+impl Contract {
+    pub fn get_shared_storage_pool(&self, owner_id: AccountId) -> Option<SharedStoragePool> {
+        self.internal_get_shared_storage_pool(&owner_id)
+    }
+
+    #[payable]
+    pub fn shared_storage_pool_deposit(&mut self, owner_id: Option<AccountId>) {
+        let attached_deposit = env::attached_deposit();
+        let owner_id = owner_id.unwrap_or_else(env::predecessor_account_id);
+        if attached_deposit < MINIMUM_SHARED_STORAGE_BALANCE {
+            env::panic_str(
+                format!(
+                    "Attached deposit is less than the minimum amount {}",
+                    MINIMUM_SHARED_STORAGE_BALANCE
+                )
+                .as_str(),
+            );
+        }
+        let mut storage_tracker = StorageTracker::default();
+        let mut shared_storage_pool = self
+            .internal_get_shared_storage_pool(&owner_id)
+            .unwrap_or_else(|| SharedStoragePool::new());
+        shared_storage_pool.storage_balance += attached_deposit;
+        storage_tracker.start();
+        self.internal_set_shared_storage_pool(&owner_id, shared_storage_pool);
+        storage_tracker.stop();
+        if storage_tracker.bytes_added > storage_tracker.bytes_released {
+            let mut shared_storage_pool = self.internal_unwrap_shared_storage_pool(&owner_id);
+            shared_storage_pool.used_bytes +=
+                storage_tracker.bytes_added - storage_tracker.bytes_released;
+            self.internal_set_shared_storage_pool(&owner_id, shared_storage_pool);
+        }
+        storage_tracker.clear();
+    }
+
+    pub fn share_storage(&mut self, account_id: AccountId, max_bytes: StorageUsage) {
+        if max_bytes < MIN_STORAGE_BYTES {
+            env::panic_str(format!("Max bytes must be at least {}", MIN_STORAGE_BYTES).as_str());
+        }
+        let pool_id = env::predecessor_account_id();
+        let account = self.internal_get_account(account_id.as_str());
+        let mut shared_storage_pool = self.internal_unwrap_shared_storage_pool(&pool_id);
+        let available_bytes = shared_storage_pool.available_bytes();
+        if available_bytes < max_bytes {
+            env::panic_str("Not enough storage available in the shared storage pool");
+        }
+        if let Some(mut account) = account {
+            // The account already exists.
+
+            if let Some(current_shared_storage) = account.shared_storage.take() {
+                // The account is already using shared storage.
+
+                if max_bytes < current_shared_storage.used_bytes {
+                    env::panic_str("Max bytes must be greater than or equal to used bytes");
+                }
+                if current_shared_storage.pool_id == pool_id {
+                    // The account is already using shared storage from the same pool.
+
+                    if max_bytes <= current_shared_storage.max_bytes {
+                        env::panic_str("Max bytes must be greater than the current max bytes");
+                    }
+
+                    let new_shared_storage = AccountSharedStorage {
+                        max_bytes,
+                        used_bytes: current_shared_storage.used_bytes,
+                        pool_id,
+                    };
+
+                    shared_storage_pool.shared_bytes +=
+                        max_bytes - current_shared_storage.max_bytes;
+                    self.internal_set_shared_storage_pool(
+                        &new_shared_storage.pool_id,
+                        shared_storage_pool,
+                    );
+
+                    account.shared_storage = Some(new_shared_storage);
+                } else {
+                    // The account is already using shared storage from a different pool.
+
+                    let mut current_shared_storage_pool =
+                        self.internal_unwrap_shared_storage_pool(&current_shared_storage.pool_id);
+                    let current_available_bytes =
+                        current_shared_storage.available_bytes(&current_shared_storage_pool);
+                    let mut new_shared_storage = AccountSharedStorage {
+                        max_bytes,
+                        used_bytes: 0,
+                        pool_id,
+                    };
+
+                    let new_available_bytes =
+                        new_shared_storage.available_bytes(&shared_storage_pool);
+                    if new_available_bytes
+                        < current_shared_storage.used_bytes
+                            + current_available_bytes
+                            + MIN_STORAGE_BYTES
+                    {
+                        env::panic_str(format!(
+                            "The difference between the new available bytes and the current available bytes must be at least {}", MIN_STORAGE_BYTES).as_str()
+                        );
+                    }
+
+                    current_shared_storage_pool.used_bytes -= current_shared_storage.used_bytes;
+                    current_shared_storage_pool.shared_bytes -= current_shared_storage.max_bytes;
+                    self.internal_set_shared_storage_pool(
+                        &current_shared_storage.pool_id,
+                        current_shared_storage_pool,
+                    );
+
+                    new_shared_storage.used_bytes = current_shared_storage.used_bytes;
+                    shared_storage_pool.used_bytes += new_shared_storage.used_bytes;
+                    shared_storage_pool.shared_bytes += new_shared_storage.max_bytes;
+                    self.internal_set_shared_storage_pool(
+                        &new_shared_storage.pool_id,
+                        shared_storage_pool,
+                    );
+
+                    account.shared_storage = Some(new_shared_storage)
+                }
+            } else {
+                // The account is not using shared storage.
+
+                shared_storage_pool.shared_bytes += max_bytes;
+                self.internal_set_shared_storage_pool(&pool_id, shared_storage_pool);
+
+                account.shared_storage = Some(AccountSharedStorage {
+                    max_bytes,
+                    used_bytes: 0,
+                    pool_id,
+                });
+            }
+            // Custom account saving logic to measure the change in the shared storage.
+            let mut storage_tracker = StorageTracker::default();
+            storage_tracker.start();
+            self.internal_set_account(account);
+            storage_tracker.stop();
+            let mut account = self.internal_unwrap_account(account_id.as_str());
+            account.storage_tracker.consume(&mut storage_tracker);
+            self.internal_set_account(account);
+        } else {
+            // The account does not exist.
+
+            shared_storage_pool.shared_bytes += max_bytes;
+            self.internal_set_shared_storage_pool(&pool_id, shared_storage_pool);
+
+            self.internal_create_account_from_shared_storage(
+                account_id.as_str(),
+                max_bytes,
+                pool_id.clone(),
+            );
+        }
+    }
+
+    /// Returns the storage usage of the given account in bytes and accounts for the shared storage.
+    pub fn get_account_storage(&self, account_id: AccountId) -> Option<StorageView> {
+        self.internal_get_account(account_id.as_str())
+            .map(|account| {
+                let available_shared_bytes = account
+                    .shared_storage
+                    .as_ref()
+                    .map(|s| {
+                        let pool = self.internal_unwrap_shared_storage_pool(&s.pool_id);
+                        s.available_bytes(&pool)
+                    })
+                    .unwrap_or(0);
+                let used_shared_bytes = account
+                    .shared_storage
+                    .as_ref()
+                    .map(|s| s.used_bytes)
+                    .unwrap_or(0);
+                let available_bytes = (account.storage_balance / env::STORAGE_PRICE_PER_BYTE)
+                    as u64
+                    - (account.used_bytes - used_shared_bytes);
+
+                StorageView {
+                    used_bytes: account.used_bytes,
+                    available_bytes: available_bytes + available_shared_bytes,
+                }
+            })
+    }
+}
+
+'''
+'''--- contract/src/storage_tracker.rs ---
+use crate::*;
+use near_sdk::StorageUsage;
+
+/// A helper object that tracks changes in state storage.
+#[derive(Default)]
+pub struct StorageTracker {
+    pub bytes_added: StorageUsage,
+    pub bytes_released: StorageUsage,
+    initial_storage_usage: Option<StorageUsage>,
+}
+
+/// Safety guard for the storage tracker.
+impl Drop for StorageTracker {
+    fn drop(&mut self) {
+        assert!(self.is_empty(), "Bug, non-tracked storage change");
+    }
+}
+
+impl StorageTracker {
+    /// Starts tracking the state storage changes.
+    pub fn start(&mut self) {
+        assert!(
+            self.initial_storage_usage
+                .replace(env::storage_usage())
+                .is_none(),
+            "The storage tracker is already tracking"
+        );
+    }
+
+    /// Stop tracking the state storage changes and record changes in bytes.
+    pub fn stop(&mut self) {
+        let initial_storage_usage = self
+            .initial_storage_usage
+            .take()
+            .expect("The storage tracker wasn't tracking");
+        let storage_usage = env::storage_usage();
+        if storage_usage >= initial_storage_usage {
+            self.bytes_added += storage_usage - initial_storage_usage;
+        } else {
+            self.bytes_released += initial_storage_usage - storage_usage;
+        }
+    }
+
+    /// Consumes the other storage tracker changes.
+    pub fn consume(&mut self, other: &mut StorageTracker) {
+        self.bytes_added += other.bytes_added;
+        other.bytes_added = 0;
+        self.bytes_released = other.bytes_released;
+        other.bytes_released = 0;
+        assert!(
+            other.initial_storage_usage.is_none(),
+            "Can't merge storage tracker that is tracking storage"
+        );
+    }
+
+    pub fn clear(&mut self) {
+        self.bytes_added = 0;
+        self.bytes_released = 0;
+        assert!(
+            self.initial_storage_usage.is_none(),
+            "Can't clear storage tracker that is active"
+        );
+    }
+
+    /// Returns true if no bytes is added or released, and the tracker is not active.
+    pub fn is_empty(&self) -> bool {
+        self.bytes_added == 0 && self.bytes_released == 0 && self.initial_storage_usage.is_none()
+    }
+}
+
+'''
+'''--- contract/src/upgrade.rs ---
+use crate::*;
+
+#[near_bindgen]
+impl Contract {
+    // A method to migrate a state during the contract upgrade.
+    #[private]
+    #[init(ignore_state)]
+    pub fn migrate_state() -> Self {
+        let old_contract: Self = env::state_read().expect("Old state doesn't exist");
+        old_contract
+    }
+
+    #[private]
+    pub fn genesis_init_node_count(&mut self, node_count: u32) {
+        self.assert_genesis();
+        self.node_count = node_count;
+    }
+
+    #[private]
+    pub fn genesis_init_nodes(&mut self, nodes: Vec<PartialNode>) {
+        self.assert_genesis();
+        for node in nodes {
+            if node.node_id == 0 {
+                populate_node(&mut self.root_node, node);
+            } else {
+                let mut current_node = self
+                    .internal_get_node(node.node_id)
+                    .unwrap_or_else(|| Node::new(node.node_id, None));
+                populate_node(&mut current_node, node);
+                self.internal_set_node(current_node);
+            }
+        }
+    }
+
+    #[private]
+    pub fn genesis_init_accounts(&mut self, accounts: Vec<(AccountId, PartialAccount)>) {
+        self.assert_genesis();
+        for (account_id, account) in accounts {
+            let mut current_account = match self
+                .root_node
+                .children
+                .get(&account_id.to_string())
+                .expect("Missing account node, make sure initializing nodes first")
+            {
+                NodeValue::Node(node_id) => {
+                    let mut account: Account = self
+                        .accounts
+                        .get(&node_id)
+                        .map(|va| va.into())
+                        .unwrap_or_else(|| Account::new(node_id));
+                    account.node_id = node_id;
+                    account
+                }
+                _ => env::panic_str("Unexpected account key. The value is not a node."),
+            };
+            assert_eq!(
+                current_account.node_id, account.node_id,
+                "Account Node ID mismatch"
+            );
+            current_account.storage_balance = account.storage_balance;
+            current_account.used_bytes = account.used_bytes;
+            current_account.permissions.extend(account.permissions);
+            self.accounts
+                .insert(&account.node_id, &current_account.into());
+        }
+    }
+
+    pub fn get_version(&self) -> String {
+        env!("CARGO_PKG_VERSION").to_string()
+    }
+}
+
+fn populate_node(node: &mut Node, partial_node: PartialNode) {
+    for (key, value) in partial_node.children {
+        node.children.insert(&key, &value.into_current_height());
+    }
+}
+
+impl Contract {
+    pub fn assert_genesis(&self) {
+        require!(
+            matches!(self.status, ContractStatus::Genesis),
+            "The status should be set to Genesis"
+        );
+    }
+}
+
+'''
+'''--- contract/src/utils.rs ---
+use crate::*;
+
+pub(crate) mod unordered_map_expensive {
+    use super::*;
+    use near_sdk::borsh::{BorshDeserialize, BorshSerialize};
+    use near_sdk::serde::Serializer;
+
+    pub fn serialize<S, K, V>(map: &UnorderedMap<K, V>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+        K: Serialize + BorshDeserialize + BorshSerialize,
+        V: Serialize + BorshDeserialize + BorshSerialize,
+    {
+        serializer.collect_seq(map.iter())
+    }
+}
+
+pub(crate) mod u128_dec_format {
+    use near_sdk::serde::de;
+    use near_sdk::serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(num: &u128, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&num.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<u128, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(de::Error::custom)
+    }
+}
+
+'''
+'''--- integration-tests/Cargo.toml ---
+[package]
+name = "integration-tests"
+version = "1.0.0"
+publish = false
+edition = "2018"
+
+[dev-dependencies]
+anyhow = "1.0"
+near-units = "0.2.0"
+# arbitrary_precision enabled for u128 types that workspaces requires for Balance types
+serde_json = { version = "1.0", features = ["arbitrary_precision"] }
+tokio = { version = "1.18.1", features = ["full"] }
+workspaces = "0.7.0"
+
+[[example]]
+name = "set_method"
+path = "src/set.rs"
+
+'''
+'''--- integration-tests/README.md ---
+# Integration Tests
+
+This directory contains integration tests for the Social DB contract.
+
+The build script compiles the WASM contract automatically if there are changes
+in the contract source code.
+
+Run a specific integration test with:
+
+```bash
+ cargo run --example set_method
+```
+
+'''
+'''--- integration-tests/build.rs ---
+#[path = "src/get_workspace_dir.rs"]
+mod get_workspace_dir;
+
+use crate::get_workspace_dir::get_workspace_dir;
+
+static CONTRACT_DIR: &str = "contract";
+
+fn main() {
+    let workspace_dir = get_workspace_dir();
+    let contract_dir = workspace_dir.join(CONTRACT_DIR);
+    // Tell Cargo to rerun this script if the `contract` source changes.
+    println!("cargo:rerun-if-changed={}", contract_dir.to_str().expect("valid UTF-8 path"));
+    // Run build_local.sh
+    let status = std::process::Command::new("bash")
+        .arg("build_local.sh")
+        .current_dir(&workspace_dir)
+        .status()
+        .expect("failed to execute build_local.sh");
+    assert!(status.success());
+}
+
+'''
+'''--- integration-tests/src/get_workspace_dir.rs ---
+use std::fs;
+use std::path::{Path, PathBuf};
+
+/// Get the canonical workspace directory.
+/// From https://stackoverflow.com/a/74942075
+pub fn get_workspace_dir() -> PathBuf {
+    let output = std::process::Command::new(env!("CARGO"))
+        .arg("locate-project")
+        .arg("--workspace")
+        .arg("--message-format=plain")
+        .output()
+        .unwrap()
+        .stdout;
+    let cargo_path = Path::new(std::str::from_utf8(&output).unwrap().trim());
+    fs::canonicalize(cargo_path.parent().unwrap().to_path_buf()).expect("can canonicalize workspace dir")
+}
+
+'''
+'''--- integration-tests/src/set.rs ---
+mod get_workspace_dir;
+
+use crate::get_workspace_dir::get_workspace_dir;
+use anyhow::Result;
+use near_units::parse_near;
+use serde_json::{from_value, json, Value};
+use std::collections::HashMap;
+use std::fs;
+use workspaces::network::Sandbox;
+use workspaces::{Account, Contract, Worker};
+
+static CONTRACT_WASM_FILEPATH: &str = "res/social_db_local.wasm";
+
+/// Tests the `set` method.
+#[tokio::main]
+async fn main() -> Result<()> {
+    test_set_method().await?;
+    test_set_method_and_refund().await?;
+    test_set_method_and_refund_with_existing_deposit().await?;
+    Ok(())
+}
+
+/// Sanity check that we can `set` and `get` a value.
+async fn test_set_method() -> Result<()> {
+    let (_, contract, user) = init_contract_and_user().await?;
+
+    let user_id = user.id().to_string();
+    let name = "Alice";
+    let args = json!({
+        "data": {
+            &user_id: {
+                "profile": {
+                    "name": name,
+                },
+            }
+        }
+    });
+
+    let set_result = user
+        .call(contract.id(), "set")
+        .args_json(args)
+        .deposit(parse_near!("0.1 N"))
+        .transact()
+        .await?
+        .json::<Value>()?;
+
+    assert!(
+        set_result["block_height"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()?
+            > 0
+    );
+
+    let name_key = format!("{user_id}/profile/name");
+    let result = user
+        .view(contract.id(), "get")
+        .args_json(json!({ "keys": [name_key] }))
+        .await?
+        .json::<HashMap<String, HashMap<String, HashMap<String, String>>>>()?;
+    let result_name = result
+        .get(&user_id)
+        .unwrap()
+        .get("profile")
+        .unwrap()
+        .get("name")
+        .unwrap();
+
+    assert_eq!(name, result_name);
+
+    Ok(())
+}
+
+/// Test that if a user requests a refund, they receive it.
+async fn test_set_method_and_refund() -> Result<()> {
+    let (_, contract, user) = init_contract_and_user().await?;
+
+    let user_id = user.id().to_string();
+    let name = "Alice";
+    let args = json!({
+        "data": {
+            &user_id: {
+                "profile": {
+                    "name": name,
+                },
+            }
+        },
+        "options": {
+            "refund_unused_deposit": true
+        }
+    });
+
+    let prev_balance = user.view_account().await?.balance;
+    let deposit = parse_near!("1 N");
+
+    user.call(contract.id(), "set")
+        .args_json(args)
+        .deposit(deposit)
+        .transact()
+        .await?
+        .into_result()?;
+
+    let post_balance = user.view_account().await?.balance;
+
+    // Check that the refund isn't more than the deposit. Because of gas fees post balance must be
+    // less than prev balance.
+    assert!(post_balance < prev_balance);
+    // Check that the refund is received.
+    assert!(post_balance > prev_balance - deposit);
+
+    Ok(())
+}
+
+/// Tests that when two users fund an account and only the second requests a refund:
+/// 1. First user doesn't receive refund.
+/// 2. Second user does receive refund.
+/// 3. Second user doesn't receive more than what they put in.
+async fn test_set_method_and_refund_with_existing_deposit() -> Result<()> {
+    let (worker, contract, first_user) = init_contract_and_user().await?;
+
+    let key = first_user.id().to_string();
+    let args = json!({
+        "data": {
+            &key: {
+                "profile": {
+                    "name": "Alice",
+                },
+            }
+        },
+    });
+
+    let deposit = parse_near!("1 N");
+
+    let first_prev_balance = first_user.view_account().await?.balance;
+    first_user
+        .call(contract.id(), "set")
+        .args_json(args)
+        .deposit(deposit)
+        .transact()
+        .await?
+        .into_result()?;
+
+    let second_user = worker.dev_create_account().await?;
+
+    let args = json!({
+        "data": {
+            &key: {}
+        },
+        "options": {
+            "refund_unused_deposit": true
+        }
+    });
+
+    let second_prev_balance = second_user.view_account().await?.balance;
+    second_user
+        .call(contract.id(), "set")
+        .args_json(args)
+        .deposit(deposit)
+        .transact()
+        .await?
+        .into_result()?;
+    let first_post_balance = first_user.view_account().await?.balance;
+    let second_post_balance = second_user.view_account().await?.balance;
+
+    // Make sure first user didn't receive refund.
+    assert!(first_post_balance < first_prev_balance - deposit);
+    // Make sure second user did receive refund.
+    assert!(second_post_balance > second_prev_balance - deposit);
+    // Make sure second user didn't receive more than what they put in.
+    assert!(second_post_balance < second_prev_balance);
+
+    Ok(())
+}
+
+async fn init_contract_and_user() -> Result<(Worker<Sandbox>, Contract, Account)> {
+    let workspace_dir = get_workspace_dir();
+    let wasm_filepath = workspace_dir.join(CONTRACT_WASM_FILEPATH);
+
+    let worker = workspaces::sandbox().await?;
+    let wasm = fs::read(wasm_filepath)?;
+
+    let contract = worker.dev_deploy(&wasm).await?;
+    contract.call("new").transact().await?.into_result()?;
+    contract
+        .as_account()
+        .call(contract.id(), "set_status")
+        .args_json(json!({
+            "status": "Live"
+        }))
+        .transact()
+        .await?
+        .into_result()?;
+
+    let account = worker.dev_create_account().await?;
+    let user = account
+        .create_subaccount("alice")
+        .initial_balance(parse_near!("30 N"))
+        .transact()
+        .await?
+        .into_result()?;
+    Ok((worker, contract, user))
+}
+
+'''
+'''--- migration/migrate.js ---
+const nearAPI = require("near-api-js");
+const path = require("path");
+const homedir = require("os").homedir();
+const Big = require("big.js");
+
+const credentialsPath = path.join(homedir, ".near-credentials");
+const keyStore = new nearAPI.keyStores.UnencryptedFileSystemKeyStore(
+  credentialsPath
+);
+
+const GasBoat = Big(10).pow(12).mul(300).toFixed(0);
+
+// const config = {
+//   keyStore,
+//   networkId: "testnet",
+//   nodeUrl: "https://rpc.testnet.near.org",
+//   inputAccountId: "v0.social08.testnet",
+//   outputAccountId: "v1.social08.testnet",
+// };
+const config = {
+  keyStore,
+  networkId: "mainnet",
+  nodeUrl: "https://rpc.mainnet.near.org",
+  inputAccountId: "db.social08.near",
+  outputAccountId: "social.near",
+};
+
+(async () => {
+  const near = await nearAPI.connect(config);
+  const account = await near.account(config.outputAccountId);
+  if (
+    (await account.viewFunction(config.inputAccountId, "get_status")) !==
+    "ReadOnly"
+  ) {
+    throw new Error("The input account is not at read-only state");
+  }
+
+  if (
+    (await account.viewFunction(config.outputAccountId, "get_status")) !==
+    "Genesis"
+  ) {
+    throw new Error("The output account is not at genesis state");
+  }
+
+  const numNodes = await account.viewFunction(
+    config.inputAccountId,
+    "get_node_count"
+  );
+
+  const limit = 50;
+  const nodesPromises = [];
+  for (let i = 0; i < numNodes; i += limit) {
+    nodesPromises.push(
+      account.viewFunction(config.inputAccountId, "get_nodes", {
+        from_index: i,
+        limit,
+      })
+    );
+  }
+  const nodes = (await Promise.all(nodesPromises)).flat();
+
+  console.log("Num nodes: " + nodes.length);
+
+  const numAccounts = await account.viewFunction(
+    config.inputAccountId,
+    "get_account_count"
+  );
+
+  const accountsPromises = [];
+  for (let i = 0; i < numAccounts; i += limit) {
+    accountsPromises.push(
+      account.viewFunction(config.inputAccountId, "get_accounts", {
+        from_index: i,
+        limit,
+      })
+    );
+  }
+  const accounts = (await Promise.all(accountsPromises)).flat();
+
+  console.log("Num accounts: " + accounts.length);
+
+  console.log(
+    "Total balance: " +
+      accounts
+        .reduce((s, a) => s.add(Big(a[1].storage_balance)), Big(0))
+        .div(Big(10).pow(24))
+        .toFixed(3) +
+      " NEAR"
+  );
+
+  console.log("Initializing node count");
+  await account.functionCall({
+    contractId: config.outputAccountId,
+    methodName: "genesis_init_node_count",
+    args: { node_count: numNodes },
+    gas: GasBoat,
+  });
+
+  const initLimit = 20;
+  for (let i = 0; i < numNodes; i += initLimit) {
+    const partialNodes = nodes.slice(i, i + initLimit);
+    console.log(
+      `Initializing nodes from ${i} to ${
+        i + partialNodes.length
+      } out of ${numNodes}`
+    );
+    await account.functionCall({
+      contractId: config.outputAccountId,
+      methodName: "genesis_init_nodes",
+      args: { nodes: partialNodes },
+      gas: GasBoat,
+    });
+  }
+
+  for (let i = 0; i < numAccounts; i += initLimit) {
+    const partialAccounts = accounts.slice(i, i + initLimit);
+    console.log(
+      `Initializing accounts from ${i} to ${
+        i + partialAccounts.length
+      } out of ${numAccounts}`
+    );
+    await account.functionCall({
+      contractId: config.outputAccountId,
+      methodName: "genesis_init_accounts",
+      args: { accounts: partialAccounts },
+      gas: GasBoat,
+    });
+  }
+})().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});
+
+'''
+'''--- migration/package.json ---
+{
+  "name": "migration",
+  "version": "1.0.0",
+  "main": "index.js",
+  "license": "Unlicence",
+  "private": true,
+  "bin": {
+    "main": "migrate.js"
+  },
+  "dependencies": {
+    "near-api-js": "^0.45.0",
+    "node-fetch": "^2.6.1",
+    "big.js": "^6.0.3"
+  },
+  "devDependencies": {
+    "prettier": "^2.2.1"
+  }
+
+}
+
+'''
+'''--- rust-toolchain.toml ---
+[toolchain]
+channel = "1.69"
+
+'''
+'''--- test_local.sh ---
+#!/bin/bash
+TARGET="${CARGO_TARGET_DIR:-target}"
+set -e
+
+cd "$(dirname $0)"
+
+cargo run --example set_method
+
+'''

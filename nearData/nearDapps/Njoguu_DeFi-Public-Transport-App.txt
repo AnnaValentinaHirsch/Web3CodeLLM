@@ -1,0 +1,647 @@
+*GitHub Repository "Njoguu/DeFi-Public-Transport-App"*
+
+'''--- README.md ---
+# DeFi-Public-Transport-App
+A Decentralized Finance(DeFi) application that will serve as a payment service for the Public Transport sector built on the NEAR Blockchain.
+
+## Exploring The Code
+
+1. The smart-contract code lives in the `/contract` folder. See the README there for
+   more info. In blockchain apps the smart contract is the "backend" of your app.
+2. The frontend code lives in the `/frontend` folder. `/frontend/index.html` is a great
+   place to start exploring. Note that it loads in `/frontend/assests/NEAR/contract.js`,
+   this is your entrypoint to learn how the frontend connects to the NEAR blockchain.
+3. Tests: there are different kinds of tests for the frontend and the smart
+   contract. See `contract/README` for info about how it's tested. The frontend
+   code gets tested with [jest]. You can run both of these at once with `npm
+   run test`.
+
+## Deploy
+
+Every smart contract in NEAR has its [own associated account][NEAR accounts]. When you run `npm run dev`, your smart contract gets deployed to the live NEAR TestNet with a throwaway account. When you're ready to make it permanent, here's how.
+
+### Step 0: Install near-cli (optional)
+
+[near-cli] is a command line interface (CLI) for interacting with the NEAR blockchain. It was installed to the local `node_modules` folder when you ran `npm install`, but for best ergonomics you may want to install it globally:
+
+    npm install --global near-cli
+
+Or, if you'd rather use the locally-installed version, you can prefix all `near` commands with `npx`
+
+Ensure that it's installed with `near --version` (or `npx near --version`)
+
+### Step 1: Create an account for the contract
+
+Each account on NEAR can have at most one contract deployed to it. If you've already created an account such as `your-name.testnet`, you can deploy your contract to `near-blank-project.your-name.testnet`. Assuming you've already created an account on [NEAR Wallet], here's how to create `near-blank-project.your-name.testnet`:
+
+1. Authorize NEAR CLI, following the commands it gives you:
+
+       near login
+
+2. Create a subaccount (replace `YOUR-NAME` below with your actual account name):
+
+       near create-account near-blank-project.YOUR-NAME.testnet --masterAccount YOUR-NAME.testnet
+
+### Step 2: set contract name in code
+
+Modify the line in `frontend/near-config.js` that sets the account name of the contract. Set it to the account id you used above.
+
+    const CONTRACT_NAME = process.env.CONTRACT_NAME || 'near-blank-project.YOUR-NAME.testnet'
+
+### Step 3: deploy!
+
+This command will build and deploy the smart contract to NEAR Testnet:
+
+    npm run deploy
+
+## Troubleshooting
+
+On Windows, if you're seeing an error containing `EPERM` it may be related to spaces in your path. Please see [this issue](https://github.com/zkat/npx/issues/209) for more details.
+
+[create-near-app]: https://github.com/near/create-near-app
+[Node.js]: https://nodejs.org/en/download/package-manager/
+[jest]: https://jestjs.io/
+[NEAR accounts]: https://docs.near.org/concepts/basics/account
+[NEAR Wallet]: https://wallet.testnet.near.org/
+[near-cli]: https://github.com/near/near-cli
+[gh-pages]: https://github.com/tschaub/gh-pages
+
+'''
+'''--- contract/Cargo.toml ---
+[package]
+name = "contract"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+near-sdk = "4.0.0-pre.4"
+hex = "0.4.3"
+
+[profile.release]
+codegen-units = 1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+# Opt into extra safety checks on arithmetic operations https://stackoverflow.com/a/64136471/249801
+overflow-checks = true
+
+'''
+'''--- contract/build.bat ---
+cargo build --target wasm32-unknown-unknown --release
+copy target\wasm32-unknown-unknown\release\*.wasm res
+'''
+'''--- contract/build.sh ---
+#!/bin/bash
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/*.wasm ./res/
+'''
+'''--- contract/src/lib.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::LookupMap;
+use near_sdk::collections::Vector;
+use near_sdk::{env, near_bindgen, AccountId, Promise};
+
+// Login Info structure
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Login {
+    message: String,
+    records: LookupMap<AccountId, String>,
+}
+
+// Routes Structure
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Routes {
+    start: String,
+    end: String,
+    fare: u128,
+}
+
+// Payment History Structure
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct PaymentHistory {
+    account: AccountId,
+    fare: u128,
+}
+
+// Vehicle Structure
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Vehicle {
+    route: Routes,
+    account: AccountId,
+    reg_number: String,
+    payments: Vector<PaymentHistory>,
+}
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct App {
+    vehicles: Vec<Vehicle>,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        App {
+            vehicles: vec![], //Vector::new(b"r".to_vec())
+        }
+    }
+}
+
+#[near_bindgen]
+impl App {
+    fn create_vehicle(
+        &mut self,
+        reg_number: String,
+        route_start: String,
+        route_end: String,
+        fare: u128,
+    ) {
+        let rte = Routes {
+            start: route_start,
+            end: route_end,
+            fare: fare,
+        };
+        let vh = Vehicle {
+            route: rte,
+            account: env::current_account_id(),
+            payments: Vector::new(b'd'),
+            reg_number: reg_number,
+        };
+
+        //  Add created vehicle to list of vehicles
+        self.vehicles.push(vh);
+    }
+    fn pay(&mut self, reg_number: String) -> String {
+        let mut vehicle_item: Option<& Vehicle> = None;
+        let mut vehicle_index: Option<usize> = None;
+        for (index, elem) in self.vehicles.iter().enumerate() {
+            if elem.reg_number == reg_number {
+                vehicle_index = Some(index);
+            }
+        }
+
+        match vehicle_index {
+            Some(x) => {
+                vehicle_item = self.vehicles.get(x);
+            }
+            None => env::log_str("vehicle index not found"),
+        }
+
+        match vehicle_item {
+            Some(item) => {
+                // implement NEAR payment
+                if env::account_balance() >= item.route.fare {
+                    Promise::new(env::current_account_id()).transfer(item.route.fare);
+
+                    let py = PaymentHistory {
+                        fare: item.route.fare,
+                        account: env::current_account_id(),
+                    };
+
+                    for elem in self.vehicles.iter_mut() {
+                        if elem.reg_number == reg_number {
+                            elem.payments.push(&py);
+                        }
+                    }
+                    return "OKAY!".to_string();
+                } else {
+                    env::log_str("You have insufficient balance!");
+                    return "Error!".to_string();
+                }
+            }
+            None => {
+                env::log_str("Vehicle is unknown!");
+                return "Error".to_string();
+            }
+        }
+    }
+}
+
+// Define the default, which automatically initializes the contract
+impl Default for Login {
+    fn default() -> Self {
+        Self {
+            message: "".to_string(),
+            records: LookupMap::new(b"r".to_vec()),
+        }
+    }
+}
+
+// Implement the Login structure
+#[near_bindgen]
+impl Login {
+    pub fn confirm_login(&mut self, message: String) {
+        let account_id = env::signer_account_id(); //gets ID of account owner
+        self.records.insert(&account_id, &message);
+    }
+
+    // Public method - returns the greeting saved, defaulting to DEFAULT_MESSAGE
+    pub fn get_message(&self) -> String {
+        return self.message.clone();
+    }
+}
+
+// TESTS
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use near_sdk::test_utils::{VMContextBuilder};
+    use near_sdk::{AccountId};
+
+    // part of writing unit tests is setting up a mock context
+    // provide a `predecessor` here, it'll modify the default context
+    fn get_context(predecessor: AccountId) -> VMContextBuilder {
+        let mut builder = VMContextBuilder::new();
+        builder.predecessor_account_id(predecessor);
+        builder
+    }
+
+    #[test]
+    fn create_vehicle() {
+        let mut app = App::default();
+        app.create_vehicle(
+            "KCP 247L".to_string(),
+            "Nairobi".to_string(),
+            "Thika".to_string(),
+            150,
+        );
+        assert_eq!(app.vehicles.len(), 1);
+    }
+
+    #[test]
+    fn test_pay() {
+        let mut app = App::default();
+        app.create_vehicle(
+            "KCP 247L".to_string(),
+            "Nairobi".to_string(),
+            "Thika".to_string(),
+            150,
+        );
+        assert_eq!(app.vehicles.len(), 1);
+        let user: AccountId = AccountId::new_unchecked("sample.testnet".to_string());
+        let mut _context: VMContextBuilder = get_context(user.clone());
+        _context.attached_deposit(1222);
+        let res = app.pay("KCP 247L".to_string());
+        assert_eq!(res, "OKAY!".to_string());
+    }
+}
+
+'''
+'''--- contract/test.sh ---
+#!/bin/bash
+set -e
+cargo test -- --nocapture
+'''
+'''--- frontend/assets/css/main.css ---
+body{
+    background-color: #2c3A3A;
+    color: snow;
+    font-family: 'Lucida Sans', 'Lucida Sans Regular', 'Lucida Grande', 'Lucida Sans Unicode', Geneva, Verdana, sans-serif;
+}
+#connect-wallet-btn{
+    float: right;
+    padding: 9px;
+    margin: 20px;
+}
+'''
+'''--- frontend/assets/js/NEAR/contract.js ---
+import 'regenerator-runtime/runtime'
+import {
+  initContract,
+  signInWithNearWallet,
+  signOutNearWallet,
+  setGreetingOnContract,
+  getGreetingFromContract,
+} from '../NEAR/near-api'
+
+document.querySelector('form').onsubmit = doUserAction
+document.querySelector('#connect-wallet-btn').onclick = signInWithNearWallet
+document.querySelector('#sign-out-button').onclick = signOutNearWallet
+
+// ====== Initialize the API for NEAR ======
+window.nearInitPromise = initContract()
+  .then(() => {
+    if (window.walletConnection.isSignedIn()) {
+      signedInFlow()
+    } else {
+      signedOutFlow()
+    }
+  })
+  .catch(alert)
+
+// Take the new greeting and send it to the contract
+async function doUserAction(event) {
+  event.preventDefault()
+  const { greeting } = event.target.elements
+  document
+    .querySelector('#signed-in-flow main')
+    .classList.add('please-wait')
+  try {
+    // ===== Call smart-contract to save the value on then blockchain =====
+    await setGreetingOnContract(greeting.value)
+  } catch (e) {
+    alert(
+      'Something went wrong! ' +
+      'Maybe you need to sign out and back in? ' +
+      'Check your browser console for more info.'
+    )
+    throw e
+  }
+
+  // ===== Fetch the data from the blockchain =====
+  await fetchGreeting()
+  document
+    .querySelector('#signed-in-flow main')
+    .classList.remove('please-wait')
+}
+
+// Get greeting from the contract on chain
+async function fetchGreeting() {
+  const currentGreeting = await getGreetingFromContract()
+
+  document.querySelectorAll('[data-behavior=greeting]').forEach(el => {
+    el.innerText = currentGreeting
+    el.value = currentGreeting
+  })
+}
+
+// Display the signed-out-flow container
+function signedOutFlow() {
+  document.querySelector('#signed-in-flow').style.display = 'none'
+  document.querySelector('#signed-out-flow').style.display = 'block'
+
+  fetchGreeting()
+}
+
+// Displaying the signed in flow container and fill in account-specific data
+function signedInFlow() {
+  document.querySelector('#signed-out-flow').style.display = 'none'
+  document.querySelector('#signed-in-flow').style.display = 'block'
+  document.querySelectorAll('[data-behavior=account-id]').forEach(el => {
+    el.innerText = window.accountId
+  })
+
+  fetchGreeting()
+}
+
+'''
+'''--- frontend/assets/js/NEAR/near-api.js ---
+import { connect, Contract, keyStores, WalletConnection } from 'near-api-js'
+import getConfig from '../NEAR/near-config'
+
+const nearConfig = getConfig(process.env.NODE_ENV || 'development')
+
+// Initialize contract & set global variables
+export async function initContract() {
+  // Initialize connection to the NEAR testnet
+  const near = await connect(Object.assign({ deps: { keyStore: new keyStores.BrowserLocalStorageKeyStore() } }, nearConfig))
+
+  // Initializing Wallet based Account. It can work with NEAR testnet wallet that
+  // is hosted at https://wallet.testnet.near.org
+  window.walletConnection = new WalletConnection(near)
+
+  // Getting the Account ID. If still unauthorized, it's just empty string
+  window.accountId = window.walletConnection.getAccountId()
+
+  // Initializing our contract APIs by contract name and configuration
+  window.contract = await new Contract(window.walletConnection.account(), nearConfig.contractName, {
+    // View methods are read only. They don't modify the state, but usually return some value.
+    viewMethods: ['get_greeting'],
+    // Change methods can modify the state. But you don't receive the returned value when called.
+    changeMethods: ['set_greeting'],
+  })
+}
+
+export function signOutNearWallet() {
+  window.walletConnection.signOut()
+  // reload page
+  window.location.replace(window.location.origin + window.location.pathname)
+}
+
+export function signInWithNearWallet() {
+  // Allow the current app to make calls to the specified contract on the
+  // user's behalf.
+  // This works by creating a new access key for the user's account and storing
+  // the private key in localStorage.
+  window.walletConnection.requestSignIn(nearConfig.contractName)
+}
+
+export async function setGreetingOnContract(message){
+  let response = await window.contract.set_greeting({
+    args:{message: message}
+  })
+  return response
+}
+
+export async function getGreetingFromContract(){
+  let greeting = await window.contract.get_greeting()
+  return greeting
+}
+'''
+'''--- frontend/assets/js/NEAR/near-config.js ---
+const CONTRACT_NAME = process.env.CONTRACT_NAME ||'near-blank-project.njoguu.testnet'
+
+function getConfig(env) {
+  switch (env) {
+
+  case 'production':
+  case 'mainnet':
+    return {
+      networkId: 'mainnet',
+      nodeUrl: 'https://rpc.mainnet.near.org',
+      contractName: CONTRACT_NAME,
+      walletUrl: 'https://wallet.near.org',
+      helperUrl: 'https://helper.mainnet.near.org',
+      explorerUrl: 'https://explorer.mainnet.near.org',
+    }
+  case 'development':
+  case 'testnet':
+    return {
+      networkId: 'testnet',
+      nodeUrl: 'https://rpc.testnet.near.org',
+      contractName: CONTRACT_NAME,
+      walletUrl: 'https://wallet.testnet.near.org',
+      helperUrl: 'https://helper.testnet.near.org',
+      explorerUrl: 'https://explorer.testnet.near.org',
+    }
+  case 'betanet':
+    return {
+      networkId: 'betanet',
+      nodeUrl: 'https://rpc.betanet.near.org',
+      contractName: CONTRACT_NAME,
+      walletUrl: 'https://wallet.betanet.near.org',
+      helperUrl: 'https://helper.betanet.near.org',
+      explorerUrl: 'https://explorer.betanet.near.org',
+    }
+  case 'local':
+    return {
+      networkId: 'local',
+      nodeUrl: 'http://localhost:3030',
+      keyPath: `${process.env.HOME}/.near/validator_key.json`,
+      walletUrl: 'http://localhost:4000/wallet',
+      contractName: CONTRACT_NAME,
+    }
+  case 'test':
+  case 'ci':
+    return {
+      networkId: 'shared-test',
+      nodeUrl: 'https://rpc.ci-testnet.near.org',
+      contractName: CONTRACT_NAME,
+      masterAccount: 'test.near',
+    }
+  case 'ci-betanet':
+    return {
+      networkId: 'shared-test-staging',
+      nodeUrl: 'https://rpc.ci-betanet.near.org',
+      contractName: CONTRACT_NAME,
+      masterAccount: 'test.near',
+    }
+  default:
+    throw Error(`Unconfigured environment '${env}'. Can be configured in src/config.js.`)
+  }
+}
+
+module.exports = getConfig
+
+'''
+'''--- frontend/assets/js/scripts.js ---
+
+'''
+'''--- frontend/index.html ---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CryptoLipa</title>
+
+    <link rel="stylesheet" href="../frontend/assets/css/main.css">
+</head>
+<body>
+    <main id="signed-out-flow" style="display: none;">
+        <button id="connect-wallet-btn">Connect Wallet and Sign In</button>
+           
+        <h1>
+          <span class="greeting" data-behavior="greeting"></span>
+          Welcome to CryptoLipa!
+        </h1>
+        <p>
+          Lorem, ipsum dolor sit amet consectetur adipisicing elit. Qui in architecto unde 
+          sequi velit! Ea vero eligendi ducimus quasi delectus sequi accusamus atque id error 
+          iure, labore pariatur dolor at molestiae qui laboriosam veritatis numquam perspiciatis
+           porro eos veniam corrupti.
+        </p>
+        <p>
+          Lorem ipsum dolor sit, amet consectetur adipisicing elit. Temporibus voluptas 
+          hic fugit explicabo. Corporis minus expedita animi totam magni repellat itaque 
+          ad natus, eaque deserunt delectus sed ducimus doloribus ea quas cupiditate 
+          obcaecati eius laboriosam consequuntur autem harum non cumque?
+        </p> 
+    </main>
+    <div id="signed-in-flow" style="display: none">
+        <button style="float: right" id="sign-out-button">
+          Sign out <span data-behavior="account-id"></span>
+        </button>
+        <main>
+          <h1>
+            <span class="greeting" data-behavior="greeting"></span>! Welcome to NEAR!
+          </h1>
+          <form class="change">
+            <label for="greeting">Change greeting:</label>
+            <div>
+              <input
+                  autocomplete="off"
+                  id="greeting"
+                  data-behavior="greeting"
+                />
+              <button>Save</button>
+            </div>
+          </form>
+          <p>
+            Look at that! A Hello World app! This greeting is stored on the NEAR blockchain. Check it out:
+          </p>
+          <ol>
+            <li>
+              Look in <code>index.js</code> and <code>near-api.js</code> – you'll see <code>get_greeting</code>
+              and <code>set_greeting</code> being called on <code>contract</code>.
+              What's this?
+            </li>
+            <li>
+              Ultimately, this <code>contract</code> code is defined in
+              <code>assembly/index.ts</code> – this is the source code for your
+              <a target="_blank" href="https://docs.near.org/docs/develop/contracts/overview">smart contract</a>.
+            </li>
+            <li>
+              When you run <code>yarn dev</code>, the code in
+              <code>assembly/index.ts</code> gets deployed to the NEAR testnet. You
+              can see how this happens by looking in <code>package.json</code> at the
+              <code>scripts</code> section to find the <code>dev</code> command.
+            </li>
+          </ol>
+          <hr>
+          <p>
+            To keep learning, check out
+            <a target="_blank" href="https://docs.near.org">the NEAR docs</a>
+            or look through some
+            <a target="_blank" href="https://examples.near.org">example apps</a>.
+          </p>
+        </main>
+    </div>
+
+    <!-- Adding NEAR api js -->
+    <!-- <script src="https://cdn.jsdelivr.net/npm/near-api-js@0.44.2/dist/near-api-js.min.js" 
+    integrity="sha256-W5o4c5DRZZXMKjuL41jsaoBpE/UHMkrGvIxN9HcjNSY=" 
+    crossorigin="anonymous"></script> -->
+    <!-- link to custom JS -->
+    <script src="../frontend/assets/js/scripts.js"></script>
+    <!-- link to contract js -->
+    <script src="../frontend/assets/js/NEAR/contract.js" type="module"></script>
+</body>
+</html>
+'''
+'''--- package.json ---
+{
+    "name": "cryptolipa",
+    "version": "1.0.0",
+    "license": "UNLICENSED",
+    "scripts": {
+      "build": "npm run build:rustup && npm run build:cpwasm",
+        "build:rustup": "cd contract && rustup target add wasm32-unknown-unknown && cargo build --all --target wasm32-unknown-unknown --release",
+        "build:cpwasm": "mkdir -p out && rm -f ./out/main.wasm && cp ./contract/target/wasm32-unknown-unknown/release/contract.wasm ./out/main.wasm",
+      "deploy": "npm run build && near dev-deploy",
+      "start": "npm run deploy && echo The app is starting! && env-cmd -f ./neardev/dev-account.env parcel frontend/index.html --open",
+      "dev": "nodemon --watch contract -e ts --exec \"npm run start\""
+      
+  
+    },
+    "devDependencies": {
+      "env-cmd": "^10.1.0",
+      "near-cli": "^3.3.0",
+      "nodemon": "~2.0.16",
+      "parcel": "^2.6.0",
+      "ava": "^4.2.0",
+      "near-workspaces": "^2.0.0",
+      "typescript": "^4.7.2",
+      "process": "^0.11.10",
+      "ts-node": "^10.8.0"
+    },
+    "dependencies": {
+      "near-api-js": "~0.43.1",
+      "regenerator-runtime": "~0.13.9"
+    }
+  }
+  
+'''

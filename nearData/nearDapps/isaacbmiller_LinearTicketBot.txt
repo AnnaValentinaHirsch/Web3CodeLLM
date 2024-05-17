@@ -1,0 +1,543 @@
+*GitHub Repository "isaacbmiller/LinearTicketBot"*
+
+'''--- README.md ---
+# Linear Webhook Ticket Bot
+
+<img alt="DroidScrumMaster" src="https://github.com/isaacbmiller/LinearTicketBot/assets/17116851/a8aa3821-b510-4935-86ea-93b6a2ffde4e" width="500">
+
+## What is it
+
+This is a bot that uses the Linear API to automatically add relevant information to a ticket when it is created.
+
+It uses LangChain to work with the OpenAI API to generate the following fields for the ticket:
+
+1. Title
+2. Objective
+3. Subtasks
+4. Success Criteria
+5. Priority
+
+## Demo
+
+https://github.com/isaacbmiller/LinearTicketBot/assets/17116851/d0fb9457-d4e3-42f2-a13f-05bfd62e8397
+
+## How it works
+
+The bot is built using Flask, GraphQL, and LangChain.
+
+When the Linear webhook is triggered, it sends a POST request to the `/linear-consumer` endpoint. This request contains the Title, Description, Identifier, and other information about the ticket.
+
+These are extracted and then passed into the LangChain pipeline.
+
+NOTE: Only the Title is currently used, the description will be overwritten
+
+The LangChain pipeline is a series of prompts that are chained together to generate the ticket fields.
+
+The resulting fields are then sent to the Linear API using a GraphQL mutation to update the ticket.
+
+### API
+
+The API is built using Flask. It has two endpoints:
+
+1. `/linear-consumer` - This is the endpoint that the Linear webhook sends a POST request to. It extracts the relevant information from the request and then passes it to the LangChain pipeline.
+
+2. `/` - This is the endpoint that is used for testing. I found it most helpful to ensure that the proxy was running locally. This would be removed for a production deployment.
+
+### LangChain
+
+It uses different prompts for each field and then uses the output from the previous prompt to generate the following field.
+
+For example, the prompt for the objective is:
+
+```python
+"""
+You are an engineering manager with an eye for detail and creating actionable objectives.
+You are helping to create parts of a ticket for a task.
+Task context:
+    Description: "{description}"
+---
+Write a concise primary actionable objective for the task.
+"""
+```
+
+These are chained together using LCEL (LangChain Expression Language) to easily pipe the output from one prompt to the next, gradually building up the ticket.
+See [app/chain/chain.py](app/chain/chain.py) for the full code.
+
+### GraphQL
+
+The GraphQL schema is downloaded as [app/api/Linear-API@current.graphql](app/api/Linear-API@current.graphql) and then parsed using the gql library. This is done when the client is initialized in [app/api/update_issue.py](app/api/update_issue.py).
+
+The mutation then looks like this:
+
+```python
+mutation = gql(
+"""
+mutation IssueUpdate($input: IssueUpdateInput!, $issueUpdateId: String!) {
+    issueUpdate(input: $input, id: $issueUpdateId) {
+        issue {
+            title
+        }
+    }
+}
+"""
+)
+# ...
+result = client.execute(
+        mutation,
+        variable_values={
+            "input": {
+                "title": title,
+                "description": description,
+                "priority": priority,
+            },
+            "issueUpdateId": issue_id,
+        },
+    )
+```
+
+### Error handling
+
+For the fields that specifically have to be certain strings, being the priority and the type, I use a Pydantic model to validate the input. If the input is not valid, it will raise an error, and the ticket will not be updated. Langchain will retry the prompt up to 6 times by default, and if it fails again, it will raise an error, and the ticket will not be updated.
+
+## Setup/Installation
+
+### Set up proxy for local development
+
+You need to set up any proxy to forward traffic from your local machine to the internet.
+
+I chose to use ngrok because it is free and easy, but you can use any other proxy service as long as it forwards traffic to your local port 3000.
+
+You can make a ngrok account [here](https://dashboard.ngrok.com/signup).
+
+You need to get the auth token and the static domain(free) for your account.
+
+```bash
+brew install ngrok
+
+ngrok config add-authtoken <token>
+
+ngrok http --domain=<your domain here> 3000
+```
+
+### Env setup
+
+I have provided a `.env.example` file in the root directory of this project. You will need to rename this file to `.env` and fill in the variables. You can find the values for these variables in the next two sections.
+
+### Linear setup
+
+Follow the guide [here](https://developers.linear.app/docs/graphql/webhooks) to add a webhook to your linear workspace. I used the Issue data changed event, and the link should be the ngrok url with the `/linear-consumer` endpoint.
+
+You will also need to add a personal access token to your linear account. You can do this by going to your account settings and clicking on the API tab. Then click on the "Create new token" button. You will need to copy this token and add it to the `.env` file in the root directory of this project under the `LINEAR_API_KEY` variable.
+
+### OpenAI setup
+
+You will need to add your OpenAI API key to the `.env` file in the root directory of this project under the `OPENAI_API_KEY` variable.
+
+### Run the local server
+
+In a separate terminal, start the flask server in debug mode.
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Run the flask server
+python run.py
+```
+
+## TODO
+
+- [x] Finish developing the chain according to the linear fields
+- [x] Convert the response into GraphQL schema to use with linear API
+- [x] Add error handling with LangChain
+- [x] Figure out how to share without deploying
+  - [x] Double-check what API keys are needed
+
+- [ ] Use both title and description if available
+- [ ] Validate Linear Webhook using API key
+
+- [ ] Add tests
+  - [ ] Test endpoints
+  - [ ] Evaluate prompts using langsmith(still on waitlist :/)
+- [ ] Dockerize and deploy to AWS
+
+'''
+'''--- app/__init__.py ---
+
+'''
+'''--- app/api/__init__.py ---
+
+'''
+'''--- app/api/linear_consumer.py ---
+"""This module contains a function to consume the webhook, 
+extract and generate the relevant data, and update the issue"""
+
+from app.chain.chain import generate_ticket_details
+from app.api.update_issue import update_issue_info, update_issue_reaction
+
+def consume_linear_webhook(data):
+    '''Consume Linear webhook, and update issue'''
+
+    if data.get("action") and data["action"] != "create":
+        return 'Action is not create', 200
+
+    if data.get("data") and data["data"].get("identifier") and data["data"].get("title"):
+        identifier = data["data"]["identifier"]
+        description = data["data"]["title"]
+    else:
+        return 'Missing identifier or title', 400
+
+    try:
+        if data["data"].get("id"):
+            issue_uuid = data["data"]["id"]
+            update_issue_reaction(issue_uuid)
+    except Exception as _:
+        # Would Log error in reality
+        # Reaction is not important enough to abort execution
+        pass
+
+    try:
+        generated_ticket_details = generate_ticket_details(description)
+    except Exception as _:
+        return 'Error generating ticket details', 500
+
+    params = {
+        "issue_id": identifier,
+        "title": generated_ticket_details["title"],
+        "description": generated_ticket_details["compiled_description"],
+        "priority": generated_ticket_details["ticket_type"].priority,
+    }
+
+    try:
+        update_issue_info(**params)
+        return 'Issue updated', 200
+    except Exception as _:
+        return 'Error updating issue', 500
+
+'''
+'''--- app/api/update_issue.py ---
+"""This module contains the function to mutate the issue using the Linear GraphQL API"""
+import os
+
+from gql import gql, Client
+from gql.transport.requests import RequestsHTTPTransport
+
+import dotenv
+
+dotenv.load_dotenv()
+
+LINEAR_API_KEY = os.getenv("LINEAR_API_KEY")
+API_URL = "https://api.linear.app/graphql"
+SCHEMA_PATH = "./app/api/Linear-API@current.graphql"
+
+transport = RequestsHTTPTransport(url=API_URL, headers={'Authorization': LINEAR_API_KEY})
+
+with open(SCHEMA_PATH, encoding='utf-8') as f:
+    schema_str = f.read()
+
+client = Client(schema=schema_str, transport=transport)
+
+# Set up the mutation to update an issue
+issue_update_mutation = gql(
+"""
+mutation IssueUpdate($input: IssueUpdateInput!, $issueUpdateId: String!) {
+    issueUpdate(input: $input, id: $issueUpdateId) {
+        issue {
+            id
+        }
+    }
+}
+"""
+)
+
+reaction_create_mutation = gql(
+"""
+mutation ReactionCreate($input: ReactionCreateInput!) {
+  reactionCreate(input: $input) {
+      success
+  }
+}
+"""
+)
+
+def update_issue_info(issue_id, title, description, priority):
+    '''Mutate the issue with the given id, and update the title, description, and priority'''
+    priority_dict = {
+        "urgent": 1,
+        "high": 2,
+        "medium": 3,
+        "low": 4,
+    }
+
+    try:
+        _ = client.execute(
+            issue_update_mutation,
+            variable_values={
+                "input": {
+                    "title": title,
+                    "description": description,
+                    "priority": priority_dict[priority],
+                },
+                "issueUpdateId": issue_id,
+            },
+        )
+        return
+    except Exception as _:
+        raise Exception("Error updating issue")
+
+def update_issue_reaction(issue_uuid, emoji="robot_face"):
+    '''Mutate the issue with the given id, and update the title, description, and priority'''
+    try:
+        _ = client.execute(
+            reaction_create_mutation,
+            variable_values={
+                "input": {
+                    "issueId": issue_uuid,
+                    "emoji": emoji
+                },
+            },
+        )
+        return
+    except Exception as _:
+        raise Exception("Error updating issue reaction")
+
+if __name__ == "__main__":
+    update_issue_info("LIN-11", "This is a test title2", "This is a test description", "urgent")
+
+'''
+'''--- app/chain/__init__.py ---
+
+'''
+'''--- app/chain/chain.py ---
+"""This module contains the LangChain pipeline for generating ticket details"""
+
+import os
+import dotenv
+from langchain.chat_models import ChatOpenAI
+from langchain.prompts import PromptTemplate
+from langchain.schema import StrOutputParser
+from langchain.schema.runnable import RunnablePassthrough
+from langchain.cache import SQLiteCache
+from langchain.globals import set_llm_cache
+from langchain.output_parsers import PydanticOutputParser
+from langchain.pydantic_v1 import BaseModel, Field, validator
+
+dotenv.load_dotenv()
+
+# Constants
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+DATABASE_PATH = ".langchain.db"
+
+# Initialize cache and model
+set_llm_cache(SQLiteCache(database_path=DATABASE_PATH))
+model = ChatOpenAI()
+model_parse_str = model | StrOutputParser()
+
+PERSONA_PROMPT = """
+You are an engineering manager with an eye for detail and creating actionable objectives.
+You are helping to create parts of a ticket for a task.
+"""
+
+objective_prompt = PromptTemplate.from_template(
+    '''
+{persona_prompt}
+Task context:
+    Description: "{description}"
+---
+Write a concise primary actionable objective for the task.
+''', partial_variables={"persona_prompt": PERSONA_PROMPT})
+objective_chain = objective_prompt | model_parse_str
+
+title_prompt = PromptTemplate.from_template(
+    '''
+{persona_prompt}
+Task context:
+    Description: "{description}"
+    Objective: "{objective}"
+---
+Write a concise title for the task.
+''', partial_variables={"persona_prompt": PERSONA_PROMPT})
+title_chain = title_prompt | model_parse_str
+
+success_prompt = PromptTemplate.from_template(
+    '''
+{persona_prompt}
+Task context:
+        Description: "{description}"
+        Objective: "{objective}"
+---
+Write a fleshed out success criteria for the task. The criteria should be measurable and observable.
+The criteria should be written in a way that it is clear when the task is complete.
+The format should be markdown checkboxes as one would see inside of a Jira ticket.
+''', partial_variables={"persona_prompt": PERSONA_PROMPT})
+success_chain = success_prompt | model_parse_str
+
+class TicketTypeAndPriority(BaseModel):
+    '''A pydantic model for ticket type and priority'''
+
+    type: str = Field(description="one of feature, bug, improvement")
+    priority: str = Field(description="one of urgent, high, medium, low")
+
+    @validator("type")
+    def ticket_is_valid_type(cls, field):  # pylint: disable=no-self-argument
+        '''Validate that the ticket type is one of feature, bug, improvement'''
+        if field not in ["feature", "bug", "improvement"]:
+            raise ValueError("Invalid ticket type")
+        return field
+
+    @validator("priority")
+    def ticket_is_valid_priority(cls, field):  # pylint: disable=no-self-argument
+        '''Validate that the ticket priority is one of urgent, high, medium, low'''
+        if field not in ["urgent", "high", "medium", "low"]:
+            raise ValueError("Invalid ticket priority")
+        return field
+
+ticket_type_parser = PydanticOutputParser(
+    pydantic_object=TicketTypeAndPriority)
+
+ticket_type_prompt = PromptTemplate.from_template(''' \
+{persona_prompt}
+Task context:
+        Description: "{description}"
+        Objective: "{objective}"
+---
+You should classify the ticket as one of the following types: \
+    feature, bug, improvement
+{format_instructions}''',
+partial_variables={"format_instructions": ticket_type_parser.get_format_instructions(), "persona_prompt": PERSONA_PROMPT})
+
+ticket_type_chain = ticket_type_prompt | model | ticket_type_parser
+
+subtask_prompt = PromptTemplate.from_template('''
+{persona_prompt}
+Task context:
+    Description: "{description}"
+    Objective: "{objective}"
+    Success Criteria: "{success_criteria}"
+---
+Given the above information, your job is to create actionable substeps. \
+Each of these substeps should be a task that can be completed by a single person. \
+The scope of each substep should be small enough that it can be completed in a single day. \
+The format should be a list markdown checkboxes of actionable task descriptions.
+''', partial_variables={"persona_prompt": PERSONA_PROMPT})
+subtask_chain = subtask_prompt | model_parse_str
+
+COMPILED_DESCRIPTION = (
+    "Description:\n{description}\n\nObjective:\n{objective}\n\nSubtasks:\n{subtasks}\n\nSuccess Criteria:\n{success_criteria}"
+)
+
+ticket_detail_chain = (
+    RunnablePassthrough.assign(objective=objective_chain)
+    | RunnablePassthrough.assign(title=title_chain)
+    | RunnablePassthrough.assign(ticket_type=ticket_type_chain)
+    | RunnablePassthrough.assign(success_criteria=success_chain)
+    | RunnablePassthrough.assign(subtasks=subtask_chain)
+)
+
+# Main function to generate ticket details
+def generate_ticket_details(description):
+    '''Generate ticket details from a description'''
+    try:
+
+        result = ticket_detail_chain.invoke({"description": description})
+        compiled_description = (
+            "Description:\n{description}\n\nObjective:\n{objective}\n\nSubtasks:\n{subtasks}\n\nSuccess Criteria:\n{success_criteria}"
+        )
+        result["compiled_description"] = compiled_description.format(**result)
+        return result
+    except Exception as e:
+        # Handle or log the exception as needed
+        raise e
+
+if __name__ == "__main__":
+    test_descriptions = [
+        # "Add Two-Factor Authentication to User Accounts",
+        # "Optimize Database Query Performance on Sales Page",
+        "Update Documentation for API Endpoints"
+    ]
+    for description in test_descriptions:
+        ticket_details = generate_ticket_details(description)
+        print(ticket_details)
+
+'''
+'''--- requirements.txt ---
+aiohttp==3.8.6
+aiosignal==1.3.1
+annotated-types==0.6.0
+anyio==3.7.1
+async-timeout==4.0.3
+attrs==23.1.0
+backoff==2.2.1
+blinker==1.7.0
+botocore==1.33.0
+certifi==2023.11.17
+charset-normalizer==3.3.2
+click==8.1.7
+dataclasses-json==0.6.2
+distro==1.8.0
+Flask==3.0.0
+frozenlist==1.4.0
+gql==3.4.1
+graphql-core==3.2.3
+h11==0.14.0
+httpcore==1.0.2
+httpx==0.25.2
+idna==3.6
+itsdangerous==2.1.2
+Jinja2==3.1.2
+jmespath==1.0.1
+jsonpatch==1.33
+jsonpointer==2.4
+langchain==0.0.340
+langsmith==0.0.66
+MarkupSafe==2.1.3
+marshmallow==3.20.1
+multidict==6.0.4
+mypy-extensions==1.0.0
+numpy==1.26.2
+openai==1.3.5
+packaging==23.2
+pydantic==2.5.2
+pydantic_core==2.14.5
+python-dateutil==2.8.2
+python-dotenv==1.0.0
+PyYAML==6.0.1
+requests==2.31.0
+requests-toolbelt==0.10.1
+six==1.16.0
+sniffio==1.3.0
+SQLAlchemy==2.0.23
+tenacity==8.2.3
+tqdm==4.66.1
+typing-inspect==0.9.0
+typing_extensions==4.8.0
+urllib3==1.26.18
+websockets==10.4
+Werkzeug==3.0.1
+yarl==1.9.3
+
+'''
+'''--- run.py ---
+"""This is the main entrypoint for the application. It is used to capture the webhook from Linear, 
+and update the issue with the generated ticket details"""
+
+from flask import Flask, request
+from app.api.linear_consumer import consume_linear_webhook
+
+app = Flask(__name__)
+
+@app.route('/', methods=['GET'])
+def index():
+    '''Index page, mostly useful to check if proxy is working'''
+    return 'Hello World'
+
+@app.route('/linear-consumer', methods=['POST'])
+def linear_consumer():
+    '''Consume Linear webhook, and update issue'''
+    data = request.get_json()
+    return consume_linear_webhook(data)
+
+if __name__ == '__main__':
+    app.run(debug=True, port=3000)
+
+'''

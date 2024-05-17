@@ -1,0 +1,540 @@
+*GitHub Repository "HAPIprotocol/hapi-near-connector"*
+
+'''--- CHANGELOG.md ---
+# Changelog
+
+## [2023-03-08]
+* added methods: `check_risk`, `get_aml_conditions`
+* updated doctests
+
+## [2023-01-17]
+* LowRiskExchange and MediumRiskExchange merged to category Exchange
+'''
+'''--- Cargo.toml ---
+[package]
+name = "hapi-near-connector"
+authors = ["HAPI"]
+version = "0.3.0"
+edition = "2021"
+description = """
+Rust library for using HAPI protocol in cmart contracts on NEAR.
+"""
+readme = "README.md"
+categories = ["wasm"]
+license-file = "LICENSE"
+repository = "https://github.com/HAPIprotocol/hapi-near-connector"
+homepage = "https://hapi.one"
+documentation = "https://hapi-one.gitbook.io/"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+near-sdk = "4.0.0"
+near-contract-standards = "4.0.0"
+serde = "1"
+
+'''
+'''--- README.md ---
+# HAPI Protocol
+
+[HAPI Protocol] is a one-of-a-kind decentralized security protocol that prevents and interrupts any potential malicious activity within the blockchain space. HAPI Protocol works by leveraging both external and off-chain data as well as on-chain data accrued directly by HAPI Protocol and is publicly available.
+
+# HAPI NEAR Proxy
+
+It is a proxy [contract](https://github.com/HAPIprotocol/near-proxy-contract) used for replicating data from [HAPI Protocol] main contract on the NEAR blockchain.
+
+Address of the contract on the **testnet**
+
+```
+contract.hapi-test.testnet
+```
+Address of the contract on the **mainnet**
+
+```
+proxy.hapiprotocol.near
+```
+
+# HAPI NEAR Connector
+
+This crate helps to implement [HAPI Protocol] in your smart contract on the NEAR blockchain. You can use it to request data from the proxy contract, and subsequent processing this data.
+
+# Usage
+
+### You need
+
+1. Add [hapi-near-connector](https://crates.io/crates/hapi-near-connector) to dependencies of your project in Cargo.toml
+
+2. Add use hapi-near-connector in your lib.rs file
+
+3. Add field with AML struct to your Contract struct
+
+4. Add `AML::new()` to init of your contract
+
+5. Add cross-contract call to the method on which we need to use the protocol
+
+6. Create a trait with a callback to handle response from HAPI Protocol NEAR proxy.
+
+It is short description of steps you need to implement [HAPI Protocol] in you contract. For detailed information go to [example](#example-of-integration-into-the-ft-contract)
+
+### The crate has an AML structure that stores
+
+- account_id: AccountId - the address of the HAPI proxy [contract](https://github.com/HAPIprotocol/near-proxy-contract);
+- pub aml_conditions: UnorderedMap<Category, RiskScore> - a map of categories and corresponding risk levels that you will add.
+
+>Note
+>
+>If the risk level was not set for some categories, then the risk level for the category **All** is used.
+
+## Methods
+___________ 
+  
+- get_aml - Returns the aml accountId and vector of added categories with accepted risk levels.
+
+- update_account_id - Updates account id of aml service.
+
+- update_category - Updates or add a category with accepted risk score to aml conditions.
+
+- remove_category - Removes category from aml conditions.
+
+- assert_risk - Checks the category according to the set level of risk, if risk is higher than allowed it panics. If the risk level is not set for this category, it checks the All category.
+
+- get_aml_conditions - Returns reference to UnorderedMap of added categories with accepted risk levels.
+
+- check_risk -  Returns true if the address is risky or false if not.
+
+## Integration into an existing contract
+
+For integration into an existing contract do steps from [this list](#you-need).
+
+And add a method that migrates your old contract struct to a new struct that includes [AML](#the-crate-has-an-aml-structure-that-stores) field.
+
+Then you need to rebuild and redeploy the new wasm.
+
+[Example](#example-integration-into-an-existing-contract)
+
+## Example of integration into the FT contract
+___________ 
+
+1. Add [hapi-near-connector](https://crates.io/crates/hapi-near-connector) to dependencies of your project in Cargo.toml
+```rust
+[dependencies]
+...
+hapi-near-connector = "0.3.0"
+```
+
+2. Add use hapi_near_connector in your lib.rs file
+```rust
+use hapi_near_connector::aml::*;
+```
+
+3. Add field with AML struct to your Contract struct
+```rust
+pub struct Contract {
+    token: FungibleToken,
+    metadata: LazyOption<FungibleTokenMetadata>,
+    owner_id: AccountId,
+    aml: AML, // field added to use HAPI Protocol
+}
+```
+
+4. Add "AML new" to init of your contract
+
+>Note. Here we set the accepted risk level as MAX_RISK_LEVEL/2 i.e 10/2 = 5. 
+```rust
+aml: AML::new(aml_account_id, MAX_RISK_LEVEL / 2)
+```
+
+5. Add cross-contract call to the method on which we need to use the protocol. 
+
+In this example we add cross-contract call to the ft_transfer method. So when user call ft_transfer a smart-contract request data about user then handle it and and ends the execution depending on the data from the HAPI Protocol.
+
+* *ext_aml* - it's the connector's trait. 
+* In get_address pass accountId you want to check. 
+* *ext_self* - is the trait that will be created in the next step. 
+* cb_ft_transfer - is the method for callback after aml.
+
+```rust
+fn ft_transfer(
+        &mut self,
+        receiver_id: AccountId,
+        amount: U128,
+        memo: Option<String>,
+) -> Promise {
+    assert_one_yocto();
+    let sender: AccountId = predecessor_account_id();
+
+    // it is a cross-contract call to the proxy contract
+    ext_aml::ext(self.aml.get_account())
+        .with_static_gas(AML_CHECK_GAS)
+        .get_address(sender.clone()) // here we pass the address that needs to be checked
+        .then(
+            ext_self::ext(current_account_id())
+                .with_static_gas(CALLBACK_AML_GAS)
+                .cb_ft_transfer(sender, receiver_id, amount, memo), // here call method that handle response from proxy contract
+        )
+}
+```
+
+6. Create a trait with a callback and impl of it
+```rust
+#[ext_contract(ext_self)]
+pub trait ExtContract {
+    /// Callback after ft_transfer.
+    fn cb_ft_transfer(
+        &mut self,
+        sender_id: AccountId,
+        #[callback] category_risk: CategoryRisk,
+        receiver_id: AccountId,
+        amount: U128,
+        memo: Option<String>,
+    );
+}
+
+#[near_bindgen]
+impl ExtContract for Contract {
+    #[private]
+    fn cb_ft_transfer(
+        &mut self,
+        sender_id: AccountId,
+        #[callback] category_risk: CategoryRisk,
+        receiver_id: AccountId,
+        amount: U128,
+        memo: Option<String>,
+    ) {
+        // here we check response from proxy contract, if you don't need to assert use "check_risk" function
+        self.aml.assert_risk(category_risk);
+        // and then you can to continue performing the function
+        self.token.ft_transfer(sender_id, receiver_id, amount, memo)
+    }
+}
+```
+
+After that,your contract is ready to work with HAPI Protocol.
+
+If you need to change the accepted risk level for *All* categories or add a new one, use *update_category*.
+
+```rust
+fn update_category(&mut self, category: Category, risk_score: RiskScore) {
+    self.assert_owner();
+    self.aml.update_category(category, risk_score);
+}
+```
+
+Also, you can delete an added category. Then it will be evaluated in the *All* category.
+>Note. You can't delete the category *All*.
+
+```rust
+fn remove_category(&mut self, category: Category) {
+    self.assert_owner();
+    self.aml.remove_category(category);
+}
+```
+
+## Example integration into an existing contract
+
+```rust
+pub trait Migrations {
+    fn add_hapi(aml_account_id: AccountId) -> Self;
+}
+
+#[near_bindgen]
+impl Migrations for Contract {
+    #[private]
+    #[init(ignore_state)]
+    #[allow(dead_code)]
+    fn add_hapi(aml_account_id: AccountId) -> Self {
+        #[derive(BorshDeserialize)]
+        pub struct OldContract {
+            token: FungibleToken,
+            metadata: LazyOption<FungibleTokenMetadata>,
+            owner_id: AccountId,
+        }
+
+        let old_contract: OldContract = env::state_read().expect("Old state doesn't exist");
+
+        let mut aml = AML::new(aml_account_id, MAX_RISK_LEVEL / 2);
+
+        // if you don't plan to modify categories often you can do it right away
+        aml.update_category(Category::Exchange, 4);
+
+        Self {
+            token: old_contract.token,
+            metadata: old_contract.metadata,
+            owner_id: old_contract.owner_id,
+            aml,
+        }
+    }
+}
+```
+# Alternative
+
+Also you can integrate [HAPI Protocol] without this crate, you can find [example on Jumbo exchange](https://github.com/jumbo-exchange/contracts#hapi-protocol-integration).
+
+[HAPI Protocol]: https://hapi-one.gitbook.io/hapi-protocol/
+'''
+'''--- src/aml/aml_registrar.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::UnorderedMap;
+use near_sdk::{AccountId, BorshStorageKey};
+use serde::{Deserialize, Serialize};
+
+use super::CategoryRisk;
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, PartialEq, Eq, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub enum Category {
+    // for all unspecified categories
+    All,
+    // HAPI returns 'None' when address wasn't find in database
+    None,
+    // Wallet service - custodial or mixed wallets
+    WalletService,
+    // Merchant service
+    MerchantService,
+    // Mining pool
+    MiningPool,
+    // Exchange
+    Exchange,
+    // DeFi application
+    DeFi,
+    // OTC Broker
+    OTCBroker,
+    // Cryptocurrency ATM
+    ATM,
+    // Gambling
+    Gambling,
+    // Illicit organization
+    IllicitOrganization,
+    // Mixer
+    Mixer,
+    // Darknet market or service
+    DarknetService,
+    // Scam
+    Scam,
+    // Ransomware
+    Ransomware,
+    // Theft - stolen funds
+    Theft,
+    // Counterfeit - fake assets
+    Counterfeit,
+    // Terrorist financing
+    TerroristFinancing,
+    // Sanctions
+    Sanctions,
+    // Child abuse and porn materials
+    ChildAbuse,
+}
+
+pub type RiskScore = u8;
+
+pub const MAX_RISK_LEVEL: RiskScore = 10;
+
+#[derive(BorshStorageKey, BorshSerialize)]
+enum StorageKey {
+    AmlCategory,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Debug)]
+pub struct AML {
+    pub(crate) account_id: AccountId,
+    pub(crate) aml_conditions: UnorderedMap<Category, RiskScore>,
+}
+
+pub trait AmlManager {
+    fn get_aml(&self) -> (&AccountId, Vec<CategoryRisk>);
+
+    fn get_aml_conditions(&self) -> &UnorderedMap<Category, RiskScore>;
+
+    fn update_account_id(&mut self, aml_account_id: AccountId);
+
+    fn update_category(&mut self, category: Category, accepted_risk_score: RiskScore);
+    fn remove_category(&mut self, category: Category);
+}
+
+impl AmlManager for AML {
+    /// Returns the aml accountId and vector of added categories with accepted risk levels.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use near_sdk::{AccountId, collections::UnorderedMap};
+    /// use hapi_near_connector::aml::*;
+    ///
+    /// let aml_account: AccountId = AccountId::new_unchecked("aml".to_string());
+    ///
+    /// let aml: AML = AML::new(aml_account, MAX_RISK_LEVEL / 2);
+    /// println!("{:?}", aml.get_aml());
+    /// ```
+    fn get_aml(&self) -> (&AccountId, Vec<(Category, RiskScore)>) {
+        (
+            &self.account_id,
+            self.aml_conditions
+                .iter()
+                .map(|(id, acc)| (id, acc))
+                .collect(),
+        )
+    }
+
+    /// Returns reference to UnorderedMap of added categories with accepted risk levels.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use near_sdk::{AccountId, collections::UnorderedMap};
+    /// use hapi_near_connector::aml::*;
+    ///
+    /// let aml_account: AccountId = AccountId::new_unchecked("aml".to_string());
+    ///
+    /// let aml: AML = AML::new(aml_account, MAX_RISK_LEVEL / 2);
+    /// println!("{:?}", aml.get_aml_conditions());
+    /// ```
+    fn get_aml_conditions(&self) -> &UnorderedMap<Category, RiskScore> {
+        &self.aml_conditions
+    }
+
+    /// Updates account id of aml service.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use near_sdk::{AccountId, collections::UnorderedMap};
+    /// use hapi_near_connector::aml::*;
+    ///
+    /// let aml_account: AccountId = AccountId::new_unchecked("aml".to_string());
+    ///
+    /// let aml: AML = AML::new(aml_account, MAX_RISK_LEVEL / 2);
+    ///
+    /// let new_aml_account: AccountId = AccountId::new_unchecked("new_aml".to_string());
+    /// aml.update_account_id(new_aml_account.clone());
+    ///
+    /// let (account_id, _) = aml.get_aml();
+    /// assert_eq!(*account_id, new_aml_account);
+    /// ```
+    fn update_account_id(&mut self, account_id: AccountId) {
+        self.account_id = account_id;
+    }
+
+    /// Updates or add category with accepted risk score to aml conditions.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use near_sdk::{AccountId, collections::UnorderedMap};
+    /// use hapi_near_connector::aml::*;
+    ///
+    /// let aml_account: AccountId = AccountId::new_unchecked("aml".to_string());
+    ///
+    /// let aml: AML = AML::new(aml_account, MAX_RISK_LEVEL / 2);
+    ///
+    /// aml.update_category(Category::Scam, 6);
+    ///
+    /// assert_eq!(aml.get_aml_conditions().get(&Category::Scam).unwrap(), 6);
+    /// ```
+    fn update_category(&mut self, category: Category, accepted_risk_score: RiskScore) {
+        assert!(
+            accepted_risk_score <= MAX_RISK_LEVEL,
+            "ERR_RISK_SCORE_IS_INVALID"
+        );
+        assert!(accepted_risk_score > 0, "ERR_RISK_SCORE_IS_INVALID");
+        self.aml_conditions.insert(&category, &accepted_risk_score);
+    }
+
+    /// Removes category from aml conditions.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use near_sdk::{AccountId, collections::UnorderedMap};
+    /// use hapi_near_connector::aml::*;
+    ///
+    /// let aml_account: AccountId = AccountId::new_unchecked("aml".to_string());
+    ///
+    /// let aml: AML = AML::new(aml_account, MAX_RISK_LEVEL / 2);
+    ///
+    /// aml.update_category(Category::Scam, 6);
+    /// aml.remove_category(Category::Scam);
+    ///
+    /// assert!(aml.get_aml_conditions().get(&Category::Scam).is_none());
+    /// ```
+    fn remove_category(&mut self, category: Category) {
+        assert!(category != Category::All);
+        self.aml_conditions.remove(&category);
+    }
+}
+
+impl AML {
+    pub fn new(account_id: AccountId, accepted_risk_score: RiskScore) -> AML {
+        let mut aml = Self {
+            account_id,
+            aml_conditions: UnorderedMap::new(StorageKey::AmlCategory),
+        };
+        aml.update_category(Category::All, accepted_risk_score);
+        aml
+    }
+}
+
+'''
+'''--- src/aml/aml_usage.rs ---
+use near_sdk::{ext_contract, AccountId, Gas};
+
+use super::{Category, RiskScore, AML};
+
+pub const AML_CHECK_GAS: Gas = near_sdk::Gas(10_000_000_000_000);
+pub const CALLBACK_AML_GAS: Gas = near_sdk::Gas(10_000_000_000_000);
+
+pub type CategoryRisk = (Category, RiskScore);
+
+#[ext_contract(ext_aml)]
+pub trait ExtAmlContract {
+    fn get_address(&self, address: AccountId) -> CategoryRisk;
+}
+
+impl AML {
+    /// Checks the category according to the set level of risk. If the risk level is not set for this category, it checks the All category.
+    pub fn assert_risk(&self, category_risk: CategoryRisk) {
+        let (category, risk) = category_risk;
+        if category != Category::None {
+            let accepted_risk = match self.aml_conditions.get(&category) {
+                Some(risk) => risk,
+                None => self
+                    .aml_conditions
+                    .get(&Category::All)
+                    .expect("ERR_NO_DEFAULT_CATEGORY"),
+            };
+
+            assert!(risk <= accepted_risk, "ERR_AML_NOT_ALLOWED");
+        }
+    }
+
+    /// This method returns true if the address is risky or false if not
+    pub fn check_risk(&self, category_risk: CategoryRisk) -> bool {
+        let (category, risk) = category_risk;
+
+        if category != Category::None {
+            risk > match self.aml_conditions.get(&category) {
+                Some(accepted_risk) => accepted_risk,
+                None => self.aml_conditions.get(&Category::All).unwrap_or_default(), // We do not want to panic here!
+            }
+        } else {
+            false
+        }
+    }
+
+    pub fn get_account(&self) -> AccountId {
+        self.account_id.clone()
+    }
+}
+
+'''
+'''--- src/aml/mod.rs ---
+pub use aml_registrar::*;
+pub use aml_usage::*;
+
+pub mod aml_registrar;
+pub mod aml_usage;
+
+'''
+'''--- src/lib.rs ---
+pub mod aml;
+
+'''

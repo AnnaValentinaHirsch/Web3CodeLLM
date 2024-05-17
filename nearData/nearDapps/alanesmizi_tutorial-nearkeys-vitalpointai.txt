@@ -1,0 +1,776 @@
+*GitHub Repository "alanesmizi/tutorial-nearkeys-vitalpointai"*
+
+'''--- babel.config.js ---
+module.exports = {
+  presets: ['@babel/preset-env', '@babel/preset-react'],
+}
+
+'''
+'''--- contract/as-pect.config.js ---
+module.exports = require('near-sdk-as/imports')
+'''
+'''--- contract/compile.js ---
+// This file does two things:
+//
+// 1. Compile the AssemblyScript contract using the scripts in package.json
+//    (see buildCmd below). This will create a wasm file in the 'build' folder.
+// 2. Create a symbolic link (symlink) to the generated wasm file in the root
+//    project's `out` folder, for easy use with near-cli.
+//
+// First, import some helper libraries. `shelljs` is included in the
+// devDependencies of the root project, which is why it's available here. It
+// makes it easy to use *NIX-style scripting (which works on Linux distros,
+// macOS, and Unix systems) on Windows as well.
+const sh = require('shelljs')
+const path = require('path')
+
+// Figure out which directory the user called this script from, which we'll use
+// later to set up the symlink.
+const calledFromDir = sh.pwd().toString()
+
+// For the duration of this script, we want to operate from within the
+// AssemblyScript project's folder. Let's change into that directory.
+sh.cd(__dirname)
+
+// You can call this script with `node compile.js` or `node compile.js --debug`.
+// Let's set a variable to track whether `--debug` was used.
+const debug = process.argv.pop() === '--debug'
+
+// Use the correct build command based on the `--debug` flag
+const buildCmd = debug
+  ? 'npm run build:debug'
+  : 'npm run build'
+
+// Execute the build command, storing exit code for later use
+const { code } = sh.exec(buildCmd)
+
+// Assuming this is compiled from the root project directory, link the compiled
+// contract to the `out` folder –
+// When running commands like `near deploy`, near-cli looks for a contract at
+// <CURRENT_DIRECTORY>/out/main.wasm
+if (code === 0 && calledFromDir !== __dirname) {
+  const linkDir = `${calledFromDir}/out`
+  const link = `${calledFromDir}/out/main.wasm`
+  const packageName = require(`${__dirname}/package.json`).name
+  const outFile = `./build/${debug ? 'debug' : 'release'}/${packageName}.wasm`
+  sh.mkdir('-p', linkDir)
+  sh.rm('-f', link)
+  const linkPath = path.relative(linkDir, outFile)
+  sh.ln('-s', linkPath, link)
+}
+
+// exit script with the same code as the build command
+process.exit(code)
+
+'''
+'''--- src/App.js ---
+import 'regenerator-runtime/runtime'
+import React, { useEffect, useState } from 'react'
+
+import * as nearApiJs from 'near-api-js'
+import { BrowserLocalStorageKeyStore } from 'near-api-js/lib/key_stores'
+
+import getConfig from './config'
+const { networkId, nodeUrl, walletUrl } = getConfig(process.env.NODE_ENV)
+
+const {
+  KeyPair,
+  InMemorySigner,
+  transactions: {
+      addKey
+  },
+  utils: {
+      PublicKey,
+      format: {
+          parseNearAmount, formatNearAmount
+      }
+  }
+} = nearApiJs
+
+const ENTRY_FEE = '2'
+
+export default function App() {
+
+  const[loaded, setLoaded] = useState(false)
+  const[currentAccount, setCurrentAccount] = useState()
+  const[accountBalance, setAccountBalance] = useState()
+  const[keyType, setKeyType] = useState()
+  const[contract, setContract] = useState()
+  const[prizePool, setPrizePool] = useState()
+  const[entered, setEntered] = useState(false)
+  const[errorMessage, setErrorMessage] = useState()
+  const[viewWinnings, setViewWinnings] = useState(false)
+  const[stealWinnings, setStealWinnings] = useState(false)
+
+ 
+
+  useEffect(
+    () => {
+          async function fetchData() {
+            try {
+              let result = await contract.isEntered({account: currentAccount.accountId})
+              result ? setEntered(true) : setEntered(false)
+              let result1 = await contract.getPrizePoolBalance({})
+              result1 ? setPrizePool(result1) : setPrizePool()
+             
+              return true
+            } catch (err) {
+              err.message = 'Become a Player to Continue'
+             
+              return false
+            }
+          }
+
+          fetchData()
+            .then((res) => {
+              res ? setLoaded(true) : setLoaded(false)
+            })
+    }, [currentAccount, contract, loaded, entered, prizePool]
+  )
+
+  async function useFullAccessKey() {
+    // switch statement to ensure we're using the right private key with the currentAccount
+    let private_key
+    switch(currentAccount.accountId) {
+      case process.env.PLAYER1:
+        private_key = process.env.PLAYER1_PRIV_KEY
+        break
+      case process.env.PLAYER2:
+        private_key = process.env.PLAYER2_PRIV_KEY
+        break
+      case process.env.PLAYER3:
+        private_key = process.env.PLAYER3_PRIV_KEY
+        break
+      default:
+        private_key = process.env.PLAYER1_PRIV_KEY
+    }
+
+    // Step 1:  get the keypair from the account's full access private key
+    let keyPair = KeyPair.fromString(private_key)
+
+    // Step 2:  load up an inMemorySigner using the keyPair for the account
+    let signer = await InMemorySigner.fromKeyPair(networkId, currentAccount.accountId, keyPair)
+
+    // Step 3:  create a connection to the network using the signer's keystore and default config for testnet
+    const near = await nearApiJs.connect({
+      networkId, nodeUrl, walletUrl, deps: { keyStore: signer.keyStore },
+    })
+
+    // Step 4:  get the account object of the currentAccount.  At this point, we should have full control over the account.
+    let account = new nearApiJs.Account(near.connection, currentAccount.accountId)
+    setCurrentAccount(account)
+   
+    // initiate the contract so its associated with this current account and exposing all the methods
+    let contract = new nearApiJs.Contract(account, process.env.CONTRACT_NAME, {
+      viewMethods: ['viewWinnings', 'isEntered', 'getPrizePoolBalance'],
+      changeMethods: ['enterCompetition', 'withdrawWinnings', 'stealWinnings', 'reset']
+    })
+    setContract(contract)
+    setKeyType('FullAccess')
+    return contract
+  }
+
+  async function useContractFullAccessKey() {    
+
+    // Step 1:  get the keypair from the contract's full access private key
+    let keyPair = KeyPair.fromString(process.env.CONTRACT_PRIV_KEY)
+
+    // Step 2:  load up an inMemorySigner using the keyPair for the account
+    let signer = await InMemorySigner.fromKeyPair(networkId, process.env.CONTRACT_NAME, keyPair)
+
+    // Step 3:  create a connection to the network using the signer's keystore and default config for testnet
+    const near = await nearApiJs.connect({
+      networkId, nodeUrl, walletUrl, deps: { keyStore: signer.keyStore },
+    })
+
+    // Step 4:  get the account object of the currentAccount.  At this point, we should have full control over the account.
+    let account = new nearApiJs.Account(near.connection, process.env.CONTRACT_NAME)
+   
+    // initiate the contract so its associated with this current account and exposing all the methods
+    let contract = new nearApiJs.Contract(account, process.env.CONTRACT_NAME, {
+      viewMethods: ['getPrizePoolBalance'],
+      changeMethods: ['withdrawWinnings', 'reset']
+    })
+    setContract(contract)
+    setKeyType('Contract FullAccess')
+    return contract
+  }
+
+  async function useFunctionAccessKey() {
+
+    let keystore = new BrowserLocalStorageKeyStore(localStorage, 'competition:')
+    
+    // Step 1:  get the keypair from the account's localstorage private key we set earlier
+    let keyPair = await keystore.getKey(networkId, currentAccount.accountId)
+   // let keyPair = KeyPair.fromString(private_key)
+
+    // Step 2:  load up an inMemorySigner using the keyPair for the account
+    let signer = await InMemorySigner.fromKeyPair(networkId, currentAccount.accountId, keyPair)
+
+    // Step 3:  create a connection to the network using the signer's keystore and default config for testnet
+    const near = await nearApiJs.connect({
+      networkId, nodeUrl, walletUrl, deps: { keyStore: signer.keyStore },
+    })
+
+    // Step 4:  get the account object of the currentAccount.  At this point, we should have full control over the account.
+    let account = new nearApiJs.Account(near.connection, currentAccount.accountId)
+    setCurrentAccount(account)
+   
+    // initiate the contract so its associated with this current account and exposing all the methods
+    let contract = new nearApiJs.Contract(account, process.env.CONTRACT_NAME, {
+      viewMethods: ['viewWinnings', 'isEntered', 'getPrizePoolBalance'],
+      changeMethods: ['enterCompetition', 'withdrawWinnings', 'stealWinnings', 'reset']
+    })
+    setContract(contract)
+    setKeyType('FunctionAccess')
+    return contract
+  }
+
+  async function setPlayerAccountFunctionCallKey() {
+  
+    // switch statement to ensure we're using the right private key with the currentAccount
+    let private_key
+    switch(currentAccount.accountId) {
+      case process.env.PLAYER1:
+        private_key = process.env.PLAYER1_PRIV_KEY
+        break
+      case process.env.PLAYER2:
+        private_key = process.env.PLAYER2_PRIV_KEY
+        break
+      case process.env.PLAYER3:
+        private_key = process.env.PLAYER3_PRIV_KEY
+        break
+      default:
+        private_key = process.env.PLAYER1_PRIV_KEY
+    }
+   
+    // Step 1:  get the keypair from the account's full access private key
+    let keyPair = KeyPair.fromString(private_key)
+
+    // Step 2:  load up an inMemorySigner using the keyPair for the account
+    let signer = await InMemorySigner.fromKeyPair(networkId, currentAccount.accountId, keyPair)
+
+    // Step 3:  create a connection to the network using the signer's keystore and default config for testnet
+    const near = await nearApiJs.connect({
+      networkId, nodeUrl, walletUrl, deps: { keyStore: signer.keyStore },
+    })
+
+    // Step 4:  get the account object of the currentAccount.  At this point, we should have full control over the account.
+    let account = new nearApiJs.Account(near.connection, currentAccount.accountId)
+    setCurrentAccount(account)
+
+    // Step 5: Make a new keyPair for the functioncall key
+    let newKeyPair = KeyPair.fromRandom('ed25519')
+
+    // Step 6:  Save it to local storage so its accessible again.  Prefixing with competition to be able to distinguish it.
+    let keystore = new BrowserLocalStorageKeyStore(localStorage, 'competition:')
+    keystore.setKey(networkId, currentAccount.accountId, newKeyPair)
+
+    // Setting the methodNames on the contract we want this key to access
+    const methodNames = ['enterCompetition', 'withdrawWinnings', 'reset']
+
+    // allowance is how much NEAR this key can spend per transaction (0.25 is default)
+    const allowance = parseNearAmount('0.25')
+
+    // these are the actions we are going to execute - in this case add a function call access key for access.vitalpointai.testnet
+    const actions = [
+        //Action 1
+        nearApiJs.transactions.addKey(
+          newKeyPair.publicKey,
+          nearApiJs.transactions.functionCallAccessKey(process.env.CONTRACT_NAME, methodNames, allowance)
+        )
+        //2nd Action would go here if we wanted to do more things in this call
+    ]
+
+    // this signs and sends the transaction
+    await account.signAndSendTransaction(currentAccount.accountId, actions)
+    setKeyType('FunctionCall Access')
+  }
+
+  async function setPlayer3ToSteal() {
+
+    // Step 1:  get the keypair from the account's full access private key
+    let keyPair = KeyPair.fromString(process.env.PLAYER3_PRIV_KEY)
+
+    // Step 2:  load up an inMemorySigner using the keyPair for the account
+    let signer = await InMemorySigner.fromKeyPair(networkId, process.env.PLAYER3, keyPair)
+
+    // Step 3:  create a connection to the network using the signer's keystore and default config for testnet
+    const near = await nearApiJs.connect(Object.assign({deps: { keyStore: signer.keyStore }}, getConfig(process.env.NODE_ENV)))
+
+    // Step 4:  switch to using the account of the contract.  At this point, we can now control the contract as if we were the contract
+    let account = new nearApiJs.Account(near.connection, process.env.PLAYER3)
+
+    // Step 5: Make a new keyPair for the functioncall key
+    let newKeyPair = KeyPair.fromRandom('ed25519')
+
+    // Step 6:  Save it to local storage so its accessible again.
+    let keystore = new BrowserLocalStorageKeyStore(localStorage, 'competition:')
+    keystore.setKey(networkId, process.env.PLAYER3, newKeyPair)
+
+    // Setting the methodNames on the contract we want this key to access
+    const methodNames = ['stealWinnings']
+
+    // allowance is how much NEAR this key can spend per transaction (0.25 is default)
+    const allowance = parseNearAmount('0.25')
+
+    // these are the actions we are going to execute - in this case add a function call access key for access.vitalpointai.testnet
+    const actions = [
+        //Action 1
+        nearApiJs.transactions.addKey(
+          newKeyPair.publicKey,
+          nearApiJs.transactions.functionCallAccessKey(process.env.CONTRACT_NAME, methodNames, allowance)
+        )
+        //2nd Action would go here if we wanted to do more things in this call
+    ]
+
+    // this signs and sends the transaction
+    await account.signAndSendTransaction(process.env.PLAYER3, actions)
+  }
+
+  async function changeAccount(playerAccount) {
+    setErrorMessage()
+    // load the browser keystore
+    let keystore = new BrowserLocalStorageKeyStore(localStorage, 'competition:')
+
+    // create a connection using the keystore and default config values for testnet
+    const near = await nearApiJs.connect({
+      networkId, nodeUrl, walletUrl, deps: { keyStore: keystore },
+    })
+
+    // load account of current player
+    let account = new nearApiJs.Account(near.connection, playerAccount)
+    setCurrentAccount(account)
+
+    // load, set, format current account balance
+    let balance = await account.getAccountBalance()
+    setAccountBalance(formatNearAmount(balance.available, 2))
+
+    // reset these two variables to false so we can see if they change
+    setViewWinnings(false)
+    setStealWinnings(false)
+    
+    // initiate the contract so its associated with this current account and exposing all the methods
+    let contract = new nearApiJs.Contract(account, process.env.CONTRACT_NAME, {
+      viewMethods: ['viewWinnings', 'isEntered', 'getPrizePoolBalance'],
+      changeMethods: ['enterCompetition', 'withdrawWinnings', 'stealWinnings', 'reset']
+    })
+    setContract(contract)
+
+     // load, set current prize pool
+     let pool = await contract.getPrizePoolBalance({})
+     setPrizePool(pool)
+
+     setKeyType('FunctionCall Access')
+  }
+
+  async function enterCompetition() {
+    setErrorMessage()
+    let contract = await useFullAccessKey()
+    try {
+      let result = await contract.enterCompetition({
+      }, process.env.DEFAULT_GAS_VALUE, parseNearAmount(ENTRY_FEE))
+
+      if(result) {
+        setEntered(true)
+        changeAccount(currentAccount.accountId)
+      }
+    } catch (err) {
+      console.log (err)
+      setErrorMessage(err.message)
+    }
+  }
+
+  async function withdrawWinnings() {
+    setErrorMessage()
+    let contract = await useContractFullAccessKey()
+    try {
+      let result = await contract.withdrawWinnings({
+        player: currentAccount.accountId
+      }, process.env.DEFAULT_GAS_VALUE, prizePool)
+
+      if(result) {
+        let result2 = await contract.getPrizePoolBalance({})
+        setPrizePool(result2)
+        let result3 = await contract.reset({
+          player1: process.env.PLAYER1,
+          player2: process.env.PLAYER2,
+          player3: process.env.PLAYER3
+        }, process.env.DEFAULT_GAS_VALUE)
+        changeAccount(currentAccount.accountId)
+      }
+
+    } catch (err) {
+      console.log (err)
+      setErrorMessage(err.message)
+    }
+  }
+
+  async function seeWinnings() {
+    setErrorMessage()
+    try {
+      let result = await contract.viewWinnings({})
+      if(result) {
+        setViewWinnings(result)
+      }
+    } catch (err) {
+      console.log (err)
+      setErrorMessage(err.message)
+    }
+  }
+
+  async function steal() {
+    try {
+      let result = await contract.stealWinnings({})
+      if(result) {
+        setStealWinnings(result)
+      }
+    } catch (err) {
+      console.log (err)
+      setErrorMessage(err.message)
+    }
+  }
+
+  async function reset() {
+    setErrorMessage()
+    let contract = await useFunctionAccessKey()
+    try {
+      let result3 = await contract.reset({
+        player1: process.env.PLAYER1,
+        player2: process.env.PLAYER2,
+        player3: process.env.PLAYER3
+      }, process.env.DEFAULT_GAS_VALUE)
+      changeAccount(currentAccount.accountId)
+    } catch (err) {
+      console.log (err)
+      err.message = 'reset not successful'
+      setErrorMessage(err.message)
+    }
+  }
+
+  return (
+    <>
+    <div style ={{float:'left', width: '30%'}}>
+      <h3>Status Window:</h3>
+      <div>Current Player: {currentAccount ? currentAccount.accountId : 'choose a player'}</div>
+      <div>Current Player Account Balance: {accountBalance ? accountBalance : 0}</div>
+      <div>Entered: {entered ? 'Yes' : 'No'}</div>
+      <div>Prize Pool: {formatNearAmount(prizePool)}</div>
+      <div>Error Messages: {errorMessage}</div>
+      <div>viewWinnings: {viewWinnings.toString()}</div>
+      <div>stealWinnings: {stealWinnings.toString()}</div>
+    </div>
+
+    <div style ={{float:'left', width: '30%'}}>
+      <h3>Actions</h3>
+      <div>
+      <button onClick={setPlayerAccountFunctionCallKey}>
+        Assign Player Access
+      </button>
+      </div>
+      <div>
+      <button onClick={enterCompetition}>
+        Enter Competition
+      </button>
+      </div>
+      <div>
+      <button onClick={seeWinnings}>
+        View Winnings
+      </button>
+      </div>
+      <div>
+      <button onClick={withdrawWinnings}>
+        Withdraw Winnings
+      </button>
+      </div>
+      <div>
+      <button onClick={reset}>
+        Reset Game
+      </button>
+      </div>
+      <div>
+      <button onClick={setPlayer3ToSteal}>
+        Set Player3 as Thief
+      </button>
+      </div>
+      <div>
+      <button onClick={steal}>
+        Steal
+      </button>
+      </div>
+    </div>
+
+    <div style={{float: 'left', width: '30%'}}>
+      <h3>Change Players</h3>
+      <div>
+        <button onClick={(e) => changeAccount(process.env.PLAYER1)}>
+          Become Player 1
+        </button>
+      </div>
+      <div>
+        <button onClick={(e) => changeAccount(process.env.PLAYER2)}>
+          Become Player 2
+        </button>
+      </div>
+      <div>
+        <button onClick={(e) => changeAccount(process.env.PLAYER3)}>
+          Become Player 3
+        </button>
+      </div>
+    </div>
+    
+    <div style={{clear: 'both', width: '60%'}}>
+      <h3>Current Key Type: {keyType} </h3>
+      <h4>Test It</h4>
+    
+      <ul>
+        <li>
+          <p>For each player - change to them (simulating you logging into the app as them) - then click the Assign Access button.
+          You can then use near keys accountname from near-cli or your wallet to see that a functionCall access key was added to
+          that account.</p>
+        </li>
+        <li>
+          <p>For each player - change to them - then click the Enter Competition button.  The prize pool should increase in multiples
+          of two and you should only be able to enter once for each player.  Current player account balance should decrease by two.</p>
+        </li>
+        <li>
+          <p>Pick a player and simulating the contest ending - have them withdraw winnings.  You should see prize pool drop and that
+          NEAR transferred to their account balance.  This will also reset the game allowing each player to enter again.  It does
+          not delete the keys we assigned.</p>
+        </li>
+        <li>
+          <p>Become player3 and click the button to make them the thief.  This will assigne them a functioncall key that allows them to 
+          access the stealWinnings function.  Check the keys on the account to verify.  Clicking stealWinnings should change it to true
+          if you are player3 and it will stay false if you are the other players (as they don't have the right access key).</p>
+        </li>
+      </ul> 
+     
+    </div>
+    
+    </>
+    )
+}
+
+'''
+'''--- src/__mocks__/fileMock.js ---
+// NOTE: This is used to mock resource imports in JSX for tests
+module.exports = '' 
+
+'''
+'''--- src/config.js ---
+const CONTRACT_NAME = process.env.CONTRACT_NAME || 'access.vitalpointai.testnet'
+
+function getConfig(env) {
+  switch (env) {
+
+  case 'production':
+  case 'mainnet':
+    return {
+      networkId: 'mainnet',
+      nodeUrl: 'https://rpc.mainnet.near.org',
+      contractName: CONTRACT_NAME,
+      walletUrl: 'https://wallet.near.org',
+      helperUrl: 'https://helper.mainnet.near.org',
+      explorerUrl: 'https://explorer.mainnet.near.org',
+    }
+  case 'development':
+  case 'testnet':
+    return {
+      networkId: 'testnet',
+      nodeUrl: 'https://rpc.testnet.near.org',
+      contractName: CONTRACT_NAME,
+      walletUrl: 'https://wallet.testnet.near.org',
+      helperUrl: 'https://helper.testnet.near.org',
+      explorerUrl: 'https://explorer.testnet.near.org',
+    }
+  case 'betanet':
+    return {
+      networkId: 'betanet',
+      nodeUrl: 'https://rpc.betanet.near.org',
+      contractName: CONTRACT_NAME,
+      walletUrl: 'https://wallet.betanet.near.org',
+      helperUrl: 'https://helper.betanet.near.org',
+      explorerUrl: 'https://explorer.betanet.near.org',
+    }
+  case 'local':
+    return {
+      networkId: 'local',
+      nodeUrl: 'http://localhost:3030',
+      keyPath: `${process.env.HOME}/.near/validator_key.json`,
+      walletUrl: 'http://localhost:4000/wallet',
+      contractName: CONTRACT_NAME,
+    }
+  case 'test':
+  case 'ci':
+    return {
+      networkId: 'shared-test',
+      nodeUrl: 'https://rpc.ci-testnet.near.org',
+      contractName: CONTRACT_NAME,
+      masterAccount: 'test.near',
+    }
+  case 'ci-betanet':
+    return {
+      networkId: 'shared-test-staging',
+      nodeUrl: 'https://rpc.ci-betanet.near.org',
+      contractName: CONTRACT_NAME,
+      masterAccount: 'test.near',
+    }
+  default:
+    throw Error(`Unconfigured environment '${env}'. Can be configured in src/config.js.`)
+  }
+}
+
+module.exports = getConfig
+
+'''
+'''--- src/index.html ---
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="./assets/favicon.ico" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="apple-touch-icon" href="./assets/favicon.ico" />
+    <title>Welcome to NEAR with React</title>
+  </head>
+  <body>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="root"></div>
+    <!--
+      This HTML file is a template.
+      If you open it directly in the browser, you will see an empty page.
+
+      You can add webfonts, meta tags, or analytics to this file.
+      The build step will place the bundled scripts into the <body> tag.
+
+      To begin the development, run `npm start` or `yarn start`.
+      To create a production bundle, use `npm run build` or `yarn build`.
+    -->
+    <script src="./index.js"></script>
+  </body>
+</html>
+
+'''
+'''--- src/index.js ---
+import React from 'react'
+import ReactDOM from 'react-dom'
+import App from './App'
+import { initContract } from './utils'
+
+//window.nearInitPromise = initContract()
+//  .then(() => {
+    ReactDOM.render(
+      <App />,
+      document.querySelector('#root')
+    )
+//  })
+//  .catch(console.error)
+
+'''
+'''--- src/jest.init.js ---
+import 'regenerator-runtime/runtime'
+
+'''
+'''--- src/main.test.js ---
+beforeAll(async function () {
+  // NOTE: nearlib and nearConfig are made available by near-cli/test_environment
+  const near = await nearlib.connect(nearConfig)
+  window.accountId = nearConfig.contractName
+  window.contract = await near.loadContract(nearConfig.contractName, {
+    viewMethods: ['getGreeting'],
+    changeMethods: [],
+    sender: window.accountId
+  })
+
+  window.walletConnection = {
+    requestSignIn() {
+    },
+    signOut() {
+    },
+    isSignedIn() {
+      return true
+    },
+    getAccountId() {
+      return window.accountId
+    }
+  }
+})
+
+test('getGreeting', async () => {
+  const message = await window.contract.getGreeting({ accountId: window.accountId })
+  expect(message).toEqual('Hello')
+})
+
+'''
+'''--- src/utils.js ---
+import { connect, Contract, keyStores, WalletConnection } from 'near-api-js'
+import getConfig from './config'
+
+const nearConfig = getConfig(process.env.NODE_ENV || 'development')
+
+// Initialize contract & set global variables
+export async function initContract() {
+  // Initialize connection to the NEAR testnet
+  const near = await connect(Object.assign({ deps: { keyStore: new keyStores.BrowserLocalStorageKeyStore() } }, nearConfig))
+  window.near = near
+  // Initializing Wallet based Account. It can work with NEAR testnet wallet that
+  // is hosted at https://wallet.testnet.near.org
+  window.walletConnection = new WalletConnection(near)
+
+  // Getting the Account ID. If still unauthorized, it's just empty string
+  window.accountId = window.walletConnection.getAccountId()
+
+  // // Initializing our contract APIs by contract name and configuration
+  // window.contract = await new Contract(window.walletConnection.account(), nearConfig.contractName, {
+  // //   // View methods are read only. They don't modify the state, but usually return some value.
+  //    viewMethods: ['withdrawWinnings','noWinnings'],
+  // //   // Change methods can modify the state. But you don't receive the returned value when called.
+  //    changeMethods: [''],
+  //  })
+}
+
+export function logout() {
+  window.walletConnection.signOut()
+  // reload page
+  window.location.replace(window.location.origin + window.location.pathname)
+}
+
+export function login() {
+  // Allow the current app to make calls to the specified contract on the
+  // user's behalf.
+  // This works by creating a new access key for the user's account and storing
+  // the private key in localStorage.
+  window.walletConnection.requestSignIn(nearConfig.contractName, 'something')
+}
+
+'''
+'''--- src/wallet/login/index.html ---
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.2.1/css/bootstrap.min.css" integrity="sha384-GJzZqFGwb1QTTN6wy59ffF1BuGJpLSa9DkKMp0DgiMDm4iYMj70gZWKYbI706tWS" crossorigin="anonymous">
+</head>
+<body style="background: #fff; margin-top: 3em">
+  <div>For local account login, Please run the following command in NEAR CLI, then enter account id here.
+  </div>
+  <div>
+      <code id="shell-command"></code>
+  </div>
+  <input type="text" id="accountId" name="accountId" placeholder="Account id"></input>
+  <button type="button" onClick="done()">done</button>
+  <script>
+    const currentUrl = new URL(window.location.href);
+    const message = `NODE_ENV=local near create_account {newAccountId} --masterAccount {masterAccountId} --publicKey ${currentUrl.searchParams.get('public_key')} --initialAmount 10000000000000000000`;
+    document.getElementById('shell-command').innerText = message;
+
+    function done() {
+      const successUrl = new URL(currentUrl.searchParams.get('success_url'));
+      successUrl.searchParams.set('account_id', document.getElementById('accountId').value);
+      successUrl.searchParams.set('public_key', currentUrl.searchParams.get('public_key'));
+      window.location.assign(successUrl.toString());
+    }
+  </script>
+</body>
+</html>
+'''

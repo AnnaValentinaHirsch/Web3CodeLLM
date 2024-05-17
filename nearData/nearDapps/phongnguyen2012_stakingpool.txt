@@ -1,0 +1,842 @@
+*GitHub Repository "phongnguyen2012/stakingpool"*
+
+'''--- Cargo.toml ---
+[package]
+name = "stakingcontract"
+version = "0.1.0"
+edition = "2021"
+authors = ["NEARDEV VN <duonghb53@gmail.com>"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+near-sdk = "3.1.0"
+
+[dev-dependencies]
+# near-sdk-sim = "3.1.0"
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+# Opt into extra safety checks on arithmetic operations https://stackoverflow.com/a/64136471/249801
+overflow-checks = true
+
+'''
+'''--- README.md ---
+Build
+./build.sh
+
+Run FT contract
+./createtoken.sh
+
+Run Staking contract
+./stakingcontract.sh
+
+'''
+'''--- build.sh ---
+#!/bin/bash
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo build --target wasm32-unknown-unknown --release
+mkdir -p out
+cp target/wasm32-unknown-unknown/release/*.wasm out/stakingcontract.wasm
+'''
+'''--- createtoken.sh ---
+#!/bin/bash
+# Smart contract FT để tạo 1 Token dùng cho Staking contract
+# Source code: https://github.com/near-examples/FT
+# More: https://nomicon.io/Standards/Tokens/FungibleToken/Core
+export MAIN_ACCOUNT=hocnear.testnet
+export NEAR_ENV=testnet
+export CONTRACT_STAKING_ID=staking.$MAIN_ACCOUNT
+export CONTRACT_FT_ID=ft.$MAIN_ACCOUNT
+export ONE_YOCTO=0.000000000000000000000001
+export ACCOUNT_TEST=test.hocnear.testnet
+#export ACCOUNT_TUN=tun.hocnear.testnet
+#export ACCOUNT_THAO=thao.hocnear.testnet
+export GAS=300000000000000
+export AMOUNT=100000000000000000000000000
+
+echo "################### DELETE ACCOUNT ###################"
+near delete $CONTRACT_FT_ID $MAIN_ACCOUNT
+near delete $ACCOUNT_TEST $MAIN_ACCOUNT
+
+echo "################### CREATE ACCOUNT ###################"
+near create-account $CONTRACT_FT_ID --masterAccount $MAIN_ACCOUNT --initialBalance 10
+near create-account $ACCOUNT_TEST --masterAccount $MAIN_ACCOUNT --initialBalance 10
+#near create-account $ACCOUNT_TUN --masterAccount $MAIN_ACCOUNT --initialBalance 10
+#near create-account $ACCOUNT_THAO --masterAccount $MAIN_ACCOUNT --initialBalance 10
+
+# 1. Deploy:
+echo "*********deploy token vbi**********"
+near deploy --wasmFile token-test/create-token.wasm --accountId $CONTRACT_FT_ID
+
+# 2. Init contract: Tạo contract default
+echo "**********Khoi tao token ************"
+near call $CONTRACT_FT_ID new_default_meta '{"owner_id": "'$MAIN_ACCOUNT'", "total_supply": "1000000000000000000000000000000000"}' --accountId $CONTRACT_FT_ID
+# Có thể tạo contract theo ý muốn:
+# near call $CONTRACT_FT_ID new '{"owner_id": "'$ID'", "total_supply": "1000000000000000", "metadata": { "spec": "ft-1.0.0", "name": "Example Token Name", "symbol": "EXLT", "decimals": 8 }}' --accountId $CONTRACT_FT_ID
+
+# 3. Register account to ft contract
+echo "**************Dang ky tai khoan voi ft contract"
+near call $CONTRACT_FT_ID storage_deposit '{"account_id": "'$CONTRACT_STAKING_ID'"}' --accountId $MAIN_ACCOUNT --deposit 0.01
+near call $CONTRACT_FT_ID storage_deposit '{"account_id": "'$ACCOUNT_TEST'"}' --accountId $MAIN_ACCOUNT --deposit 0.01
+#near call $CONTRACT_FT_ID storage_deposit '{"account_id": "'$ACCOUNT_TUN'"}' --accountId $MAIN_ACCOUNT --deposit 0.01
+#near call $CONTRACT_FT_ID storage_deposit '{"account_id": "'$ACCOUNT_THAO'"}' --accountId $MAIN_ACCOUNT --deposit 0.01
+
+echo "*******transfer ft token tu owner_id den tai khoan test = claim token"
+# 4. Transfer ft token from owner_id to account test(Claim token)
+near call $CONTRACT_FT_ID ft_transfer '{"receiver_id": "'$ACCOUNT_TEST'", "amount": "'$AMOUNT'"}' --accountId $MAIN_ACCOUNT --deposit $ONE_YOCTO
+#near call $CONTRACT_FT_ID ft_transfer '{"receiver_id": "'$ACCOUNT_TUN'", "amount": "'$AMOUNT'"}' --accountId $MAIN_ACCOUNT --deposit $ONE_YOCTO
+#near call $CONTRACT_FT_ID ft_transfer '{"receiver_id": "'$ACCOUNT_THAO'", "amount": "'$AMOUNT'"}' --accountId $MAIN_ACCOUNT --deposit $ONE_YOCTO
+
+# 5. Check FT metadata
+echo "********check FT metadata **********"
+near view $CONTRACT_FT_ID ft_metadata
+
+# 6. View balance of account
+echo "************view ft_balance_of"
+near view $CONTRACT_FT_ID ft_balance_of '{"account_id": "'$CONTRACT_STAKING_ID'"}'
+near view $CONTRACT_FT_ID ft_balance_of '{"account_id": "'$ACCOUNT_TEST'"}'
+near view $CONTRACT_FT_ID ft_balance_of '{"account_id": "'$MAIN_ACCOUNT'"}'
+#near view $CONTRACT_FT_ID ft_balance_of '{"account_id": "'$ACCOUNT_TUN'"}'
+#near view $CONTRACT_FT_ID ft_balance_of '{"account_id": "'$ACCOUNT_THAO'"}'
+'''
+'''--- src/account.rs ---
+use crate::*;
+use near_sdk::Timestamp;
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct AccountV1 {
+    pub stake_balance: Balance,
+    pub pre_reward: Balance,
+    pub last_block_balance_change: BlockHeight,
+    pub unstake_balance: Balance,
+    pub unstake_start_timestamp: Timestamp,
+    pub unstake_available_epoch: EpochHeight,
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize)]
+#[serde(crate="near_sdk::serde")]
+pub struct Account {
+    pub stake_balance: Balance,
+    pub pre_reward: Balance,
+    pub last_block_balance_change: BlockHeight,
+    pub unstake_balance: Balance,
+    pub unstake_start_timestamp: Timestamp,
+    pub unstake_available_epoch: EpochHeight,
+    pub new_account_data: U128,
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub enum UpgradebleAccount{
+    V1(AccountV1),
+    Current(Account)
+}
+
+impl From<Account> for UpgradebleAccount {
+    fn from(account: Account) -> Self {
+        UpgradebleAccount::Current(account)
+    }
+}
+
+impl From<UpgradebleAccount> for Account {
+    fn from(upgradeable_account: UpgradebleAccount) -> Self {
+        match upgradeable_account {
+            UpgradebleAccount::Current(account) => account,
+            UpgradebleAccount::V1(account_v1) =>
+                Account {
+                     stake_balance: account_v1.stake_balance,
+                     pre_reward: account_v1.pre_reward,
+                     last_block_balance_change: account_v1.last_block_balance_change,
+                     unstake_balance: account_v1.unstake_balance,
+                     unstake_start_timestamp: account_v1.unstake_start_timestamp,
+                    unstake_available_epoch: account_v1.unstake_available_epoch,
+                     new_account_data: U128(128),
+            }
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct AccountJson {
+    pub account_id: AccountId,
+    pub stake_balance: U128,
+    pub unstake_balance: U128,
+    pub reward: U128,
+    pub can_withdraw: bool,
+    pub unstake_start_timestamp: Timestamp,
+    pub unstake_avaiable_epoch: EpochHeight,
+    pub current_epoch: EpochHeight,
+    pub new_account_data: U128,
+}
+
+impl AccountJson {
+    pub fn from(account_id: AccountId, new_reward: Balance, account: Account) -> Self {
+        AccountJson {
+            account_id,
+            stake_balance: U128(account.stake_balance),
+            unstake_balance: U128(account.unstake_balance),
+            unstake_start_timestamp: account.unstake_start_timestamp,
+            reward: U128(new_reward),
+            can_withdraw: account.unstake_available_epoch <= env::epoch_height(),
+            current_epoch: env::epoch_height(),
+            unstake_avaiable_epoch: account.unstake_available_epoch,
+            new_account_data: account.new_account_data,
+        }
+    }
+}
+
+// Timeline: t1 ---------------- t2 -------------- now
+// Balance: 100k --------------- 200k ------------
+
+'''
+'''--- src/config.rs ---
+use crate::*;
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Config {
+    pub reward_numerator: u32,
+    pub reward_denumerator: u32,
+}
+
+// APR 15% = (token_stacking * 15/100) * total_block
+// Moi block se tra thuong 715 / 1_000_000_000 --> tinh ra duoc thanh APR 15%
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            reward_numerator: 715,
+            reward_denumerator: 1_000_000_000,
+        }
+    }
+}
+
+'''
+'''--- src/core_impl.rs ---
+use crate::*;
+use near_sdk::{ext_contract, Gas, PromiseResult};
+pub const DEPOSIT_ONE_YOCTO: Balance = 1;
+pub const NO_DEPOSIT: Balance = 0;
+pub const FT_TRANSFER_GAS: Gas = 10_000_000_000_000;
+pub const FT_HARVEST_CALLBACK_GAS: Gas = 10_000_000_000_000;
+
+pub trait FungibleTokenReceiver {
+    fn ft_on_transfer(
+        &mut self,
+        sender_id: AccountId,
+        amount: U128,
+        msg: String,
+    ) -> PromiseOrValue<U128>;
+}
+
+#[ext_contract(ext_ft_contract)]
+pub trait FungibleToken {
+    fn ft_transfer(&mut self, receiver_id: AccountId, amount: U128, memo: Option<String>);
+}
+
+#[ext_contract(ext_self)]
+pub trait ExtStackingContract {
+    fn ft_transfer_callback(&mut self, amount: U128, account_id: AccountId);
+    fn fn_withdraw_callback(&mut self, account_id: AccountId, old_account: Account);
+}
+
+#[near_bindgen]
+impl FungibleTokenReceiver for StakingContract {
+    fn ft_on_transfer(
+        &mut self,
+        sender_id: AccountId,
+        amount: U128,
+        msg: String,
+    ) -> PromiseOrValue<U128> {
+        self.internal_deposit_and_stake(sender_id, amount.0);
+        PromiseOrValue::Value(U128(0))
+    }
+}
+
+#[near_bindgen]
+impl StakingContract {
+    #[payable]
+    pub fn harvest(&mut self) -> Promise {
+        assert_one_yocto();
+        let account_id = env::predecessor_account_id();
+        let upgradable_account = self.accounts.get(&account_id);
+        assert!(upgradable_account.is_some(), "ERR_ACCOUNT_ID_NOT_FOUND");
+        let account = Account::from(upgradable_account.unwrap());
+
+        let new_reward = self.internal_calculate_account_reward(&account);
+        let current_reward = account.pre_reward + new_reward;
+
+        assert!(current_reward > 0, "ERR_REWARD_EQUAL_ZERO");
+
+        ext_ft_contract::ft_transfer(
+            account_id.clone(),
+            U128(current_reward),
+            Some("Staking harvest".to_string()),
+            &self.ft_contract_id,
+            DEPOSIT_ONE_YOCTO,
+            FT_TRANSFER_GAS,
+        )
+        .then(ext_self::ft_transfer_callback(
+            U128(current_reward),
+            account_id.clone(),
+            &env::current_account_id(),
+            NO_DEPOSIT,
+            FT_HARVEST_CALLBACK_GAS,
+        ))
+    }
+
+    #[private]
+    pub fn ft_transfer_callback(&mut self, amount: U128, account_id: AccountId) -> U128 {
+        assert_eq!(env::promise_results_count(), 1, "ERR_TOO_MANY_RESULT");
+        match env::promise_result(0) {
+            PromiseResult::NotReady => unreachable!(),
+            PromiseResult::Failed => env::panic(b"ERR_CALLBACK"),
+            PromiseResult::Successful(_value) => {
+                let upgradable_account = self.accounts.get(&account_id).unwrap();
+                let mut account = Account::from(upgradable_account);
+
+                account.pre_reward = 0;
+                account.last_block_balance_change = env::block_index();
+
+                self.accounts
+                    .insert(&account_id, &UpgradebleAccount::from(account));
+                self.total_paid_reward_balance += amount.0;
+
+                amount
+            }
+        }
+    }
+
+    #[private]
+    pub fn fn_withdraw_callback(&mut self, account_id: AccountId, old_account: Account) -> U128 {
+        assert_eq!(env::promise_results_count(), 1, "ERR_TOO_MANY_RESULT");
+        match env::promise_result(0) {
+            PromiseResult::NotReady => unreachable!(),
+            PromiseResult::Failed => {
+                // handle rollback account
+                self.accounts
+                    .insert(&account_id, &UpgradebleAccount::from(old_account));
+                U128(0)
+            }
+            PromiseResult::Successful(_value) => U128(old_account.unstake_balance),
+        }
+    }
+
+    #[payable]
+    pub fn unstake(&mut self, amount: U128) {
+        assert_one_yocto();
+        let account_id = env::predecessor_account_id();
+        self.internal_unstake(account_id, amount.0);
+    }
+
+    #[payable]
+    pub fn withdraw(&mut self) -> Promise {
+        assert_one_yocto();
+        let account_id = env::predecessor_account_id();
+        let old_account = self.internal_withdraw(account_id.clone());
+
+        ext_ft_contract::ft_transfer(
+            account_id.clone(),
+            U128(old_account.unstake_balance),
+            Some("Staking contract withdraw".to_string()),
+            &self.ft_contract_id,
+            DEPOSIT_ONE_YOCTO,
+            FT_TRANSFER_GAS,
+        )
+        .then(ext_self::fn_withdraw_callback(
+            account_id.clone(),
+            old_account,
+            &env::current_account_id(),
+            NO_DEPOSIT,
+            FT_HARVEST_CALLBACK_GAS,
+        ))
+    }
+}
+
+'''
+'''--- src/enumeration.rs ---
+use crate::*;
+
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct PoolJson {
+    pub total_stake_balance: U128,
+    pub total_reward: U128,
+    pub total_paid_reward_balance: U128,
+    pub total_stakers: U128,
+    pub is_paused: bool,
+}
+
+#[near_bindgen]
+impl StakingContract {
+    pub fn get_account_info(&self, account_id: AccountId) -> AccountJson {
+        let upgradable_account = self.accounts.get(&account_id);
+        assert!(upgradable_account.is_some(), "ERR_ACCOUNT_ID_NOT_FOUND");
+
+        let account = Account::from(upgradable_account.unwrap());
+        let new_reward = self.internal_calculate_account_reward(&account);
+        AccountJson::from(account_id, new_reward, account)
+    }
+
+    pub fn get_account_reward(&self, account_id: AccountId) -> Balance {
+        let upgradeable_account = self.accounts.get(&account_id).unwrap();
+        let account = Account::from(upgradeable_account);
+        let new_reward = self.internal_calculate_account_reward(&account);
+
+        account.pre_reward + new_reward
+    }
+
+    pub fn get_pool_info(&self) -> PoolJson {
+        PoolJson {
+            total_stake_balance: U128(self.total_stake_balance),
+            total_reward: U128(self.pre_reward + self.internal_calculate_global_reward()),
+            total_paid_reward_balance: U128(self.total_paid_reward_balance),
+            total_stakers: U128(self.total_stacker),
+            is_paused: self.is_pause,
+        }
+    }
+}
+
+'''
+'''--- src/internal.rs ---
+use crate::*;
+
+impl StakingContract {
+    pub(crate) fn internal_register_account(&mut self, account_id: AccountId) {
+        let account = Account {
+            stake_balance: 0,
+            pre_reward: 0,
+            last_block_balance_change: env::block_index(),
+            unstake_balance: 0,
+            unstake_start_timestamp: 0,
+            unstake_available_epoch: 0,
+            new_account_data: U128(0),
+        };
+
+        self.accounts
+            .insert(&account_id, &UpgradebleAccount::from(account));
+    }
+
+    pub(crate) fn internal_calculate_account_reward(&self, account: &Account) -> Balance {
+        let last_block = if self.is_pause {
+            self.pause_is_block
+        } else {
+            env::block_index()
+        };
+
+        let diff_block = last_block - account.last_block_balance_change;
+        let reward: Balance =
+            (account.stake_balance * self.config.reward_numerator as u128 * diff_block as u128)
+                / self.config.reward_denumerator as u128;
+        reward
+    }
+
+    pub(crate) fn internal_calculate_global_reward(&self) -> Balance {
+        let last_block = if self.is_pause {
+            self.pause_is_block
+        } else {
+            env::block_index()
+        };
+
+        let diff_block = last_block - self.last_block_balance_change;
+        let reward: Balance =
+            (self.total_stake_balance * self.config.reward_numerator as u128 * diff_block as u128)
+                / self.config.reward_denumerator as u128;
+        reward
+    }
+
+    pub(crate) fn internal_deposit_and_stake(&mut self, account_id: AccountId, amount: u128) {
+        // Validate data
+        let upgradable_account = self.accounts.get(&account_id);
+        assert!(upgradable_account.is_some(), "ERR_ACCOUNT_ID_NOT_FOUND");
+        assert_eq!(self.is_paused(), false, "ERR_CONTRACT_PAUSE");
+        assert_eq!(
+            self.ft_contract_id,
+            env::predecessor_account_id(),
+            "ERR_INVALID_FT_CONTRACT_ID"
+        );
+
+        let mut account = Account::from(upgradable_account.unwrap());
+        if account.stake_balance == 0 {
+            self.total_stacker += 1;
+        }
+        let new_reward = self.internal_calculate_account_reward(&account);
+
+        // Update Account Data
+        account.pre_reward += new_reward;
+        account.stake_balance += amount;
+        account.last_block_balance_change = env::block_index();
+
+        self.accounts
+            .insert(&account_id, &UpgradebleAccount::from(account));
+
+        // Update Pool Data
+        let new_contract_reward = self.internal_calculate_global_reward();
+        self.total_stake_balance += amount;
+        self.pre_reward += new_contract_reward;
+        self.last_block_balance_change = env::block_index();
+    }
+
+    pub(crate) fn internal_unstake(&mut self, account_id: AccountId, amount: u128) {
+        let upgradable_account = self.accounts.get(&account_id).unwrap();
+        let mut account = Account::from(upgradable_account);
+
+        assert!(
+            amount <= account.stake_balance,
+            "ERR_AMOUNT_MUST_LESS_THAN_STAKE_BALANCE"
+        );
+
+        let new_reward = self.internal_calculate_account_reward(&account);
+
+        // Update account data
+        account.pre_reward += new_reward;
+        account.stake_balance -= amount;
+        account.last_block_balance_change = env::block_index();
+        account.unstake_balance += amount;
+        account.unstake_start_timestamp = env::block_timestamp();
+        account.unstake_available_epoch = env::epoch_height(); // + 1 remove for test
+
+        if account.stake_balance == 0 {
+            self.total_stacker -= 1;
+        }
+
+        self.accounts
+            .insert(&account_id, &UpgradebleAccount::from(account));
+
+        let new_contract_reward = self.internal_calculate_global_reward();
+        self.pre_reward += new_contract_reward;
+        self.last_block_balance_change = env::block_index();
+        self.total_stake_balance -= amount;
+    }
+
+    pub(crate) fn internal_withdraw(&mut self, account_id: AccountId) -> Account {
+        let upgradable_account = self.accounts.get(&account_id).unwrap();
+        let account = Account::from(upgradable_account);
+
+        assert!(
+            account.unstake_balance > 0,
+            "ERR_UNSTAKE_BALANCE_EQUAL_ZERO"
+        );
+        assert!(
+            env::epoch_height() >= account.unstake_available_epoch,
+            "ERR_DISABLED_WITHDRAW"
+        );
+
+        let new_account = Account {
+            stake_balance: account.stake_balance,
+            pre_reward: account.pre_reward,
+            last_block_balance_change: account.last_block_balance_change,
+            unstake_balance: 0,
+            unstake_start_timestamp: 0,
+            unstake_available_epoch: 0,
+            new_account_data: account.new_account_data,
+        };
+
+        self.accounts
+            .insert(&account_id, &UpgradebleAccount::from(new_account));
+
+        account
+    }
+}
+
+'''
+'''--- src/lib.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::LookupMap;
+use near_sdk::json_types::U128;
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{
+    env, near_bindgen, AccountId, Balance, BlockHeight, BorshStorageKey, EpochHeight,
+    PanicOnDefault, Promise, PromiseOrValue
+};
+use near_sdk::log;
+
+mod account;
+mod config;
+mod enumeration;
+mod internal;
+mod utils;
+mod core_impl;
+use crate::account::*;
+use crate::config::*;
+use crate::enumeration::*;
+use crate::internal::*;
+use crate::utils::*;
+use crate::core_impl::*;
+
+#[derive(BorshDeserialize, BorshSerialize, BorshStorageKey)]
+pub enum StorageKey {
+    AccountKey,
+}
+
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct StakingContractV1 {
+    pub owner_id: AccountId,
+    pub ft_contract_id: AccountId,
+    pub config: Config, // Cấu hình công thức trả thưởng cho user
+    pub total_stake_balance: Balance,
+    pub total_paid_reward_balance: Balance,
+    pub total_stacker: Balance,
+    pub pre_reward: Balance,
+    pub last_block_balance_change: BlockHeight,
+    pub accounts: LookupMap<AccountId, UpgradebleAccount>, // Thong tin chi tiet accout theo AccountId
+    pub is_pause: bool,
+    pub pause_is_block: BlockHeight,
+}
+
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+#[near_bindgen]
+pub struct StakingContract {
+    pub owner_id: AccountId,
+    pub ft_contract_id: AccountId,
+    pub config: Config, // Cấu hình công thức trả thưởng cho user
+    pub total_stake_balance: Balance,
+    pub total_paid_reward_balance: Balance,
+    pub total_stacker: Balance,
+    pub pre_reward: Balance,
+    pub last_block_balance_change: BlockHeight,
+    pub accounts: LookupMap<AccountId, UpgradebleAccount>, // Thong tin chi tiet accout theo AccountId
+    pub is_pause: bool,
+    pub pause_is_block: BlockHeight,
+    pub new_data: U128,
+}
+
+#[near_bindgen]
+impl StakingContract {
+    #[init]
+    pub fn new_default_config(owner_id: AccountId, ft_contract_id: AccountId) -> Self {
+        Self::new(owner_id, ft_contract_id, Config::default())
+    }
+
+    #[init]
+    pub fn new(owner_id: AccountId, ft_contract_id: AccountId, config: Config) -> Self {
+        StakingContract {
+            owner_id,
+            ft_contract_id,
+            config,
+            total_stake_balance: 0,
+            total_paid_reward_balance: 0,
+            total_stacker: 0,
+            pre_reward: 0,
+            last_block_balance_change: 0,
+            accounts: LookupMap::new(StorageKey::AccountKey),
+            is_pause: false,
+            pause_is_block: 0,
+            new_data: U128(0),
+        }
+    }
+
+    #[payable]
+    pub fn storage_deposit(&mut self, account_id: Option<AccountId>) {
+        assert_at_least_one_yocto();
+        let account_id = account_id.unwrap_or_else(|| env::predecessor_account_id());
+        let account_stake = self.accounts.get(&account_id);
+        if account_stake.is_some() {
+            // Refund toan bo token deposit
+            refund_deposit(0);
+        } else {
+            // Tao account moi
+            let before_storage_usage = env::storage_usage();
+            self.internal_register_account(account_id);
+            let after_storage_usage = env::storage_usage();
+            // Refund token deposit con thua
+            refund_deposit(after_storage_usage - before_storage_usage);
+        }
+    }
+
+    pub fn storage_balance_of(&self, account_id: AccountId) -> U128 {
+
+        let account = self.accounts.get(&account_id);
+        if account.is_some() {
+            U128(1)
+        } else {
+            U128(0)
+        }
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.is_pause
+    }
+
+    pub fn get_new_data(&self) -> U128 {
+        self.new_data
+    }
+
+    #[private]
+    #[init(ignore_state)]
+    pub fn migrate() -> Self {
+        let contractV1: StakingContractV1 = env::state_read().expect("Can not read state data");
+        StakingContract {
+            owner_id: contractV1.owner_id,
+            ft_contract_id: contractV1.ft_contract_id,
+            config: contractV1.config,
+            total_stake_balance: contractV1.total_stake_balance,
+            total_paid_reward_balance: contractV1.total_paid_reward_balance,
+            total_stacker: contractV1.total_stacker,
+            pre_reward: contractV1.pre_reward,
+            last_block_balance_change: contractV1.last_block_balance_change,
+            accounts: contractV1.accounts,
+            is_pause:contractV1.is_pause,
+            pause_is_block: contractV1.pause_is_block,
+            new_data: U128(10),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::{testing_env, MockedBlockchain};
+
+    fn get_context(is_view: bool) -> VMContextBuilder {
+        let mut builder = VMContextBuilder::new();
+        builder
+            .current_account_id(accounts(0))
+            .signer_account_id(accounts(0))
+            .predecessor_account_id(accounts(0))
+            .is_view(is_view);
+
+        builder
+    }
+
+    #[test]
+    fn test_init_contract() {
+        let context = get_context(false);
+        testing_env!(context.build());
+
+        let config: Config = Config {
+            reward_numerator: 500,
+            reward_denumerator: 100_000,
+        };
+
+        let contract =
+            StakingContract::new(accounts(1).to_string(), "ft_contract".to_string(), config);
+
+        assert_eq!(contract.owner_id, accounts(1).to_string());
+        assert_eq!(contract.ft_contract_id, "ft_contract".to_string());
+        assert_eq!(config.reward_numerator, contract.config.reward_numerator);
+        assert_eq!(contract.is_pause, false);
+    }
+}
+
+'''
+'''--- src/utils.rs ---
+use crate::*;
+
+pub(crate) fn assert_at_least_one_yocto() {
+    assert!(
+        env::attached_deposit() >= 1,
+        "Required attached deposit at least 1 yoctoNEAR"
+    );
+}
+
+pub(crate) fn assert_one_yocto() {
+    assert!(
+        env::attached_deposit() == 1,
+        "Required attached deposit exactly 1 yoctoNEAR"
+    );
+}
+
+pub(crate) fn refund_deposit(storage_used: u64) {
+    let required_cost = env::storage_byte_cost() * Balance::from(storage_used);
+    let attached_deposit = env::attached_deposit();
+
+    assert!(
+        attached_deposit >= required_cost,
+        "Must attached {} yoctoNear to cover storage",
+        required_cost
+    );
+    let refund = attached_deposit - required_cost;
+    if refund > 0 {
+        Promise::new(env::predecessor_account_id()).transfer(refund);
+    }
+}
+
+'''
+'''--- stakingcontract.sh ---
+#!/bin/bash
+export MAIN_ACCOUNT=hocnear.testnet
+export NEAR_ENV=testnet
+export CONTRACT_STAKING_ID=staking.$MAIN_ACCOUNT
+export CONTRACT_FT_ID=ft.$MAIN_ACCOUNT
+export ONE_YOCTO=0.000000000000000000000001
+export ACCOUNT_TEST=test.hocnear.testnet
+#export ACCOUNT_TUN=tun.hocnear.testnet
+export GAS=300000000000000
+export AMOUNT=100000000000000000000000000
+
+# 1. Build smart contract and deploy
+./build.sh
+
+echo "################### DELETE ACCOUNT ###################"
+near delete $CONTRACT_STAKING_ID $MAIN_ACCOUNT
+near delete $ACCOUNT_TEST $MAIN_ACCOUNT
+
+echo "################### CREATE ACCOUNT ###################"
+near create-account $CONTRACT_STAKING_ID --masterAccount $MAIN_ACCOUNT --initialBalance 10
+near create-account $ACCOUNT_TEST --masterAccount $MAIN_ACCOUNT --initialBalance 10
+
+# 2. Deploy:
+echo "****************near deploy --wasmFile res/staking-contract.wasm****************"
+near deploy --wasmFile out/stakingcontract.wasm --accountId $CONTRACT_STAKING_ID
+
+# 3. Init contract
+echo "**********near call $CONTRACT_STAKING_ID new_default_config"
+near call $CONTRACT_STAKING_ID new_default_config '{"owner_id": "'$MAIN_ACCOUNT'", "ft_contract_id": "'$CONTRACT_FT_ID'"}' --accountId $MAIN_ACCOUNT
+
+# 4. Add account to storage staking
+echo "*****near call STAKING.TESTNET.HOCNEAR.TESTNET storage_deposit***********"
+near call $CONTRACT_STAKING_ID storage_deposit '{"account_id": "'$ACCOUNT_TEST'"}' --accountId $ACCOUNT_TEST --deposit 0.01
+#near call $CONTRACT_STAKING_ID storage_deposit '{"account_id": "'$ACCOUNT_TUN'"}' --accountId $ACCOUNT_TUN --deposit 0.01
+echo "********SATKING.HOCNEAR.TESTNET"
+near call $CONTRACT_STAKING_ID storage_deposit '{"account_id": "'$MAIN_ACCOUNT'"}' --accountId $MAIN_ACCOUNT --deposit 0.01
+
+# 5. Staking ft token to pool
+echo "******** ft.hocnear.testnet**********"
+near call $CONTRACT_FT_ID ft_transfer_call '{"receiver_id": "'$CONTRACT_STAKING_ID'", "amount": "'$AMOUNT'", "msg": ""}' --accountId $MAIN_ACCOUNT --deposit $ONE_YOCTO --gas $GAS
+echo "******** ft.test.hocnear.testnet**********"
+near call $CONTRACT_FT_ID ft_transfer_call '{"receiver_id": "'$CONTRACT_STAKING_ID'", "amount": "10000000000000000000000000", "msg": ""}' --accountId $ACCOUNT_TEST --deposit $ONE_YOCTO --gas $GAS
+
+#near call $CONTRACT_FT_ID ft_transfer_call '{"receiver_id": "'$CONTRACT_STAKING_ID'", "amount": "10000000000000000000000000", "msg": ""}' --accountId $ACCOUNT_TUN --deposit $ONE_YOCTO --gas $GAS
+echo "******** ft.test.hocnear.testnet**********"
+near call $CONTRACT_FT_ID ft_transfer_call '{"receiver_id": "'$CONTRACT_STAKING_ID'", "amount": "50000000000000000000000000", "msg": ""}' --accountId $ACCOUNT_TEST --deposit $ONE_YOCTO --gas $GAS
+
+#near call $CONTRACT_FT_ID ft_transfer_call '{"receiver_id": "'$CONTRACT_STAKING_ID'", "amount": "50000000000000000000000000", "msg": ""}' --accountId $ACCOUNT_TUN --deposit $ONE_YOCTO --gas $GAS
+
+# 6. Harvest all reward
+echo "********harvest test.hocnear.testnet"
+near call $CONTRACT_STAKING_ID harvest --accountId $ACCOUNT_TEST --deposit $ONE_YOCTO --gas $GAS
+
+#near call $CONTRACT_STAKING_ID harvest --accountId $ACCOUNT_TUN --deposit $ONE_YOCTO --gas $GAS
+
+# 7. Unstacked
+echo "*******unstake test.hocnear.testnet*************"
+near call $CONTRACT_STAKING_ID unstake '{"amount": "10000000000000000000000000"}' --accountId $ACCOUNT_TEST --deposit $ONE_YOCTO
+
+#near call $CONTRACT_STAKING_ID unstake '{"amount": "10000000000000000000000000"}' --accountId $ACCOUNT_TUN --deposit $ONE_YOCTO
+
+# 8. Withdraw
+echo "******** withdraw *************"
+near call $CONTRACT_STAKING_ID withdraw '' --accountId $ACCOUNT_TEST --deposit $ONE_YOCTO --gas $GAS
+#near call $CONTRACT_STAKING_ID withdraw '' --accountId $ACCOUNT_TUN --deposit $ONE_YOCTO --gas $GAS
+
+# 9. Get pool info
+echo "********xem thong tin pool"
+near view $CONTRACT_STAKING_ID get_pool_info
+
+# 10. Get account info
+echo "***********xem thong tin account info *************"
+near view $CONTRACT_STAKING_ID get_account_info '{"account_id": "'$ACCOUNT_TEST'"}'
+near view $CONTRACT_STAKING_ID get_account_info '{"account_id": "'$MAIN_ACCOUNT'"}'
+near view $CONTRACT_STAKING_ID get_account_info '{"account_id": "'$ACCOUNT_TUN'"}'
+'''

@@ -1,0 +1,641 @@
+*GitHub Repository "medvedNick/MarketContract"*
+
+'''--- README.md ---
+# Market Contract 
+
+Simple Rust market contract for token exchange.
+
+## Description
+
+There are two contracts - `market` and `token_holder` (one per token). The first one acts as an exchange and contains the business logic, while the last ones simply store the tokens with the ability to transfer them with the command from the market contract. You can add as many tokens as you want, while exchanging between any of them.
+
+The main flow is as follows:
+
+1. Deploy contract (for example, to `market.medvednick.testnet`)
+2. Add tokens with appropriate balance
+    - use `add_token` method with parameter `{"token": <TOKEN_NAME>}`
+    - minumum deposit is 0.02 Ⓝ
+3. Contract creates sub-account (i.e. `token1.market.medvednick.testnet`) and deploys the `token_holder` contract to it
+3. Execute market orders between any tokens with automatic rate as X * Y = K
+    - use `execute_order` method with parameter 
+        ```
+        {
+            "sell": <TOKEN_YOU_WANT_TO_SELL>,
+            "buy": <TOKEN_YOU_WANT_TO_BUY,
+            "token_id": <WHERE_TO_TRANSFER_BUY_TOKEN>
+        }
+        ```
+    - minumum deposit is 0.01 Ⓝ
+4. You can remove also remove token from market which will also delete token subaccount
+    - use `remove_token` with parameter `{"token": <TOKEN_NAME>}`
+
+## Unit Tests
+
+You can run unit tests from root folder with:
+
+`./test.sh`
+
+or for each contract from its directory with the same command.
+
+## Deploy and Test Run
+
+You'll need near cli and other tools to build and deploy the contract.
+
+You can deploy and run automatic testing the contract on **TESTNET** with script with:
+
+`./deploy.sh <TESTNET_ACC_WUTHOUT_SUFFIX>`
+
+For example:
+    
+`./deploy.sh medvednick`
+
+will deploy contract to `market.medvednick.testnet` using `medvednick.testnet` as master account. The script will first try to delete current market.* account and then to add 2 tokens to market sending 2 Near to each. Tokens would be added into `<TOKEN>.market.medvednick.testnet` accounts. The last step will exchange 0.25 Near between tokens.
+
+You can look into `deploy.sh` and comment/modify any commands.
+
+## Thoughts on bugs
+
+There are multiple bugs and possible vulnerabilities within the contract, but due to the test nature of the task they are not fixed. Although they are mentioned in the list below, to show the awareness of them.
+
+- Remove token does not work properly because of some errors with ownership, need to find out why
+- Not sure if it's good to use `cd` in build scripts, but it's not working from other directory due to `.toml` absence
+- Fees and gas calculation probably should be made more dynamic
+- Probably it's also worth to move fees into class variables to be able to override them inside tests
+- No checks for success of `Promise`s, must-have but it will require a lot of additional code :(
+- K = X * Y results in overflow, changing formulae allows to avoid it, but still we have accuracy losses
+- Not sure how to unit test returned `Promise`s, can we?
+- Function `new::` on `token_holder` may be changed to `function_call`. Should check if there is any difference
+- Deploying contract in two different calls (`deploy` and call `new`) is a bad practice
+
+'''
+'''--- build.sh ---
+#!/bin/bash
+set -e
+
+cd token
+./build.sh
+cd ../market
+./build.sh
+cd ..
+
+'''
+'''--- deploy.sh ---
+#!/bin/bash
+set -e
+
+if [ "$#" -ne 1 ]; then
+  echo "Usage: $0 <ACCOUNT_ID>" >&2
+  echo "example: $0 medvednick" >&2
+  exit 1
+fi
+
+near delete market.$1.testnet $1.testnet || true
+near create-account market.$1.testnet --masterAccount $1.testnet
+near deploy market.$1.testnet --wasmFile market/res/market_contract.wasm
+near call market.$1.testnet new '{"owner_id": "'${1}'.testnet"}' --accountId $1.testnet
+
+# Comment this for stop adding tokens on deploy
+near call market.$1.testnet add_token '{"token": "token1"}' --amount 2 --accountId $1.testnet
+near call market.$1.testnet add_token '{"token": "token2"}' --amount 2 --accountId $1.testnet
+
+# Comment this for stop executing order on deploy
+near call market.$1.testnet execute_order '{"sell": "token1", "buy": "token2", "token_id": "'${1}'.testnet"}' --amount 0.25 --accountId $1.testnet
+
+'''
+'''--- market/Cargo.toml ---
+[package]
+name = "market-contract"
+version = "0.1.0"
+authors = ["Nikita Medvedev @medvednick"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+near-sdk = "4.0.0-pre.4"
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+# Opt into extra safety checks on arithmetic operations https://stackoverflow.com/a/64136471/249801
+overflow-checks = true
+
+'''
+'''--- market/build.sh ---
+#!/bin/bash
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/*.wasm ./res/
+
+'''
+'''--- market/src/lib.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::LookupMap;
+use near_sdk::{
+    env, near_bindgen, ext_contract, require,
+    AccountId, PanicOnDefault, Promise, Gas, Balance
+};
+
+const TOKEN_CONTRACT: &[u8] = include_bytes!("../../token/res/token_contract.wasm");
+
+const ADD_TOKEN_RESERVE: Balance = 10_000_000_000_000_000_000_000; // 0.01 Ⓝ, reserve to store on main contract when adding token
+const TOKEN_RESERVE: Balance = 10_000_000_000_000_000_000_000; // 0.01 Ⓝ, reserve to store on token contract
+const EXCHANGE_TOKEN_FEE: Balance = 10_000_000_000_000_000_000_000; // 0.01 Ⓝ, exchange fee
+const BASE_GAS: Gas = Gas(5_000_000_000_000);
+
+#[near_bindgen]
+#[derive(PanicOnDefault, BorshDeserialize, BorshSerialize)]
+pub struct Contract {
+    owner_id: AccountId,
+    market: LookupMap<AccountId, Balance>, // <TokenName: Balance> map with market's accounts and their balances
+}
+
+#[ext_contract(ext_token_holder)]
+pub trait TokenHolder {
+    fn new(owner_id: AccountId) -> Self;
+    fn transfer(&mut self, to: AccountId, amount: Balance);
+}
+
+pub trait TokenHolder {
+    fn new(owner_id: AccountId) -> Self;
+    fn transfer(&mut self, to: AccountId, amount: Balance);
+}
+
+#[near_bindgen]
+impl Contract {
+    #[init]
+    pub fn new(owner_id: AccountId) -> Self {
+        require!(!env::state_exists(), "Already initialized");
+        Self {
+            owner_id: owner_id.clone().into(),
+            market: LookupMap::new(b"m"),
+        }
+    }
+
+    #[payable]
+    pub fn add_token(&mut self, token: AccountId) {
+        require!(
+            env::predecessor_account_id() == self.owner_id,
+            "Adding token to market is allowed for owner only"
+        );
+        let token_balance = self.market.get(&token);
+        require!(
+            token_balance == None,
+            "Token is already added"
+        );
+        require!(
+            env::attached_deposit() > ADD_TOKEN_RESERVE + TOKEN_RESERVE,
+            format!("Adding new token require minimum deposit {} yocto", ADD_TOKEN_RESERVE + TOKEN_RESERVE)
+        );
+
+        let deposit_to_transfer = env::attached_deposit() - ADD_TOKEN_RESERVE;
+        let token_deposit = deposit_to_transfer - TOKEN_RESERVE;
+
+        let token_id = Contract::token_id(token.clone());
+
+        // TODO: add token to market in callback only for successfull promise result
+        self.market.insert(&token, &token_deposit);
+
+        Promise::new(token_id.clone())
+            .create_account()
+            .add_full_access_key(env::signer_account_pk())
+            .transfer(deposit_to_transfer)
+            .deploy_contract(TOKEN_CONTRACT.to_vec())
+            .and(
+                ext_token_holder::new(
+                    env::current_account_id(),
+                    token_id,
+                    0, 
+                    BASE_GAS
+                )
+            );
+    }
+
+    pub fn remove_token(&mut self, token: AccountId) {
+        require!(
+            env::predecessor_account_id() == self.owner_id,
+            "Removing token from market is allowed for owner only"
+        );
+        self.market.remove(&token);
+
+        Promise::new(Contract::token_id(token))
+            .delete_account(env::signer_account_id());
+    }
+
+    #[payable]
+    pub fn execute_order(&mut self, sell: AccountId, buy: AccountId, token_id: AccountId) {
+        require!(sell != buy, "Can not exchange same token");
+        require!(
+            env::attached_deposit() > EXCHANGE_TOKEN_FEE, 
+            format!("Exchanging require the deposit to be greater than {} yocto", EXCHANGE_TOKEN_FEE)
+        );
+        let sell_balance = self.market.get(&sell);
+        let buy_balance = self.market.get(&buy);
+        if let (Some(sell_balance), Some(buy_balance)) = (sell_balance, buy_balance) { 
+            let dsell = env::attached_deposit() - EXCHANGE_TOKEN_FEE;
+            // Instead of dY = Y - K / (X + dX) using dY = Y * dX / (X + dX), so no overflow at X * Y occurs
+            // TODO: still significantly losing accuracy
+            let fraction = (dsell as f64) / ((sell_balance + dsell) as f64);
+            let dbuy = ((buy_balance as f64) * fraction) as Balance;
+            let new_sell_balance = sell_balance + dsell;
+            let new_buy_balance = buy_balance - dbuy;
+
+            // TODO: insert in callback (or maybe insert now and revert then?)
+            self.market.insert(&sell, &new_sell_balance);
+            self.market.insert(&buy, &new_buy_balance);
+
+            let buy_id = Contract::token_id(buy);
+            let sell_id = Contract::token_id(sell);
+
+            Promise::new(sell_id)
+                .transfer(dsell)
+                .and(
+                    ext_token_holder::transfer(
+                        token_id.clone(),
+                        dbuy,
+                        buy_id.clone(),
+                        0,
+                        BASE_GAS
+                    )
+                );
+        } else {
+            require!(false, "Token has not yet been added to market");
+        }
+    }
+}
+
+impl Contract {
+    fn token_id(token: AccountId) -> AccountId {
+        AccountId::new_unchecked(
+            format!("{}.{}", token, env::current_account_id())
+        )
+    }
+}
+
+// Unit Testing
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use near_sdk::test_utils::{VMContextBuilder};
+    use near_sdk::{testing_env, AccountId};
+
+    const ONE_NEAR: Balance = 1_000_000_000_000_000_000_000_000; // 1 Ⓝ
+
+    fn get_context(predecessor: AccountId, deposit: Balance) -> VMContextBuilder {
+        let mut builder = VMContextBuilder::new();
+        builder.predecessor_account_id(predecessor);
+        builder.attached_deposit(deposit);
+        builder.signer_account_pk("ed25519:6E8sCci9badyRkXb3JoRpBj5p8C6Tw41ELDZoiihKEtp".parse().unwrap());
+        builder.current_account_id("market".parse().unwrap());
+        builder
+    }
+
+    fn nikita() -> AccountId {
+        "nikita".parse().unwrap()
+    }
+
+    fn denis() -> AccountId {
+        "denis".parse().unwrap()
+    }
+
+    fn token1() -> AccountId {
+        "token1".parse().unwrap()
+    }
+
+    fn token2() -> AccountId {
+        "token2".parse().unwrap()
+    }
+
+    fn token3() -> AccountId {
+        "token3".parse().unwrap()
+    }
+
+    // Tests
+    #[test]
+    fn test_contract_creation() {
+        // arrange
+        testing_env!(get_context(nikita(), 0).build());
+
+        // act
+        let contract = Contract::new(nikita());
+
+        // assert
+        assert_eq!(contract.owner_id, nikita());
+    }
+
+    #[test]
+    fn test_adding_token_by_owner() {
+        // arrange
+        testing_env!(get_context(nikita(), ONE_NEAR).build());
+        let mut contract = Contract::new(nikita());
+
+        // act
+        contract.add_token(token1());
+
+        // assert
+        let expected_token_deposit = ONE_NEAR - ADD_TOKEN_RESERVE - TOKEN_RESERVE;
+        assert_eq!(contract.market.get(&token1()), Some(expected_token_deposit));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_adding_token_by_non_owner() {
+        // arrange
+        testing_env!(get_context(nikita(), 0).build());
+        let mut contract = Contract::new(nikita());
+        testing_env!(get_context(denis(), ONE_NEAR).build());
+
+        // act
+        contract.add_token(token1());
+
+        // assert
+        assert!(false);
+    }
+
+    #[test]
+    fn test_removing_token_by_owner() {
+        // arrange
+        testing_env!(get_context(nikita(), ONE_NEAR).build());
+        let mut contract = Contract::new(nikita());
+        contract.add_token(token1());
+
+        // act
+        contract.remove_token(token1());
+
+        // assert
+        assert_eq!(contract.market.get(&token1()), None);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_removing_token_by_non_owner() {
+        // arrange
+        testing_env!(get_context(nikita(), ONE_NEAR).build());
+        let mut contract = Contract::new(nikita());
+        contract.add_token(token1());
+        testing_env!(get_context(denis(), 0).build());
+
+        // act
+        contract.remove_token(token1());
+
+        // assert
+        assert!(false);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_exchange_non_existing_tokens() {
+        // arrange
+        testing_env!(get_context(nikita(), 100).build());
+        let mut contract = Contract::new(nikita());
+
+        // act & assert
+        contract.execute_order(token1(), token1(), denis());
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_exchange_with_low_deposit() {
+        // arrange
+        testing_env!(get_context(nikita(), ONE_NEAR).build());
+        let mut contract = Contract::new(nikita());
+        contract.add_token(token1());
+        contract.add_token(token2());
+        testing_env!(get_context(denis(), EXCHANGE_TOKEN_FEE).build());
+
+        // act & assert
+        contract.execute_order(token1(), token2(), denis());
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_exchange_same_token() {
+        // arrange
+        testing_env!(get_context(nikita(), ONE_NEAR).build());
+        let mut contract = Contract::new(nikita());
+        contract.add_token(token1());
+
+        // act & assert
+        contract.execute_order(token1(), token1(), denis());
+    }
+
+    #[test]
+    fn test_exchange_tokens() {
+        // arrange
+        let near_100_with_add_fee = ONE_NEAR * 100 + ADD_TOKEN_RESERVE + TOKEN_RESERVE;
+        let near_25_with_exchange_fee = ONE_NEAR * 25 + EXCHANGE_TOKEN_FEE;
+
+        testing_env!(get_context(nikita(), near_100_with_add_fee).build());
+        let mut contract = Contract::new(nikita());
+        contract.add_token(token1());
+
+        testing_env!(get_context(nikita(), near_100_with_add_fee).build());
+        contract.add_token(token2());
+
+        testing_env!(get_context(nikita(), near_100_with_add_fee).build());
+        contract.add_token(token3());
+        
+        testing_env!(get_context(denis(), near_25_with_exchange_fee).build());
+
+        // act
+
+        // t1 = 100
+        // t2 = 100
+        // k = 10_000
+        // dt1 = 25
+        // dt2 = 100 - 10_000 / (100 + 25) = 100 - 10_000 / 125 = 100 - 80 == 20
+        // newT1 = 125
+        // newT2 = 79 or 80  due to float point errors
+        contract.execute_order(token1(), token2(), denis());
+
+        // t1 = 125
+        // t3 = 100
+        // k = 12_500
+        // dt1 = 25
+        // dt3 = 100 - 12_500 / (125 + 25) = 100 - 12_500 / 150 = 100 - 83 == 17
+        // newT1 = 150
+        // newT3 = 83 or 84
+        contract.execute_order(token1(), token3(), denis());
+
+        // assert
+        assert_eq!(contract.market.get(&token1()).unwrap() / ONE_NEAR, 150);
+        assert_eq!(contract.market.get(&token2()).unwrap() / ONE_NEAR, 79);
+        assert_eq!(contract.market.get(&token3()).unwrap() / ONE_NEAR, 83);
+    }
+
+    #[test]
+    fn test_equilibrium_calculation_overflow() {
+        // arrange
+        testing_env!(get_context(nikita(), ONE_NEAR * 100 + ADD_TOKEN_RESERVE + TOKEN_RESERVE).build());
+        let mut contract = Contract::new(nikita());
+        contract.add_token(token1());
+        contract.add_token(token2());
+        
+        testing_env!(get_context(denis(), 25_000_000_000_000_000_000_000_000).build());
+
+        // act
+        contract.execute_order(token1(), token2(), denis());
+
+        // assert
+        assert_eq!(contract.market.get(&token1()), Some(124_990_000_000_000_000_000_000_000));
+        assert_eq!(contract.market.get(&token2()), Some(80_006_400_512_040_962_227_175_424));
+    }
+}
+
+'''
+'''--- market/test.sh ---
+#!/bin/bash
+set -e
+
+cargo test -- --nocapture
+
+'''
+'''--- test.sh ---
+#!/bin/bash
+set -e
+
+cd token
+./test.sh
+cd ../market
+./test.sh
+cd ..
+
+'''
+'''--- token/Cargo.toml ---
+[package]
+name = "token-contract"
+version = "0.1.0"
+authors = ["Nikita Medvedev @medvednick"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+near-sdk = "4.0.0-pre.4"
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+# Opt into extra safety checks on arithmetic operations https://stackoverflow.com/a/64136471/249801
+overflow-checks = true
+
+'''
+'''--- token/build.sh ---
+#!/bin/bash
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/*.wasm ./res/
+
+'''
+'''--- token/src/lib.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::{
+    env, near_bindgen, require,
+    AccountId, Promise, Balance, PanicOnDefault
+};
+
+#[near_bindgen]
+#[derive(PanicOnDefault, BorshDeserialize, BorshSerialize)]
+pub struct TokenHolderContract {
+    owner_id: AccountId,
+}
+
+#[near_bindgen]
+impl TokenHolderContract {
+    #[init]
+    pub fn new(owner_id: AccountId) -> Self {
+        require!(!env::state_exists(), "Already initialized");
+        Self {
+            owner_id: owner_id.clone().into(),
+        }
+    }
+
+    pub fn transfer(&mut self, to: AccountId, amount: Balance) {
+        require!(
+            env::predecessor_account_id() == self.owner_id,
+            "Transfering token is allowed for owner only"
+        );
+        Promise::new(to).transfer(amount);
+    }
+}
+
+// Unit Testing
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use near_sdk::test_utils::{VMContextBuilder};
+    use near_sdk::{testing_env, AccountId};
+
+    fn get_context(predecessor: AccountId) -> VMContextBuilder {
+        let mut builder = VMContextBuilder::new();
+        builder.predecessor_account_id(predecessor);
+        builder
+    }
+
+    fn nikita() -> AccountId {
+        "nikita".parse().unwrap()
+    }
+
+    fn denis() -> AccountId {
+        "denis".parse().unwrap()
+    }
+
+    // Tests
+    #[test]
+    fn test_contract_creation() {
+        // arrange
+        testing_env!(get_context(nikita()).build());
+
+        // act
+        let contract = TokenHolderContract::new(nikita());
+
+        // assert
+        assert_eq!(contract.owner_id, nikita());
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_transfer_non_owner() {
+        // arrange
+        testing_env!(get_context(nikita()).build());
+        let mut contract = TokenHolderContract::new(nikita());
+        
+        // act
+        testing_env!(get_context(denis()).build());
+        contract.transfer(nikita(), 100);
+
+        // assert
+        assert_eq!(contract.owner_id, nikita());
+    }
+
+    #[test]
+    fn test_transfer() {
+        // arrange
+        testing_env!(get_context(nikita()).build());
+        let mut contract = TokenHolderContract::new(nikita());
+        
+        // act & assert
+        contract.transfer(nikita(), 100);
+    }
+}
+
+'''
+'''--- token/test.sh ---
+#!/bin/bash
+set -e
+
+cargo test -- --nocapture
+
+'''

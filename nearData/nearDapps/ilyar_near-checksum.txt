@@ -1,0 +1,478 @@
+*GitHub Repository "ilyar/near-checksum"*
+
+'''--- .cargo/audit.toml ---
+[advisories]
+# warn for categories of informational advisories
+informational_warnings = [
+    "unmaintained",
+    "unsound",
+]
+
+[target]
+arch = "wasm32"
+
+'''
+'''--- .cargo/config.toml ---
+[build]
+rustflags = ["-C", "link-arg=-s"]
+
+'''
+'''--- .github/workflows/contract.yml ---
+on: [push]
+
+name: contract
+
+jobs:
+
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt
+          profile: minimal
+          override: true
+      - uses: actions-rs/cargo@v1
+        with:
+          command: fmt
+          args: --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          components: clippy
+          profile: minimal
+          override: true
+      - uses: actions-rs/clippy-check@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          args: --all-targets
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/audit-check@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          target: wasm32-unknown-unknown
+          toolchain: stable
+          profile: minimal
+          override: true
+      - run: make test-contract
+
+'''
+'''--- Cargo.toml ---
+[package]
+name = "near-checksum"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+crate-type = ["cdylib", "rlib"]
+test = true
+doctest = false
+bench = false
+doc = false
+
+# [make rustup]
+# rustup component add clippy
+# rustup component add rustfmt
+# rustup target add wasm32-unknown-unknown
+[dev-dependencies]
+near-sdk-sim = "3.1.0"
+rand = "0.8.3"
+
+[dependencies]
+near-sdk = "3.1.0"
+hex = "0.4.3"
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+# Opt into extra safety checks on arithmetic operations https://stackoverflow.com/a/64136471/249801
+overflow-checks = true
+
+'''
+'''--- docs/readme.md ---
+# Create Rust Smart Contract
+
+1. function that receives not a null array (Vec<u8>)
+2. Calculate sha256 hash
+3. Check is hash exist in the storage
+    1. If exist - fail execution
+    2. if not exist - save to storage
+4. Return hash as String
+5. Cover with unit tests
+6. Cover with integration tests
+
+## Tools
+
+* near-cli
+* near-sdk-rs
+* near-sdk-sim
+
+'''
+'''--- readme.md ---
+<div align="center">
+  <h1><code>near-checksum</code></h1>
+  <p>
+    <strong>Implementation of a checksum any data on NEAR Protocol</strong>
+  </p>
+</div>
+
+## Develop
+
+```shell
+make fix
+make qa
+make build
+make clean
+```
+
+### Run CI local
+
+Installation [act](https://github.com/nektos/act):
+```shell
+brew install act
+```
+
+Setup env vars:
+```shell
+echo "GITHUB_TOKEN=%GITHUB_TOKEN%" | tee .secrets
+```
+
+Run
+```shell
+act --help
+```
+
+## Deploy stage
+
+```shell
+make deploy-force
+accountId=ilyar.testnet
+contractName=$(cat neardev/dev-account)
+near state $contractName
+near delete $contractName $accountId
+```
+
+## Deploy testnet
+
+```shell
+make qa
+make build
+accountId=ilyar.testnet
+contractName="checksum.$accountId"
+near create-account --masterAccount $accountId $contractName 
+near deploy --wasmFile build/checksum.wasm --accountId $contractName
+```
+
+## Usage
+
+```shell
+near view $contractName has '{"hash": "c3ab8ff13720e8ad9047dd39466b3c8974e592c2fa383d4a3960714caef0c4f2"}'
+near call $contractName add '{"data": [102, 111, 111, 98, 97, 114]}' --accountId $accountId
+near view $contractName has '{"hash": "c3ab8ff13720e8ad9047dd39466b3c8974e592c2fa383d4a3960714caef0c4f2"}'
+```
+
+## Note init
+
+https://docs.near.org/docs/tutorials/contracts/intro-to-rust
+
+```shell
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
+mkdir near-checksum  && cd $_
+git init
+cargo init --edition 2018 --lib --vcs git
+```
+
+'''
+'''--- src/lib.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::LookupSet;
+use near_sdk::{env, near_bindgen, setup_alloc, BorshStorageKey};
+
+setup_alloc!();
+
+#[derive(BorshSerialize, BorshStorageKey)]
+enum StorageKey {
+    Hash,
+}
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Checksum {
+    hash_set: LookupSet<String>,
+}
+
+impl Default for Checksum {
+    fn default() -> Self {
+        Self {
+            hash_set: LookupSet::new(StorageKey::Hash),
+        }
+    }
+}
+
+#[near_bindgen]
+impl Checksum {
+    pub fn add(&mut self, data: Vec<u8>) -> String {
+        assert!(!data.is_empty(), "Given empty data");
+        let checksum = hex::encode(env::sha256(&data));
+        assert!(
+            !self.hash_set.contains(&checksum),
+            "For given data checksum exist"
+        );
+        if !self.hash_set.insert(&checksum) {
+            env::panic(b"Failed to save checksum");
+        }
+        checksum
+    }
+
+    pub fn has(&self, hash: String) -> bool {
+        if hash.len() != 64 {
+            return false;
+        }
+        self.hash_set.contains(&hash)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(test)]
+mod unit {
+    use super::*;
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::testing_env;
+    use near_sdk::MockedBlockchain;
+
+    fn context() -> VMContextBuilder {
+        let mut builder = VMContextBuilder::new();
+        builder.signer_account_id(accounts(0));
+        builder
+    }
+
+    #[test]
+    #[should_panic(expected = "Given empty data")]
+    fn add_empty() {
+        testing_env!(context().build());
+        let mut contract = Checksum::default();
+        contract.add([].to_vec());
+    }
+
+    #[test]
+    fn add() {
+        testing_env!(context().build());
+        let mut contract = Checksum::default();
+        let hash = String::from("2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae");
+        assert_eq!(hash, contract.add([102, 111, 111].to_vec()));
+        assert!(contract.has(hash));
+    }
+
+    #[test]
+    #[should_panic(expected = "For given data checksum exist")]
+    fn add_fail_on_exist() {
+        testing_env!(context().build());
+        let mut contract = Checksum::default();
+        contract.add([98, 97, 114].to_vec());
+        contract.add([98, 97, 114].to_vec());
+    }
+
+    #[test]
+    #[ignore] // TODO setup context with empty storage
+    #[should_panic(expected = "Failed to save checksum")]
+    fn add_fail_on_storage() {
+        testing_env!(context().build());
+        let mut contract = Checksum::default();
+        contract.add([98, 97, 114].to_vec());
+    }
+
+    #[test]
+    fn has() {
+        testing_env!(context().is_view(true).build());
+        let contract = Checksum::default();
+        assert!(!contract.has(String::from(
+            "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae"
+        )));
+        assert!(!contract.has(String::from("bad hash")));
+    }
+}
+
+'''
+'''--- tests/integration/add_simulate.rs ---
+use crate::utils::fixture;
+use crate::utils::init;
+use near_sdk::serde_json::json;
+use near_sdk_sim::DEFAULT_GAS;
+
+#[test]
+fn default() {
+    let (root, contract, _alice) = init();
+    let (data, hash) = fixture();
+
+    let result = root.call(
+        contract.account_id(),
+        "add",
+        &json!({
+            "data": data,
+        })
+        .to_string()
+        .into_bytes(),
+        DEFAULT_GAS,
+        0, // deposit
+    );
+    assert_eq!(hash, result.unwrap_json::<String>());
+
+    let actual: bool = root
+        .view(
+            contract.account_id(),
+            "has",
+            &json!({
+                "hash": hash,
+            })
+            .to_string()
+            .into_bytes(),
+        )
+        .unwrap_json();
+    assert_eq!(true, actual);
+}
+
+'''
+'''--- tests/integration/gas_simulate.rs ---
+use crate::utils::{init, to_gas};
+use near_sdk::serde_json::json;
+use near_sdk_sim::{to_yocto, DEFAULT_GAS};
+use rand::Rng;
+
+#[test]
+fn default() {
+    let (root, contract, _alice) = init();
+    let mut rng = rand::thread_rng();
+    let data: Vec<u8> = (0..u32::pow(10, 4)).map(|_| rng.gen()).collect(); // of size 10Kb
+
+    let result = root.call(
+        contract.account_id(),
+        "add",
+        &json!({
+            "data": data,
+        })
+        .to_string()
+        .into_bytes(),
+        DEFAULT_GAS,
+        0, // deposit
+    );
+    // 10b   tokens: 0.0003Ⓝ gas:   3.1TeraGas Success
+    // 100b  tokens: 0.0003Ⓝ gas:   3.5TeraGas Success
+    // 1Kb   tokens: 0.0007Ⓝ gas:   7.1TeraGas Success
+    // 10Kb  tokens: 0.0043Ⓝ gas:  43.9TeraGas Success
+    // 100Kb tokens: 0.0203Ⓝ gas: 203.2TeraGas Failure
+    println!(
+        "burnt {:.05}Ⓝ {:.02}TeraGas",
+        (result.tokens_burnt()) as f64 / 1e24,
+        (result.gas_burnt()) as f64 / 1e12,
+    );
+    assert!(result.gas_burnt() <= to_gas("43.995"));
+    assert!(result.tokens_burnt() <= to_yocto("0.00445"));
+}
+
+'''
+'''--- tests/integration/has_simulate.rs ---
+use crate::utils::init;
+use near_sdk::serde_json::json;
+
+#[test]
+fn default() {
+    let (root, contract, _alice) = init();
+
+    let actual: bool = root
+        .view(
+            contract.account_id(),
+            "has",
+            &json!({
+                "hash": "foo".to_string(),
+            })
+            .to_string()
+            .into_bytes(),
+        )
+        .unwrap_json();
+
+    assert_eq!(false, actual);
+}
+
+'''
+'''--- tests/integration/main.rs ---
+mod add_simulate;
+mod gas_simulate;
+mod has_simulate;
+mod utils;
+
+'''
+'''--- tests/integration/utils.rs ---
+near_sdk_sim::lazy_static_include::lazy_static_include_bytes! {
+    CONTRACT_WASM_BYTES => "build/checksum.wasm",
+}
+
+use near_sdk::Gas;
+use near_sdk_sim::init_simulator;
+use near_sdk_sim::to_yocto;
+use near_sdk_sim::UserAccount;
+use near_sdk_sim::STORAGE_AMOUNT;
+
+const CONTRACT_ID: &str = "contract";
+
+pub fn fixture() -> (Vec<u8>, String) {
+    (
+        vec![102, 111, 111],
+        String::from("2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae"),
+    )
+}
+
+pub fn init() -> (UserAccount, UserAccount, UserAccount) {
+    // Use `None` for default genesis configuration; more info below
+    let root = init_simulator(None);
+
+    let contract = root.deploy(
+        &CONTRACT_WASM_BYTES,
+        CONTRACT_ID.to_string(),
+        STORAGE_AMOUNT, // attached deposit
+    );
+
+    let alice = root.create_user(
+        "alice".to_string(),
+        to_yocto("100"), // initial balance
+    );
+
+    (root, contract, alice)
+}
+
+pub fn to_gas(tera_gas: &str) -> Gas {
+    let part: Vec<_> = tera_gas.split('.').collect();
+    let number = part[0].parse::<Gas>().unwrap() * u64::pow(10, 12);
+    if part.len() > 1 {
+        let power = part[1].len() as u32;
+        let mantissa = part[1].parse::<Gas>().unwrap() * u64::pow(10, 12 - power);
+        number + mantissa
+    } else {
+        number
+    }
+}
+
+'''

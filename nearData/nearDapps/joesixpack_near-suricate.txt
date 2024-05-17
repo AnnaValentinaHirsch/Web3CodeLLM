@@ -1,0 +1,1368 @@
+*GitHub Repository "joesixpack/near-suricate"*
+
+'''--- README.md ---
+*DISCLAIMER : Proof of concept in intense development. For use in Near Betanet ONLY*
+
+# Suricate
+
+Monitoring program for Near Protocol validators
+
+## Features
+In the Near network :
+- Keeps track of the next validator seat price and the funds staked in `poolAccoundId`.
+- Using the funds staked/unstaked from `delegatorAccountId`, rebalances the staked funds in the `poolAccountId` pool so the staked funds stay in between defined thresholds (default: between 110% of seat price and 190% of seat price).
+- Publishes delegator and pool Prometheus metrics (default on `http://<yourHost>:3039/metrics`).
+- Emits alerts when node is outdated or when validator status changes or online rate is below 95% (more alerts to come).
+
+Know limitations : Not epoch-aware (gets info on `next` epoch), bad arithmetic precision.
+
+## Usage
+
+### Production (betanet)
+Install *suricate* globally
+```
+npm install -g near-suricate
+```
+Run
+```
+near-suricate monitor --delegatorAccountId <yourAccountId> --poolAccountId <yourPoolId> 
+```
+See [Configuring](#configuring) section for advanced usage.
+### Development
+The bot is written in Javascript/Typescript and requires `nodejs` and `npm`.
+Install dependencies :
+```
+npm install
+```
+Compile, then start monitoring using `suricate.config.json` config file (See [Configuring](#configuring) section below)
+```
+npm start
+```
+
+Alternatively, for debugging, you can compile...
+```
+npm run tsc
+```
+... and run with given config file (at least the required <delegatorAccountId> and <poolAccountId> fields must be present in the file)
+```
+node dist --config suricate.config.json
+```
+
+## Configuring
+
+Suricate accepts parameters either via command line arguments or from a config file passed with `--config`. 
+Other command line arguments override config file values (ex: `--alerts.enabled=false`).
+
+### Configuration file
+Copy the configuration file example.
+```
+cp suricate.config.json.example suricate.config.json
+```
+And modify it according to your needs :
+```
+{
+  "delegatorAccountId": "neozaru14.betanet",
+  "poolAccountId": "neozaru.stakehouse.betanet",
+  "near": {
+    "networkId": "betanet",
+    "nodeUrl": "https://rpc.betanet.near.org/",
+    "keystoreDir": "./neardev/"
+  },
+  "rebalancing": {
+    "enabled": true,
+    "autoping": true,
+    "levels": {
+      "lowThreshold": 1.2,
+      "lowTarget": 1.3,
+      "highTarget": 1.7,
+      "highThreshold": 1.8
+    },
+    "policy": {
+      "type": "BEST",
+      "minRebalanceAmount": 1000
+    }
+  },
+  "alerts": {
+    "enabled": true,
+    "emitters": ["console"]
+  },
+  "metrics": {
+    "enabled": true,
+    "hostname": "0.0.0.0",
+    "port": 3039
+  }
+}
+```
+#### near{}
+- `near.keystoreDir` should have the same structure as your `~/.near-credentials/` folder (which is default value if you simply omit it). It should contain at least of keys associated with `delegatorAccountId`.
+#### rebalancing{}
+- `rebalancing.autoping` means that a `ping` command will be sent before every rebalancing check (every `interval`). This should consume a tiny amount of gas but will allow your node to automatically restake without manual intervention if it gets kicked out.
+- `rebalancing.levels` defines at what levels (`lowThreshold`, `highThreshold`) the automatic rebalancing should be triggered and to what levels (`lowTarget`, `highTarget`) it should put the stake by rebalancing.
+Ex: If current seat price is 1000 and the currently staked balance in the pool is 1850, it will trigger the `highThreshold` (1850 > 1000 * `1.8`) and take action to set the staked balance in the pool to 1700 (`1.7` * 1000).
+- `rebalancing.policy` defines what to do when the delegator account does have enough fund deposited in the pool to meet the stake/unstake target. Setting the type to `BEST` will make the delegator account stake/unstake as many tokens as it can even if it is not enough to meet the `lowTarget`/`highTarget`. It is triggered only if the user can stake/unstake at least `minRebalanceAmount` (in NEAR).
+
+Another option for `rebalancing.policy` is FOK, which simply doesn't take any action if the delegator account doesn't have enough fund deposited :
+```
+"rebalancing": {
+  "policy": {
+    "type": "FOK"
+  },
+  "levels": {
+    [...]
+  }
+}
+```
+#### alerts{}
+Alerts are scanned every `interval` seconds (default every 5 minutes).
+The same alert won't be triggered twice for the same epoch, but the same alert will be triggered again if the epoch changes and the same alert persists.
+By default, they are logged to the console. You can set up email alerts by modifying the `alerts{}` configuration :
+```
+"alerts": {
+  "enabled": true,
+  "emitters": ["mail", "console"],
+  "mail": {
+    "smtp": {
+      "host": "smtp.gmail.com",
+      "port": 465,
+      "secure": true,
+      "auth": {
+        "user": "neozaru14@gmail.com",
+        "pass": "<yourMailPassword>"
+      }
+    },
+    "sender": "neozaru14@gmail.com",
+    "recipients": ["neozaru14@gmail.com"]
+  }
+},
+```
+... will send alert both by mail and to the console.
+Note that the `alerts.mail.smtp{}` field format is the same as [Nodemailer](https://nodemailer.com/about/) library syntax.
+
+[NEW] Use your own Telegram Bot to receive alerts :
+```
+"alerts": {
+  "enabled": true,
+  "emitters": ["telegram", "console"],
+  "telegram": {
+    "token": "<yourBotToken>",
+    "channelId": "<yourChannelIdOrUserId>"
+  }
+}
+```
+Where `token` is the "HTTP API" token given by `@FatherBot` when creating your bot from Telegram (https://core.telegram.org/bots#creating-a-new-bot) and `channelId` can be your own user ID given by talking with `@userinfobot` (it can probably be the ID of an actual channel as well but I am not familiar with Telegram).
+
+Right now, alert emitted are :
+- `NOT_CURRENT_VALIDATOR` the validator account `validatorAccountId` (`poolAccountId`) is not in the validators list for current epoch.
+- `NOT_NEXT_VALIDATOR` the validator account `validatorAccountId` (`poolAccountId`) is not in the validators list for next epoch.
+- `VALIDATOR_EXPECTED_PRODUCED_BLOCKS` is triggered when a validator produced only 95% (or less) of the expected blocks.
+- `VALIDATOR_KICKED_OUT` is triggered when validator was kicked out during previous (ie: for being offline for too long during previous epoch).
+- `VALIDATOR_SLASHED` the validator account `validatorAccountId` (`poolAccountId`) has been slashed.
+- `PROTOCOL_VERSION` your target RPC node is outdated (not reliable if you use a public RPC instead of your own node)
+
+#### metrics{}
+
+The following metrics are exported for *Prometheus* on `http://<yourHost>:3039/metrics` by default.
+```
+# HELP suricate_pool_total_staked_balance suricate_pool_total_staked_balance
+# TYPE suricate_pool_total_staked_balance gauge
+suricate_pool_total_staked_balance 168524.20893628307
+
+# HELP suricate_pool_delegator_staked_balance suricate_pool_delegator_staked_balance
+# TYPE suricate_pool_delegator_staked_balance gauge
+suricate_pool_delegator_staked_balance 56390.831213471494
+
+# HELP suricate_pool_delegator_unstaked_balance suricate_pool_delegator_unstaked_balance
+# TYPE suricate_pool_delegator_unstaked_balance gauge
+suricate_pool_delegator_unstaked_balance 19485.220010316676
+
+# HELP suricate_seat_price_current suricate_seat_price_current
+# TYPE suricate_seat_price_current gauge
+suricate_seat_price_current 107168.27592853646
+
+# HELP suricate_seat_price_next suricate_seat_price_next
+# TYPE suricate_seat_price_next gauge
+suricate_seat_price_next 112327.51129207034
+
+# HELP suricate_seat_price_proposals suricate_seat_price_proposals
+# TYPE suricate_seat_price_proposals gauge
+suricate_seat_price_proposals 113267.00549267698
+
+# HELP suricate_seat_price_low_threshold suricate_seat_price_low_threshold
+# TYPE suricate_seat_price_low_threshold gauge
+suricate_seat_price_low_threshold 157258.21357744085
+
+# HELP suricate_seat_price_high_threshold suricate_seat_price_high_threshold
+# TYPE suricate_seat_price_high_threshold gauge
+suricate_seat_price_high_threshold 213422.27145493322
+
+# HELP suricate_validator_produced_blocks suricate_validator_produced_blocks
+# TYPE suricate_validator_produced_blocks gauge
+suricate_validator_produced_blocks 32
+
+# HELP suricate_validator_expected_blocks suricate_validator_expected_blocks
+# TYPE suricate_validator_expected_blocks gauge
+suricate_validator_expected_blocks 32
+
+# HELP suricate_validator_uptime_ratio suricate_validator_uptime_ratio
+# TYPE suricate_validator_uptime_ratio gauge
+suricate_validator_uptime_ratio 100
+
+# HELP suricate_epoch_id suricate_epoch_id
+# TYPE suricate_epoch_id gauge
+suricate_epoch_id 10
+
+# HELP suricate_epoch_id_float suricate_epoch_id_float
+# TYPE suricate_epoch_id_float gauge
+suricate_epoch_id_float 10.3278
+
+# HELP suricate_epoch_start_height suricate_epoch_start_height
+# TYPE suricate_epoch_start_height gauge
+suricate_epoch_start_height 9040874
+
+# HELP suricate_epoch_progress suricate_epoch_progress
+# TYPE suricate_epoch_progress gauge
+suricate_epoch_progress 32.69
+
+# HELP suricate_epoch_blocks suricate_epoch_blocks
+# TYPE suricate_epoch_blocks gauge
+suricate_epoch_blocks 3269
+
+# HELP suricate_alerts_count suricate_alerts_count
+# TYPE suricate_alerts_count gauge
+suricate_alerts_count 0
+```
+
+## Bugs & Feature requests
+
+Please use *Github*'s *issues* section. I'll be happy to try to help you.
+'''
+'''--- package.json ---
+{
+  "name": "near-suricate",
+  "version": "0.1.5",
+  "description": "Monitoring program for Near Protocol validators",
+  "homepage": "https://github.com/neozaru/near-suricate",
+  "main": "dist/index.js",
+  "bin": {
+    "near-suricate": "./dist/index.js"
+  },
+  "scripts": {
+    "start": "tsc && node dist/index.js --config suricate.config.json",
+    "tsc": "tsc"
+  },
+  "keywords": [
+    "near",
+    "suricate",
+    "monitor",
+    "pool",
+    "stake",
+    "alerts",
+    "validator"
+  ],
+  "preferGlobal": true,
+  "author": "neozaru",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/yargs": "^15.0.5",
+    "typescript": "^3.9.5"
+  },
+  "dependencies": {
+    "lodash": "^4.17.15",
+    "near-api-js": "^0.28.0",
+    "nodemailer": "^6.4.10",
+    "server": "^1.0.29",
+    "telegraf": "^3.38.0",
+    "winston": "^3.3.3",
+    "yargs": "^15.3.1"
+  }
+}
+
+'''
+'''--- src/alerts/ISuricateAlert.ts ---
+export default interface ISuricateAlert {
+  type: string,
+  message: string,
+  values: any,
+}
+'''
+'''--- src/alerts/ISuricateAlertEmitter.ts ---
+import ISuricateAlertsReport from "./ISuricateAlertsReport";
+
+export default interface ISuricateAlertEmitter {
+  emit: (alertsReport: ISuricateAlertsReport) => Promise<any>
+}
+'''
+'''--- src/alerts/ISuricateAlertsReport.ts ---
+import ISuricateAlert from "./ISuricateAlert";
+
+export default interface ISuricateAlertsReport {
+  alerts: ISuricateAlert[],
+  addedAlerts: ISuricateAlert[],
+  removedAlerts: ISuricateAlert[],
+  context: {
+    epochId: number,
+    isFirstReportForEpoch: boolean,
+  }
+}
+'''
+'''--- src/alerts/alerts-manager.ts ---
+import SuricateAlert from "./ISuricateAlert";
+import ISuricateAlertEmitter from "./ISuricateAlertEmitter";
+import ISuricateAlertsReport from "./ISuricateAlertsReport";
+import MailEmitter from "./mail-emitter";
+import { statusAlerts, validatorsAlerts } from "./alerts";
+import ConsoleEmitter from "./console-emitter";
+import { createLoggerWithLabel } from "../logger-factory";
+import { reqValidatorsInfo } from "../near-utils";
+import { computeEpochInfo } from "../utils";
+
+import _ from 'lodash';
+import TelegramEmitter from "./telegram-emitter";
+
+const emittersFactory = {
+  'mail': config => new MailEmitter(config),
+  'console': config => new ConsoleEmitter(),
+  'telegram': config => new TelegramEmitter(config)
+}
+
+export default class AlertsManager {
+
+  logger = createLoggerWithLabel('Alerts');
+
+  private emitters: ISuricateAlertEmitter[] = [];
+
+  private latestAlertsReport: ISuricateAlertsReport;
+
+  constructor(private near, private alertsConfig) {
+    this.emitters = alertsConfig.emitters.map(emitterKey => emittersFactory[emitterKey](alertsConfig[emitterKey]));
+    this.latestAlertsReport = this.generateEmptyAlertsReport();
+  }
+
+  private generateEmptyAlertsReport() {
+    return this.generateFreshAlertsReport([], -1);
+  }
+
+  private generateFreshAlertsReport(alerts: SuricateAlert[], epochId: number): ISuricateAlertsReport {
+    return {
+      alerts,
+      addedAlerts: alerts,
+      removedAlerts: [],
+      context: {
+        epochId,
+        isFirstReportForEpoch: true
+      }
+    }
+  }
+
+  private generateAlertsReport(alerts: SuricateAlert[], epochId: number): ISuricateAlertsReport {
+    const {latestAlertsReport, logger} = this;
+    if (Math.floor(epochId) > Math.floor(latestAlertsReport.context.epochId)) {
+      logger.info(`New epoch : ${epochId}. Building fresh alerts report.`)
+      return this.generateFreshAlertsReport(alerts, epochId);
+    }
+    return {
+      alerts,
+      addedAlerts: _.differenceBy(alerts, this.latestAlertsReport.alerts, 'type'),
+      removedAlerts: _.differenceBy(this.latestAlertsReport.alerts, alerts, 'type'),
+      context: {
+        epochId,
+        isFirstReportForEpoch: false
+      }
+    }
+  }
+
+  private async scanAlerts() {
+    const {near, alertsConfig} = this;
+
+    let alerts: SuricateAlert[] = [];
+    const status = await near.connection.provider.status();
+
+    const latestBlockHeight = status.sync_info.latest_block_height 
+    alerts = alerts.concat(statusAlerts(status));
+
+    const valInfo = await reqValidatorsInfo(near, latestBlockHeight);
+    alerts = alerts.concat(validatorsAlerts(valInfo, alertsConfig.validatorAccountId));
+
+    const epochInfo = computeEpochInfo(valInfo, latestBlockHeight);
+
+    return this.generateAlertsReport(alerts, epochInfo.id);
+  }
+
+  private async emitAlertReport(alertsReport: ISuricateAlertsReport) {
+    const {alertsConfig, logger} = this;
+
+    // TODO filter alerts by user config
+    if (alertsReport.addedAlerts.length === 0 && alertsReport.removedAlerts.length === 0) {
+      logger.log('info', `No update on alerts (${alertsReport.alerts.length} current alerts).`);
+      return;
+    }
+    logger.log('info', `${alertsReport.addedAlerts.length} added alerts. ${alertsReport.removedAlerts.length} removed alerts. Emitting in [${alertsConfig.emitters.join(', ')}].`)
+
+    return Promise.all(
+      this.emitters.map(emitter => emitter.emit(alertsReport))
+    );
+  }
+
+  public async scanAndEmitAlerts() {
+    const {logger} = this;
+
+    logger.log('info', `Scanning for alerts...`);
+    this.latestAlertsReport = await this.scanAlerts();
+    this.emitAlertReport(this.latestAlertsReport);
+    return this.latestAlertsReport;
+  }
+
+}
+'''
+'''--- src/alerts/alerts.ts ---
+import _ from 'lodash';
+
+import SuricateAlert from './ISuricateAlert';
+import ISuricateAlertsReport from './ISuricateAlertsReport';
+import ISuricateAlert from './ISuricateAlert';
+
+// TODO: Make it somewhat configurable
+const BLOCKS_PRODUCED_EXPECTED_ALERT_RATIO = 0.95;
+const BLOCKS_PRODUCED_EXPECTED_KICKOUT_RATIO = 0.90;
+
+function createAlertProtocolVersion(nodeProtocolVersion: number, latestProtocolVersion: number): SuricateAlert {
+  return {
+    type: 'PROTOCOL_VERSION',
+    message: `Node protocol version (${nodeProtocolVersion}) is different from latest protocol version (${latestProtocolVersion}). An upgrade might be required.`,
+    values: {
+      nodeProtocolVersion,
+      latestProtocolVersion,
+    }
+  }
+}
+
+function createAlertValidatorExpectedProducedBlocks(poolAccountId: string, producedExpectedRatio: number, producedBlocks: number, expectedBlocks: number): SuricateAlert {
+  return {
+    type: 'VALIDATOR_EXPECTED_PRODUCED_BLOCKS',
+    message: `Account ${poolAccountId} has produced less blocks (${producedBlocks}) than expected (${expectedBlocks}). Online status is only ${Math.round(producedExpectedRatio*10000)/100}%, close to the kickout threshold (${BLOCKS_PRODUCED_EXPECTED_KICKOUT_RATIO*100}%)`,
+    values: {
+      poolAccountId,
+      producedBlocks,
+      expectedBlocks,
+    }
+  }
+}
+
+function createAlertNotValidator(poolAccountId: string, validators: any[], epochType: 'NEXT' | 'CURRENT'): SuricateAlert {
+  return {
+    type: `NOT_${epochType}_VALIDATOR`,
+    message: `Account ${poolAccountId} not found in ${epochType} validator's list.`,
+    values: {
+      poolAccountId,
+      validators,
+      epochType,
+    }
+  }
+}
+
+function createAlertValidatorSlashed(poolAccountId: string): SuricateAlert {
+  return {
+    type: 'VALIDATOR_SLASHED',
+    message: `Account ${poolAccountId} is slashed. It won't be able to continue validating.`,
+    values: {
+      poolAccountId,
+    }
+  }
+}
+
+function createAlertValidatorKickedOut(poolAccountId: string, kickoutReason: any): SuricateAlert {
+  return {
+    type: 'VALIDATOR_KICKED_OUT',
+    message: `Account ${poolAccountId} has been kicked out. It won't be validating for the next epoch. Reason : ${JSON.stringify(kickoutReason)}`,
+    values: {
+      poolAccountId,
+      kickoutReason,
+    }
+  }
+}
+
+function findValidator(validators, poolAccountId: string) {
+  return validators.find(v => v.account_id === poolAccountId);
+}
+
+// TODO: Type validators
+function validatorsAlerts(validatorsInfo: any, poolAccountId: string): SuricateAlert[] {
+  let alerts: SuricateAlert[] = [];
+
+  const userValidator = findValidator(validatorsInfo.current_validators, poolAccountId);
+  if (!userValidator) {
+    alerts.push(createAlertNotValidator(poolAccountId, validatorsInfo.current_validators, 'CURRENT'));
+  } else {
+    if (userValidator.is_slashed === true) {
+      alerts.push(createAlertValidatorSlashed(poolAccountId))
+    } 
+    const blocksProducedExpectedRatio = userValidator.num_produced_blocks / userValidator.num_expected_blocks
+    if (blocksProducedExpectedRatio < BLOCKS_PRODUCED_EXPECTED_ALERT_RATIO) {
+      alerts.push(createAlertValidatorExpectedProducedBlocks(poolAccountId, blocksProducedExpectedRatio, userValidator.num_produced_blocks, userValidator.num_expected_blocks));
+    }
+  }
+  if (!findValidator(validatorsInfo.next_validators, poolAccountId)) {
+    alerts.push(createAlertNotValidator(poolAccountId, validatorsInfo.next_validators, 'NEXT'))
+  }
+  const validatorKickout = findValidator(validatorsInfo.prev_epoch_kickout, poolAccountId);
+  if (validatorKickout) {
+    alerts.push(createAlertValidatorKickedOut(poolAccountId, validatorKickout.reason))
+  }
+  return alerts;
+}
+
+function alertString(alert): string {
+  return `- ${alert.type}: ${alert.message}`
+}
+
+function alertsListText(alerts: ISuricateAlert[]) {
+  return alerts.map(alertString).join('\n');
+}
+
+function alertsTypesList(alerts: ISuricateAlert[]) {
+  return _.map(alerts, 'type').join(', ');
+}
+
+function alertsListHTML(alerts: ISuricateAlert[]) {
+  return alerts.map(alertString).join('<br>');
+}
+
+function alertsReportToText(alertsReport: ISuricateAlertsReport): String {
+  const {alerts, addedAlerts, removedAlerts} = alertsReport;
+
+  const textBodyAddedAlerts = addedAlerts.length > 0 ? `New alerts detected:\n${alertsListText(addedAlerts)}` : null;
+  const textBodyRemovedAlerts = removedAlerts.length > 0 ? `The following alerts are no longer an issue:\n${alertsListText(removedAlerts)}`: null;
+
+  const textActiveAlerts = alerts.length > 0 ? `Active alerts :\n${alertsTypesList(alerts)}` : null;
+
+  return `${_.compact([textBodyAddedAlerts, textBodyRemovedAlerts, textActiveAlerts]).join('\n')}\nEpoch ID: ${alertsReport.context.epochId}`;
+}
+
+function alertsReportToHTML(alertsReport: ISuricateAlertsReport): String {
+  const {alerts, addedAlerts, removedAlerts} = alertsReport;
+
+  const htmlBodyAddedAlerts = addedAlerts.length > 0 ? `New alerts detected:<br>${alertsListHTML(addedAlerts)}` : null;
+  const htmlBodyRemovedAlerts = removedAlerts.length > 0 ? `The following alerts are no longer an issue:<br>${alertsListHTML(removedAlerts)}`: null;
+
+  const htmlActiveAlerts = alerts.length > 0 ? `Active alerts :<br>${alertsTypesList(alerts)}` : null;
+
+  return  `${_.compact([htmlBodyAddedAlerts, htmlBodyRemovedAlerts, htmlActiveAlerts]).join('<br>')}<br>Epoch ID: ${alertsReport.context.epochId}`;
+}
+
+// TODO: Type status
+function statusAlerts(status: any): SuricateAlert[] {
+  let alerts: SuricateAlert[] = [];
+  if (status.protocol_version != status.latest_protocol_version) {
+    alerts.push(createAlertProtocolVersion(status.protocol_version, status.latest_protocol_version));
+  }
+  return alerts;
+}
+
+export {
+  statusAlerts,
+  validatorsAlerts,
+  alertsReportToText,
+  alertsReportToHTML,
+}
+'''
+'''--- src/alerts/console-emitter.ts ---
+import ISuricateAlertEmitter from "./ISuricateAlertEmitter";
+import ISuricateAlert from "./ISuricateAlert";
+import { createLoggerWithLabel } from "../logger-factory";
+import ISuricateAlertsReport from "./ISuricateAlertsReport";
+
+export default class ConsoleEmitter implements ISuricateAlertEmitter {
+
+  logger = createLoggerWithLabel('ALERT.emitter:console')
+
+  public emit(suricateAlertsReport: ISuricateAlertsReport): any {
+    const {logger} = this;
+    suricateAlertsReport.addedAlerts.forEach(alert => {
+      logger.log('warn', `[ADDED ALERT] ${alert.type} ${alert.message}`)
+    });
+    suricateAlertsReport.removedAlerts.forEach(alert => {
+      logger.log('warn', `[REMOVED ALERT] ${alert.type} is no longer an issue (${alert.message})`)
+    });
+  }
+}
+'''
+'''--- src/alerts/mail-emitter.ts ---
+import nodemailer from 'nodemailer';
+import _ from 'lodash';
+
+import ISuricateAlertEmitter from "./ISuricateAlertEmitter";
+import ISuricateAlert from "./ISuricateAlert";
+import ISuricateAlertsReport from './ISuricateAlertsReport';
+
+import {alertsReportToText, alertsReportToHTML} from './alerts';
+
+export default class MailEmitter implements ISuricateAlertEmitter {
+  
+  private mailTransporter;
+
+  constructor(private mailConfig) {
+    this.mailTransporter = nodemailer.createTransport(mailConfig.smtp);
+  }
+
+  public async emit(alertsReport: ISuricateAlertsReport): Promise<any> {
+
+    const {addedAlerts, removedAlerts} = alertsReport;
+
+    const intEpochId = Math.floor(alertsReport.context.epochId);
+
+    const subjectAddedAlertsPart = addedAlerts.length > 0 ? `${alertsReport.addedAlerts.length} added alerts` : null;
+    const subjectRemovedAlertsPart = removedAlerts.length > 0 ? `${alertsReport.removedAlerts.length} removed alerts` : null;
+
+    const alertsReportText = alertsReportToText(alertsReport);
+    const alertsReportHTML = alertsReportToHTML(alertsReport);
+
+    let info = await this.mailTransporter.sendMail({
+      from: this.mailConfig.sender,
+      to: this.mailConfig.recipients.join(', '),
+      subject: `[Suricate] [Epoch ${intEpochId}] ${_.compact([subjectAddedAlertsPart, subjectRemovedAlertsPart]).join(', ')}`,
+      text: alertsReportText,
+      html: alertsReportHTML,
+    });  
+    return info;
+  }
+
+}
+'''
+'''--- src/alerts/telegram-emitter.ts ---
+import { Telegraf } from 'telegraf';
+
+import ISuricateAlertsReport from "./ISuricateAlertsReport";
+import ISuricateAlertEmitter from "./ISuricateAlertEmitter";
+import { alertsReportToText } from './alerts';
+
+export default class TelegramEmitter implements ISuricateAlertEmitter {
+
+  private telegramBot;
+
+  constructor(private telegramBotConfig: any) {
+    this.telegramBot = new Telegraf(telegramBotConfig.token)
+    this.telegramBot.launch();
+  }
+
+  public async emit(alertsReport: ISuricateAlertsReport): Promise<any> {
+    const alertsReportText = alertsReportToText(alertsReport);
+    this.telegramBot.telegram.sendMessage(this.telegramBotConfig.channelId, alertsReportText);
+  }
+
+}
+'''
+'''--- src/flow-runner.ts ---
+
+import {extractFeatureConfig, isFeatureEnabled} from './utils';
+import RebalancingManager from './rebalancing/rebalancing-manager';
+import AlertsManager from './alerts/alerts-manager';
+import MetricsManager from './metrics/metrics-manager';
+import { createLoggerWithLabel } from './logger-factory';
+import ISuricateAlertsReport from './alerts/ISuricateAlertsReport';
+
+export default class FlowRunner {
+
+  logger = createLoggerWithLabel('Runner');
+
+  constructor(private near, private config) {
+  }
+
+  private isBalancingEnabled(): boolean {
+    return isFeatureEnabled(this.config, 'rebalancing');
+  }
+
+  private isAlertsEnabled(): boolean {
+    return isFeatureEnabled(this.config, 'alerts');
+  }
+
+  private isMetricsEnabled(): boolean {
+    return isFeatureEnabled(this.config, 'metrics');
+  }
+
+  private async runFlow(account, rebalancingManager, alertsManager, metricsManager) {
+    let rebalancingResult;
+    if (this.isBalancingEnabled()) {
+      rebalancingResult = await rebalancingManager.checkAndRebalanceStakeForAccount(account)
+    }
+    let alertsReport: ISuricateAlertsReport | undefined;
+    if (this.isAlertsEnabled()) {
+      alertsReport = await alertsManager.scanAndEmitAlerts();
+    }
+    if (this.isMetricsEnabled()) {
+      await metricsManager.refreshMetrics(account, rebalancingResult, alertsReport);
+    }
+  }
+
+  public async startFlowLoop() {
+    const {near, config, logger} = this;
+
+    const rebalancingConfig = extractFeatureConfig(config, 'rebalancing');
+    const rebalancingManager = new RebalancingManager(near, rebalancingConfig);
+    const alertsConfig = extractFeatureConfig(config, 'alerts');
+    const alertsManager = new AlertsManager(near, alertsConfig);
+    const metricsManager = new MetricsManager(near, config);
+  
+    if (this.isMetricsEnabled()) {
+      // Server
+      logger.info('Starting metrics server')
+      metricsManager.enable();
+    }
+
+    const account = await near.account(config.delegatorAccountId);
+
+    this.runFlow(account, rebalancingManager, alertsManager, metricsManager);
+    setInterval(() => {
+      this.runFlow(account, rebalancingManager, alertsManager, metricsManager)
+    }, config.interval * 1000)
+  
+  }
+}
+'''
+'''--- src/index.ts ---
+#!/usr/bin/env node
+
+import * as nearApi from 'near-api-js';
+import fs from 'fs';
+import os from 'os';
+
+import yargs from 'yargs';
+
+import {
+  generateConnectionConfig,
+} from './near-utils';
+
+import FlowRunner from './flow-runner';
+
+const APP_NAME = 'near-suricate'
+
+function loadConfigFile(configPath: string) {
+  const configData = fs.readFileSync(configPath).toString();
+  return JSON.parse(configData);
+}
+
+function parseArgv() {
+  return yargs
+  .scriptName(APP_NAME)
+  .usage('Usage: $0 [options]')
+  .example(`$0 --config config.json`, `Run using given config file - at least <delegatorAccountId> and <poolAccountId> fields must exist in config.json`)
+  .example('$0 --delegatorAccountId neozaru14.betanet --poolAccountId neozaru.stakehouse.net', 'Run using default configuration and account arguments.')
+  .config('config', (configPath) => {
+    return loadConfigFile(configPath);
+  })
+  .alias('c', 'config')
+
+  .alias('poolAccountId', 'validatorAccountId')
+  .demandOption(['validatorAccountId', 'delegatorAccountId'])
+
+  .default('interval', 300)
+
+  .default('near.networkId', 'betanet')
+  .default('near.nodeUrl', 'https://rpc.betanet.near.org')
+  .default('near.keystoreDir', os.homedir() + '/.near-credentials')
+
+  .default('rebalancing.enabled', true)
+  .default('rebalancing.autoping', true)
+  .default('rebalancing.levels.lowThreshold', 1.2)
+  .default('rebalancing.levels.lowTarget', 1.3)
+  .default('rebalancing.levels.highTarget', 1.7)
+  .default('rebalancing.levels.highThreshold', 1.8)
+  .default('rebalancing.policy.type', 'BEST')
+  .default('rebalancing.policy.minRebalanceAmount', 1000)
+
+  .default('alerts.enabled', true)
+  .default('alerts.emitters', ['console'])
+
+  .default('metrics.enabled', true)
+  .default('metrics.hostname', '0.0.0.0')
+  .default('metrics.port', 3039)
+
+  .help('h')
+  .alias('h', 'help')
+  .argv
+}
+
+async function main() {
+  const config: any = parseArgv();
+
+  console.log(`Initializing with delegatorAccount ${config.delegatorAccountId} and validatorAccount ${config.validatorAccountId} (keystore: ${config.near.keystoreDir})`)
+
+  const nearConnectionConfig = generateConnectionConfig(config.near);
+  const near = await nearApi.connect(nearConnectionConfig);
+
+  const flowRunner = new FlowRunner(near, config);
+  flowRunner.startFlowLoop();
+}
+
+main();
+
+'''
+'''--- src/logger-factory.ts ---
+import winston from 'winston';
+
+function createLoggerWithLabel(label: string) {
+  return winston.createLogger({
+    transports: [
+      new winston.transports.Console(),
+      new winston.transports.File({filename: 'suricate.log'})
+    ],
+    format: winston.format.combine(
+      winston.format.timestamp({
+        format: 'YYYY-MM-DD HH:mm:ss'
+      }),
+      winston.format.printf(info => `${info.timestamp} [${label}] ${info.level}: ${info.message}`)
+    )
+  });
+}
+
+export {
+  createLoggerWithLabel
+}
+'''
+'''--- src/metrics/metrics-manager.ts ---
+import PrometheusExporter from "./prometheus-exporter";
+import { reqValidatorsInfo, fetchStakingData, reqSeatPrices } from "../near-utils";
+import { computeEpochInfo, computeValidatorInfo } from "../utils";
+import { createLoggerWithLabel } from "../logger-factory";
+import ISuricateAlertsReport from "../alerts/ISuricateAlertsReport";
+
+export default class MetricsManager {
+
+  private prometheusExporter;
+  logger = createLoggerWithLabel('Metrics');
+
+  // TODO: Metrics manager takes global config ?
+  constructor(private near, private config) {
+    this.prometheusExporter = new PrometheusExporter(config.metrics);
+  }
+
+  public async refreshMetrics(account, rebalancingReport?, alertsReport?: ISuricateAlertsReport) {
+    const {near, config, logger} = this;
+    const stakingData = await fetchStakingData(account, config.poolAccountId, config.delegatorAccountId);
+    const seatPrices = await reqSeatPrices(account);
+    const status = await near.connection.provider.status();
+    const latestBlockHeight = status.sync_info.latest_block_height 
+    const valInfo = await reqValidatorsInfo(near, latestBlockHeight);
+
+    const epochInfo = computeEpochInfo(valInfo, latestBlockHeight);
+    const validatorInfo = computeValidatorInfo(valInfo, config.poolAccountId);
+
+    // TODO: Organize all that 
+    const metricsData = {
+      latestBlockHeight,
+      epochInfo,
+      stakingData,
+      validatorInfo,
+      seatPrices: {
+        ...seatPrices,
+        lowThresholdNextSeatPrice: seatPrices.next.muln(config.rebalancing.levels.lowThreshold),
+        highThresholdNextSeatPrice: seatPrices.next.muln(config.rebalancing.levels.highThreshold),
+      },
+      alertsCount: alertsReport ? alertsReport.alerts.length : 0
+    }
+
+    logger.log('info', `Updating metrics...`);
+    this.prometheusExporter && this.prometheusExporter.feed(metricsData);
+    logger.log('info', `Metrics updated.`);
+  }
+
+  public async enable() {
+    this.prometheusExporter.serve();
+  }
+
+}
+'''
+'''--- src/metrics/prometheus-exporter.ts ---
+import BN from 'bn.js';
+import http from 'http';
+import { c2h } from '../utils';
+import { StakingData } from '../near-utils';
+
+interface SuricateMetrics extends StakingData {
+  stakingData: any,
+  seatPrices: any,
+  epochInfo: any,
+  validatorInfo: any,
+  lowThresholdSeatPrice: BN,
+  highThresholdSeatPrice: BN,
+  alertsCount: number,
+}
+
+const metricsPrefix = 'suricate_';
+
+export default class PrometheusExporter {
+
+  private metrics: SuricateMetrics | undefined;
+
+  constructor(private metricsConfig) {}
+
+  private generateMetric(key, value, type): string {
+    return `
+# HELP ${key} ${key}
+# TYPE ${key} ${type}
+${key} ${value}
+`;
+  }
+
+  private generateNearAmountMetric(key: string, value: BN): string {
+    return this.generateMetric(metricsPrefix + key, c2h(value), 'gauge');
+  }
+
+  private generateGaugeMetric(key: string, value: number) {
+    return this.generateMetric(metricsPrefix + key, value, 'gauge');
+  }
+
+  private generateMetricsString(metrics: SuricateMetrics) {
+    return this.generateNearAmountMetric('pool_total_staked_balance', metrics.stakingData.poolTotalStake)
+    + this.generateNearAmountMetric('pool_delegator_staked_balance', metrics.stakingData.poolDelegatorStakedBalance)
+    + this.generateNearAmountMetric('pool_delegator_unstaked_balance', metrics.stakingData.poolDelegatorUnstakedBalance)
+    + this.generateNearAmountMetric('seat_price_current', metrics.seatPrices.current)
+    + this.generateNearAmountMetric('seat_price_next', metrics.seatPrices.next)
+    + this.generateNearAmountMetric('seat_price_proposals', metrics.seatPrices.proposals)
+    + this.generateNearAmountMetric('seat_price_low_threshold', metrics.seatPrices.lowThresholdNextSeatPrice)
+    + this.generateNearAmountMetric('seat_price_high_threshold', metrics.seatPrices.highThresholdNextSeatPrice)
+    + this.generateGaugeMetric('validator_produced_blocks', metrics.validatorInfo && metrics.validatorInfo.producedBlocks || 0)
+    + this.generateGaugeMetric('validator_expected_blocks', metrics.validatorInfo && metrics.validatorInfo.expectedBlocks || 0)
+    + this.generateGaugeMetric('validator_uptime_ratio', metrics.validatorInfo && metrics.validatorInfo.uptimeRatio || 0)
+    + this.generateGaugeMetric('epoch_id', metrics.epochInfo.id)
+    + this.generateGaugeMetric('epoch_id_float', metrics.epochInfo.idFloat)
+    + this.generateGaugeMetric('epoch_start_height', metrics.epochInfo.startHeight)
+    + this.generateGaugeMetric('epoch_progress', metrics.epochInfo.progress)
+    + this.generateGaugeMetric('epoch_blocks', metrics.epochInfo.blocks)
+    
+    + this.generateGaugeMetric('alerts_count', metrics.alertsCount)
+  }
+
+  public feed(metrics: SuricateMetrics) {
+    this.metrics = metrics;
+  }
+
+  public serve() {
+    const {hostname, port} = this.metricsConfig;
+    http.createServer((req, res) => {
+      res.writeHead(200, {'Content-Type': 'text/plain'});
+      if (req.url === '/metrics' && this.metrics) {
+        const metricsString = this.generateMetricsString(this.metrics);
+        res.end(metricsString);
+      } else {
+        res.writeHead(404, {"Content-Type": "text/html"});
+        res.end();
+      }
+    }).listen(port, hostname);
+  }
+
+}
+'''
+'''--- src/near-utils.ts ---
+
+import * as nearApi from 'near-api-js';
+import BN from 'bn.js';
+
+import { computeEpochInfo } from './utils';
+
+interface SeatPrices {
+  current: BN, next: BN, proposals: BN
+}
+
+interface StakingData {
+  poolTotalStake: BN,
+  poolDelegatorStakedBalance: BN,
+  poolDelegatorUnstakedBalance: BN,
+};
+
+// Vigorously stolen from https://github.com/near/near-shell/blob/6a233cc59a1d1e83ccdbe5eabcefdda9741caf9f/utils/validators-info.js
+async function reqValidatorsInfo(near, epochId) {
+  const genesisConfig = await near.connection.provider.sendJsonRpc('EXPERIMENTAL_genesis_config', {});
+  const result = await near.connection.provider.sendJsonRpc('validators', [epochId]);
+  result.genesisConfig = genesisConfig;
+  result.numSeats = genesisConfig.num_block_producer_seats + genesisConfig.avg_hidden_validator_seats_per_shard.reduce((a, b) => a + b);
+  return result;
+}
+
+function combineValidatorsAndProposals(currentValidators, proposals) {
+  let currentValidatorsMap = new Map();
+  currentValidators.forEach((v) => currentValidatorsMap.set(v.account_id, v));
+  let proposalsMap = new Map();
+  proposals.forEach((p) => proposalsMap.set(p.account_id, p));
+  // TODO: filter out all kicked out validators.
+  let result = currentValidators.filter((validator) => !proposalsMap.has(validator.account_id));
+  
+  return result.concat([...proposalsMap.values()]);
+}
+
+function reqSeatPrices(near): Promise<SeatPrices> {
+  return reqValidatorsInfo(near, null).then(computeSeatPricesFromValidatorsInfo); 
+}
+
+function computeSeatPricesFromValidatorsInfo(validatorsInfo): SeatPrices {
+  return {
+    next: nearApi.validators.findSeatPrice(validatorsInfo.next_validators, validatorsInfo.numSeats),
+    current: nearApi.validators.findSeatPrice(validatorsInfo.current_validators, validatorsInfo.numSeats),
+    // Proposals seat price doesn't filter out kicked validators for estimate. This is incorrect but consistent will near-shell calculation (as of 09 Jul 2020).
+    proposals: nearApi.validators.findSeatPrice(combineValidatorsAndProposals(validatorsInfo.current_validators, validatorsInfo.current_proposals), validatorsInfo.numSeats)
+  };
+}
+
+async function retrieveCurrentEpoch(near) {
+  const status = await near.connection.provider.status();
+  const latestBlockHeight = status.sync_info.latest_block_height 
+  const valInfo = await reqValidatorsInfo(near, latestBlockHeight);
+
+  return computeEpochInfo(valInfo, latestBlockHeight);
+}
+
+function reqPoolGetTotalStakedBalance(account, poolAccountId) {
+  return account.viewFunction(poolAccountId, 'get_total_staked_balance', null).then((res) => new BN(res))
+}
+
+function reqPoolGetAccountStakedBalance(account, accountId, poolAccountId) {
+  return account.viewFunction(poolAccountId, 'get_account_staked_balance', {account_id: accountId}).then((res) => new BN(res))
+}
+
+function reqPoolGetAccountUnstakedBalance(account, accountId, poolAccountId) {
+  return account.viewFunction(poolAccountId, 'get_account_unstaked_balance', {account_id: accountId}).then((res) => new BN(res))
+}
+
+function executePing(account, poolAccountId) {
+  return account.functionCall(poolAccountId, 'ping', {}, '100000000000000')
+}
+
+function executeStakeUnstakeAction(account, action, contractId) {
+  return account.functionCall(contractId, action.method, {amount: action.amount.toString()})
+}
+
+function fetchStakingData(account, poolAccountId, delegatorAccountId): Promise<StakingData> {
+  return Promise.all([
+    reqPoolGetTotalStakedBalance(account, poolAccountId),
+    reqPoolGetAccountStakedBalance(account, delegatorAccountId, poolAccountId),
+    reqPoolGetAccountUnstakedBalance(account, delegatorAccountId, poolAccountId)
+  ])
+  .then(([poolTotalStake, poolDelegatorStakedBalance, poolDelegatorUnstakedBalance]) => {
+    return {
+      poolTotalStake,
+      poolDelegatorStakedBalance,
+      poolDelegatorUnstakedBalance
+    };
+  })
+
+}
+
+function generateConnectionConfig(nearConfig) {
+  return {
+    nodeUrl: nearConfig.nodeUrl || 'https://rpc.betanet.near.org',
+    networkId: nearConfig.networkId || 'betanet',
+    deps: {
+      keyStore: new nearApi.keyStores.UnencryptedFileSystemKeyStore(nearConfig.keystoreDir || undefined)
+    }
+  };
+}
+
+export {
+  retrieveCurrentEpoch,
+  fetchStakingData,
+  executePing,
+  executeStakeUnstakeAction,
+  generateConnectionConfig,
+  reqValidatorsInfo,
+  reqSeatPrices,
+  StakingData,
+}
+'''
+'''--- src/rebalancing/IRebalancingAction.ts ---
+
+interface IRebalancingAction {
+  method: 'stake' | 'unstake',
+  amount: string,
+};
+
+'''
+'''--- src/rebalancing/rebalancing-manager.ts ---
+import { createLoggerWithLabel } from "../logger-factory";
+import { fetchStakingData, reqSeatPrices, executePing, executeStakeUnstakeAction, retrieveCurrentEpoch } from "../near-utils";
+import { c2h } from "../utils";
+import { generateProposedAction, generateActionToExecute, actionToString } from "./stake-unstake-actions";
+
+export default class RebalancingManager {
+
+  logger = createLoggerWithLabel('Rebalancing');
+  lastEpochIdPinged = -1;
+
+  constructor(private near, private rebalancingConfig) {}
+
+  private async refreshStakingData(account) {
+    const {near, rebalancingConfig, logger} = this;
+
+    if (rebalancingConfig.autoping) {
+      // Auto-Pinging only every epoch for gas-saving purposes
+      let currentEpoch = await retrieveCurrentEpoch(near);
+      if (currentEpoch.id > this.lastEpochIdPinged) {
+        logger.log('info', `New epoch ${currentEpoch.id} - Ping-ing ${rebalancingConfig.validatorAccountId}...`)
+        try {
+          await executePing(account, rebalancingConfig.validatorAccountId);
+          this.lastEpochIdPinged = currentEpoch.id; 
+        }
+        catch (error) {
+          console.error(error)
+          logger.log('warn', `Ping failed : ${JSON.stringify(error)}`);
+        }
+
+      }
+    }
+    logger.log('info', `Fetching staking data ${rebalancingConfig.validatorAccountId}...`)
+    return fetchStakingData(account, rebalancingConfig.validatorAccountId, rebalancingConfig.delegatorAccountId);
+  }
+
+  private rebalancingReport(stakingData: any, proposedAction?: IRebalancingAction, actionToExecute?: IRebalancingAction, executionError?: any) {
+    const actionExecuted: boolean = !!actionToExecute && !executionError;
+    return Promise.resolve({
+      stakingData,
+      proposedAction,
+      actionToExecute,
+      result: {
+        actionExecuted,
+        error: executionError
+      }
+    });
+  }
+
+  public async checkAndRebalanceStakeForAccount(account) {
+    const {near, rebalancingConfig, logger} = this;
+
+    logger.log('info', 'Starting refresh...');
+    const stakingData = await this.refreshStakingData(account);
+    const seatPrices = await reqSeatPrices(near);
+    logger.log('info', `current seatPrice ${c2h(seatPrices.current)}, next seatPrice ${c2h(seatPrices.next)}, proposals seatPrice ${c2h(seatPrices.proposals)} poolStake ${c2h(stakingData.poolTotalStake)}, ratio ${c2h(stakingData.poolTotalStake)/c2h(seatPrices.next)} (desired range : [${rebalancingConfig.levels.lowThreshold}, ${rebalancingConfig.levels.highThreshold}])`);
+    const proposedAction = generateProposedAction(rebalancingConfig.levels, seatPrices.next, stakingData.poolTotalStake);
+    if (!proposedAction) {
+      logger.log('info', 'Current pool stake is conform to requirements. No action proposed.');
+      return this.rebalancingReport(stakingData);
+    }
+    logger.log('warn', `Proposed action : ${actionToString(proposedAction)}`);
+    const actionToExecute = generateActionToExecute(rebalancingConfig.policy, proposedAction, stakingData.poolDelegatorStakedBalance, stakingData.poolDelegatorUnstakedBalance);
+    if (!actionToExecute) {
+      logger.log('warn', `Won't execute proposed action : ${actionToString(proposedAction)}`) 
+      return this.rebalancingReport(stakingData, proposedAction);
+    }
+    logger.log('info', `Executing action : ${actionToString(proposedAction)}`)
+    return executeStakeUnstakeAction(account, actionToExecute, rebalancingConfig.validatorAccountId)
+    .then(async () => {
+      const newStakingData = await this.refreshStakingData(account);
+      logger.log('info', `poolStake ${c2h(newStakingData.poolTotalStake)}, ratio ${c2h(newStakingData.poolTotalStake)/c2h(seatPrices.next)} (desired range : [${rebalancingConfig.levels.lowThreshold}, ${rebalancingConfig.levels.highThreshold}])`);
+      return this.rebalancingReport(newStakingData, proposedAction, actionToExecute);
+    })
+    .catch(err => {
+      logger.log('error', 'Error while executing action', err);
+      return this.rebalancingReport(stakingData, proposedAction, actionToExecute, err);
+    });
+  }
+
+}
+'''
+'''--- src/rebalancing/stake-unstake-actions.ts ---
+import { c2h } from '../utils'
+import BN from 'bn.js'
+
+function generateProposedAction(rebalanceLevels, seatPrice, totalStakedInPool): IRebalancingAction | null {
+  const stakeSeatPriceRatio = totalStakedInPool / seatPrice;
+  if (stakeSeatPriceRatio < rebalanceLevels.lowThreshold) {
+    console.log(`Stake / Seat Price ratio (${stakeSeatPriceRatio}) below lowThreshold (${rebalanceLevels.lowThreshold})`);
+    const targetAmount = seatPrice.muln(rebalanceLevels.lowTarget);
+    const diffAmount = targetAmount.sub(totalStakedInPool);
+    return {
+      method: 'stake',
+      amount: diffAmount,
+    }
+  } 
+  if (stakeSeatPriceRatio > rebalanceLevels.highThreshold) {
+    console.log(`Stake / Seat Price ratio (${stakeSeatPriceRatio}) above highThreshold (${rebalanceLevels.highThreshold})`);
+    const targetAmount = seatPrice.muln(rebalanceLevels.highTarget);
+    const diffAmount = totalStakedInPool.sub(targetAmount);
+    return {
+      method: 'unstake',
+      amount: diffAmount,
+    }
+  }
+
+  return null;
+}
+
+function generateActionToExecute(rebalancePolicy, proposedAction, delegatorAccountStakedBalance, delegatorAccountUnstakedBalance): IRebalancingAction | null {
+  const minRebalanceAmount = (new BN(parseInt(rebalancePolicy.minRebalanceAmount))).mul(new BN(10).pow(new BN(24)));
+
+  if (proposedAction.method === 'unstake' && delegatorAccountStakedBalance.lt(proposedAction.amount)) {
+    console.warn(`Rebalancing policy set to ${rebalancePolicy.type} and delegator staked balance (${c2h(delegatorAccountStakedBalance)}) < proposed unstake amount (${c2h(proposedAction.amount)})`)
+    if (rebalancePolicy.type === 'BEST') {
+      if (delegatorAccountStakedBalance.gte(minRebalanceAmount)) {
+        return {
+          method: proposedAction.method,
+          amount: delegatorAccountStakedBalance,
+        };
+      }
+    }
+    return null;
+  }
+  if (proposedAction.method === 'stake' && delegatorAccountUnstakedBalance.lt(proposedAction.amount)) {
+    console.warn(`Rebalancing policy set to ${rebalancePolicy.type} and delegator unstaked balance (${c2h(delegatorAccountUnstakedBalance)}) < proposed stake amount (${c2h(proposedAction.amount)})`)
+    if (rebalancePolicy.type === 'BEST') {
+      if (delegatorAccountUnstakedBalance.gte(minRebalanceAmount)) {
+        return {
+          method: proposedAction.method,
+          amount: delegatorAccountUnstakedBalance,
+        };
+      }
+    }
+    return null;
+  }
+  return proposedAction;
+}
+
+function actionToString(action: IRebalancingAction): string {
+  return `${action.method} ${c2h(action.amount)}`
+}
+
+export {
+  generateProposedAction,
+  generateActionToExecute,
+  actionToString,
+}
+'''
+'''--- src/utils.ts ---
+
+// Yocta to Near
+function c2h(value): number {
+  return value.toString() / Math.pow(10,24)
+}
+
+function toPercentTwoDecimals(value) {
+  return Math.round(value * 10000) / 100;
+}
+
+function computeEpochId(blockHeight: number, epochLength: number, genesisHeight: number) {
+  return (blockHeight - genesisHeight) / epochLength;
+}
+
+function computeEpochProgress(blockHeight: number, epochLength: number, epochStartHeight: number) {
+  return (blockHeight - epochStartHeight) / epochLength;
+}
+
+// TODO type validatorInfo
+function computeEpochInfo(validatorInfo: any, blockHeight: number) {
+  const epochLength = validatorInfo.genesisConfig.epoch_length;
+  const epochStartHeight = validatorInfo.epoch_start_height;
+  const genesisHeight = validatorInfo.genesisConfig.genesis_height;
+  const epochId = computeEpochId(blockHeight, epochLength, genesisHeight);
+  return {
+    id: Math.floor(epochId),
+    idFloat: epochId,
+    startHeight: epochStartHeight,
+    progress: toPercentTwoDecimals(computeEpochProgress(blockHeight, epochLength, epochStartHeight)),
+    blocks: (blockHeight - epochStartHeight)
+  }
+}
+
+function computeValidatorInfo(validatorInfo: any, validatorAccountId: string) {
+  const validator = validatorInfo.current_validators.find(v => v.account_id === validatorAccountId);
+  if (validator) {
+    return {
+      expectedBlocks: validator.num_expected_blocks,
+      producedBlocks: validator.num_produced_blocks,
+      uptimeRatio: toPercentTwoDecimals(validator.num_produced_blocks / validator.num_expected_blocks)
+    }
+  }
+}
+
+function extractFeatureConfig(config: any, featureName: string) {
+  const {delegatorAccountId, validatorAccountId} = config;
+  return {
+    delegatorAccountId,
+    validatorAccountId,
+    ...config[featureName]
+  }
+}
+
+function isFeatureEnabled(config: any, featureName: string) {
+  const featureEnabledValue = config[featureName].enabled;
+  return featureEnabledValue === true || featureEnabledValue === 'true';
+}
+
+export {
+  c2h,
+  computeEpochInfo,
+  computeValidatorInfo,
+  extractFeatureConfig,
+  isFeatureEnabled,
+}
+'''
+'''--- tsconfig.json ---
+{
+  "compilerOptions": {
+    /* Visit https://aka.ms/tsconfig.json to read more about this file */
+
+    /* Basic Options */
+    // "incremental": true,                   /* Enable incremental compilation */
+    "target": "es5",                          /* Specify ECMAScript target version: 'ES3' (default), 'ES5', 'ES2015', 'ES2016', 'ES2017', 'ES2018', 'ES2019', 'ES2020', or 'ESNEXT'. */
+    "module": "commonjs",                     /* Specify module code generation: 'none', 'commonjs', 'amd', 'system', 'umd', 'es2015', 'es2020', or 'ESNext'. */
+    // "lib": [],                             /* Specify library files to be included in the compilation. */
+    "allowJs": true,                       /* Allow javascript files to be compiled. */
+    // "checkJs": true,                       /* Report errors in .js files. */
+    // "jsx": "preserve",                     /* Specify JSX code generation: 'preserve', 'react-native', or 'react'. */
+    // "declaration": true,                    /* Generates corresponding '.d.ts' file. */
+    // "declarationMap": true,                /* Generates a sourcemap for each corresponding '.d.ts' file. */
+    "sourceMap": true,                     /* Generates corresponding '.map' file. */
+    // "outFile": "dist/",                    /* Concatenate and emit output to single file. */
+    "outDir": "dist",                        /* Redirect output structure to the directory. */
+    "rootDir": "src",                       /* Specify the root directory of input files. Use to control the output directory structure with --outDir. */
+    // "composite": true,                     /* Enable project compilation */
+    // "tsBuildInfoFile": "./",               /* Specify file to store incremental compilation information */
+    // "removeComments": true,                /* Do not emit comments to output. */
+    // "noEmit": true,                        /* Do not emit outputs. */
+    // "importHelpers": true,                 /* Import emit helpers from 'tslib'. */
+    "downlevelIteration": true,            /* Provide full support for iterables in 'for-of', spread, and destructuring when targeting 'ES5' or 'ES3'. */
+    // "isolatedModules": true,               /* Transpile each file as a separate module (similar to 'ts.transpileModule'). */
+
+    /* Strict Type-Checking Options */
+    "strict": true,                           /* Enable all strict type-checking options. */
+    "noImplicitAny": false,                 /* Raise error on expressions and declarations with an implied 'any' type. */
+    // "strictNullChecks": true,              /* Enable strict null checks. */
+    // "strictFunctionTypes": true,           /* Enable strict checking of function types. */
+    // "strictBindCallApply": true,           /* Enable strict 'bind', 'call', and 'apply' methods on functions. */
+    // "strictPropertyInitialization": true,  /* Enable strict checking of property initialization in classes. */
+    // "noImplicitThis": true,                /* Raise error on 'this' expressions with an implied 'any' type. */
+    // "alwaysStrict": true,                  /* Parse in strict mode and emit "use strict" for each source file. */
+
+    /* Additional Checks */
+    // "noUnusedLocals": true,                /* Report errors on unused locals. */
+    // "noUnusedParameters": true,            /* Report errors on unused parameters. */
+    // "noImplicitReturns": true,             /* Report error when not all code paths in function return a value. */
+    // "noFallthroughCasesInSwitch": true,    /* Report errors for fallthrough cases in switch statement. */
+
+    /* Module Resolution Options */
+    "moduleResolution": "node",            /* Specify module resolution strategy: 'node' (Node.js) or 'classic' (TypeScript pre-1.6). */
+    // "baseUrl": "./",                       /* Base directory to resolve non-absolute module names. */
+    // "paths": {},                           /* A series of entries which re-map imports to lookup locations relative to the 'baseUrl'. */
+    // "rootDirs": [],                        /* List of root folders whose combined content represents the structure of the project at runtime. */
+    // "typeRoots": [],                       /* List of folders to include type definitions from. */
+    // "types": [],                           /* Type declaration files to be included in compilation. */
+    // "allowSyntheticDefaultImports": true,  /* Allow default imports from modules with no default export. This does not affect code emit, just typechecking. */
+    "esModuleInterop": true,                  /* Enables emit interoperability between CommonJS and ES Modules via creation of namespace objects for all imports. Implies 'allowSyntheticDefaultImports'. */
+    // "preserveSymlinks": true,              /* Do not resolve the real path of symlinks. */
+    // "allowUmdGlobalAccess": true,          /* Allow accessing UMD globals from modules. */
+
+    /* Source Map Options */
+    // "sourceRoot": "",                      /* Specify the location where debugger should locate TypeScript files instead of source locations. */
+    // "mapRoot": "",                         /* Specify the location where debugger should locate map files instead of generated locations. */
+    // "inlineSourceMap": true,               /* Emit a single file with source maps instead of having a separate file. */
+    // "inlineSources": true,                 /* Emit the source alongside the sourcemaps within a single file; requires '--inlineSourceMap' or '--sourceMap' to be set. */
+
+    /* Experimental Options */
+    // "experimentalDecorators": true,        /* Enables experimental support for ES7 decorators. */
+    // "emitDecoratorMetadata": true,         /* Enables experimental support for emitting type metadata for decorators. */
+
+    /* Advanced Options */
+    "skipLibCheck": true,                     /* Skip type checking of declaration files. */
+    "forceConsistentCasingInFileNames": true,  /* Disallow inconsistently-cased references to the same file. */
+    "resolveJsonModule": true
+  },
+  "lib": ["es2015"]
+}
+
+'''

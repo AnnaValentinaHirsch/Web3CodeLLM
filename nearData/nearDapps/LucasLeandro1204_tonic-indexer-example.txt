@@ -1,0 +1,1284 @@
+*GitHub Repository "LucasLeandro1204/tonic-indexer-example"*
+
+'''--- Cargo.toml ---
+[package]
+name = "indexer"
+version = "0.1.0"
+authors = ["Tonic Foundation <hello@tonic.foundation>"]
+edition = "2018"
+
+[dependencies]
+near-lake-framework = "0.5.0"
+
+# pin this version until we can update it in the dex
+near-sdk = "=4.0.0-pre.9"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.55"
+futures = "0.3.5"
+tokio = { version = "1.1", features = ["sync", "time", "macros", "rt-multi-thread"] }
+tokio-stream = { version = "0.1" }
+
+# app deps
+ansi_term = "0.12.1"
+anyhow = "1.0.52"
+bs58 = "0.4.0"
+clap = { version = "3.0.14", features = ["derive"] }
+tracing = "0.1.32"
+tracing-subscriber = { version = "0.3.9", features = ["env-filter"] }
+rand = { version = "0.8.5" }
+
+chrono = "0.4"
+diesel = { version = "1.4.8", features = ["chrono", "postgres", "r2d2"] }
+
+tonic-sdk = { git = "https://github.com/tonic-foundation/tonic-sdk-rs.git", branch = "master" }
+
+'''
+'''--- README.md ---
+[tonic-site]: https://tonic.foundation
+[diesel-cli]: https://github.com/diesel-rs/diesel/tree/master/diesel_cli
+[aws-cli]: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
+[running-a-node]: https://near-nodes.io/validator/compile-and-run-a-node#testnet
+[near-lake]: https://github.com/near/near-lake-framework-rs
+[tonic-deploy-block]: https://nearblocks.io/txns/3nQNWkwAK4hRydDM9i9AQUEABRgHoXvvczkWbGPiNaCY
+
+# Tonic DEX Indexer
+
+Example indexer using the [NEAR Lake Framework][near-lake] for saving trade data
+from [Tonic][tonic-site].
+
+## Developing
+
+**Prerequisites**
+
+- a working [Rust installation](https://rustup.rs/)
+- a Postgres instance that you control
+  - Docker users: a compose file is included in the repo
+- the [Diesel CLI][diesel-cli] (`cargo install diesel_cli --no-default-features --features postgres`)
+- an AWS account with permission to fetch from the NEAR lake S3 bucket
+
+<details>
+<summary>Required IAM permissions</summary>
+
+At a minimum, you need the following permissions
+
+```
+GetBucketLocation
+ListBucket
+GetObject
+```
+
+on the following resources
+
+```
+arn:aws:s3:::near-lake-data-mainnet
+arn:aws:s3:::near-lake-data-mainnet/*
+```
+
+A basic policy would be
+
+```terraform
+data "aws_iam_policy_document" "near_lake_reader_policy" {
+  statement {
+    sid = "AllowReadNearLakeBucket"
+
+    actions = [
+      "s3:GetBucketLocation",
+      "s3:ListBucket",
+      "s3:GetObject",
+    ]
+
+    resources = [
+      "arn:aws:s3:::near-lake-data-mainnet",
+      "arn:aws:s3:::near-lake-data-mainnet/*"
+    ]
+  }
+}
+
+resource "aws_iam_policy" "near_lake_reader_policy" {
+  name        = "near-lake-reader-policy"
+  description = "Allow access to the NEAR Lake S3 bucket"
+  policy      = data.aws_iam_policy_document.near_lake_reader_policy.json
+}
+```
+
+</details>
+
+**Set required environment variables**
+
+```bash
+export DATABASE_URL=postgres://postgres:test@localhost:5432/postgres
+export TONIC_CONTRACT_ID=v1.orderbook.near
+```
+
+**(Docker users only): Start dev postgres container**
+
+```
+docker compose up -d
+```
+
+**Run migrations**
+
+```
+diesel migration run
+```
+
+**Run indexer**
+
+When the indexer starts, it will check the database for the latest processed
+block number. If none is found, it starts from block 0. You can pass the
+`--from-blockheight` flag to start at a specific block. The official Tonic
+contract was [deployed in block 66,296,455][tonic-deploy-block].
+
+```bash
+# if you have Just
+just run --from-blockheight 66296455
+
+# or
+cargo run --release -- run --contract-ids $TONIC_CONTRACT_ID --from-blockheight 66296455
+```
+
+For all future runs, the flag can be omitted
+
+```bash
+# if you have Just
+just run
+
+# or
+cargo run --release -- run --contract-ids $TONIC_CONTRACT_ID
+```
+
+'''
+'''--- diesel.toml ---
+# For documentation on how to configure this file,
+# see diesel.rs/guides/configuring-diesel-cli
+
+[print_schema]
+file = "src/schema.rs"
+
+'''
+'''--- migrations/00000000000000_diesel_initial_setup/down.sql ---
+-- This file was automatically created by Diesel to setup helper functions
+-- and other internal bookkeeping. This file is safe to edit, any future
+-- changes will be added to existing projects as new migrations.
+
+DROP FUNCTION IF EXISTS diesel_manage_updated_at(_tbl regclass);
+DROP FUNCTION IF EXISTS diesel_set_updated_at();
+
+'''
+'''--- migrations/00000000000000_diesel_initial_setup/up.sql ---
+-- This file was automatically created by Diesel to setup helper functions
+-- and other internal bookkeeping. This file is safe to edit, any future
+-- changes will be added to existing projects as new migrations.
+
+-- Sets up a trigger for the given table to automatically set a column called
+-- `updated_at` whenever the row is modified (unless `updated_at` was included
+-- in the modified columns)
+--
+-- # Example
+--
+-- ```sql
+-- CREATE TABLE users (id SERIAL PRIMARY KEY, updated_at TIMESTAMP NOT NULL DEFAULT NOW());
+--
+-- SELECT diesel_manage_updated_at('users');
+-- ```
+CREATE OR REPLACE FUNCTION diesel_manage_updated_at(_tbl regclass) RETURNS VOID AS $$
+BEGIN
+    EXECUTE format('CREATE TRIGGER set_updated_at BEFORE UPDATE ON %s
+                    FOR EACH ROW EXECUTE PROCEDURE diesel_set_updated_at()', _tbl);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION diesel_set_updated_at() RETURNS trigger AS $$
+BEGIN
+    IF (
+        NEW IS DISTINCT FROM OLD AND
+        NEW.updated_at IS NOT DISTINCT FROM OLD.updated_at
+    ) THEN
+        NEW.updated_at := current_timestamp;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+'''
+'''--- migrations/2022-03-22-230442_init_indexer/down.sql ---
+-- This file should undo anything in `up.sql`
+
+-- views
+drop view tv_market;
+
+-- objects
+drop table market;
+drop table nep_141_token;
+
+-- events
+drop table market_event;
+drop table order_event;
+drop table fill_event;
+drop table cancel_event;
+
+drop function publish_event_to_channel;
+
+'''
+'''--- migrations/2022-03-22-230442_init_indexer/up.sql ---
+-- Your SQL goes here
+--
+-- indexer events
+--
+create table if not exists market_event (
+    id serial primary key,
+
+    receipt_id text not null,
+    created_at timestamp default current_timestamp,
+
+    market_id text not null,
+    base_token_id text not null,
+    quote_token_id text not null
+);
+
+create index market_event__receipt_id on market_event(receipt_id);
+
+create table if not exists order_event (
+    id serial primary key,
+
+    receipt_id text not null,
+    created_at timestamp default current_timestamp,
+
+    order_id text not null,
+    market_id text not null,
+    -- user_id text not null,
+    limit_price text not null,
+    quantity text not null,
+    side text not null,
+    order_type text not null
+);
+
+create index order_event__receipt_id on order_event(receipt_id);
+
+create table if not exists fill_event (
+    id serial primary key,
+
+    receipt_id text not null,
+    created_at timestamp default current_timestamp,
+
+    market_id text not null,
+    maker_order_id text not null,
+    -- maker_user_id text not null,
+    taker_order_id text not null,
+    -- taker_user_id text not null,
+    fill_qty text not null,
+    fill_price text not null,
+    quote_qty text not null,
+    taker_fee text not null,
+    maker_rebate text not null
+);
+
+create index fill_event__receipt_id on fill_event(receipt_id);
+
+-- for recent trades
+create index fill_event__market_id__created_at on fill_event(market_id, created_at);
+
+create table if not exists cancel_event (
+    id serial primary key,
+
+    receipt_id text not null,
+    created_at timestamp default current_timestamp,
+
+    market_id text not null,
+    order_id text not null,
+    refund_amount text not null,
+    refund_token text not null
+);
+
+create index cancel_event__receipt_id on cancel_event(receipt_id);
+
+--
+-- "hard objects"
+--
+create table if not exists nep_141_token (
+    id varchar(64) primary key,
+    spec text default 'ft-1.0.0',
+    name text not null,
+    symbol text not null,
+    decimals smallint not null,
+    icon text,
+    reference text,
+    reference_hash text,
+    created_at timestamp default current_timestamp
+);
+
+create table if not exists market (
+    id text primary key,
+    symbol text not null,
+    base_decimals smallint not null,
+    quote_decimals smallint not null,
+    base_token_id varchar(64) references nep_141_token(id),
+    quote_token_id varchar(64) references nep_141_token(id),
+    created_at timestamp default current_timestamp
+);
+
+create index market__symbol on market(symbol);
+
+--
+-- views
+--
+create
+or replace view tv_market as
+select
+    m.id as market_id,
+    m.symbol as market_symbol,
+    b.decimals as base_decimals,
+    q.decimals as quote_decimals
+from
+    market as m
+    join nep_141_token as b on m.base_token_id = b.id
+    join nep_141_token as q on m.quote_token_id = q.id;
+
+--
+-- triggers
+--
+create or replace function publish_event_to_channel()
+returns trigger
+as $$
+begin
+    perform pg_notify(tg_argv[0]::text, row_to_json(new)::text);
+    return new;
+end;
+$$ language plpgsql;
+
+create trigger publish after insert on market_event
+for each row execute function publish_event_to_channel('market');
+
+create trigger publish after insert on order_event
+for each row execute function publish_event_to_channel('order');
+
+create trigger publish after insert on fill_event
+for each row execute function publish_event_to_channel('fill');
+
+create trigger publish after insert on cancel_event
+for each row execute function publish_event_to_channel('cancel');
+
+'''
+'''--- migrations/2022-04-24-192617_add_fee_and_account_id_fields/down.sql ---
+-- This file should undo anything in `up.sql`
+alter table fill_event add column taker_fee text not null default '0';
+
+alter table order_event drop column account_id;
+
+alter table order_event drop column taker_fee;
+'''
+'''--- migrations/2022-04-24-192617_add_fee_and_account_id_fields/up.sql ---
+-- Your SQL goes here
+alter table fill_event drop column taker_fee;
+
+alter table order_event add column account_id text not null default '';
+
+alter table order_event add column taker_fee text not null default '0';
+'''
+'''--- migrations/2022-05-02-162037_add_lot_size_fields/down.sql ---
+-- This file should undo anything in `up.sql`
+
+alter table market drop column base_lot_size;
+alter table market drop column quote_lot_size;
+
+'''
+'''--- migrations/2022-05-02-162037_add_lot_size_fields/up.sql ---
+-- Your SQL goes here
+
+alter table market add column base_lot_size text not null default '';
+alter table market add column quote_lot_size text not null default '';
+
+'''
+'''--- migrations/2022-05-04-204517_add_indices_on_fill_and_order_events/down.sql ---
+-- This file should undo anything in `up.sql`
+
+-- undo deletion of fill_event__market_id__created_at
+create index fill_event__market_id__created_at on fill_event(market_id, created_at);
+
+-- undo creation of new indices on fill_event
+drop index fill_event_market_id;
+drop index fill_event_market_id_created_at_desc;
+drop index fill_event_maker_order_id;
+drop index fill_event_taker_order_id;
+
+-- undo creation of new indices on order_event
+drop index order_event_market_id;
+drop index order_event_account_id;
+drop index order_event_order_id;
+
+'''
+'''--- migrations/2022-05-04-204517_add_indices_on_fill_and_order_events/up.sql ---
+-- Your SQL goes here
+
+-- remove the existing fill_event__market_id__created_at index 
+drop index fill_event__market_id__created_at;
+
+-- create indices on fill_event table
+create index fill_event_market_id on fill_event(market_id);
+create index fill_event_market_id_created_at_desc on fill_event(market_id, created_at desc);
+create index fill_event_maker_order_id on fill_event(maker_order_id);
+create index fill_event_taker_order_id on fill_event(taker_order_id);
+
+-- create indices on order_event table
+create index order_event_market_id  on order_event(market_id);
+create index order_event_account_id on order_event(account_id);
+create index order_event_order_id   on order_event(order_id);
+
+'''
+'''--- migrations/2022-05-04-213658_add_mat_views_for_trade_candles/down.sql ---
+DROP MATERIALIZED VIEW candle_5m;
+DROP MATERIALIZED VIEW candle_15m;
+DROP MATERIALIZED VIEW candle_30m;
+DROP MATERIALIZED VIEW candle_60m;
+
+DROP INDEX candle_5m_market_time;
+DROP INDEX candle_15m_market_time;
+DROP INDEX candle_30m_market_time;
+DROP INDEX candle_60m_market_time;
+'''
+'''--- migrations/2022-05-04-213658_add_mat_views_for_trade_candles/up.sql ---
+--
+-- 5 minute candles
+--
+CREATE MATERIALIZED VIEW IF NOT EXISTS candle_5m AS (
+  SELECT DISTINCT
+    market_id,
+    to_timestamp(floor((extract('epoch' from created_at) / 300 )) * 300) as t,
+    first_value(fill_price) OVER w as o,
+    min(fill_price) OVER w as l,
+    max(fill_price) OVER w as h,
+    last_value(fill_price) OVER w as c,
+    sum(fill_qty::numeric) OVER w as v,
+    rank() OVER w as the_rank
+  FROM
+    fill_event
+  WINDOW w AS (PARTITION BY market_id, to_timestamp(floor((extract('epoch' from created_at) / 300 )) * 300))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS candle_5m_market_time ON candle_5m (market_id, t);
+
+--
+-- 15 minute candles
+--
+CREATE MATERIALIZED VIEW IF NOT EXISTS candle_15m AS (
+  SELECT DISTINCT
+    market_id,
+    to_timestamp(floor((extract('epoch' from created_at) / 900 )) * 900) as t,
+    first_value(fill_price) OVER w as o,
+    min(fill_price) OVER w as l,
+    max(fill_price) OVER w as h,
+    last_value(fill_price) OVER w as c,
+    sum(fill_qty::numeric) OVER w as v,
+    rank() OVER w as the_rank
+  FROM
+    fill_event
+  WINDOW w AS (PARTITION BY market_id, to_timestamp(floor((extract('epoch' from created_at) / 900 )) * 900))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS candle_15m_market_time ON candle_15m (market_id, t);
+
+--
+-- 30 minute candles
+--
+CREATE MATERIALIZED VIEW IF NOT EXISTS candle_30m AS (
+  SELECT DISTINCT
+    market_id,
+    to_timestamp(floor((extract('epoch' from created_at) / 1800 )) * 1800) as t,
+    first_value(fill_price) OVER w as o,
+    min(fill_price) OVER w as l,
+    max(fill_price) OVER w as h,
+    last_value(fill_price) OVER w as c,
+    sum(fill_qty::numeric) OVER w as v,
+    rank() OVER w as the_rank
+  FROM
+    fill_event
+  WINDOW w AS (PARTITION BY market_id, to_timestamp(floor((extract('epoch' from created_at) / 1800 )) * 1800))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS candle_30m_market_time ON candle_30m (market_id, t);
+
+--
+-- 60 minute candles
+--
+CREATE MATERIALIZED VIEW IF NOT EXISTS candle_60m AS (
+  SELECT DISTINCT
+    market_id,
+    to_timestamp(floor((extract('epoch' from created_at) / 3600 )) * 3600) as t,
+    first_value(fill_price) OVER w as o,
+    min(fill_price) OVER w as l,
+    max(fill_price) OVER w as h,
+    last_value(fill_price) OVER w as c,
+    sum(fill_qty::numeric) OVER w as v,
+    rank() OVER w as the_rank
+  FROM
+    fill_event
+  WINDOW w AS (PARTITION BY market_id, to_timestamp(floor((extract('epoch' from created_at) / 3600 )) * 3600))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS candle_60m_market_time ON candle_60m (market_id, t);
+
+'''
+'''--- migrations/2022-05-05-195628_add_unique_symbols_constraint_to_market_table/down.sql ---
+-- This file should undo anything in `up.sql`
+ALTER TABLE market DROP CONSTRAINT unique_symbol;
+'''
+'''--- migrations/2022-05-05-195628_add_unique_symbols_constraint_to_market_table/up.sql ---
+-- Your SQL goes here
+ALTER TABLE market ADD CONSTRAINT unique_symbol UNIQUE (symbol);
+
+'''
+'''--- migrations/2022-05-10-014809_add_fee_and_account_fields/down.sql ---
+-- This file should undo anything in `up.sql`
+alter table order_event drop column referrer_rebate;
+alter table order_event drop column referrer_id;
+
+alter table fill_event drop column is_bid;
+alter table fill_event drop column taker_account_id;
+alter table fill_event drop column maker_account_id;
+'''
+'''--- migrations/2022-05-10-014809_add_fee_and_account_fields/up.sql ---
+-- Your SQL goes here
+alter table order_event add column referrer_rebate text not null default '0';
+alter table order_event add column referrer_id text default null;
+
+alter table fill_event add column is_bid boolean not null;
+alter table fill_event add column taker_account_id text not null;
+alter table fill_event add column maker_account_id text not null;
+'''
+'''--- migrations/2022-07-05-203321_add_latest_processed_block/down.sql ---
+-- This file should undo anything in `up.sql`
+drop table indexer_processed_block;
+'''
+'''--- migrations/2022-07-05-203321_add_latest_processed_block/up.sql ---
+-- Your SQL goes here
+create table indexer_processed_block (
+    block_height integer primary key,
+    processed_at timestamp default current_timestamp
+);
+'''
+'''--- migrations/2022-07-06-004221_add_visible_market_column/down.sql ---
+-- This file should undo anything in `up.sql`
+alter table
+    market drop column visible;
+'''
+'''--- migrations/2022-07-06-004221_add_visible_market_column/up.sql ---
+-- Your SQL goes here
+alter table
+    market
+add
+    column visible boolean default false;
+'''
+'''--- migrations/2022-07-10-060747_add_is_swap_column/down.sql ---
+-- This file should undo anything in `up.sql`
+alter table
+    order_event drop column is_swap;
+'''
+'''--- migrations/2022-07-10-060747_add_is_swap_column/up.sql ---
+-- Your SQL goes here
+alter table
+    order_event
+add
+    column is_swap boolean default false;
+'''
+'''--- src/configs.rs ---
+use clap::Parser;
+use tracing_subscriber::EnvFilter;
+
+#[derive(Parser, Debug)]
+#[clap(
+    version = "0.0.1",
+    author = "Tonic Foundation <hello@tonic.foundation>"
+)]
+pub(crate) struct Opts {
+    #[clap(subcommand)]
+    pub subcmd: SubCommand,
+}
+
+#[derive(Parser, Debug)]
+pub(crate) enum SubCommand {
+    Run(RunConfigArgs),
+}
+
+#[derive(Parser, Debug)]
+pub(crate) struct RunConfigArgs {
+    /// contracts to watch for (comma-separated). Omit to process all contracts
+    #[clap(long)]
+    pub contract_ids: Option<Vec<String>>,
+
+    #[clap(long)]
+    pub from_blockheight: Option<u64>,
+}
+
+pub(crate) fn init_logging() {
+    let env_filter = EnvFilter::new(
+        "nearcore=info,tonic=info,tonic-tps=info,tokio_reactor=info,near=info,stats=info,telemetry=info,indexer=info,near-performance-metrics=info",
+    );
+    tracing_subscriber::fmt::Subscriber::builder()
+        .with_env_filter(env_filter)
+        .with_writer(std::io::stderr)
+        .init();
+}
+
+'''
+'''--- src/constants.rs ---
+pub const TARGET: &'static str = "tonic";
+
+'''
+'''--- src/db.rs ---
+use std::env;
+
+use diesel::pg::PgConnection;
+use diesel::r2d2::{ConnectionManager, Pool};
+
+pub type PgPool = Pool<ConnectionManager<PgConnection>>;
+
+pub fn connect() -> PgPool {
+    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let manager = ConnectionManager::<PgConnection>::new(database_url);
+    Pool::builder()
+        .build(manager)
+        .expect("Error getting connection pool")
+}
+
+'''
+'''--- src/event.rs ---
+/// Implements NEP-297 (Events standard) parsing.
+/// https://github.com/near/NEPs/pull/298/files
+use tonic_sdk::events::Event as DexEvent;
+
+// const EVENT_PREFIX: &'static str = "EVENT_JSON:";
+const EVENT_PREFIX: &'static str = "";
+const PREFIX_LENGTH: usize = EVENT_PREFIX.len();
+
+/// Return true if the string starts with [`EVENT_PREFIX`]
+pub fn is_event_log(s: &str) -> bool {
+    // true
+    s.starts_with(EVENT_PREFIX)
+}
+
+fn extract_event_str(s: &str) -> String {
+    s.chars().skip(PREFIX_LENGTH).collect()
+}
+
+pub fn parse_dex_event(s: &str) -> Result<DexEvent, serde_json::Error> {
+    let extracted = extract_event_str(s);
+    serde_json::from_str::<DexEvent>(&extracted)
+}
+
+'''
+'''--- src/main.rs ---
+#[macro_use]
+extern crate diesel;
+
+use db::PgPool;
+use models::get_latest_processed_block;
+use std::sync::{Arc, Mutex};
+use tokio::time::{self, Duration};
+
+use anyhow::Result;
+use clap::Parser;
+use tracing::info;
+
+use configs::{init_logging, Opts, SubCommand};
+
+use futures::StreamExt;
+use near_lake_framework::LakeConfigBuilder;
+
+use crate::constants::TARGET;
+
+mod configs;
+mod constants;
+mod db;
+mod event;
+mod models;
+mod schema;
+mod tps_counter;
+mod worker;
+
+#[tokio::main]
+async fn main() -> Result<(), tokio::io::Error> {
+    init_logging();
+
+    let opts: Opts = Opts::parse();
+
+    match opts.subcmd {
+        SubCommand::Run(cli_config) => {
+            info!(target: TARGET, "Connecting to DB");
+            let db_pool = db::connect();
+
+            let conn = db_pool.get().expect("Unable to get connection");
+            let latest_processed = get_latest_processed_block(&conn).unwrap();
+            let starting_block = cli_config.from_blockheight.unwrap_or(latest_processed);
+            info!(target: TARGET, "Starting from block {}", starting_block);
+            let lake_config = LakeConfigBuilder::default()
+                .mainnet()
+                .start_block_height(starting_block)
+                .build()
+                .expect("Failed to build LakeConfig");
+            let (_, stream) = near_lake_framework::streamer(lake_config);
+
+            let wrapped_counter = create_tps_counter();
+            let wrapped_counter_copy = wrapped_counter.clone(); // hack
+            tokio::spawn(async move {
+                let mut log_interval = time::interval(Duration::from_secs(30));
+                loop {
+                    log_interval.tick().await;
+                    let mut counter = wrapped_counter_copy.lock().unwrap();
+                    tps_counter::lap_and_log_tps(&mut counter);
+                }
+            });
+
+            let worker = create_worker(db_pool);
+            let mut handlers = tokio_stream::wrappers::ReceiverStream::new(stream)
+                .map(|m| {
+                    let mut counter = wrapped_counter.lock().unwrap();
+                    counter.add(1);
+                    worker.process_message(m)
+                })
+                .buffer_unordered(1usize);
+
+            while let Some(_) = handlers.next().await {}
+            drop(handlers)
+        }
+    }
+
+    Ok(())
+}
+
+fn create_worker(pool: PgPool) -> worker::Worker {
+    info!(target: TARGET, "Starting worker");
+    worker::Worker::new(None, pool)
+}
+
+fn create_tps_counter() -> Arc<Mutex<tps_counter::TpsCounter>> {
+    let tps_counter = tps_counter::TpsCounter::default();
+    let mutex_tps_counter: Mutex<tps_counter::TpsCounter> = Mutex::new(tps_counter);
+    Arc::new(mutex_tps_counter)
+}
+
+'''
+'''--- src/models.rs ---
+use chrono::NaiveDateTime;
+use diesel::prelude::*;
+use diesel::result::QueryResult;
+
+use tonic_sdk::events;
+use tonic_sdk::json::Base58VecU8;
+use tonic_sdk::types::{OrderType, Side};
+
+use crate::schema;
+use crate::schema::*;
+
+fn base58_encode(data: &Base58VecU8) -> String {
+    bs58::encode(&data.0).into_string()
+}
+
+fn order_type_to_string(order_type: OrderType) -> String {
+    use OrderType::*;
+    match order_type {
+        Limit => "limit",
+        ImmediateOrCancel => "ioc",
+        PostOnly => "postOnly",
+        FillOrKill => "fillOrKill",
+        Market => "market",
+    }
+    .to_string()
+}
+
+#[derive(Insertable)]
+#[table_name = "cancel_event"]
+pub struct NewCancelEvent {
+    receipt_id: String,
+    market_id: String,
+    order_id: String,
+    refund_amount: String,
+    refund_token: String,
+    created_at: NaiveDateTime,
+}
+
+pub fn save_new_cancel_event<'a>(
+    conn: &PgConnection,
+    receipt_id: String,
+    created_at: NaiveDateTime,
+    ev: events::NewCancelEvent,
+) -> QueryResult<()> {
+    let data: Vec<NewCancelEvent> = ev
+        .cancels
+        .iter()
+        .map(|c| NewCancelEvent {
+            receipt_id: receipt_id.clone(),
+            market_id: base58_encode(&ev.market_id.into()),
+            order_id: base58_encode(&c.order_id.into()),
+            refund_amount: c.refund_amount.0.to_string(),
+            refund_token: c.refund_token.key(),
+            created_at,
+        })
+        .collect();
+
+    diesel::insert_into(schema::cancel_event::table)
+        .values(&data)
+        .execute(conn)?;
+
+    Ok(())
+}
+
+#[derive(Insertable)]
+#[table_name = "fill_event"]
+pub struct NewFillEvent {
+    receipt_id: String,
+    market_id: String,
+    maker_order_id: String,
+    taker_order_id: String,
+    fill_qty: String,
+    fill_price: String,
+    quote_qty: String,
+    maker_rebate: String,
+    created_at: NaiveDateTime,
+    /// Whether the taker order was a bid
+    is_bid: bool,
+    taker_account_id: String,
+    maker_account_id: String,
+}
+
+pub fn save_new_fill_event<'a>(
+    conn: &PgConnection,
+    receipt_id: String,
+    created_at: NaiveDateTime,
+    ev: events::NewFillEvent,
+) -> QueryResult<()> {
+    let taker_order_id = base58_encode(&ev.order_id.into());
+    let data: Vec<NewFillEvent> = ev
+        .fills
+        .iter()
+        .map(|f| NewFillEvent {
+            receipt_id: receipt_id.clone(),
+            market_id: base58_encode(&ev.market_id.into()),
+            fill_price: f.fill_price.0.to_string(),
+            fill_qty: f.fill_qty.0.to_string(),
+            quote_qty: f.quote_qty.0.to_string(),
+            maker_rebate: f.maker_rebate.0.to_string(),
+            maker_order_id: base58_encode(&f.maker_order_id.into()),
+            taker_order_id: taker_order_id.clone(),
+            is_bid: f.side == Side::Buy,
+            taker_account_id: f.taker_account_id.to_string(),
+            maker_account_id: f.maker_account_id.to_string(),
+            created_at,
+        })
+        .collect();
+
+    diesel::insert_into(schema::fill_event::table)
+        .values(&data)
+        .execute(conn)?;
+
+    Ok(())
+}
+
+#[derive(Insertable)]
+#[table_name = "market_event"]
+pub struct NewMarketEvent {
+    receipt_id: String,
+    market_id: String,
+    base_token_id: String,
+    quote_token_id: String,
+    created_at: NaiveDateTime,
+}
+
+pub fn save_new_market_event<'a>(
+    conn: &PgConnection,
+    receipt_id: String,
+    created_at: NaiveDateTime,
+    ev: events::NewMarketEvent,
+) -> QueryResult<()> {
+    let data = NewMarketEvent {
+        receipt_id,
+        market_id: base58_encode(&ev.market_id.into()),
+        base_token_id: ev.base_token.key(),
+        quote_token_id: ev.quote_token.key(),
+        created_at,
+    };
+
+    diesel::insert_into(schema::market_event::table)
+        .values(&data)
+        .execute(conn)?;
+
+    Ok(())
+}
+
+#[derive(Insertable)]
+#[table_name = "order_event"]
+pub struct NewOrderEvent {
+    account_id: String,
+    receipt_id: String,
+    order_id: String,
+    market_id: String,
+    limit_price: String,
+    quantity: String,
+    side: String,
+    order_type: String,
+    taker_fee: String,
+    created_at: NaiveDateTime,
+    referrer_id: Option<String>,
+    referrer_rebate: String,
+    is_swap: bool,
+}
+
+pub fn save_new_order_event<'a>(
+    conn: &PgConnection,
+    receipt_id: String,
+    created_at: NaiveDateTime,
+    ev: events::NewOrderEvent,
+) -> QueryResult<()> {
+    let data = NewOrderEvent {
+        receipt_id,
+        account_id: ev.account_id.to_string(),
+        order_id: base58_encode(&ev.order_id.into()),
+        limit_price: ev.limit_price.0.to_string(),
+        market_id: base58_encode(&ev.market_id.into()),
+        order_type: order_type_to_string(ev.order_type),
+        quantity: ev.quantity.0.to_string(),
+        side: ev.side.to_string(),
+        taker_fee: ev.taker_fee.0.to_string(),
+        referrer_id: ev.referrer_id.map(|r| r.into()),
+        referrer_rebate: ev.referrer_rebate.0.to_string(),
+        created_at,
+        is_swap: ev.is_swap,
+    };
+
+    diesel::insert_into(schema::order_event::table)
+        .values(&data)
+        .execute(conn)?;
+
+    Ok(())
+}
+
+#[derive(Insertable)]
+#[table_name = "indexer_processed_block"]
+pub struct IndexerProcessedBlock {
+    block_height: i32,
+}
+
+pub fn get_latest_processed_block<'a>(conn: &PgConnection) -> QueryResult<u64> {
+    use schema::indexer_processed_block::dsl::*;
+    let res = indexer_processed_block
+        .order_by(block_height.desc())
+        .select(block_height)
+        .first::<i32>(conn);
+
+    match res {
+        Ok(latest) => Ok(latest as u64),
+        Err(e) => match e {
+            diesel::NotFound => Ok(0),
+            _ => panic!("Error getting latest block {:?}", e),
+        },
+    }
+}
+
+pub fn save_latest_processed_block<'a>(conn: &PgConnection, block_height: u64) -> QueryResult<()> {
+    diesel::insert_into(schema::indexer_processed_block::table)
+        .values(&IndexerProcessedBlock {
+            block_height: block_height as i32,
+        })
+        .execute(conn)?;
+
+    Ok(())
+}
+
+'''
+'''--- src/schema.rs ---
+table! {
+    cancel_event (id) {
+        id -> Int4,
+        receipt_id -> Text,
+        created_at -> Nullable<Timestamp>,
+        market_id -> Text,
+        order_id -> Text,
+        refund_amount -> Text,
+        refund_token -> Text,
+    }
+}
+
+table! {
+    fill_event (id) {
+        id -> Int4,
+        receipt_id -> Text,
+        created_at -> Nullable<Timestamp>,
+        market_id -> Text,
+        maker_order_id -> Text,
+        taker_order_id -> Text,
+        fill_qty -> Text,
+        fill_price -> Text,
+        quote_qty -> Text,
+        maker_rebate -> Text,
+        is_bid -> Bool,
+        taker_account_id -> Text,
+        maker_account_id -> Text,
+    }
+}
+
+table! {
+    indexer_processed_block (block_height) {
+        block_height -> Int4,
+        processed_at -> Nullable<Timestamp>,
+    }
+}
+
+table! {
+    market (id) {
+        id -> Text,
+        symbol -> Text,
+        base_decimals -> Int2,
+        quote_decimals -> Int2,
+        base_token_id -> Nullable<Varchar>,
+        quote_token_id -> Nullable<Varchar>,
+        created_at -> Nullable<Timestamp>,
+        base_lot_size -> Text,
+        quote_lot_size -> Text,
+        visible -> Nullable<Bool>,
+    }
+}
+
+table! {
+    market_event (id) {
+        id -> Int4,
+        receipt_id -> Text,
+        created_at -> Nullable<Timestamp>,
+        market_id -> Text,
+        base_token_id -> Text,
+        quote_token_id -> Text,
+    }
+}
+
+table! {
+    nep_141_token (id) {
+        id -> Varchar,
+        spec -> Nullable<Text>,
+        name -> Text,
+        symbol -> Text,
+        decimals -> Int2,
+        icon -> Nullable<Text>,
+        reference -> Nullable<Text>,
+        reference_hash -> Nullable<Text>,
+        created_at -> Nullable<Timestamp>,
+    }
+}
+
+table! {
+    order_event (id) {
+        id -> Int4,
+        receipt_id -> Text,
+        created_at -> Nullable<Timestamp>,
+        order_id -> Text,
+        market_id -> Text,
+        limit_price -> Text,
+        quantity -> Text,
+        side -> Text,
+        order_type -> Text,
+        account_id -> Text,
+        taker_fee -> Text,
+        referrer_rebate -> Text,
+        referrer_id -> Nullable<Text>,
+        is_swap -> Nullable<Bool>,
+    }
+}
+
+allow_tables_to_appear_in_same_query!(
+    cancel_event,
+    fill_event,
+    indexer_processed_block,
+    market,
+    market_event,
+    nep_141_token,
+    order_event,
+);
+
+'''
+'''--- src/tps_counter.rs ---
+use chrono::{DateTime, Duration, Utc};
+use tracing::info;
+
+/// Basic DEX event counter. Note that when restarting the indexer, the stats
+/// may appear artificially high as the indexer syncs up to head.
+#[derive(Default)]
+pub struct TpsCounter {
+    lap_start: Option<DateTime<Utc>>,
+    lap_count: u32,
+}
+
+impl TpsCounter {
+    /// Start a new lap. Return the previous lap start, lap count, lap duration, and tps.
+    pub fn lap(&mut self) -> (DateTime<Utc>, u32, Duration, f64) {
+        let (prev_start, prev_count) = (self.lap_start.unwrap_or_else(Utc::now), self.lap_count);
+
+        self.lap_start = Some(Utc::now());
+        self.lap_count = 0;
+
+        let elapsed = self.lap_start.unwrap() - prev_start;
+        let tps = prev_count as f64 / elapsed.num_seconds() as f64;
+        (prev_start, prev_count, elapsed, tps)
+    }
+
+    /// Add to the count. Return lap count after addition.
+    pub fn add(&mut self, number: u32) -> u32 {
+        self.lap_count += number;
+        self.lap_count
+    }
+}
+
+pub fn lap_and_log_tps(tps_counter: &mut TpsCounter) {
+    let (start, count, elapsed, tps) = tps_counter.lap();
+
+    let message = format!(
+        "TPS since {}: {:.2} ({} total in {} seconds)",
+        start,
+        tps,
+        count,
+        elapsed.num_seconds()
+    );
+
+    info!(
+        target: "tonic-tps",
+        "{}",
+        ansi_term::Colour::Cyan.bold().paint(message)
+    );
+}
+
+'''
+'''--- src/worker.rs ---
+use diesel::{Connection, PgConnection};
+use rand::Rng;
+use std::convert::TryInto;
+
+use chrono::NaiveDateTime;
+use near_lake_framework::near_indexer_primitives::views::{
+    ExecutionStatusView, ReceiptEnumView, ReceiptView,
+};
+use near_lake_framework::near_indexer_primitives::IndexerExecutionOutcomeWithReceipt;
+use tracing::{error, info};
+
+use tonic_sdk::events::{Event as DexEvent, EventType as DexEventType};
+
+use crate::constants::TARGET;
+use crate::db::PgPool;
+use crate::event;
+use crate::models::{self, save_latest_processed_block};
+
+pub struct Worker {
+    contract_ids: Option<Vec<String>>,
+    db_pool: PgPool,
+}
+
+impl Worker {
+    pub fn new(contract_ids: Option<Vec<String>>, db_pool: PgPool) -> Self {
+        Self {
+            contract_ids,
+            db_pool,
+        }
+    }
+}
+
+impl Worker {
+    pub async fn process_message(
+        &self,
+        streamer_message: near_lake_framework::near_indexer_primitives::StreamerMessage,
+    ) {
+        let conn = self.db_pool.get().expect("Unable to get connection");
+        let block_height = streamer_message.block.header.height;
+
+        // process each block as a transaction
+        let res = conn.transaction::<_, diesel::result::Error, _>(|| {
+            for shard in streamer_message.shards {
+                for o in shard.receipt_execution_outcomes {
+                    if self.should_save(&o) {
+                        let block_timestamp_ns = streamer_message.block.header.timestamp_nanosec;
+                        save_execution_outcome(&conn, o, block_timestamp_ns)?;
+                    }
+                }
+            }
+            // unique constraint on block number will roll back (ie, skip) dupes
+            save_latest_processed_block(&conn, block_height)?;
+
+            Ok(())
+        });
+
+        if let Err(e) = res {
+            error!(
+                target: TARGET,
+                "Error saving block {}, {:?}", block_height, e
+            );
+        }
+    }
+
+    pub fn should_save(&self, o: &IndexerExecutionOutcomeWithReceipt) -> bool {
+        if matches!(
+            o.execution_outcome.outcome.status,
+            ExecutionStatusView::Unknown | ExecutionStatusView::Failure(_)
+        ) {
+            return false;
+        }
+        if o.execution_outcome.outcome.logs.is_empty() {
+            return false;
+        }
+        match &self.contract_ids {
+            Some(contracts_to_watch) => {
+                let contract_id: String = o.receipt.receiver_id.to_string();
+                contracts_to_watch.contains(&contract_id)
+            }
+            None => true,
+        }
+    }
+}
+
+fn save_execution_outcome(
+    conn: &PgConnection,
+    o: IndexerExecutionOutcomeWithReceipt,
+    block_timestamp_ns: u64,
+) -> diesel::result::QueryResult<()> {
+    for log in o.execution_outcome.outcome.logs {
+        if !event::is_event_log(&log) {
+            continue;
+        }
+        if let Ok(ev) = event::parse_dex_event(&log) {
+            save_event(conn, ev, &o.receipt, block_timestamp_ns)?
+        }
+    }
+
+    Ok(())
+}
+
+fn save_event(
+    conn: &PgConnection,
+    ev: DexEvent,
+    receipt: &ReceiptView,
+    block_timestamp_ns: u64,
+) -> diesel::result::QueryResult<()> {
+    use models::*;
+
+    if !matches!(receipt.receipt, ReceiptEnumView::Action { .. }) {
+        return Ok(());
+    }
+
+    let receipt_id = receipt.receipt_id.to_string();
+    let (timestamp_ms, excess_ns) = (
+        block_timestamp_ns / 1_000_000_000,
+        block_timestamp_ns % 1_000_000_000,
+    );
+    let timestamp = NaiveDateTime::from_timestamp(
+        timestamp_ms.try_into().unwrap(),
+        excess_ns.try_into().unwrap(),
+    );
+
+    let now = std::time::Instant::now();
+    match ev.data {
+        DexEventType::NewMarket(ev) => save_new_market_event(&conn, receipt_id, timestamp, ev)?,
+        DexEventType::Order(ev) => save_new_order_event(&conn, receipt_id, timestamp, ev)?,
+        DexEventType::Fill(ev) => save_new_fill_event(&conn, receipt_id, timestamp, ev)?,
+        DexEventType::Cancel(ev) => save_new_cancel_event(&conn, receipt_id, timestamp, ev)?,
+    };
+    // log 1% of events
+    let mut rng = rand::thread_rng();
+    if rng.gen_range(0.0..1.0) < 0.01 {
+        let elapsed = now.elapsed();
+        info!(target: TARGET, "Wrote event in {:.2?}", elapsed);
+    }
+
+    Ok(())
+}
+
+'''

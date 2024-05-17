@@ -1,0 +1,502 @@
+*GitHub Repository "Learn-NEAR-Club/near_crowdfunding_ncd"*
+
+'''--- Cargo.toml ---
+[package]
+name = "crowdfunding"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "3.1.0"
+url = "2.2.2"
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+# Opt into extra safety checks on arithmetic operations https://stackoverflow.com/a/64136471/249801
+overflow-checks = true
+
+'''
+'''--- README.md ---
+ # Crowdfunding
+ What make it different?
+ We will implement vesting approach for distribute funding.
+ With each interval, every supporter need to vote to release or cancel this funding
+
+## TODO
+- Implement DAO for each interval
+- admin fns to control this dapp
+### new
+```sh
+near call $ID new '{}' --accountId $ID
+```
+### new_project
+```sh
+// Create new job: job_creator.testnet
+near call $ID new_project '{}' --accountId job_creator.testnet --amount 1
+```
+### support_project
+```sh
+near call $ID support_project '{"project_id": "'$PID'"}' --accountId job_worker.testnet --amount 2
+```
+
+### get_claimable_amount
+```sh
+near view $ID get_claimable_amount '{"project_id": "'$PID'"}'
+```
+
+### claim_reward
+```sh
+near call $ID claim_reward '{"project_id": "'$PID'"}' --accountId job_worker.testnet 
+```
+
+//TODO: Force stop cases:
+//TODO: Create new project and call force_stop 
+### force_stop
+```sh
+near call $ID force_stop '{"project_id": "'$PID'"}' --accountId job_worker.testnet 
+
+```
+
+'''
+'''--- neardev/dev-account.env ---
+CONTRACT_NAME=dev-1649861340702-41828352204902
+'''
+'''--- src/actions_of_project.rs ---
+use crate::*;
+
+#[near_bindgen]
+impl Contract {
+    //attach 1 Near to create a project (services fee)
+    #[payable]
+    pub fn new_project(&mut self, metadata: Option<ProjectMetadata>) -> ProjectId {
+        let owner: AccountId = env::predecessor_account_id().into();
+        let project = Project {
+            owner_id: owner.clone(),
+        };
+
+        let mut metadata = {
+            if metadata.is_some() {
+                metadata.unwrap()
+            } else {
+                ProjectMetadata::default()
+            }
+        };
+
+        assert!(
+            env::attached_deposit() == NEAR_DECIMAL,
+            "Attach exactly 1 Near to create new project"
+        );
+
+        assert!(
+            metadata.title.len() <= MAX_TITLE_LENGTH,
+            "Title's too long!"
+        );
+
+        assert!(
+            valid_url(metadata.clone().description),
+            "Submit description as an ipfs url"
+        );
+
+        assert!(
+            metadata.ended_at > env::block_timestamp(),
+            "Endtime is not valid"
+        );
+
+        metadata.started_at = env::block_timestamp();
+
+        let project_id = gen_proj_id();
+        self.project.insert(&project_id, &project);
+        self.project_metadata.insert(&project_id, &metadata);
+
+        //Add project to owner
+        let mut owner_projects =
+            self.project_per_owner
+                .get(&owner.clone())
+                .unwrap_or(UnorderedSet::new(StorageKey::ProjectPerOwnerInner {
+                    id: owner.clone(),
+                }));
+        owner_projects.insert(&project_id);
+        self.project_per_owner.insert(&owner, &owner_projects);
+
+        //TODO: assert metadata
+        assert!(
+            metadata.title.len() <= MAX_TITLE_LENGTH,
+            "Title's too long!"
+        );
+
+        assert!(
+            valid_url(metadata.clone().description),
+            "Submit description as an ipfs url"
+        );
+
+        assert!(
+            metadata.ended_at > env::block_timestamp(),
+            "Endtime is not valid"
+        );
+
+        metadata.started_at = env::block_timestamp();
+
+        let project_id = gen_proj_id();
+        self.project.insert(&project_id, &project);
+        self.project_metadata.insert(&project_id, &metadata);
+
+        //Add project to owner
+        let mut owner_projects =
+            self.project_per_owner
+                .get(&owner.clone())
+                .unwrap_or(UnorderedSet::new(StorageKey::ProjectPerOwnerInner {
+                    id: owner.clone(),
+                }));
+        owner_projects.insert(&project_id);
+        self.project_per_owner.insert(&owner, &owner_projects);
+        project_id
+    }
+
+    #[payable]
+    //Return current balance of sender
+    pub fn support_project(&mut self, project_id: ProjectId) -> Balance {
+        let amount = env::attached_deposit();
+
+        let mut metadata = self
+            .project_metadata
+            .get(&project_id)
+            .expect("Project doesn't exist!");
+        let mut funded = u128::from(metadata.funded);
+        let minimum_deposit = u128::from(metadata.minimum_deposit);
+
+        assert!(
+            amount >= minimum_deposit,
+            "Donation must greater than {}",
+            minimum_deposit
+        );
+
+        assert!(
+            metadata.ended_at >= env::block_timestamp(),
+            "Donation time is ended"
+        );
+
+        funded += amount;
+        metadata.funded = U128(funded);
+        self.project_metadata.insert(&project_id, &metadata);
+
+        //Update balance of supporter
+        let supporter: AccountId = env::predecessor_account_id().into();
+        let mut supporters =
+            self.supporters_per_project
+                .get(&project_id)
+                .unwrap_or(UnorderedMap::new(StorageKey::SupporterPerProjectInner {
+                    id: supporter.clone(),
+                }));
+
+        let mut my_balance = supporters.get(&supporter).unwrap_or(0_u128);
+        my_balance += amount;
+        supporters.insert(&supporter.into(), &my_balance);
+        self.supporters_per_project.insert(&project_id, &supporters);
+
+        my_balance
+    }
+}
+
+'''
+'''--- src/actions_of_reward.rs ---
+use near_sdk::{ext_contract, PromiseResult};
+
+use crate::*;
+
+#[near_bindgen]
+impl Contract {
+    pub fn claim_reward(&mut self, project_id: ProjectId) -> Balance {
+        let _project = self
+            .project
+            .get(&project_id)
+            .expect("Project doesn't exists!");
+
+        assert!(
+            !self.is_force_stop(project_id.clone()),
+            "The reward is forced stop by the community!!"
+        );
+
+        let beneficiry = env::predecessor_account_id().into();
+
+        let amount = self.get_claimable_amount(project_id.clone());
+        env::log(format!("Amount to claim = {}", amount).as_bytes());
+
+        assert!(amount > 0, "There is nothing to claim at the moment");
+
+        Promise::new(beneficiry)
+            .transfer(amount)
+            .then(ext_self::on_reward_transfer(
+                project_id,
+                amount,
+                &env::current_account_id(),
+                0,
+                DEFAULT_GAS_FEE,
+            ));
+        amount
+    }
+
+    //Calculate percent of each contributor after event ended
+    //TODO: Send reward back to supporters after project forced stop
+}
+
+#[ext_contract(ext_self)]
+pub trait ExtProjectReward {
+    fn on_reward_transfer(&mut self, project_id: ProjectId, amount: Balance) -> bool;
+}
+
+#[near_bindgen]
+impl Contract {
+    #[private]
+    pub fn on_reward_transfer(&mut self, project_id: ProjectId, amount: Balance) -> bool {
+        match env::promise_result(0) {
+            PromiseResult::Successful(_) => {
+                let mut metadata = self.project_metadata.get(&project_id).unwrap();
+                metadata.claimed = U128::from(u128::from(metadata.claimed) + amount);
+                self.project_metadata.insert(&project_id, &metadata);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+'''
+'''--- src/actions_of_supporters.rs ---
+use crate::*;
+
+//Implement a simple DAO for supporters
+
+#[near_bindgen]
+impl Contract {
+    pub fn force_stop(&mut self, project_id: ProjectId) {
+        let supporters = self
+            .supporters_per_project
+            .get(&project_id.clone())
+            .expect("Project not found");
+        let _ = supporters
+            .get(&env::predecessor_account_id())
+            .expect("You are not a supporter!");
+
+        let mut force_stop = self
+            .force_stop_project
+            .get(&project_id)
+            .unwrap_or(UnorderedSet::new(StorageKey::ForceStopProjectInner {
+                id: project_id.clone(),
+            }));
+
+        force_stop.insert(&env::predecessor_account_id());
+        self.force_stop_project.insert(&project_id, &force_stop);
+    }
+}
+
+'''
+'''--- src/constants.rs ---
+use crate::*;
+
+pub const MAX_TITLE_LENGTH: usize = 100;
+pub const DEFAULT_GAS_FEE: Gas = 20_000_000_000_000;
+pub const NEAR_DECIMAL: Balance = 1_000_000_000_000_000_000_000_000;
+
+pub type ProjectId = String;
+
+#[derive(BorshStorageKey, BorshSerialize)]
+pub(crate) enum StorageKey {
+    ProjectPerOwner,
+    Project,
+    ProjectPerOwnerInner { id: AccountId },
+    ProjectMetadata,
+    SupportersPerProject,
+    SupporterPerProjectInner { id: AccountId },
+    ForceStopProject,
+    ForceStopProjectInner { id: ProjectId },
+}
+
+'''
+'''--- src/lib.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::{LookupMap, UnorderedMap, UnorderedSet};
+use near_sdk::json_types::U128;
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{
+    env, near_bindgen, setup_alloc, AccountId, Balance, BorshStorageKey, Gas, PanicOnDefault,
+    Promise, Timestamp,
+};
+
+pub use crate::actions_of_project::*;
+pub use crate::actions_of_reward::*;
+pub use crate::actions_of_supporters::*;
+pub use crate::constants::*;
+pub use crate::project::*;
+pub use crate::utils::*;
+
+mod actions_of_project;
+mod actions_of_reward;
+mod actions_of_supporters;
+mod constants;
+mod project;
+mod utils;
+
+setup_alloc!();
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Contract {
+    pub owner_id: AccountId,
+    pub project_per_owner: LookupMap<AccountId, UnorderedSet<ProjectId>>,
+    pub project: LookupMap<ProjectId, Project>,
+    pub project_metadata: UnorderedMap<ProjectId, ProjectMetadata>,
+    pub supporters_per_project: LookupMap<ProjectId, UnorderedMap<AccountId, Balance>>,
+    pub force_stop_project: LookupMap<ProjectId, UnorderedSet<AccountId>>, //TODO: Add creator to blacklist
+}
+
+#[near_bindgen]
+impl Contract {
+    #[init]
+    pub fn new() -> Self {
+        Self {
+            owner_id: env::predecessor_account_id(),
+            project_per_owner: LookupMap::new(StorageKey::ProjectPerOwner),
+            project: LookupMap::new(StorageKey::Project),
+            project_metadata: UnorderedMap::new(StorageKey::ProjectMetadata),
+            supporters_per_project: LookupMap::new(StorageKey::SupportersPerProject),
+            force_stop_project: LookupMap::new(StorageKey::ForceStopProject),
+        }
+    }
+}
+
+'''
+'''--- src/project.rs ---
+use crate::*;
+use near_sdk::Duration;
+
+pub enum ProjectStatus {
+    NotStarted,
+    CrowdFunding,
+    Vesting,
+    Ended,
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Project {
+    pub owner_id: AccountId,
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, PartialEq, Debug, Clone)]
+#[serde(crate = "near_sdk::serde")]
+pub struct ProjectMetadata {
+    pub title: String,
+    pub description: String,
+    pub target: U128,
+    pub minimum_deposit: U128,
+    pub started_at: Timestamp,
+    pub ended_at: Timestamp,
+    pub funded: U128,
+
+    //vesting
+    pub vesting_start_time: Timestamp,
+    pub vesting_end_time: Timestamp,
+    pub vesting_interval: Duration,
+    pub claimed: U128,
+    pub force_stop: Vec<AccountId>,
+}
+
+impl Default for ProjectMetadata {
+    fn default() -> Self {
+        Self {
+            title: "Default title".to_string(),
+            description: "https://app.pinata.cloud/pinmanager".to_string(),
+            target: U128(NEAR_DECIMAL * 100),    //100 Near
+            minimum_deposit: U128(NEAR_DECIMAL), //1 Near
+            started_at: env::block_timestamp(),
+            ended_at: env::block_timestamp() + 1_000_000_000 /*1s*/ * 60, // 60 seconds
+            funded: U128(0),
+            vesting_start_time: env::block_timestamp() + 1_000_000_000 * 60,
+            vesting_end_time: env::block_timestamp() + 1_000_000_000 * 180, // 180 seconds
+            vesting_interval: 1_000_000_000 * 30,                           // 30 seconds
+            claimed: U128(0),
+            force_stop: vec![],
+        }
+    }
+}
+
+#[near_bindgen]
+impl Contract {
+    //TODO: implement view method for project
+    pub fn get_claimable_amount(&self, project_id: ProjectId) -> Balance {
+        let current_ts = env::block_timestamp();
+
+        let metadata = self
+            .project_metadata
+            .get(&project_id)
+            .expect("Project doesn't exists!");
+
+        let claimable_amount = {
+            if current_ts < metadata.vesting_start_time {
+                0
+            } else if current_ts >= metadata.vesting_end_time {
+                u128::from(metadata.funded) - u128::from(metadata.claimed)
+            } else {
+                let cur_intervals: u64 =
+                    (current_ts - metadata.vesting_start_time) / metadata.vesting_interval;
+                let total_intervals: u64 = self.get_number_of_miletones(project_id.clone());
+                u128::from(metadata.funded) / u128::from(total_intervals)
+                    * u128::from(cur_intervals)
+                    - u128::from(metadata.claimed)
+            }
+        };
+
+        //Check force_stop
+        if self.is_force_stop(project_id) {
+            return 0;
+        }
+        claimable_amount
+    }
+
+    pub fn is_force_stop(&self, project_id: ProjectId) -> bool {
+        if let Some(force_stop) = self.force_stop_project.get(&project_id.clone()) {
+            let supporters_len = self.supporters_per_project.get(&project_id).unwrap().len();
+            let force_stop_len = force_stop.len();
+
+            if force_stop_len > supporters_len / 2 {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn get_number_of_miletones(&self, project_id: ProjectId) -> u64 {
+        let metadata = self
+            .project_metadata
+            .get(&project_id)
+            .expect("Project doesn't exists!");
+
+        (metadata.vesting_end_time - metadata.vesting_start_time) / metadata.vesting_interval
+    }
+
+    pub fn get_project_status(&self, project_id: ProjectId) {}
+}
+
+'''
+'''--- src/utils.rs ---
+use crate::*;
+use url::Url;
+
+pub fn gen_proj_id() -> ProjectId {
+    env::predecessor_account_id() + "#" + &env::block_index().to_string()
+}
+
+pub fn valid_url(maybe_url: String) -> bool {
+    return Url::parse(&maybe_url).is_ok();
+}
+
+'''

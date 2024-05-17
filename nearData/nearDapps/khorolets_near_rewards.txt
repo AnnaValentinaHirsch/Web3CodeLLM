@@ -1,0 +1,811 @@
+*GitHub Repository "khorolets/near_rewards"*
+
+'''--- .github/workflows/rust.yml ---
+name: Rust
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+    - name: Check
+      run: cargo check
+    - name: Clippy
+      run: cargo check
+    - name: Run tests
+      run: cargo test --verbose
+
+'''
+'''--- Cargo.toml ---
+[package]
+name = "near-rewards"
+version = "0.6.1"
+authors = ["Bohdan Khorolets <b@khorolets.com>"]
+edition = "2018"
+
+[dependencies]
+base64 = "0.21.0"
+borsh = "0.10.3"
+clap = { version = "4.2.7", features = ["derive"] }
+colored = "2"
+dirs = "3.0.1"
+futures = "0.3.28"
+near-sdk = "4.1.1"
+prettytable-rs = "0.10.0"
+reqwest = { version = "0.11.17", features = ["json"] }
+serde = { version = "1.0.162", features = ["derive"] }
+serde_json = "1.0.96"
+tokio = { version = "1.28.0", features = ["full"] }
+uint = { version = "0.9.5", default-features = false }
+'''
+'''--- README.md ---
+# near_rewards
+
+Small console application to check the staking rewards for ~~lockup~~ accounts on [NEAR protocol](https://near.org)
+
+## Example result:
+
+![near_reward result example](docs/near_rewards.png)
+
+## Prerequisites
+
+This utility requires Rust. To install, run:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+([Official documentation](https://www.rust-lang.org/tools/install))
+
+Follow the directions which includes running:
+
+```bash
+source $HOME/.cargo/env
+```
+
+## Usage
+
+1. Create a `near_rewards` folder inside your home directory.
+
+2. In `near_rewards` create a file `accounts.json` with the following structure:
+
+```json
+[
+  {
+    "account_id": "account.near",
+    "pool_account_id": "pool.poolv1.near"
+  }
+]
+```
+
+OR
+
+```json
+[
+  {
+    "account_id": "account.lockup.near",
+    "key": "ed25519:FQxoGzhKW129Vq8Uk8WqeSV1e8z3oJFMC1UbN6z6yBHT"
+  }
+]
+```
+
+~~_**Note:** This tool only works for lockup accounts._~~
+
+The tool works for any account in NEAR
+
+3. Run `cargo install --git https://github.com/khorolets/near_rewards` in your terminal.
+4. Run `near-rewards` in your terminal.
+
+'''
+'''--- src/configs.rs ---
+use clap::Parser;
+
+/// NEAR Rewards
+/// Checks the rewards of lockup accounts
+#[derive(Parser, Debug)]
+#[command(author, about, version, long_about = None)]
+pub(crate) struct Opts {
+    /// Sets a custom near_rewards dir. Defaults to ~/near_rewards
+    #[arg(long)]
+    pub home_dir: Option<std::path::PathBuf>,
+    #[arg(short, long)]
+    pub verbose: bool,
+    /// Provide a custom RPC server URL
+    #[arg(long, default_value = "https://rpc.mainnet.near.org")]
+    pub rpc_url: String,
+}
+
+'''
+'''--- src/main.rs ---
+use std::collections::HashSet;
+
+use clap::Parser;
+
+#[macro_use]
+extern crate prettytable;
+use prettytable::{color, Attr, Cell, Row, Table};
+
+use near_jsonrpc_client::NearJsonRpcClient;
+use primitives::Account;
+use utils::{collect_account_data, reward_diff};
+
+mod configs;
+mod near_jsonrpc_client;
+mod primitives;
+mod utils;
+
+const EPOCH_LENGTH: u64 = 43200;
+
+fn print_table(table: &Table, reward_sum: f64, liquid_balance_sum: f64, price: f32) {
+    let mut table = table.clone();
+
+    table.add_row(Row::new(vec![
+        Cell::new(format!("{:.2}", (reward_sum as f32)).as_str())
+            .with_hspan(2)
+            .style_spec("brFg"),
+        Cell::new(format!("{:.2}", (liquid_balance_sum as f32)).as_str())
+            .with_hspan(4)
+            .style_spec("bFc"),
+    ]));
+
+    table.add_row(Row::new(vec![
+        Cell::new(format!("${:.2}", price * (reward_sum as f32)).as_str())
+            .with_hspan(2)
+            .style_spec("brFg"),
+        Cell::new(format!("${:.2}", price * (liquid_balance_sum as f32)).as_str())
+            .with_hspan(4)
+            .style_spec("bFc"),
+    ]));
+
+    table.printstd();
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let opts: configs::Opts = configs::Opts::parse();
+
+    let home_dir = opts
+        .home_dir
+        .unwrap_or_else(|| match dirs::home_dir() {
+            Some(path) => path.join("near_rewards"),
+            None => panic!("Unavailable to use default path ~/near_rewards/. Try to run `near_rewards --home-dir ~/near_rewards`"),
+        });
+
+    let mut accounts_file: Vec<Account> = match utils::read_accounts(home_dir) {
+        Ok(s) => serde_json::from_str(&s).unwrap(),
+        Err(err) => {
+            panic!("File read error: {}", err);
+        }
+    };
+
+    let client = NearJsonRpcClient::new(opts.rpc_url);
+
+    let current_block = match client.get_final_block().await {
+        Ok(block) => block,
+        Err(err) => panic!("Error: {}", err),
+    };
+
+    let epoch_start_height = match client.get_validators().await {
+        Ok(validators) => validators.epoch_start_height,
+        Err(err) => panic!("Error: {}", err),
+    };
+
+    // TODO: Improve this, we may end up in missing block so we want
+    // somehow to increment the amount of block we subtract from epoch_start_height
+    let prev_epoch_block = match client.get_block(epoch_start_height - 6).await {
+        Ok(block) => block,
+        Err(err) => panic!("Error: {}", err),
+    };
+
+    let current_position_in_epoch =
+        utils::current_position_in_epoch(epoch_start_height, current_block.header.height);
+
+    let mut reward_sum = 0_f64;
+    let mut liquid_balance_sum = 0_f64;
+
+    let price = utils::binance_price().await.unwrap_or(0.0);
+
+    let mut table = Table::new();
+    table.add_row(Row::new(vec![
+        Cell::new(format!("Epoch progress: {}%", current_position_in_epoch).as_str()).with_hspan(2),
+        Cell::new("NEAR-USDT (Binance)").with_hspan(2),
+        Cell::new(format!("${}", price).as_str())
+            .with_hspan(1)
+            .with_style(Attr::ForegroundColor(color::GREEN)),
+    ]));
+
+    table.add_row(row![
+        "LOCKUP ACCOUNT",
+        "REWARD",
+        "LIQUID",
+        "UNSTAKED",
+        "NATIVE",
+        "POOL",
+    ]);
+
+    println!("Fetching accounts data...");
+
+    let mut alredy_fetched_liquid_balance_accounts: HashSet<String> = HashSet::new();
+
+    accounts_file.sort_by(|a, b| a.key.cmp(&b.key));
+
+    for mut account in accounts_file {
+        let account_at_current_block =
+            collect_account_data(&client, &mut account, current_block.clone()).await;
+
+        let account_at_prev_epoch =
+            collect_account_data(&client, &mut account, prev_epoch_block.clone()).await;
+
+        reward_sum += utils::human(account_at_current_block.reward);
+
+        let liquid_balance = if alredy_fetched_liquid_balance_accounts
+            .get(&account.account_id)
+            .is_none()
+        {
+            alredy_fetched_liquid_balance_accounts.insert(account.account_id.clone());
+            account_at_current_block.liquid_balance
+        } else {
+            0
+        };
+
+        liquid_balance_sum += utils::human(liquid_balance);
+
+        table.add_row(Row::new(vec![
+            Cell::new(
+                account
+                    .account_id
+                    .chars()
+                    .take(14)
+                    .collect::<String>()
+                    .as_str(),
+            )
+            .with_style(Attr::Bold)
+            .with_style(Attr::ForegroundColor(color::WHITE)),
+            Cell::new(&format!(
+                "{} {}",
+                utils::current_reward(account_at_current_block.reward),
+                &reward_diff(
+                    account_at_current_block.reward,
+                    account_at_prev_epoch.reward,
+                ),
+            )),
+            Cell::new(&format!(
+                "{:.2}",
+                utils::human(account_at_current_block.liquid_balance)
+            ))
+            .with_style(Attr::ForegroundColor(color::CYAN)),
+            Cell::new(&format!(
+                "{:.2}",
+                utils::human(
+                    account_at_current_block
+                        .account_in_pool
+                        .get_unstaked_balance(),
+                )
+            ))
+            .style_spec(if account_at_current_block.account_in_pool.can_withdraw {
+                "Fy"
+            } else {
+                "Fr"
+            }),
+            Cell::new(&format!(
+                "{:.2}",
+                utils::human(account_at_current_block.native_balance)
+            )),
+            Cell::new(account.get_pool_account_id(&client).await.unwrap().as_str()),
+        ]));
+        if opts.verbose {
+            print_table(&table, reward_sum, liquid_balance_sum, price);
+        }
+    }
+    if !opts.verbose {
+        print_table(&table, reward_sum, liquid_balance_sum, price);
+    }
+    Ok(())
+}
+
+'''
+'''--- src/near_jsonrpc_client.rs ---
+use base64::Engine;
+use serde_json::json;
+
+use crate::primitives::{
+    AccountInPoolResponse, AccountInPoolResult, Block, BlockResponse, Response, Validators,
+    ValidatorsResponse, ViewAccountResponse,
+};
+
+#[derive(Debug)]
+pub(crate) struct NearJsonRpcClient {
+    endpoint: String,
+}
+
+impl NearJsonRpcClient {
+    pub fn new(endpoint: String) -> Self {
+        NearJsonRpcClient { endpoint }
+    }
+
+    pub async fn get_locked_amount(
+        &self,
+        account_id: String,
+        block_height: u64,
+    ) -> Result<u128, reqwest::Error> {
+        let params = json!({
+            "jsonrpc": "2.0",
+            "id": "dontcare",
+            "method": "query",
+            "params": json!({
+                "request_type": "call_function",
+                "block_id": block_height,
+                "account_id": account_id,
+                "method_name": "get_locked_amount",
+                "args_base64": ""
+            })
+        });
+
+        let client = reqwest::Client::new();
+        let res = client.post(&self.endpoint).json(&params).send().await?;
+
+        let body: Response = res.json().await?;
+
+        Ok(body.result.get_amount())
+    }
+
+    pub async fn get_liquid_owners_balance(
+        &self,
+        account_id: String,
+        block_height: u64,
+    ) -> Result<u128, reqwest::Error> {
+        let params = json!({
+            "jsonrpc": "2.0",
+            "id": "dontcare",
+            "method": "query",
+            "params": json!({
+                "request_type": "call_function",
+                "block_id": block_height,
+                "account_id": account_id,
+                "method_name": "get_liquid_owners_balance",
+                "args_base64": ""
+            })
+        });
+
+        let client = reqwest::Client::new();
+        let res = client.post(&self.endpoint).json(&params).send().await?;
+
+        let body: Response = res.json().await?;
+
+        Ok(body.result.get_amount())
+    }
+
+    pub async fn get_account_in_pool(
+        &self,
+        account_id: String,
+        pool_account_id: String,
+        block_height: u64,
+    ) -> Result<AccountInPoolResult, reqwest::Error> {
+        let params = json!({
+            "jsonrpc": "2.0",
+            "id": "dontcare",
+            "method": "query",
+            "params": json!({
+                "request_type": "call_function",
+                "block_id": block_height,
+                "account_id": pool_account_id,
+                "method_name": "get_account",
+                "args_base64": base64::engine::general_purpose::STANDARD.encode(json!({"account_id": account_id}).to_string()),
+            })
+        });
+
+        let client = reqwest::Client::new();
+        let res = client.post(&self.endpoint).json(&params).send().await?;
+
+        let body: AccountInPoolResponse = res.json().await?;
+
+        let account_in_pool: AccountInPoolResult =
+            serde_json::from_slice(&body.result.result[..]).unwrap();
+
+        Ok(account_in_pool)
+    }
+
+    pub async fn get_native_balance(
+        &self,
+        account_id: String,
+        block_height: u64,
+    ) -> Result<u128, reqwest::Error> {
+        let params = json!({
+            "jsonrpc": "2.0",
+            "id": "dontcare",
+            "method": "query",
+            "params": json!({
+                "request_type": "view_account",
+                "block_id": block_height,
+                "account_id": account_id,
+            })
+        });
+
+        let client = reqwest::Client::new();
+        let res = client.post(&self.endpoint).json(&params).send().await?;
+
+        let body: ViewAccountResponse = res.json().await?;
+
+        Ok(body.result.get_amount())
+    }
+
+    pub async fn get_validators(&self) -> Result<Validators, reqwest::Error> {
+        let params = json!({
+            "jsonrpc": "2.0",
+            "id": "dontcare",
+            "method": "validators",
+            "params": json!({"latest": null}),
+        });
+
+        let client = reqwest::Client::new();
+
+        let res = client.post(&self.endpoint).json(&params).send().await?;
+
+        let body: ValidatorsResponse = res.json().await?;
+
+        Ok(body.result)
+    }
+
+    pub async fn get_block(&self, block_height: u64) -> Result<Block, reqwest::Error> {
+        let params = json!({
+            "jsonrpc": "2.0",
+            "id": "dontcare",
+            "method": "block",
+            "params": json!({"block_id": block_height}),
+        });
+
+        let client = reqwest::Client::new();
+
+        let res = client.post(&self.endpoint).json(&params).send().await?;
+
+        let body: BlockResponse = res.json().await?;
+
+        Ok(body.result)
+    }
+
+    pub async fn get_final_block(&self) -> Result<Block, reqwest::Error> {
+        let params = json!({
+            "jsonrpc": "2.0",
+            "id": "dontcare",
+            "method": "block",
+            "params": json!({"finality": "final"}),
+        });
+
+        let client = reqwest::Client::new();
+
+        let res = client.post(&self.endpoint).json(&params).send().await?;
+
+        let body: BlockResponse = res.json().await?;
+
+        Ok(body.result)
+    }
+    pub async fn get_staking_pool_account_id(
+        &self,
+        account_id: String,
+    ) -> Result<String, reqwest::Error> {
+        let params = json!({
+            "jsonrpc": "2.0",
+            "id": "dontcare",
+            "method": "query",
+            "params": json!({
+                "request_type": "call_function",
+                "finality": "final",
+                "account_id": account_id,
+                "method_name": "get_staking_pool_account_id",
+                "args_base64": "e30="
+            })
+        });
+
+        let client = reqwest::Client::new();
+        let res = client.post(&self.endpoint).json(&params).send().await?;
+
+        let body: AccountInPoolResponse = res.json().await?;
+
+        let pool_account_id: String = serde_json::from_slice(&body.result.result[..]).unwrap();
+        Ok(pool_account_id)
+    }
+}
+
+'''
+'''--- src/primitives.rs ---
+use crate::near_jsonrpc_client::NearJsonRpcClient;
+use borsh::{self, BorshDeserialize, BorshSerialize};
+use serde::{self, Deserialize};
+
+#[derive(Debug, Deserialize, BorshDeserialize, Clone)]
+pub(crate) struct Response {
+    pub result: ResponseResult,
+}
+
+#[derive(Debug, Deserialize, BorshDeserialize, Clone)]
+pub(crate) struct ResponseResult {
+    pub result: Vec<u8>,
+}
+
+impl ResponseResult {
+    pub fn get_amount(self) -> u128 {
+        String::from_utf8(self.result)
+            .unwrap()
+            .trim_matches('"')
+            .parse::<u128>()
+            .unwrap()
+    }
+}
+
+#[derive(Debug, Deserialize, BorshDeserialize)]
+pub(crate) struct ViewAccountResponse {
+    pub result: ViewAccountResult,
+}
+
+#[derive(Debug, Deserialize, BorshDeserialize)]
+pub(crate) struct ViewAccountResult {
+    pub amount: String,
+}
+
+impl ViewAccountResult {
+    pub fn get_amount(self) -> u128 {
+        self.amount.trim_matches('"').parse::<u128>().unwrap()
+    }
+}
+
+#[derive(Debug, Deserialize, BorshDeserialize)]
+pub(crate) struct AccountInPoolResponse {
+    pub result: ResponseResult,
+}
+
+#[derive(Debug, Deserialize, BorshSerialize, BorshDeserialize)]
+pub(crate) struct AccountInPoolResult {
+    pub account_id: String,
+    pub unstaked_balance: String,
+    pub staked_balance: String,
+    pub can_withdraw: bool,
+}
+
+impl AccountInPoolResult {
+    pub fn get_staked_balance(&self) -> u128 {
+        self.staked_balance
+            .trim_matches('"')
+            .parse::<u128>()
+            .unwrap()
+    }
+
+    pub fn get_unstaked_balance(&self) -> u128 {
+        self.unstaked_balance
+            .trim_matches('"')
+            .parse::<u128>()
+            .unwrap()
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub(crate) struct Account {
+    /// Value used to identify the account.
+    pub key: Option<String>,
+    pub account_id: String,
+    pub pool_account_id: Option<String>,
+    pub locked_amount: Option<String>,
+}
+
+impl Account {
+    pub async fn get_pool_account_id(&mut self, client: &NearJsonRpcClient) -> Option<String> {
+        if self.pool_account_id.is_none() {
+            self.pool_account_id = client
+                .get_staking_pool_account_id(self.account_id.clone())
+                .await
+                .ok();
+        }
+        self.pool_account_id.clone()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ValidatorsResponse {
+    pub result: Validators,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct Validators {
+    pub epoch_start_height: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct BlockResponse {
+    pub result: Block,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub(crate) struct Block {
+    pub header: BlockHeader,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub(crate) struct BlockHeader {
+    pub height: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct AccountBalancesAtBlock {
+    pub account_in_pool: AccountInPoolResult,
+    pub native_balance: u128,
+    pub liquid_balance: u128,
+    pub reward: u128,
+}
+
+'''
+'''--- src/utils/accounts.rs ---
+use colored::*;
+
+use crate::near_jsonrpc_client::NearJsonRpcClient;
+use crate::primitives::{Account, AccountBalancesAtBlock, Block};
+use crate::utils;
+
+pub(crate) async fn collect_account_data(
+    client: &NearJsonRpcClient,
+    account: &mut Account,
+    block: Block,
+) -> AccountBalancesAtBlock {
+    let account_in_pool = match client
+        .get_account_in_pool(
+            account.clone().account_id,
+            account
+                .get_pool_account_id(client)
+                .await
+                .expect("Unable to get the pool"),
+            block.header.height,
+        )
+        .await
+    {
+        Ok(account) => account,
+        Err(err) => {
+            panic!("Error: {}", err);
+        }
+    };
+    let locked_amount: u128 = if let Some(amount) = &account.locked_amount {
+        if let Ok(amount) = amount.parse() {
+            amount
+        } else {
+            0
+        }
+    } else {
+        match client
+            .get_locked_amount(account.clone().account_id, block.header.height)
+            .await
+        {
+            Ok(amount) => amount,
+            Err(_err) => 0,
+        }
+    };
+    let native_balance = match client
+        .get_native_balance(account.clone().account_id, block.header.height)
+        .await
+    {
+        Ok(amount) => amount,
+        Err(err) => {
+            panic!("Reqwest Error: {}", err);
+        }
+    };
+    let liquid_balance = match client
+        .get_liquid_owners_balance(account.clone().account_id, block.header.height)
+        .await
+    {
+        Ok(amount) => amount,
+        Err(_err) => native_balance,
+    };
+    let reward = account_in_pool
+        .get_staked_balance()
+        .saturating_add(account_in_pool.get_unstaked_balance())
+        .saturating_add(if locked_amount > 0 { native_balance } else { 0 })
+        .saturating_sub(locked_amount);
+
+    AccountBalancesAtBlock {
+        account_in_pool,
+        native_balance,
+        liquid_balance,
+        reward,
+    }
+}
+
+pub(crate) fn reward_diff(current_reward: u128, prev_reward: u128) -> String {
+    if current_reward > prev_reward {
+        format!("+{:.2}", utils::human(current_reward - prev_reward))
+            .blue()
+            .to_string()
+    } else {
+        format!("-{:.2}", utils::human(prev_reward - current_reward))
+            .red()
+            .to_string()
+    }
+}
+
+pub(crate) fn current_reward(current_reward: u128) -> String {
+    format!("{:.2}", utils::human(current_reward))
+        .green()
+        .to_string()
+}
+
+'''
+'''--- src/utils/binance.rs ---
+use serde::{self, Deserialize};
+
+#[derive(Deserialize, Debug)]
+struct BinanceResponse {
+    price: String,
+}
+
+impl BinanceResponse {
+    fn get_price(&self) -> f32 {
+        self.price.parse::<f32>().unwrap()
+    }
+}
+
+pub(crate) async fn binance_price() -> Result<f32, reqwest::Error> {
+    print!("Fetching NEAR-USDT price from Binance...");
+    let body: BinanceResponse =
+        reqwest::get("https://api.binance.com/api/v3/ticker/price?symbol=NEARUSDT")
+            .await?
+            .json()
+            .await?;
+    println!(" {}", &body.get_price());
+    Ok(body.get_price())
+}
+
+'''
+'''--- src/utils/human.rs ---
+pub(crate) fn human(yocto: u128) -> f64 {
+    yocto as f64 / 1000000000000000000000000_f64
+}
+
+pub(crate) fn current_position_in_epoch(start: u64, current: u64) -> u64 {
+    (current - start) * 100 / crate::EPOCH_LENGTH
+}
+
+'''
+'''--- src/utils/mod.rs ---
+use std::fs::File;
+use std::io::prelude::*;
+
+pub(crate) use accounts::{collect_account_data, current_reward, reward_diff};
+pub(crate) use binance::binance_price;
+pub(crate) use human::{current_position_in_epoch, human};
+
+mod accounts;
+mod binance;
+mod human;
+
+pub(crate) fn read_accounts(home_dir: std::path::PathBuf) -> Result<String, std::io::Error> {
+    let accounts_list_path = home_dir.join("accounts.json");
+    if !accounts_list_path.exists() {
+        panic!(
+            "You must create {:?} with list of accounts to check. Example:\n {}",
+            &home_dir,
+            "
+        [\n  \
+          {\n    \
+            \"account_id\": \"accountid.near\",\n    \
+            \"pool_account_id\": \"nameofpool.poolv1.near\"\n  \
+          }\n\
+        ]\n",
+        );
+    }
+    println!(
+        "Reading accounts from {}...",
+        &accounts_list_path.to_string_lossy()
+    );
+    let mut file = File::open(accounts_list_path)?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+    Ok(contents)
+}
+
+'''

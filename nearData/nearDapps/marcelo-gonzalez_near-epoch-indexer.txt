@@ -1,0 +1,1095 @@
+*GitHub Repository "marcelo-gonzalez/near-epoch-indexer"*
+
+'''--- Cargo.toml ---
+[package]
+name = "near-epoch-indexer"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0"
+clap = "2.33.3"
+diesel = { version = "1.4.8", features = ["postgres"] }
+dotenv = "0.15.0"
+futures = "0.3.17"
+actix-web = "3"
+actix-http = { version = "2.2.1", features = ["openssl"] }
+http = "0.2.5"
+log = "0.4.14"
+serde = "1.0.130"
+serde_derive = "1.0.130"
+serde_json = "1.0.69"
+simple_logger = "1.13.0"
+tracing = "0.1.29"
+
+[dependencies.near-primitives]
+git = "https://github.com/near/nearcore"
+# first commit containing chunk production stats
+rev="6c3feafb27f40e8725b6e076f1fefda9fc42e371"
+features=["protocol_feature_chunk_only_producers"]
+
+'''
+'''--- README.md ---
+# NEAR Epoch Indexer
+
+This is an indexer meant to collect validator statistics from an RPC node and dump them into a postgres database. For now we just save the number of blocks produced and expected for each validator, but more stats could be added pretty easily.
+
+## Build and run
+
+We need the `diesel-cli` tool to create and manage the tables involved.
+
+```bash
+$ cargo install diesel_cli --no-default-features --features "postgres"
+```
+
+Assuming you have postgres installed, run:
+
+```bash
+$ createdb epochs-testnet
+$ echo DATABASE_URL=postgresql://yourname:password@localhost/epochs-testnet >> .env
+$ diesel migration run
+```
+
+Build the code...
+```bash
+$ sudo apt update && sudo apt-get install libpq-dev
+$ cargo build --release
+```
+
+Run it with the `DATABASE_URL` environment variable set or listed in the file `./.env` as above.
+```bash
+$ ./target/release/near-epoch-indexer --rpc-url http://localhost:3030 --chain-id testnet
+```
+
+'''
+'''--- diesel.toml ---
+# For documentation on how to configure this file,
+# see diesel.rs/guides/configuring-diesel-cli
+
+[print_schema]
+file = "src/schema.rs"
+
+'''
+'''--- migrations/00000000000000_diesel_initial_setup/down.sql ---
+-- This file was automatically created by Diesel to setup helper functions
+-- and other internal bookkeeping. This file is safe to edit, any future
+-- changes will be added to existing projects as new migrations.
+
+DROP FUNCTION IF EXISTS diesel_manage_updated_at(_tbl regclass);
+DROP FUNCTION IF EXISTS diesel_set_updated_at();
+
+'''
+'''--- migrations/00000000000000_diesel_initial_setup/up.sql ---
+-- This file was automatically created by Diesel to setup helper functions
+-- and other internal bookkeeping. This file is safe to edit, any future
+-- changes will be added to existing projects as new migrations.
+
+-- Sets up a trigger for the given table to automatically set a column called
+-- `updated_at` whenever the row is modified (unless `updated_at` was included
+-- in the modified columns)
+--
+-- # Example
+--
+-- ```sql
+-- CREATE TABLE users (id SERIAL PRIMARY KEY, updated_at TIMESTAMP NOT NULL DEFAULT NOW());
+--
+-- SELECT diesel_manage_updated_at('users');
+-- ```
+CREATE OR REPLACE FUNCTION diesel_manage_updated_at(_tbl regclass) RETURNS VOID AS $$
+BEGIN
+    EXECUTE format('CREATE TRIGGER set_updated_at BEFORE UPDATE ON %s
+                    FOR EACH ROW EXECUTE PROCEDURE diesel_set_updated_at()', _tbl);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION diesel_set_updated_at() RETURNS trigger AS $$
+BEGIN
+    IF (
+        NEW IS DISTINCT FROM OLD AND
+        NEW.updated_at IS NOT DISTINCT FROM OLD.updated_at
+    ) THEN
+        NEW.updated_at := current_timestamp;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+'''
+'''--- migrations/2021-12-20-000000_init/down.sql ---
+DROP TABLE public.validator_stats;
+DROP TABLE public.epochs;
+'''
+'''--- migrations/2021-12-20-000000_init/up.sql ---
+CREATE TABLE public.epochs (
+    epoch_id text PRIMARY KEY,
+    height integer NOT NULL,
+    start_timestamp bigint UNIQUE NOT NULL,
+    end_timestamp bigint UNIQUE NOT NULL,
+    -- For convenience, the start height is the first actually present block
+    start_height bigint UNIQUE NOT NULL,
+    end_height bigint UNIQUE NOT NULL
+    CHECK(start_timestamp < end_timestamp)
+    CHECK(start_height < end_height)
+);
+
+CREATE TABLE public.validator_stats (
+    account_id text NOT NULL,
+    epoch_id text NOT NULL REFERENCES public.epochs (epoch_id) ON DELETE CASCADE,
+    num_produced_blocks integer NOT NULL,
+    num_expected_blocks integer NOT NULL,
+    num_produced_chunks integer NOT NULL,
+    num_expected_chunks integer NOT NULL,
+    PRIMARY KEY (account_id, epoch_id)
+);
+
+CREATE UNIQUE INDEX start_timestamp_idx ON epochs (start_timestamp);
+CREATE UNIQUE INDEX end_timestamp_idx ON epochs (end_timestamp);
+
+'''
+'''--- src/main.rs ---
+use actix_web::client::Client;
+use anyhow::{anyhow, Context};
+use clap::{value_t, App, Arg};
+use diesel::pg::PgConnection;
+use http::StatusCode;
+use log::{info, warn};
+use near_primitives::hash::CryptoHash;
+use near_primitives::types::{BlockHeight, EpochHeight};
+use near_primitives::views::{BlockView, EpochValidatorInfo};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::fmt;
+use std::time::{Duration, Instant};
+
+#[macro_use]
+extern crate diesel;
+
+use diesel::prelude::*;
+
+pub mod models;
+pub mod schema;
+
+#[derive(Debug, Deserialize, Serialize)]
+struct JSONError {
+    code: i32,
+    message: String,
+    data: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JSONRpcResponse<T> {
+    jsonrpc: String,
+    result: Option<T>,
+    error: Option<JSONError>,
+    id: Value,
+}
+
+#[derive(Debug)]
+enum JSONRpcError {
+    RPC(JSONError),
+    Parse,
+}
+
+impl std::fmt::Display for JSONRpcError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            JSONRpcError::RPC(e) => match serde_json::ser::to_string(e) {
+                Ok(json) => f.write_str(&json),
+                Err(_) => write!(f, "{:?}", &e),
+            },
+            JSONRpcError::Parse => {
+                write!(
+                    f,
+                    "Received bad JSONRPC response: no \"result\" or \"error\" given"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for JSONRpcError {}
+
+#[derive(Clone, Debug)]
+struct Options {
+    chain_id: String,
+    rpc_url: String,
+    backfill_qps: u32,
+}
+
+#[derive(Debug)]
+struct EpochInfo {
+    id: CryptoHash,
+    info: EpochValidatorInfo,
+    first_block: BlockView,
+    last_block: BlockView,
+}
+
+#[derive(Debug)]
+struct EpochRef {
+    epoch_id: CryptoHash,
+    epoch_height: EpochHeight,
+    // hash of the last block in the previous epoch
+    prev_last_block: CryptoHash,
+}
+
+impl EpochRef {
+    fn from_info(epoch: &EpochInfo) -> Self {
+        Self {
+            epoch_id: epoch.id,
+            epoch_height: epoch.info.epoch_height,
+            prev_last_block: epoch.first_block.header.prev_hash,
+        }
+    }
+}
+
+struct EpochIndexer {
+    options: Options,
+    db: PgConnection,
+    client: Client,
+    earliest_block: Option<BlockHeight>,
+    req_count: u32,
+}
+
+fn til_next_request(max_qps: u32, started_at: Instant, reqs_sent: u32) -> Duration {
+    let dur = Instant::now() - started_at;
+    if dur >= Duration::from_secs(1) {
+        return Duration::from_secs(0);
+    }
+    let mut min_dur = Duration::from_secs(1) * reqs_sent;
+    min_dur /= max_qps;
+    if min_dur < dur {
+        Duration::from_secs(0)
+    } else {
+        min_dur - dur
+    }
+}
+
+// SendRequestError is not Send or Sync, so can't be made into an anyhow::Error :(
+fn anyhow_from_actix(e: actix_http::client::SendRequestError) -> anyhow::Error {
+    anyhow!("{}", e)
+}
+
+impl EpochIndexer {
+    fn new(options: &Options, db: PgConnection) -> Self {
+        Self {
+            options: options.clone(),
+            db,
+            client: Default::default(),
+            earliest_block: None,
+            req_count: 0,
+        }
+    }
+
+    async fn call_jsonrpc<T: serde::de::DeserializeOwned>(
+        &mut self,
+        method: &str,
+        params: &Value,
+    ) -> anyhow::Result<T> {
+        self.req_count += 1;
+
+        let mut response = match self
+            .client
+            .post(&self.options.rpc_url)
+            .header("User-Agent", "near-validator-indexer")
+            .timeout(Duration::from_secs(30))
+            .send_json(&json!({
+                "jsonrpc": "2.0",
+                "method": method,
+                "id": "dontcare",
+                "params": params,
+            }))
+            .await
+        {
+            Ok(r) => match r.status() {
+                StatusCode::OK => r,
+                code => {
+                    return Err(anyhow!(
+                        "Call to JSONRPC method \"{}\" with params {} at {} returned HTTP {}",
+                        method,
+                        params,
+                        &self.options.rpc_url,
+                        code
+                    ))
+                }
+            },
+            Err(e) => {
+                return Err(anyhow_from_actix(e));
+            }
+        };
+        let json = response.json::<JSONRpcResponse<T>>().limit(1 << 20).await?;
+        match json.result {
+            Some(result) => {
+                return Ok(result);
+            }
+            None => match json.error {
+                Some(error) => return Err(JSONRpcError::RPC(error).into()),
+                None => return Err(JSONRpcError::Parse.into()),
+            },
+        }
+    }
+
+    async fn get_latest_epoch_info(&mut self) -> anyhow::Result<EpochValidatorInfo> {
+        self.call_jsonrpc("validators", &json!({ "latest": Value::Null }))
+            .await
+    }
+
+    async fn get_epoch_info(&mut self, id: &CryptoHash) -> anyhow::Result<EpochValidatorInfo> {
+        self.call_jsonrpc("validators", &json!({ "epoch_id": id }))
+            .await
+    }
+
+    async fn fetch_block_at_height(&mut self, height: BlockHeight) -> anyhow::Result<BlockView> {
+        self.call_jsonrpc("block", &json!({ "block_id": height }))
+            .await
+    }
+
+    async fn fetch_block(&mut self, hash: &CryptoHash) -> anyhow::Result<BlockView> {
+        self.call_jsonrpc("block", &json!({ "block_id": hash }))
+            .await
+    }
+
+    fn save_validator_info(&mut self, epoch_info: &EpochInfo) -> Result<(), diesel::result::Error> {
+        let epoch = models::Epoch::new(epoch_info);
+        diesel::insert_into(schema::epochs::table)
+            .values(epoch)
+            .on_conflict_do_nothing()
+            .execute(&self.db)?;
+        let mut validators = Vec::new();
+        for v in epoch_info.info.current_validators.iter() {
+            validators.push(models::ValidatorStat::new(&epoch_info.id, &v));
+        }
+        diesel::insert_into(schema::validator_stats::table)
+            .values(validators)
+            .on_conflict_do_nothing()
+            .execute(&self.db)?;
+        info!(
+            "Successfully indexed epoch #{}, starting at #{} ending at #{}",
+            epoch_info.info.epoch_height,
+            epoch_info.first_block.header.height,
+            epoch_info.last_block.header.height,
+        );
+        Ok(())
+    }
+
+    async fn fetch_epoch(
+        &mut self,
+        last_block_hash: &CryptoHash,
+    ) -> anyhow::Result<Option<EpochInfo>> {
+        if *last_block_hash == Default::default() {
+            return Ok(None);
+        }
+
+        let last_block = self.fetch_block(last_block_hash).await?;
+        if last_block.header.prev_hash == Default::default() {
+            return Ok(None);
+        }
+        let info = match self.get_epoch_info(&last_block.header.epoch_id).await {
+            Ok(info) => info,
+            Err(e) => return Err(e),
+        };
+
+        let mut start_height = info.epoch_start_height;
+
+        if let Some(earliest) = self.earliest_block {
+            if start_height < earliest {
+                info!(
+                    "First block #{} of epoch #{} is earlier than the earliest \
+		     block {} knows about. Stopping...",
+                    start_height, info.epoch_height, self.options.rpc_url
+                );
+                return Ok(None);
+            }
+        }
+
+        while start_height < last_block.header.height {
+            match self.fetch_block_at_height(start_height).await {
+                Ok(first_block) => {
+                    return Ok(Some(EpochInfo {
+                        id: last_block.header.epoch_id,
+                        info,
+                        first_block,
+                        last_block,
+                    }));
+                }
+                Err(e) => {
+                    // this parsing stuff is required because the error code is a bit too broad.
+                    // We'll get -32000, which could be other kinds of errors
+                    match e.downcast_ref::<JSONRpcError>() {
+                        Some(JSONRpcError::RPC(rpc_error)) => match &rpc_error.data {
+                            Some(Value::String(msg)) => {
+                                if msg.starts_with("DB Not Found") {
+                                    info!(
+                                        "Block #{} doesn't seem to exist. Checking whether \
+					 epoch #{} really started at block #{}",
+                                        start_height,
+                                        info.epoch_height,
+                                        start_height + 1
+                                    );
+                                    start_height += 1;
+                                } else {
+                                    return Err(e);
+                                }
+                            }
+                            _ => {
+                                return Err(e);
+                            }
+                        },
+                        _ => {
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+            // There's already logic to limit QPS in backfill(),
+            // but let's still try not to spam in this tight loop
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        return Err(anyhow!(
+            "Could not find any blocks in epoch #{} other than the last block #{}. \
+	     Something must be wrong...",
+            info.epoch_height,
+            last_block.header.height
+        ));
+    }
+
+    fn read_indexed_epochs(
+        &self,
+        before: Option<EpochHeight>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(EpochHeight, BlockHeight)>> {
+        let query = schema::epochs::table
+            .select((schema::epochs::height, schema::epochs::start_height))
+            .order_by(schema::epochs::height.desc());
+        let rows = if let Some(before) = before {
+            query
+                .filter(schema::epochs::height.lt(i32::try_from(before).unwrap()))
+                .limit(limit.try_into().unwrap())
+                .load::<(i32, i64)>(&self.db)?
+        } else {
+            query
+                .limit(limit.try_into().unwrap())
+                .load::<(i32, i64)>(&self.db)?
+        };
+
+        if rows.len() > limit {
+            return Err(anyhow!("SELECT height FROM epochs ORDER BY height DESC LIMIT {} unexpectedly returned {} rows...",
+			       limit, rows.len()));
+        }
+        let mut ret = vec![];
+
+        for row in rows.iter() {
+            let height = match EpochHeight::try_from(row.0) {
+                Ok(h) => h,
+                Err(_) => {
+                    return Err(anyhow!(
+                        "epochs table seems to contain a negative height!: {}",
+                        row.0
+                    ));
+                }
+            };
+            let start_height = match BlockHeight::try_from(row.1) {
+                Ok(h) => h,
+                Err(_) => {
+                    return Err(anyhow!(
+                        "epochs table seems to contain a negative block height!: {}",
+                        row.1
+                    ));
+                }
+            };
+            ret.push((height, start_height));
+        }
+        Ok(ret)
+    }
+
+    fn read_num_epochs_indexed(&self) -> diesel::result::QueryResult<u64> {
+        Ok(schema::epochs::table
+            .count()
+            .get_result::<i64>(&self.db)?
+            .try_into()
+            .unwrap())
+    }
+
+    // returns true if the RPC node we're querying can be expected to give earlier info.
+    // i.e. we haven't hit the earliest point in the chain that it knows about.
+    async fn backfill(
+        &mut self,
+        start: EpochHeight,
+        end: EpochHeight,
+        end_first_block: BlockHeight,
+    ) -> anyhow::Result<bool> {
+        if let Some(earliest) = self.earliest_block {
+            if end_first_block < earliest {
+                info!(
+                    "First block #{} of epoch #{} is earlier than the earliest \
+		     block {} knows about. Stopping...",
+                    end_first_block, end, self.options.rpc_url
+                );
+                return Ok(false);
+            }
+        }
+
+        let mut epoch_ref = match self.fetch_block_at_height(end_first_block).await {
+            Ok(b) => EpochRef {
+                epoch_id: b.header.epoch_id,
+                epoch_height: end,
+                prev_last_block: b.header.prev_hash,
+            },
+            Err(e) => return Err(e),
+        };
+
+        loop {
+            let started_at = Instant::now();
+            let start_req_count = self.req_count;
+
+            if start >= epoch_ref.epoch_height - 1 {
+                return Ok(true);
+            }
+            let epoch = match self.fetch_epoch(&epoch_ref.prev_last_block).await {
+                Ok(Some(epoch)) => epoch,
+                Ok(None) => return Ok(false),
+                Err(e) => return Err(e),
+            };
+            if epoch.info.epoch_height < epoch_ref.epoch_height {
+                if epoch.info.epoch_height != epoch_ref.epoch_height - 1 {
+                    warn!(
+                        "Found a gap in epoch heights! No epoch between #{} and #{} found.",
+                        epoch.info.epoch_height, epoch_ref.epoch_height
+                    );
+                }
+                if start < epoch.info.epoch_height {
+                    self.save_validator_info(&epoch)?;
+                } else {
+                    return Ok(true);
+                }
+            } else if epoch.info.epoch_height == epoch_ref.epoch_height {
+                warn!(
+                    "Found an epoch height repeat! Epochs {} and {} both have height #{}. Skipping...",
+                    epoch.id, epoch_ref.epoch_id, epoch_ref.epoch_height
+		);
+            } else {
+                warn!(
+                    "Epoch height sequence is descending from {} -> {}! (height #{} -> #{}). Skipping...",
+                    epoch.id, epoch_ref.epoch_id, epoch.info.epoch_height, epoch_ref.epoch_height);
+            }
+            std::thread::sleep(til_next_request(
+                self.options.backfill_qps,
+                started_at,
+                self.req_count - start_req_count,
+            ));
+            epoch_ref = EpochRef::from_info(&epoch);
+        }
+    }
+
+    async fn fetch_status(&mut self) -> anyhow::Result<Value> {
+        let mut res = match self
+            .client
+            .get(format!("{}/status", &self.options.rpc_url))
+            .header("User-Agent", "near-validator-indexer")
+            .send()
+            .await
+        {
+            Ok(req) => match req.status() {
+                StatusCode::OK => req,
+                code => {
+                    return Err(anyhow!(
+                        "{}/status returned {}",
+                        &self.options.rpc_url,
+                        code
+                    ))
+                }
+            },
+            Err(e) => return Err(anyhow_from_actix(e)),
+        };
+        let response = res.body().await?;
+        serde_json::from_slice::<Value>(&response).context(format!(
+            "Parsing {}/status body:\n{}",
+            &self.options.rpc_url,
+            String::from_utf8_lossy(response.as_ref())
+        ))
+    }
+
+    async fn check_chain_id(&self, status: &Value) -> anyhow::Result<()> {
+        match status.get("chain_id") {
+            Some(id) => match id.as_str() {
+                Some(id) => {
+                    if id == self.options.chain_id {
+                        Ok(())
+                    } else {
+                        Err(anyhow!(
+                            "mismatch: {}/status: {}, ours: {}, ",
+                            &self.options.rpc_url,
+                            id.to_string(),
+                            &self.options.chain_id
+                        ))
+                    }
+                }
+                None => Err(anyhow!(
+                    "bad \"chain_id\" at {}/status: {}",
+                    self.options.rpc_url,
+                    id.to_string()
+                )),
+            },
+            None => Err(anyhow!(
+                "no \"chain_id\" at {}/status",
+                self.options.rpc_url
+            )),
+        }
+    }
+
+    // returns true if there is more to go.
+    async fn index_missing_rows(
+        &mut self,
+        rows: &[(EpochHeight, BlockHeight)],
+        query_limit: usize,
+        smallest_indexed: &mut (EpochHeight, BlockHeight),
+        missing_rows: &mut u64,
+        latest: EpochHeight,
+        latest_start_height: BlockHeight,
+    ) -> anyhow::Result<bool> {
+        for row in rows.iter() {
+            let height = row.0;
+
+            // the height == 1 check should not be needed since we check missing_rows,
+            // but keep it as a paranoid check
+            if height == 1 || *missing_rows == 0 {
+                return Ok(false);
+            }
+
+            if height >= smallest_indexed.0 {
+                return Err(anyhow!(
+                    "epochs query with \"ORDER BY height DESC\" not strictly descending: {} -> {}",
+                    smallest_indexed.0,
+                    height
+                ));
+            }
+            if height >= latest {
+                *missing_rows -= smallest_indexed.0 - height - 1;
+                *smallest_indexed = *row;
+                continue;
+            }
+            if height < smallest_indexed.0 - 1 && height < latest - 1 {
+                let result = if smallest_indexed.0 < latest {
+                    self.backfill(height, smallest_indexed.0, smallest_indexed.1)
+                        .await
+                } else {
+                    self.backfill(height, latest, latest_start_height).await
+                };
+
+                match result {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(false),
+                    Err(e) => return Err(e),
+                }
+                *missing_rows -= smallest_indexed.0 - height - 1;
+            }
+            *smallest_indexed = *row;
+        }
+        if rows.len() < query_limit {
+            let result = if smallest_indexed.0 < latest {
+                self.backfill(0, smallest_indexed.0, smallest_indexed.1)
+                    .await
+            } else {
+                self.backfill(0, latest, latest_start_height).await
+            };
+            match result {
+                Ok(_) => Ok(false),
+                Err(e) => Err(e),
+            }
+        } else {
+            Ok(true)
+        }
+    }
+
+    async fn run(&mut self) -> anyhow::Result<()> {
+        let status = self
+            .fetch_status()
+            .await
+            .context("failed to fetch RPC node status")?;
+        self.check_chain_id(&status)
+            .await
+            .context("chain ID check failed")?;
+
+        if let Some(sync_info) = status.get("sync_info") {
+            if let Some(Value::Number(height)) = sync_info.get("earliest_block_height") {
+                if let Some(height) = height.as_u64() {
+                    self.earliest_block = Some(height);
+                }
+            }
+        }
+
+        let latest_epoch = self
+            .get_latest_epoch_info()
+            .await
+            .context("failed fetching validator info")?;
+        let num_rows = self
+            .read_num_epochs_indexed()
+            .context("failed reading num rows from the database")?;
+
+        let last_row = self
+            .read_indexed_epochs(None, 1)
+            .context("failed querying the database")?
+            .first()
+            .copied();
+
+        let last_indexed = match last_row {
+            Some(row) => row.0,
+            None => 0,
+        };
+        let mut missing_rows = 0;
+
+        if latest_epoch.epoch_height > last_indexed + 1 {
+            info!(
+                "There are new epochs to index. Current epoch = #{}. Last indexed = #{}.",
+                latest_epoch.epoch_height, last_indexed
+            );
+            missing_rows += latest_epoch.epoch_height - last_indexed - 1;
+        }
+        if last_indexed > num_rows {
+            info!(
+                "There seem to be some missing rows in the database. \
+		 The last indexed epoch has height #{} but there are only \
+		 {} rows. Attempting to backfill...",
+                last_indexed, num_rows
+            );
+            missing_rows += last_indexed - num_rows;
+        }
+        if missing_rows == 0 {
+            info!(
+                "The latest completed epoch #{} has already been saved. Nothing to do.",
+                last_indexed
+            );
+            return Ok(());
+        }
+
+        let mut smallest_indexed;
+
+        if let Some(row) = last_row {
+            let height = row.0;
+            if height < latest_epoch.epoch_height - 1 {
+                match self
+                    .backfill(
+                        height,
+                        latest_epoch.epoch_height,
+                        latest_epoch.epoch_start_height,
+                    )
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(()),
+                    Err(e) => return Err(e),
+                };
+
+                missing_rows -= latest_epoch.epoch_height - height - 1;
+                if missing_rows == 0 {
+                    return Ok(());
+                }
+            } else if height >= latest_epoch.epoch_height {
+                warn!(
+                    "{} gave latest epoch height = #{}. \
+		       Seems to be behind what has already been indexed (latest = #{})",
+                    self.options.rpc_url, latest_epoch.epoch_height, height
+                );
+            }
+            smallest_indexed = row;
+        } else {
+            return self
+                .backfill(
+                    0,
+                    latest_epoch.epoch_height,
+                    latest_epoch.epoch_start_height,
+                )
+                .await
+                .map(|_| ());
+        }
+
+        loop {
+            let limit = 100;
+            let heights = self
+                .read_indexed_epochs(Some(smallest_indexed.0), limit)
+                .with_context(|| {
+                    format!(
+                        "failed querying database for epochs earlier than #{}",
+                        smallest_indexed.0
+                    )
+                })?;
+
+            match self
+                .index_missing_rows(
+                    &heights,
+                    limit,
+                    &mut smallest_indexed,
+                    &mut missing_rows,
+                    latest_epoch.epoch_height,
+                    latest_epoch.epoch_start_height,
+                )
+                .await
+                .with_context(|| format!("failed indexing missing rows in the database"))
+            {
+                Ok(true) => (),
+                Ok(false) => return Ok(()),
+                Err(e) => return Err(e),
+            };
+        }
+    }
+}
+
+#[actix_web::main]
+async fn main() -> anyhow::Result<()> {
+    simple_logger::SimpleLogger::new()
+        .with_level(log::LevelFilter::Info)
+        .env()
+        .init()
+        .unwrap();
+
+    let matches = App::new("epoch-indexer")
+        .arg(
+            Arg::with_name("rpc-url")
+                .long("rpc-url")
+                .takes_value(true)
+                .default_value("http://localhost:3030")
+                .value_name("url"),
+        )
+        .arg(
+            Arg::with_name("backfill-max-qps")
+                .long("backfill-max-qps")
+                .takes_value(true)
+                .value_name("qps")
+                .default_value("10")
+                .help("maximum number of queries per second to make to the RPC node"),
+        )
+        .arg(
+            Arg::with_name("chain-id")
+                .long("chain-id")
+                .takes_value(true)
+                .value_name("chain")
+                .required(true),
+        )
+        .get_matches();
+    let options = Options {
+        chain_id: matches.value_of("chain-id").unwrap().to_string(),
+        rpc_url: matches.value_of("rpc-url").unwrap().to_string(),
+        backfill_qps: clap::value_t!(matches, "backfill-max-qps", u32).unwrap(),
+    };
+
+    dotenv::dotenv().ok();
+    let database_url = match std::env::var("DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            return Err(anyhow!("The DATABASE_URL environment variable is not set."));
+        }
+    };
+    let db = match PgConnection::establish(&database_url) {
+        Ok(db) => db,
+        Err(e) => {
+            return Err(e.into());
+        }
+    };
+
+    let mut indexer = EpochIndexer::new(&options, db);
+    indexer.run().await
+}
+
+'''
+'''--- src/models.rs ---
+use crate::schema::{epochs, validator_stats};
+
+use near_primitives::hash::CryptoHash;
+use near_primitives::views::CurrentEpochValidatorInfo;
+
+#[derive(Insertable, Queryable)]
+pub struct Epoch {
+    pub epoch_id: String,
+    pub height: i32,
+    pub start_timestamp: i64,
+    pub end_timestamp: i64,
+    pub start_height: i64,
+    pub end_height: i64,
+}
+
+impl Epoch {
+    pub(crate) fn new(epoch: &crate::EpochInfo) -> Self {
+        Self {
+            epoch_id: epoch.id.to_string(),
+            height: i32::try_from(epoch.info.epoch_height).unwrap_or(i32::MAX),
+            start_timestamp: i64::try_from(epoch.first_block.header.timestamp).unwrap_or(i64::MAX),
+            end_timestamp: i64::try_from(epoch.last_block.header.timestamp).unwrap_or(i64::MAX),
+            start_height: i64::try_from(epoch.first_block.header.height).unwrap_or(i64::MAX),
+            end_height: i64::try_from(epoch.last_block.header.height).unwrap_or(i64::MAX),
+        }
+    }
+}
+
+#[derive(Insertable)]
+pub struct ValidatorStat {
+    pub account_id: String,
+    pub epoch_id: String,
+    pub num_produced_blocks: i32,
+    pub num_expected_blocks: i32,
+    pub num_produced_chunks: i32,
+    pub num_expected_chunks: i32,
+}
+
+impl ValidatorStat {
+    pub(crate) fn new(epoch_id: &CryptoHash, info: &CurrentEpochValidatorInfo) -> Self {
+        Self {
+            account_id: info.account_id.to_string(),
+            epoch_id: epoch_id.to_string(),
+            num_produced_blocks: i32::try_from(info.num_produced_blocks).unwrap_or(i32::MAX),
+            num_expected_blocks: i32::try_from(info.num_expected_blocks).unwrap_or(i32::MAX),
+            num_produced_chunks: i32::try_from(info.num_produced_chunks).unwrap_or(i32::MAX),
+            num_expected_chunks: i32::try_from(info.num_expected_chunks).unwrap_or(i32::MAX),
+        }
+    }
+}
+
+'''
+'''--- src/schema.rs ---
+table! {
+    epochs (epoch_id) {
+        epoch_id -> Text,
+        height -> Int4,
+        start_timestamp -> Int8,
+        end_timestamp -> Int8,
+        start_height -> Int8,
+        end_height -> Int8,
+    }
+}
+
+table! {
+    validator_stats (account_id, epoch_id) {
+        account_id -> Text,
+        epoch_id -> Text,
+        num_produced_blocks -> Int4,
+        num_expected_blocks -> Int4,
+        num_produced_chunks -> Int4,
+        num_expected_chunks -> Int4,
+    }
+}
+
+joinable!(validator_stats -> epochs (epoch_id));
+
+allow_tables_to_appear_in_same_query!(epochs, validator_stats,);
+
+'''
+'''--- validator_stats.sh ---
+#!/usr/bin/env bash
+
+usage() {
+    cat <<-EOF
+	Usage:
+	    validators.sh [options] <account ID>
+
+	    Displays block/chunk production stats for the given validator ID. The script
+	    expects the MAINNET_EPOCHS_DATABASE_URL, TESTNET_EPOCHS_DATABASE_URL
+	    and BETANET_EPOCHS_DATABASE_URL environment variables to be set.
+
+	    Options:
+
+	    -c <chain_id>: possible values are "mainnet", "testnet" or "betanet". Default "mainnet"
+	    -f <timestamp>: f as in "from". Results will only include epochs that ended
+	       		    at or after this timestamp
+	    -t <timestamp>: t as in "to". Results will only include epochs that began
+	       		    at or before this timestamp
+
+	    Example:
+
+	    $ export TESTNET_EPOCHS_DATABASE_URL=postgresql://myuser:mypassword@localhost/testnet
+	    $ sh validator_stats.sh -c testnet -f "2022-01-01 03:04:06" -t "2022-01-06 03:04:06" node0
+
+	EOF
+    exit $1
+}
+
+show_stats() {
+    if [ "$chain_id" = "mainnet" ]; then
+        if [ -z "$MAINNET_EPOCHS_DATABASE_URL" ]; then
+            echo "please set the MAINNET_EPOCHS_DATABASE_URL environment variable"
+            exit 1
+        fi
+        url=$MAINNET_EPOCHS_DATABASE_URL
+    elif [ "$chain_id" = "testnet" ]; then
+        if [ -z "$TESTNET_EPOCHS_DATABASE_URL" ]; then
+            echo "please set the TESTNET_EPOCHS_DATABASE_URL environment variable"
+            exit 1
+        fi
+        url=$TESTNET_EPOCHS_DATABASE_URL
+    elif [ "$chain_id" = "betanet" ]; then
+        if [ -z "$BETANET_EPOCHS_DATABASE_URL" ]; then
+            echo "please set the BETANET_EPOCHS_DATABASE_URL environment variable"
+            exit 1
+        fi
+        url=$BETANET_EPOCHS_DATABASE_URL
+    else
+        usage 1
+    fi
+
+    query=$(
+        cat <<EOF
+SELECT to_timestamp(epochs.start_timestamp / 1000000000) AS start,
+to_timestamp(epochs.end_timestamp / 1000000000) AS end, epochs.height,
+validator_stats.num_produced_blocks, validator_stats.num_expected_blocks,
+validator_stats.num_produced_chunks, validator_stats.num_expected_chunks
+FROM validator_stats LEFT OUTER JOIN epochs ON (validator_stats.epoch_id = epochs.epoch_id)
+WHERE validator_stats.account_id = '$account_id'
+EOF
+    )
+    if [ "$from" != "none" ]; then
+        query="${query} AND epochs.end_timestamp >=
+DATE_PART('epoch', TIMESTAMP '${from}')::numeric::bigint * 1000000000"
+    fi
+    if [ "$to" != "none" ]; then
+        query="${query} AND epochs.start_timestamp <=
+DATE_PART('epoch', TIMESTAMP '${to}')::numeric::bigint * 1000000000"
+    fi
+
+    psql -c "$query ORDER BY height DESC;" "$url"
+}
+
+run() {
+    if [ $# -lt 1 ]; then
+        usage 1
+        exit 1
+    fi
+
+    local chain_id="mainnet"
+    local from="none"
+    local to="none"
+
+    while getopts "c:f:t:" o; do
+        case "${o}" in
+        c)
+            chain_id=${OPTARG}
+            ;;
+        f)
+            from=${OPTARG}
+            ;;
+        t)
+            to=${OPTARG}
+            ;;
+        *)
+            usage 1
+            ;;
+        esac
+    done
+
+    shift $((OPTIND - 1))
+    if [ $# -ne 1 ]; then
+        usage 1
+    fi
+
+    account_id=$1
+    show_stats
+}
+
+case "$1" in
+help | --help)
+    usage 0
+    ;;
+*)
+    run "$@"
+    ;;
+esac
+
+'''

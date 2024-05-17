@@ -1,0 +1,1536 @@
+*GitHub Repository "near-examples/crossword-tutorial-chapter-2"*
+
+'''--- README.md ---
+# Getting Started with Create React App
+
+This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
+
+## Available Scripts
+
+In the project directory, you can run:
+
+### `env CONTRACT_NAME=crossword.friend.testnet npm run start`
+
+Runs the app in the development mode.\
+Open [http://localhost:1234](http://localhost:1234) to view it in the browser.
+
+The page will reload if you make edits.\
+You will also see any lint errors in the console.
+
+### `yarn test`
+
+Launches the test runner in the interactive watch mode.\
+See the section about [running tests](https://facebook.github.io/create-react-app/docs/running-tests) for more information.
+
+### `yarn build`
+
+Builds the app for production to the `build` folder.\
+It correctly bundles React in production mode and optimizes the build for the best performance.
+
+The build is minified and the filenames include the hashes.\
+Your app is ready to be deployed!
+
+See the section about [deployment](https://facebook.github.io/create-react-app/docs/deployment) for more information.
+
+### `yarn eject`
+
+**Note: this is a one-way operation. Once you `eject`, you can’t go back!**
+
+If you aren’t satisfied with the build tool and configuration choices, you can `eject` at any time. This command will remove the single build dependency from your project.
+
+Instead, it will copy all the configuration files and the transitive dependencies (webpack, Babel, ESLint, etc) right into your project so you have full control over them. All of the commands except `eject` will still work, but they will point to the copied scripts so you can tweak them. At this point you’re on your own.
+
+You don’t have to ever use `eject`. The curated feature set is suitable for small and middle deployments, and you shouldn’t feel obligated to use this feature. However we understand that this tool wouldn’t be useful if you couldn’t customize it when you are ready for it.
+
+## Learn More
+
+You can learn more in the [Create React App documentation](https://facebook.github.io/create-react-app/docs/getting-started).
+
+To learn React, check out the [React documentation](https://reactjs.org/).
+
+### Code Splitting
+
+This section has moved here: [https://facebook.github.io/create-react-app/docs/code-splitting](https://facebook.github.io/create-react-app/docs/code-splitting)
+
+### Analyzing the Bundle Size
+
+This section has moved here: [https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size](https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size)
+
+### Making a Progressive Web App
+
+This section has moved here: [https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app](https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app)
+
+### Advanced Configuration
+
+This section has moved here: [https://facebook.github.io/create-react-app/docs/advanced-configuration](https://facebook.github.io/create-react-app/docs/advanced-configuration)
+
+### Deployment
+
+This section has moved here: [https://facebook.github.io/create-react-app/docs/deployment](https://facebook.github.io/create-react-app/docs/deployment)
+
+### `yarn build` fails to minify
+
+This section has moved here: [https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify](https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify)
+
+'''
+'''--- contract/Cargo.toml ---
+[package]
+name = "crossword-tutorial-chapter-2"
+version = "0.1.0"
+authors = ["Near Inc <hello@near.org>", "Mike Purvis <mike@near.org>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+near-sdk = "4.0.0"
+hex = "0.4.3"
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+# Opt into extra safety checks on arithmetic operations https://stackoverflow.com/a/64136471/249801
+overflow-checks = true
+
+'''
+'''--- contract/build.bat ---
+cargo build --target wasm32-unknown-unknown --release
+copy target\wasm32-unknown-unknown\release\crossword_tutorial_chapter_2.wasm res
+'''
+'''--- contract/build.sh ---
+#!/bin/bash
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/crossword_tutorial_chapter_2.wasm ./res/
+
+'''
+'''--- contract/src/lib.rs ---
+use near_sdk::collections::{LookupMap, UnorderedSet};
+use near_sdk::{
+    borsh::{self, BorshDeserialize, BorshSerialize},
+    log,
+    serde::{Deserialize, Serialize},
+    AccountId, PanicOnDefault, Promise,
+};
+use near_sdk::{env, near_bindgen};
+
+// 5 Ⓝ in yoctoNEAR
+const PRIZE_AMOUNT: u128 = 5_000_000_000_000_000_000_000_000;
+
+#[derive(BorshDeserialize, BorshSerialize, Deserialize, Serialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub enum AnswerDirection {
+    Across,
+    Down,
+}
+
+/// The origin (0,0) starts at the top left side of the square
+#[derive(BorshDeserialize, BorshSerialize, Deserialize, Serialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct CoordinatePair {
+    x: u8,
+    y: u8,
+}
+
+// {"num": 1, "start": {"x": 19, "y": 31}, "direction": "Across", "length": 8, "clue": "not far but"}
+// We'll have the clue stored on-chain for now for simplicity.
+#[derive(BorshDeserialize, BorshSerialize, Deserialize, Serialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Answer {
+    num: u8,
+    start: CoordinatePair,
+    direction: AnswerDirection,
+    length: u8,
+    clue: String,
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Deserialize, Serialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub enum PuzzleStatus {
+    Unsolved,
+    Solved { memo: String },
+}
+
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct UnsolvedPuzzles {
+    puzzles: Vec<JsonPuzzle>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct JsonPuzzle {
+    /// The human-readable (not in bytes) hash of the solution
+    solution_hash: String,
+    status: PuzzleStatus,
+    answer: Vec<Answer>,
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Debug)]
+pub struct Puzzle {
+    status: PuzzleStatus,
+    /// Use the CoordinatePair assuming the origin is (0, 0) in the top left side of the puzzle.
+    answer: Vec<Answer>,
+}
+
+/// Regarding PanicOnDefault:
+/// When you want to have a "new" function initialize a smart contract,
+/// you'll likely want to follow this pattern of having a default implementation that panics,
+/// directing the user to call the initialization method. (The one with the #[init] macro)
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Crossword {
+    owner_id: AccountId,
+    puzzles: LookupMap<String, Puzzle>,
+    unsolved_puzzles: UnorderedSet<String>,
+}
+
+#[near_bindgen]
+impl Crossword {
+    #[init]
+    pub fn new(owner_id: AccountId) -> Self {
+        Self {
+            owner_id,
+            puzzles: LookupMap::new(b"c"),
+            unsolved_puzzles: UnorderedSet::new(b"u"),
+        }
+    }
+
+    pub fn submit_solution(&mut self, solution: String, memo: String) {
+        let hashed_input = env::sha256(solution.as_bytes());
+        let hashed_input_hex = hex::encode(&hashed_input);
+
+        // Check to see if the hashed answer is among the puzzles
+        let mut puzzle = self
+            .puzzles
+            .get(&hashed_input_hex)
+            .expect("ERR_NOT_CORRECT_ANSWER");
+
+        // Check if the puzzle is already solved. If it's unsolved, set the status to solved,
+        //   then proceed to update the puzzle and pay the winner.
+        puzzle.status = match puzzle.status {
+            PuzzleStatus::Unsolved => PuzzleStatus::Solved { memo: memo.clone() },
+            _ => {
+                env::panic_str("ERR_PUZZLE_SOLVED");
+            }
+        };
+
+        // Reinsert the puzzle back in after we modified the status:
+        self.puzzles.insert(&hashed_input_hex, &puzzle);
+        // Remove from the list of unsolved ones
+        self.unsolved_puzzles.remove(&hashed_input_hex);
+
+        log!(
+            "Puzzle with solution hash {} solved, with memo: {}",
+            hashed_input_hex,
+            memo
+        );
+
+        // Transfer the prize money to the winner
+        Promise::new(env::predecessor_account_id()).transfer(PRIZE_AMOUNT);
+    }
+
+    /// Get the hash of a crossword puzzle solution from the unsolved_puzzles
+    pub fn get_solution(&self, puzzle_index: u32) -> Option<String> {
+        let mut index = 0;
+        for puzzle_hash in self.unsolved_puzzles.iter() {
+            if puzzle_index == index {
+                return Some(puzzle_hash);
+            }
+            index += 1;
+        }
+        // Did not find that index
+        None
+    }
+
+    pub fn get_puzzle_status(&self, solution_hash: String) -> Option<PuzzleStatus> {
+        let puzzle = self.puzzles.get(&solution_hash);
+        if puzzle.is_none() {
+            return None;
+        }
+        Some(puzzle.unwrap().status)
+    }
+
+    pub fn new_puzzle(&mut self, solution_hash: String, answers: Vec<Answer>) {
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.owner_id,
+            "Only the owner may call this method"
+        );
+        let existing = self.puzzles.insert(
+            &solution_hash,
+            &Puzzle {
+                status: PuzzleStatus::Unsolved,
+                answer: answers,
+            },
+        );
+
+        assert!(existing.is_none(), "Puzzle with that key already exists");
+        self.unsolved_puzzles.insert(&solution_hash);
+    }
+
+    pub fn get_unsolved_puzzles(&self) -> UnsolvedPuzzles {
+        let solution_hashes = self.unsolved_puzzles.to_vec();
+        let mut all_unsolved_puzzles = vec![];
+        for hash in solution_hashes {
+            let puzzle = self
+                .puzzles
+                .get(&hash)
+                .unwrap_or_else(|| env::panic_str("ERR_LOADING_PUZZLE"));
+            let json_puzzle = JsonPuzzle {
+                solution_hash: hash,
+                status: puzzle.status,
+                answer: puzzle.answer,
+            };
+            all_unsolved_puzzles.push(json_puzzle)
+        }
+        UnsolvedPuzzles {
+            puzzles: all_unsolved_puzzles,
+        }
+    }
+}
+
+/*
+ * the rest of this file sets up unit tests
+ * to run these, the command will be:
+ * cargo test --package rust-template -- --nocapture
+ * Note: 'rust-template' comes from Cargo.toml's 'name' key
+ */
+
+// use the attribute below for unit tests
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use near_sdk::test_utils::VMContextBuilder;
+    use near_sdk::{testing_env, AccountId};
+
+    // part of writing unit tests is setting up a mock context
+    // provide a `predecessor` here, it'll modify the default context
+    fn get_context(predecessor: AccountId) -> VMContextBuilder {
+        let mut builder = VMContextBuilder::new();
+        builder.predecessor_account_id(predecessor);
+        builder
+    }
+
+    fn get_answers() -> Vec<Answer> {
+        vec![
+            Answer {
+                num: 1,
+                start: CoordinatePair { x: 2, y: 1 },
+                direction: AnswerDirection::Across,
+                length: 4,
+                clue: "Native token".to_string(),
+            },
+            Answer {
+                num: 1,
+                start: CoordinatePair { x: 2, y: 1 },
+                direction: AnswerDirection::Down,
+                length: 7,
+                clue: "Name of the specs/standards site is ______.io".to_string(),
+            },
+            Answer {
+                num: 2,
+                start: CoordinatePair { x: 5, y: 1 },
+                direction: AnswerDirection::Down,
+                length: 3,
+                clue: "DeFi site on NEAR is ___.finance".to_string(),
+            },
+            Answer {
+                num: 4,
+                start: CoordinatePair { x: 0, y: 7 },
+                direction: AnswerDirection::Across,
+                length: 7,
+                clue: "DeFi decentralizes this".to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn debug_get_hash() {
+        // Basic set up for a unit test
+        testing_env!(VMContextBuilder::new().build());
+
+        // Using a unit test to rapidly debug and iterate
+        let debug_solution = "near nomicon ref finance";
+        let debug_hash_bytes = env::sha256(debug_solution.as_bytes());
+        let debug_hash_string = hex::encode(debug_hash_bytes);
+        println!("Let's debug: {:?}", debug_hash_string);
+    }
+
+    #[test]
+    #[should_panic(expected = "ERR_NOT_CORRECT_ANSWER")]
+    fn check_submit_solution_failure() {
+        // Get Alice as an account ID
+        let alice = AccountId::new_unchecked("alice.testnet".to_string());
+        // Set up the testing context and unit test environment
+        let context = get_context(alice.clone());
+        testing_env!(context.build());
+
+        // Set up contract object and call the new method
+        let mut contract = Crossword::new(alice);
+        // Add puzzle
+        let answers = get_answers();
+        contract.new_puzzle(
+            "69c2feb084439956193f4c21936025f14a5a5a78979d67ae34762e18a7206a0f".to_string(),
+            answers,
+        );
+        contract.submit_solution("wrong answer here".to_string(), "my memo".to_string());
+    }
+
+    #[test]
+    fn check_submit_solution_success() {
+        // Get Alice as an account ID
+        let alice = AccountId::new_unchecked("alice.testnet".to_string());
+        // Set up the testing context and unit test environment
+        let context = get_context(alice.clone());
+        testing_env!(context.build());
+
+        // Set up contract object
+        let mut contract = Crossword::new(alice);
+
+        // Add puzzle
+        let answers = get_answers();
+        contract.new_puzzle(
+            "69c2feb084439956193f4c21936025f14a5a5a78979d67ae34762e18a7206a0f".to_string(),
+            answers,
+        );
+
+        contract.submit_solution(
+            "near nomicon ref finance".to_string(),
+            "my memo".to_string(),
+        );
+
+        // Ensure the puzzle status is now Solved
+        // contract.get_puzzle_status("69c2feb084439956193f4c21936025f14a5a5a78979d67ae34762e18a7206a0f".to_string());
+        // assert_eq!(contract.unsolved_puzzles.len(), 0, "Should not have any unsolved puzzles.");
+    }
+}
+
+'''
+'''--- contract/test.sh ---
+#!/bin/bash
+set -e
+
+cargo test -- --nocapture
+
+'''
+'''--- contract/testnet-deploy.sh ---
+#!/bin/bash
+
+./build.sh
+
+export NEAR_ACCT=xword.demo.testnet
+export PARENT_ACCT=demo.testnet
+near delete $NEAR_ACCT $PARENT_ACCT
+near create-account $NEAR_ACCT --masterAccount $PARENT_ACCT
+near deploy $NEAR_ACCT --wasmFile res/crossword_tutorial_chapter_2.wasm --initFunction new --initArgs '{"owner_id": "'$NEAR_ACCT'"}'
+
+# We're able to determine the public key by visiting a site like:
+# https://www.wolframalpha.com/input/?i=sha256+%22paras+rainbowbridge+mintbase+yoctonear+cli%22
+
+near call $NEAR_ACCT new_puzzle '{
+  "solution_hash": "d1a5cf9ad1adefe0528f7d31866cf901e665745ff172b96892693769ad284010",
+  "answers": [
+   {
+     "num": 1,
+     "start": {
+       "x": 1,
+       "y": 1
+     },
+     "direction": "Down",
+     "length": 5,
+     "clue": "NFT market on NEAR that specializes in cards and comics."
+   },
+   {
+     "num": 2,
+     "start": {
+       "x": 0,
+       "y": 2
+     },
+     "direction": "Across",
+     "length": 13,
+     "clue": "You can move assets between NEAR and different chains, including Ethereum, by visiting ______.app"
+   },
+   {
+     "num": 3,
+     "start": {
+       "x": 9,
+       "y": 1
+     },
+     "direction": "Down",
+     "length": 8,
+     "clue": "NFT market on NEAR with art, physical items, tickets, and more."
+   },
+   {
+     "num": 4,
+     "start": {
+       "x": 3,
+       "y": 8
+     },
+     "direction": "Across",
+     "length": 9,
+     "clue": "The smallest denomination of the native token on NEAR."
+   },
+   {
+     "num": 5,
+     "start": {
+       "x": 5,
+       "y": 8
+     },
+     "direction": "Down",
+     "length": 3,
+     "clue": "You typically deploy a smart contract with the NEAR ___ tool."
+   }
+  ]
+}' --accountId $NEAR_ACCT
+
+'''
+'''--- dist/index.css ---
+#page {
+    padding: 2em;
+}
+
+h1 {
+    margin-bottom: 1em;
+}
+
+#crossword-wrapper .clue.correct::before {
+    content: "✓";
+    display: inline-block;
+    text-decoration: none;
+    color: rgb(100, 200, 100);
+    margin-right: 0.25em;
+}
+
+#crossword-wrapper {
+    margin-top: 2em;
+}
+
+#messages {
+    background-color: rgb(230, 230, 230);
+    margin: 1em 0;
+    padding: 1em;
+}
+
+body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+code {
+    font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
+    monospace;
+}
+
+/*# sourceMappingURL=/index.css.map */
+'''
+'''--- dist/index.html ---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <link rel="icon" href="/favicon.26242483.ico">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#000000">
+  <link rel="apple-touch-icon" href="/favicon.26242483.ico">
+<!--  <link rel="stylesheet" href="global.scss">-->
+  <title>NEAR Crossword Puzzle</title>
+  <meta property="og:title" content="NEAR Crossword Puzzle">
+  <meta property="og:description" content="A learning opportunity with NEAR smart contracts and tools.">
+
+<link rel="stylesheet" href="/src.e31bb0bc.css"></head>
+<body>
+<noscript>You need to enable JavaScript to run this app.</noscript>
+<div id="root"></div>
+<script src="/src.e31bb0bc.js"></script>
+</body>
+</html>
+
+'''
+'''--- dist/src.e31bb0bc.css ---
+#page {
+    padding: 2em;
+}
+
+h1 {
+    margin-bottom: 1em;
+}
+
+#crossword-wrapper .clue.correct::before {
+    content: "✓";
+    display: inline-block;
+    text-decoration: none;
+    color: rgb(100, 200, 100);
+    margin-right: 0.25em;
+}
+
+#crossword-wrapper {
+    max-width: 66%;
+    margin: 2em auto 0 auto;
+}
+
+#messages {
+    background-color: rgb(230, 230, 230);
+    margin: 1em 0;
+    padding: 1em;
+}
+
+@font-face {
+    font-family: 'Inter';
+    src:  url('/Inter-Regular.3b99ff55.ttf') format('ttf'),
+    url('/Inter-Medium.ccf17ea8.ttf') format('ttf');
+}
+
+body {
+    margin: 0;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+code {
+    font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
+    monospace;
+}
+
+span.important {
+    font-size: 1.9rem;
+    color: #FF585D;
+}
+
+.claim-inputs {
+    margin-top: 30px
+}
+
+.claim-inputs label {
+    font-size: 1.3em;
+}
+
+#claim-memo, #claim-account-id, .btn {
+    border-radius: 5px;
+    border: .1em solid #000;
+    padding: .5em 1em;
+    font-size: 1.66em;
+    margin: .5em;
+}
+
+.claim-inputs .btn {
+    margin: .5em;
+}
+
+#page h1, #page .no-puzzles {
+    text-align: center;
+}
+
+#page .no-puzzles .cli-command {
+    text-align: left;
+}
+
+#page.claim {
+    margin: 0 auto;
+    width: 576px;
+}
+
+/*# sourceMappingURL=/src.e31bb0bc.css.map */
+'''
+'''--- package.json ---
+{
+  "name": "crossword-react",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": {
+    "@testing-library/jest-dom": "^5.11.4",
+    "@testing-library/react": "^11.1.0",
+    "@testing-library/user-event": "^12.1.10",
+    "bs58": "^4.0.1",
+    "js-sha256": "^0.9.0",
+    "near-api-js": "^0.42.0",
+    "react": "^16.13.1",
+    "react-crossword-near": "^2.3.1",
+    "react-dom": "^16.13.1",
+    "react-fullpage-custom-loader": "^0.1.6",
+    "react-scripts": "4.0.3",
+    "styled-components": "^5.2.0",
+    "web-vitals": "^1.0.1"
+  },
+  "scripts": {
+    "start": "parcel src/index.html",
+    "build": "react-scripts build",
+    "test": "react-scripts test",
+    "eject": "react-scripts eject"
+  },
+  "eslintConfig": {
+    "extends": [
+      "react-app",
+      "react-app/jest"
+    ]
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  },
+  "devDependencies": {
+    "parcel-bundler": "^1.12.5"
+  }
+}
+
+'''
+'''--- public/index.html ---
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="%PUBLIC_URL%/favicon.ico" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#000000" />
+    <meta
+      name="description"
+      content="Web site created using create-react-app"
+    />
+    <link rel="apple-touch-icon" href="%PUBLIC_URL%/logo192.png" />
+    <!--
+      manifest.json provides metadata used when your web app is installed on a
+      user's mobile device or desktop. See https://developers.google.com/web/fundamentals/web-app-manifest/
+    -->
+    <link rel="manifest" href="%PUBLIC_URL%/manifest.json" />
+    <!--
+      Notice the use of %PUBLIC_URL% in the tags above.
+      It will be replaced with the URL of the `public` folder during the build.
+      Only files inside the `public` folder can be referenced from the HTML.
+
+      Unlike "/favicon.ico" or "favicon.ico", "%PUBLIC_URL%/favicon.ico" will
+      work correctly both with client-side routing and a non-root public URL.
+      Learn how to configure a non-root public URL by running `npm run build`.
+    -->
+    <title>React App</title>
+  </head>
+  <body>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="root"></div>
+    <!--
+      This HTML file is a template.
+      If you open it directly in the browser, you will see an empty page.
+
+      You can add webfonts, meta tags, or analytics to this file.
+      The build step will place the bundled scripts into the <body> tag.
+
+      To begin the development, run `npm start` or `yarn start`.
+      To create a production bundle, use `npm run build` or `yarn build`.
+    -->
+  </body>
+</html>
+
+'''
+'''--- public/manifest.json ---
+{
+  "short_name": "React App",
+  "name": "Create React App Sample",
+  "icons": [
+    {
+      "src": "favicon.ico",
+      "sizes": "64x64 32x32 24x24 16x16",
+      "type": "image/x-icon"
+    },
+    {
+      "src": "logo192.png",
+      "type": "image/png",
+      "sizes": "192x192"
+    },
+    {
+      "src": "logo512.png",
+      "type": "image/png",
+      "sizes": "512x512"
+    }
+  ],
+  "start_url": ".",
+  "display": "standalone",
+  "theme_color": "#000000",
+  "background_color": "#ffffff"
+}
+
+'''
+'''--- public/robots.txt ---
+# https://www.robotstxt.org/robotstxt.html
+User-agent: *
+Disallow:
+
+'''
+'''--- src/App.css ---
+#page {
+    padding: 2em;
+}
+
+h1 {
+    margin-bottom: 1em;
+}
+
+#crossword-wrapper .clue.correct::before {
+    content: "✓";
+    display: inline-block;
+    text-decoration: none;
+    color: rgb(100, 200, 100);
+    margin-right: 0.25em;
+}
+
+#crossword-wrapper {
+    max-width: 66%;
+    margin: 2em auto 0 auto;
+}
+
+#messages {
+    background-color: rgb(230, 230, 230);
+    margin: 1em 0;
+    padding: 1em;
+}
+
+@font-face {
+    font-family: 'Inter';
+    src:  url('./fonts/static/Inter-Regular.ttf') format('ttf'),
+    url('./fonts/static/Inter-Medium.ttf') format('ttf');
+}
+
+body {
+    margin: 0;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+code {
+    font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
+    monospace;
+}
+
+span.important {
+    font-size: 1.9rem;
+    color: #FF585D;
+}
+
+.claim-inputs {
+    margin-top: 30px
+}
+
+.claim-inputs label {
+    font-size: 1.3em;
+}
+
+#claim-memo, #claim-account-id, .btn {
+    border-radius: 5px;
+    border: .1em solid #000;
+    padding: .5em 1em;
+    font-size: 1.66em;
+    margin: .5em;
+}
+
+.claim-inputs .btn {
+    margin: .5em;
+}
+
+#page h1, #page .no-puzzles {
+    text-align: center;
+}
+
+#page .no-puzzles .cli-command {
+    text-align: left;
+}
+
+#page.claim {
+    margin: 0 auto;
+    width: 576px;
+}
+
+button, .highlight {
+    border-radius: 5px;
+    border: 0.1em solid #262626;
+    padding: 0.5em 1em;
+}
+
+button:hover, button:focus, button:focus-within, .highlight:hover, .highlight:focus, .highlight:focus-within {
+    border-color: #5F8AFA;
+}
+
+#login {
+    text-align: right;
+}
+
+button {
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    font: inherit;
+    outline: none;
+}
+'''
+'''--- src/App.js ---
+import './App.css';
+import React, { useCallback, useRef, useState } from 'react';
+import Crossword from 'react-crossword-near';
+import { parseSolutionSeedPhrase } from './utils';
+import nearCLICommand from './near-cli-command';
+import { createGridData, loadGuesses } from "react-crossword-near/dist/es/util";
+import sha256 from 'js-sha256';
+import SimpleDark from './loader';
+import { DEFAULT_FUNCTION_CALL_GAS } from "near-api-js/src/constants";
+
+const App = ({ data, hash, nearConfig, walletConnection, currentUser }) => {
+  const crossword = useRef();
+  const [solutionFound, setSolutionFound] = useState("Not correct yet");
+  const [showLoader, setShowLoader] = useState(false);
+  const [solutionHash, setSolutionHash] = useState(hash);
+  const [transactionHash, setTransactionHash] = useState(false);
+
+  const onCrosswordComplete = useCallback(
+    async (completeCount) => {
+      if (completeCount !== false) {
+        let gridData = createGridData(data).gridData;
+        loadGuesses(gridData, 'guesses');
+        await checkSolution(gridData);
+      }
+    },
+    []
+  );
+
+  // This function is called when all entries are filled
+  async function checkSolution(gridData) {
+    let seedPhrase = parseSolutionSeedPhrase(data, gridData);
+    let answerHash = sha256.sha256(seedPhrase);
+    // Compare crossword solution's public key with the known public key for this puzzle
+    // (It was given to us when we first fetched the puzzle in index.js)
+    if (answerHash === solutionHash) {
+      console.log("You're correct!");
+      setSolutionFound("Correct!");
+
+      // Clean up and get ready for next puzzle
+      localStorage.removeItem('guesses');
+      setSolutionHash(null);
+      // Show full-screen loader as we process transaction
+      setShowLoader(true);
+      // Send the 5 NEAR prize to the logged-in winner
+      let functionCallResult = await walletConnection.account().functionCall({
+        contractId: nearConfig.contractName,
+        methodName: 'submit_solution',
+        args: {solution: seedPhrase, memo: "Yay I won!"},
+        gas: DEFAULT_FUNCTION_CALL_GAS, // optional param, by the way
+        attachedDeposit: 0,
+        walletMeta: '', // optional param, by the way
+        walletCallbackUrl: '' // optional param, by the way
+      });
+      if (functionCallResult && functionCallResult.transaction && functionCallResult.transaction.hash) {
+        console.log('Transaction hash for explorer', functionCallResult.transaction.hash)
+        setTransactionHash(functionCallResult.transaction.hash);
+      }
+      setShowLoader(false);
+    } else {
+      console.log("That's not the correct solution. :/");
+      setSolutionFound("Not correct yet");
+    }
+  }
+
+  const signIn = () => {
+    walletConnection.requestSignIn(
+      nearConfig.contractName,
+      '', // title. Optional, by the way
+      '', // successUrl. Optional, by the way
+      '', // failureUrl. Optional, by the way
+    );
+  };
+
+  const signOut = () => {
+    walletConnection.signOut();
+    window.location.replace(window.location.origin + window.location.pathname);
+  };
+
+  if (showLoader) {
+    return (
+      <div className="wrapper">
+        <header className="site-header">
+        </header>
+        <main className="main-area">
+          <SimpleDark />
+        </main>
+      </div>
+    )
+  } else if (solutionHash) {
+    // A solution hash was found, meaning there's a crossword puzzle to solve
+    return (
+      <div id="page">
+        <h1>NEAR Crossword Puzzle</h1>
+        <div id="crossword-wrapper">
+          <div id="login">
+            { currentUser
+              ? <button onClick={signOut}>Log out</button>
+              : <button onClick={signIn}>Log in</button>
+            }
+          </div>
+          <h3>Status: { solutionFound }</h3>
+          <Crossword
+            data={data}
+            ref={crossword}
+            onCrosswordComplete={onCrosswordComplete}
+          />
+          <p>Thank you <a href="https://github.com/JaredReisinger/react-crossword" target="_blank" rel="noreferrer">@jaredreisinger/react-crossword</a>!</p>
+        </div>
+      </div>
+    );
+  } else {
+    // No solution hash was found, let the user know
+    const explorerUrl = `https://explorer.testnet.near.org/transactions/${transactionHash}`;
+    return (
+      <div id="page">
+        <h1>NEAR Crossword Puzzle</h1>
+        <div id="crossword-wrapper" className="no-puzzles">
+          { transactionHash && <a href={explorerUrl} target="_blank">See transaction on NEAR Explorer</a>}
+          <h2>No puzzles to solve :)</h2>
+          <p>Sorry, no puzzles to solve.</p>
+          <p>If you are the developer and are surprised to see this, perhaps you'll want to add a puzzle:</p>
+          <p>With <a href="https://docs.near.org/docs/tools/near-cli#installation" target="_blank">NEAR CLI</a>:</p>
+          <div className="cli-command">
+            <code>
+              {nearCLICommand}
+            </code>
+          </div>
+        </div>
+      </div>
+    );
+  }
+}
+
+export default App;
+
+'''
+'''--- src/config.js ---
+const CONTRACT_NAME = process.env.CONTRACT_NAME || 'your-crossword-account.testnet';
+
+function getConfig(env) {
+  switch(env) {
+    case 'production':
+    case 'mainnet':
+      return {
+        networkId: 'mainnet',
+        nodeUrl: 'https://rpc.mainnet.near.org',
+        contractName: CONTRACT_NAME,
+        walletUrl: 'https://wallet.near.org',
+        helperUrl: 'https://helper.mainnet.near.org'
+      };
+    case 'development':
+    case 'testnet':
+      return {
+        networkId: 'testnet',
+        nodeUrl: 'https://rpc.testnet.near.org',
+        contractName: CONTRACT_NAME,
+        walletUrl: 'https://wallet.testnet.near.org',
+        helperUrl: 'https://helper.testnet.near.org'
+      };
+    case 'betanet':
+      return {
+        networkId: 'betanet',
+        nodeUrl: 'https://rpc.betanet.near.org',
+        contractName: CONTRACT_NAME,
+        walletUrl: 'https://wallet.betanet.near.org',
+        helperUrl: 'https://helper.betanet.near.org'
+      };
+    case 'local':
+      return {
+        networkId: 'local',
+        nodeUrl: 'http://localhost:3030',
+        keyPath: `${process.env.HOME}/.near/validator_key.json`,
+        walletUrl: 'http://localhost:4000/wallet',
+        contractName: CONTRACT_NAME
+      };
+    case 'test':
+    case 'ci':
+      return {
+        networkId: 'shared-test',
+        nodeUrl: 'https://rpc.ci-testnet.near.org',
+        contractName: CONTRACT_NAME,
+        masterAccount: 'test.near'
+      };
+    case 'ci-betanet':
+      return {
+        networkId: 'shared-test-staging',
+        nodeUrl: 'https://rpc.ci-betanet.near.org',
+        contractName: CONTRACT_NAME,
+        masterAccount: 'test.near'
+      };
+    default:
+      throw Error(`Unconfigured environment '${env}'. Can be configured in src/config.js.`);
+  }
+}
+
+module.exports = getConfig;
+
+'''
+'''--- src/fonts/OFL.txt ---
+Copyright (c) 2016-2019 The Inter Project Authors (me@rsms.me)
+
+This Font Software is licensed under the SIL Open Font License, Version 1.1.
+This license is copied below, and is also available with a FAQ at:
+http://scripts.sil.org/OFL
+
+-----------------------------------------------------------
+SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007
+-----------------------------------------------------------
+
+PREAMBLE
+The goals of the Open Font License (OFL) are to stimulate worldwide
+development of collaborative font projects, to support the font creation
+efforts of academic and linguistic communities, and to provide a free and
+open framework in which fonts may be shared and improved in partnership
+with others.
+
+The OFL allows the licensed fonts to be used, studied, modified and
+redistributed freely as long as they are not sold by themselves. The
+fonts, including any derivative works, can be bundled, embedded, 
+redistributed and/or sold with any software provided that any reserved
+names are not used by derivative works. The fonts and derivatives,
+however, cannot be released under any other type of license. The
+requirement for fonts to remain under this license does not apply
+to any document created using the fonts or their derivatives.
+
+DEFINITIONS
+"Font Software" refers to the set of files released by the Copyright
+Holder(s) under this license and clearly marked as such. This may
+include source files, build scripts and documentation.
+
+"Reserved Font Name" refers to any names specified as such after the
+copyright statement(s).
+
+"Original Version" refers to the collection of Font Software components as
+distributed by the Copyright Holder(s).
+
+"Modified Version" refers to any derivative made by adding to, deleting,
+or substituting -- in part or in whole -- any of the components of the
+Original Version, by changing formats or by porting the Font Software to a
+new environment.
+
+"Author" refers to any designer, engineer, programmer, technical
+writer or other person who contributed to the Font Software.
+
+PERMISSION & CONDITIONS
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of the Font Software, to use, study, copy, merge, embed, modify,
+redistribute, and sell modified and unmodified copies of the Font
+Software, subject to the following conditions:
+
+1) Neither the Font Software nor any of its individual components,
+in Original or Modified Versions, may be sold by itself.
+
+2) Original or Modified Versions of the Font Software may be bundled,
+redistributed and/or sold with any software, provided that each copy
+contains the above copyright notice and this license. These can be
+included either as stand-alone text files, human-readable headers or
+in the appropriate machine-readable metadata fields within text or
+binary files as long as those fields can be easily viewed by the user.
+
+3) No Modified Version of the Font Software may use the Reserved Font
+Name(s) unless explicit written permission is granted by the corresponding
+Copyright Holder. This restriction only applies to the primary font name as
+presented to the users.
+
+4) The name(s) of the Copyright Holder(s) or the Author(s) of the Font
+Software shall not be used to promote, endorse or advertise any
+Modified Version, except to acknowledge the contribution(s) of the
+Copyright Holder(s) and the Author(s) or with their explicit written
+permission.
+
+5) The Font Software, modified or unmodified, in part or in whole,
+must be distributed entirely under this license, and must not be
+distributed under any other license. The requirement for fonts to
+remain under this license does not apply to any document created
+using the Font Software.
+
+TERMINATION
+This license becomes null and void if any of the above conditions are
+not met.
+
+DISCLAIMER
+THE FONT SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO ANY WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT
+OF COPYRIGHT, PATENT, TRADEMARK, OR OTHER RIGHT. IN NO EVENT SHALL THE
+COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+INCLUDING ANY GENERAL, SPECIAL, INDIRECT, INCIDENTAL, OR CONSEQUENTIAL
+DAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM
+OTHER DEALINGS IN THE FONT SOFTWARE.
+
+'''
+'''--- src/fonts/README.txt ---
+Inter Variable Font
+===================
+
+This download contains Inter as both a variable font and static fonts.
+
+Inter is a variable font with these axes:
+  slnt
+  wght
+
+This means all the styles are contained in a single file:
+  Inter-VariableFont_slnt,wght.ttf
+
+If your app fully supports variable fonts, you can now pick intermediate styles
+that aren’t available as static fonts. Not all apps support variable fonts, and
+in those cases you can use the static font files for Inter:
+  static/Inter-Thin.ttf
+  static/Inter-ExtraLight.ttf
+  static/Inter-Light.ttf
+  static/Inter-Regular.ttf
+  static/Inter-Medium.ttf
+  static/Inter-SemiBold.ttf
+  static/Inter-Bold.ttf
+  static/Inter-ExtraBold.ttf
+  static/Inter-Black.ttf
+
+Get started
+-----------
+
+1. Install the font files you want to use
+
+2. Use your app's font picker to view the font family and all the
+available styles
+
+Learn more about variable fonts
+-------------------------------
+
+  https://developers.google.com/web/fundamentals/design-and-ux/typography/variable-fonts
+  https://variablefonts.typenetwork.com
+  https://medium.com/variable-fonts
+
+In desktop apps
+
+  https://theblog.adobe.com/can-variable-fonts-illustrator-cc
+  https://helpx.adobe.com/nz/photoshop/using/fonts.html#variable_fonts
+
+Online
+
+  https://developers.google.com/fonts/docs/getting_started
+  https://developer.mozilla.org/en-US/docs/Web/CSS/CSS_Fonts/Variable_Fonts_Guide
+  https://developer.microsoft.com/en-us/microsoft-edge/testdrive/demos/variable-fonts
+
+Installing fonts
+
+  MacOS: https://support.apple.com/en-us/HT201749
+  Linux: https://www.google.com/search?q=how+to+install+a+font+on+gnu%2Blinux
+  Windows: https://support.microsoft.com/en-us/help/314960/how-to-install-or-remove-a-font-in-windows
+
+Android Apps
+
+  https://developers.google.com/fonts/docs/android
+  https://developer.android.com/guide/topics/ui/look-and-feel/downloadable-fonts
+
+License
+-------
+Please read the full license text (OFL.txt) to understand the permissions,
+restrictions and requirements for usage, redistribution, and modification.
+
+You can use them freely in your products & projects - print or digital,
+commercial or otherwise.
+
+This isn't legal advice, please consider consulting a lawyer and see the full
+license for all details.
+
+'''
+'''--- src/index.html ---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <link rel="icon" href="./favicon.ico" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#000000" />
+  <link rel="apple-touch-icon" href="./favicon.ico" />
+<!--  <link rel="stylesheet" href="global.scss">-->
+  <title>NEAR Crossword Puzzle</title>
+  <meta property="og:title" content="NEAR Crossword Puzzle">
+  <meta property="og:description" content="A learning opportunity with NEAR smart contracts and tools.">
+
+</head>
+<body>
+<noscript>You need to enable JavaScript to run this app.</noscript>
+<div id="root"></div>
+<script src="./index.js"></script>
+</body>
+</html>
+
+'''
+'''--- src/index.js ---
+import React from 'react';
+import ReactDOM from 'react-dom';
+import * as nearAPI from 'near-api-js';
+import App from './App';
+import getConfig from './config.js';
+import { viewMethodOnContract, mungeBlockchainCrossword } from './utils';
+
+async function initCrossword() {
+  const nearConfig = getConfig(process.env.NEAR_ENV || 'testnet');
+
+  // create a keyStore for signing transactions using the user's key
+  // which is located in the browser local storage after user logs in
+  const keyStore = new nearAPI.keyStores.BrowserLocalStorageKeyStore();
+
+  // Initializing connection to the NEAR testnet
+  const near = await nearAPI.connect({ keyStore, ...nearConfig });
+
+  // Initialize wallet connection
+  const walletConnection = new nearAPI.WalletConnection(near);
+
+  // Load in user's account data
+  let currentUser;
+  if (walletConnection.getAccountId()) {
+    currentUser = walletConnection.getAccountId();
+  }
+
+  const chainData = await viewMethodOnContract(nearConfig, 'get_unsolved_puzzles', '{}');
+
+  let data;
+  let solutionHash;
+
+  // There may not be any crossword puzzles to solve, check this.
+  if (chainData.puzzles.length) {
+    solutionHash = chainData.puzzles[0]['solution_hash'];
+    data = mungeBlockchainCrossword(chainData.puzzles);
+  } else {
+    console.log("Oof, there's no crossword to play right now, friend.");
+  }
+  return { data, solutionHash, nearConfig, walletConnection, currentUser };
+}
+
+initCrossword()
+  .then(({ data, solutionHash, nearConfig, walletConnection, currentUser }) => {
+    ReactDOM.render(
+      <App
+        data={data}
+        hash={solutionHash}
+        nearConfig={nearConfig}
+        walletConnection={walletConnection}
+        currentUser={currentUser}
+      />,
+      document.getElementById('root'));
+  });
+
+'''
+'''--- src/loader.js ---
+import React from 'react'
+import ExampleComponent from 'react-fullpage-custom-loader'
+
+const defaultProps = {
+  sentences: [
+    'Transaction processing…',
+  ],
+  loaderType: 'fire', // a nice one
+  loaderSize: 'big', // small, medium or big?
+  color: '#f2f2f2', // your default color for the loader
+  textStyles: { // Any CSS style!
+    fontSize: 19,
+    fontWeight: 'bold',
+    height: '6em',
+    color: '#f2f2f2'
+  },
+  wrapperBackgroundColor: 'linear-gradient(to bottom, #f2f2f2 0%, #111111 100%)', // any valid CSS background string works (gradients here!)
+  counter: false, // We are going to show the counter below the text
+  counterMax: 5, // Stop after 5 cycles
+  counterDelay: 3000, // A cycle length in milliseconds
+  counterChars: null, // if no chars are passed you get to see the counter number
+  counterStyles: {
+    color: 'white'
+  }, // any text style to modify the counter
+  fadeIn: true, // controlled on top level
+  startFadeOut: false // controlled on top level
+}
+
+const SimpleDark = (props) => {
+  return (
+    <ExampleComponent
+      {...defaultProps}
+      {...props}
+    />
+  )
+}
+
+export default SimpleDark
+
+'''
+'''--- src/near-cli-command.js ---
+const nearCLICommand = `
+      near call crossword.friend.testnet new_puzzle '{
+        "solution_hash": "d1a5cf9ad1adefe0528f7d31866cf901e665745ff172b96892693769ad284010",
+        "answers": [
+      {
+        "num": 1,
+        "start": {
+        "x": 1,
+        "y": 1
+      },
+        "direction": "Down",
+        "length": 5,
+        "clue": "NFT market on NEAR that specializes in cards and comics."
+      },
+      {
+        "num": 2,
+        "start": {
+        "x": 0,
+        "y": 2
+      },
+        "direction": "Across",
+        "length": 13,
+        "clue": "You can move assets between NEAR and different chains, including Ethereum, by visiting ______.app"
+      },
+      {
+        "num": 3,
+        "start": {
+        "x": 9,
+        "y": 1
+      },
+        "direction": "Down",
+        "length": 8,
+        "clue": "NFT market on NEAR with art, physical items, tickets, and more."
+      },
+      {
+        "num": 4,
+        "start": {
+        "x": 3,
+        "y": 8
+      },
+        "direction": "Across",
+        "length": 9,
+        "clue": "The smallest denomination of the native token on NEAR."
+      },
+      {
+        "num": 5,
+        "start": {
+        "x": 5,
+        "y": 8
+      },
+        "direction": "Down",
+        "length": 3,
+        "clue": "You typically deploy a smart contract with the NEAR ___ tool."
+      }
+        ]
+      }' --accountId crossword.friend.testnet    
+    `;
+
+module.exports = nearCLICommand
+'''
+'''--- src/utils.js ---
+// This function takes the input from the Rust smart contract
+// and turns it into what the crossword library would like.
+// Opportunity to enhance the library so this isn't necessary.
+import * as nearAPI from 'near-api-js';
+import bs58 from 'bs58';
+
+// Our API could be improved here :)
+// See: https://github.com/near/near-api-js/issues/612
+async function viewMethodOnContract(nearConfig, method, params) {
+  const paramBytes = Buffer.from(params, 'utf8');
+  const base58Params = bs58.encode(paramBytes);
+
+  const provider = new nearAPI.providers.JsonRpcProvider(nearConfig.nodeUrl);
+  const rawResult = await provider.query(`call/${nearConfig.contractName}/${method}`, base58Params);
+  return JSON.parse(rawResult.result.map((x) => String.fromCharCode(x)).join(''));
+}
+
+function parseSolutionSeedPhrase(data, gridData) {
+  // JavaScript determining what the highest clue number is
+  // Example: 10 if there are ten clues, some which have both across and down clues
+  let totalClues = Object.keys(data.across).concat(Object.keys(data.down))
+    .map(n => parseInt(n))
+    .reduce((n, m) => Math.max(n, m));
+
+  let seedPhrase = [];
+  // Assume that crossword starts at 1 and goes to totalClues
+  for (let i = 1; i <= totalClues; i++) {
+    let word = '';
+    // If a number has both across and down clues, do across first.
+    let iString = i.toString(); // not strictly necessary
+    if (data.across.hasOwnProperty(iString)) {
+      const answerLength = data.across[i].answer.length;
+      for (let j = 0; j < answerLength; j++) {
+        word += gridData[data['across'][i].row][data['across'][i].col + j].guess;
+      }
+      seedPhrase.push(word);
+    }
+    word = ''; // Clear for items where there's both across and down
+    if (data.down.hasOwnProperty(iString)) {
+      const answerLength = data.down[i].answer.length;
+      for (let j = 0; j < answerLength; j++) {
+        word += gridData[data['down'][i].row + j][data['down'][i].col].guess;
+      }
+      seedPhrase.push(word);
+    }
+  }
+  const finalSeedPhrase = seedPhrase.map(w => w.toLowerCase()).join(' ');
+  console.log(`Crossword solution as seed phrase: %c${finalSeedPhrase}`, "color: #00C1DE;");
+  return finalSeedPhrase;
+}
+
+/* Example of expected data for crossword library
+  export const data = {
+    across: {
+      1: {
+        clue: 'one plus one',
+        answer: 'TWO',
+        row: 0,
+        col: 0,
+      },
+    },
+    down: {
+      2: {
+        clue: 'three minus two',
+        answer: 'ONE',
+        row: 0,
+        col: 2,
+      },
+    },
+  };
+*/
+
+function mungeBlockchainCrossword(chainData) {
+  const data = {
+    across: {},
+    down: {}
+  };
+  // Assume there is only one crossword puzzle, get the first
+  const crosswordClues = chainData[0].answer;
+
+  crosswordClues.forEach((clue) => {
+    // In the smart contract it's stored as "Across" but the
+    // React library uses "across"
+    const direction = clue.direction.toLowerCase();
+    data[direction][clue.num] = {};
+    data[direction][clue.num]['clue'] = clue.clue;
+    data[direction][clue.num]['answer'] = '?'.repeat(clue.length);
+    data[direction][clue.num]['row'] = clue.start.y;
+    data[direction][clue.num]['col'] = clue.start.x;
+  });
+  return data;
+}
+
+module.exports = {
+  viewMethodOnContract,
+  parseSolutionSeedPhrase,
+  mungeBlockchainCrossword
+};
+
+'''

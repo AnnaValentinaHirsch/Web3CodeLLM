@@ -1,0 +1,345 @@
+*GitHub Repository "kiseln/near-stash"*
+
+'''--- README.md ---
+# Overview
+
+Smart contract for NEAR blockchain that allows you to stash your NEAR for a provided period of time. You will only be able to get your NEAR back after the period expires.
+
+## Contract interface
+
+- ```
+  deposit(lockPeriodInMinutes: u64): void
+  ```
+    Deposits attached NEAR to the contract and locks it for a specified period.
+
+- ```
+  withdraw(): void
+  ```
+    Withdraws NEAR to the caller if lock period expired.
+
+# Develop
+
+- `yarn` to install dependencies
+- `yarn build` to build the project
+- `yarn build:release` to build in release mode
+- `yarn test` to run unit tests
+
+# TODO
+- Add fungible tokens support
+- Add NFT support
+- Add build/deploy bash scripts
+- Fix potential bug when withdrawal is pending: [index.ts](./src/contract/assembly/index.ts#L49)
+- Add multiple deposits per user
+- Charge for data storage
+- Add UI
+- Port to RUST
+- Add simulation tests
+'''
+'''--- as-pect.config.js ---
+module.exports = require("near-sdk-as/imports");
+module.exports.include.push("**/*.unit.spec.ts");
+
+'''
+'''--- asconfig.json ---
+{
+  "workspaces": [
+    "src/contract"
+  ]
+}
+
+'''
+'''--- package.json ---
+{
+  "name": "near-money-saver",
+  "version": "0.0.1",
+  "description": "TBC",
+  "scripts": {
+    "dev": "watch -d -n 1 'clear && yarn test'",
+    "test": "yarn asp -f unit.spec",
+    "clean": "rm -rf ./build && rm -rf ./neardev",
+    "build": "asb --target debug",
+    "build:release": "asb",
+    "asp": "asp --verbose --nologo"
+  },
+  "keywords": [],
+  "devDependencies": {
+    "near-sdk-as": "^3.1.0"
+  }
+}
+
+'''
+'''--- src/as_types.d.ts ---
+/// <reference types="near-sdk-as/assembly/as_types" />
+'''
+'''--- src/contract/__tests__/as-pect.d.ts ---
+/// <reference types="@as-pect/assembly/types/as-pect" />
+'''
+'''--- src/contract/__tests__/index.unit.spec.ts ---
+import { u128, VMContext } from "near-sdk-as";
+import { Contract } from "../assembly/index";
+
+let contract: Contract;
+
+beforeEach(() => {
+    VMContext.setSigner_account_id("user1");
+    contract = new Contract();
+});
+
+describe("Contract deposit", () => {
+    it("should not allow zero deposits with default minimum", () => {
+        VMContext.setAttached_deposit(u128.Zero);
+        expect(() => { contract.deposit(); }).toThrow();
+    });
+
+    it("should not allow deposits less than defined minimum", () => {
+        contract = new Contract(new u128(10));
+        VMContext.setAttached_deposit(new u128(4));
+        expect(() => { contract.deposit(); }).toThrow();
+    });
+
+    it("should deposit if amount is higher than minimum", () => {
+        VMContext.setAttached_deposit(new u128(4));
+        expect(() => { contract.deposit(); }).not.toThrow();
+    });
+
+    it("should not allow more than one deposit from a single sender", () => {
+        VMContext.setAttached_deposit(new u128(4));
+        contract.deposit();
+        expect(() => { contract.deposit(); }).toThrow();
+    });
+});
+
+describe("Contract withdraw", () => {
+    beforeEach(() => {
+        VMContext.setSigner_account_id("user1");
+        VMContext.setAttached_deposit(new u128(4));
+        contract.deposit();
+    });
+
+    it("should fail if there is no deposit found", () => {
+        VMContext.setSigner_account_id("user2");
+        expect(() => { contract.withdraw(); }).toThrow();
+    });
+
+    it("should withdraw if deposit exists", () => {
+        contract.withdraw();
+    });
+
+    it("should delete the deposit after withdrawing", () => {
+        contract.withdraw();
+        expect(() => { contract.withdraw(); }).toThrow();
+    });
+});
+
+describe("Contract withdraw", () => {
+    beforeEach(() => {
+        VMContext.setAttached_deposit(new u128(4));
+        VMContext.setBlock_timestamp(1643297131_000_000_000);
+        contract.deposit(10);
+    });
+
+    it("should allow withdraw if required time has passed", () => {
+        VMContext.setBlock_timestamp(1643297843_000_000_000)
+        expect(() => { contract.withdraw(); }).not.toThrow();
+    });
+
+    it("should not allow withdraw if required time hasn't passed", () => {
+        VMContext.setBlock_timestamp(1643297283_000_000_000)
+        expect(() => { contract.withdraw(); }).toThrow();
+    });
+});
+'''
+'''--- src/contract/asconfig.json ---
+{
+  "extends": "near-sdk-as/asconfig.json"
+}
+
+'''
+'''--- src/contract/assembly/deposit.ts ---
+import { u128 } from "near-sdk-as";
+
+@nearBindgen
+export class Deposit {
+    constructor(public amount: u128, public endTimestamp: u64) {}
+}
+'''
+'''--- src/contract/assembly/index.ts ---
+import { Context, u128, PersistentMap, ContractPromiseBatch, ContractPromise } from "near-sdk-core"
+import { AccountId, assert_self, readableTimespan, minutesToTimestamp, XCC_GAS } from "../../utils"
+import { Deposit } from "./deposit";
+
+@nearBindgen
+export class Contract {
+    private minDeposit: u128;
+    private deposits: PersistentMap<AccountId, Deposit> = new PersistentMap<AccountId, Deposit>("deposit");
+
+    constructor(minDeposit: u128 = u128.One) {
+        this.minDeposit = minDeposit;
+    };
+
+    @mutateState()
+    deposit(lockPeriodInMinutes: u64 = 0): void {
+        const amount = Context.attachedDeposit;
+        
+        assert(amount >= this.minDeposit, `Deposit should be at least ${this.minDeposit} yNear`);
+        assert(!this.deposits.contains(Context.sender), "You already have a deposit");
+
+        let endTimestamp = Context.blockTimestamp + minutesToTimestamp(lockPeriodInMinutes);
+        
+        this.deposits.set(Context.sender, new Deposit(amount, endTimestamp));
+    }
+
+    @mutateState()
+    withdraw(): void {
+        const sender = Context.sender;
+        assert(this.deposits.contains(sender), "You don't have a deposit");
+
+        let deposit = this.deposits.getSome(sender);
+        assert(deposit.endTimestamp <= Context.blockTimestamp,
+            `You will be able to withdraw your deposit in ${readableTimespan(deposit.endTimestamp - Context.blockTimestamp)}`);
+
+        this.deposits.delete(sender);
+
+        ContractPromiseBatch.create(sender)
+            .transfer(deposit.amount)
+                .then(Context.contractName)
+                .function_call("on_withdraw_complete", new OnWithdrawCompleteArgs(deposit), u128.Zero, XCC_GAS);
+    }
+
+    @mutateState()
+    on_withdraw_complete(deposit: Deposit): void {
+        assert_self();
+
+        const results = ContractPromise.getResults()
+        // If withdraw failed return deposit back to the collection.
+        // TODO: If customer made another deposit we will accidentally override it here. Handle this case.
+        if (!results[0].succeeded) {
+            this.deposits.set(Context.sender, deposit);
+        }
+    }
+}
+
+@nearBindgen
+class OnWithdrawCompleteArgs {
+    constructor(public deposit: Deposit) {}
+}
+'''
+'''--- src/tsconfig.json ---
+{
+  "extends": "../node_modules/assemblyscript/std/assembly.json",
+  "include": ["./**/*.ts"]
+}
+
+'''
+'''--- src/utils.ts ---
+import { u128, Context, ContractPromise } from "near-sdk-as";
+
+/**
+ * == TYPES ====================================================================
+ */
+
+/**
+ * Account IDs in NEAR are just strings.
+ */
+export type AccountId = string;
+
+/**
+ * Gas is u64
+ */
+export type Gas = u64;
+
+/**
+ * Amounts, Balances, and Money in NEAR is are u128.
+ */
+
+export type Amount = u128;
+
+export type Balance = Amount;
+
+export type Money = Amount;
+
+/**
+ * Timestamp in NEAR is a number.
+ */
+export type Timestamp = u64;
+
+/**
+ * == CONSTANTS ================================================================
+ *
+ * ONE_NEAR = unit of NEAR token in yocto Ⓝ (1e24)
+ * XCC_GAS = gas for cross-contract calls, ~5 Tgas (teragas = 1e12) per "hop"
+ * MIN_ACCOUNT_BALANCE = 3 NEAR min to keep account alive via storage staking
+ *
+ * TODO: revist MIN_ACCOUNT_BALANCE after some real data is included b/c this
+ *  could end up being much higher
+ */
+
+export const ONE_NEAR = u128.from("1000000000000000000000000");
+export const XCC_GAS: Gas = 20_000_000_000_000;
+export const MIN_ACCOUNT_BALANCE: u128 = u128.mul(ONE_NEAR, u128.from(3));
+
+/**
+ * == FUNCTIONS ================================================================
+ */
+
+/**
+ * @function asNEAR
+ * @param amount {u128} - Yocto Ⓝ token quantity as an unsigned 128-bit integer
+ * @returns {string}    - Amount in NEAR, as a string
+ *
+ * @example
+ *
+ *    asNEAR(7000000000000000000000000)
+ *    // => '7'
+ */
+export function asNEAR(amount: u128): string {
+  return u128.div(amount, ONE_NEAR).toString();
+}
+
+/**
+ * @function toYocto
+ * @param amount {number} - Integer to convert
+ * @returns {u128}        - Amount in yocto Ⓝ as an unsigned 128-bit integer
+ *
+ * @example
+ *
+ *    toYocto(7)
+ *    // => 7000000000000000000000000
+ */
+export function toYocto(amount: number): u128 {
+  return u128.mul(ONE_NEAR, u128.from(amount))
+}
+
+/**
+ * Function to assert that the contract has called itself
+ */
+export function assert_self(): void {
+  const caller = Context.predecessor
+  const self = Context.contractName
+  assert(caller == self, "Only this contract may call itself");
+}
+
+export function assert_single_promise_success(): void {
+  const x = ContractPromise.getResults()
+  assert(x.length == 1, "Expected exactly one promise result")
+  assert(x[0].succeeded, "Expected PromiseStatus to be successful")
+}
+
+export function minutesToTimestamp(minutes: u64): Timestamp {
+  return minutes * 60 * 1000_000_000;
+}
+
+export function readableTimespan(timestamp: u64): string {
+  let seconds = timestamp / 1000000000;
+  let minutes = seconds / 60;
+  let hours = minutes / 60;
+  let days = hours / 24;
+
+  let secondsStr = `${seconds % 60} Seconds`,
+      minutesStr = minutes == 0 ? "" : `${minutes % 60} Minutes, `,
+      hoursStr = hours == 0 ? "" : `${hours % 24} Hours, `,
+      daysStr = days == 0 ? "" : `${days} Days, `;
+
+  return daysStr + hoursStr + minutesStr + secondsStr;
+}
+'''

@@ -1,0 +1,400 @@
+*GitHub Repository "kobby-pentangeli/merkle-tree-accumulator"*
+
+'''--- Cargo.toml ---
+[package]
+name = "merkle-tree-accumulator"
+version = "0.2.0"
+description = "Pure Rust implementation of a Merkle tree accumulator"
+authors = ["Kobby Pentangeli <kobbypentangeli@gmail.com>"]
+repository = "https://github.com/kobby-pentangeli/merkle-tree-accumulator"
+license = "MIT"
+edition = "2018"
+keywords = ["merkle", "accumulator", "webassembly"]
+categories = ["wasm"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+byteorder = "1.4.3"
+near-sdk = "3.1.0"
+thiserror = "1.0.29"
+tiny-keccak = { version = "2.0", features = ["sha3"] }
+rlp = "0.5.1"
+safe-transmute = "0.11.2"
+'''
+'''--- README.md ---
+# Merkle Tree Accumulator (MTA)
+
+Pure Rust implementation of a Merkle tree accumulator
+
+'''
+'''--- src/error.rs ---
+//! Error types
+
+use thiserror::Error;
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum Error {
+    /// Serialization error
+    #[error("Serialization error: _0")]
+    HashSerialize(String),
+    /// None error
+    #[error("Option.None an error")]
+    NoneError,
+}
+
+'''
+'''--- src/hash.rs ---
+use crate::error::Error;
+use byteorder::{BigEndian, ByteOrder};
+use near_sdk::borsh::{self, BorshDeserialize, BorshSchema, BorshSerialize};
+use near_sdk::serde::{Deserialize, Serialize};
+use rlp::{self, encode_list};
+use safe_transmute::transmute_vec;
+use tiny_keccak::{Hasher, Sha3};
+
+#[derive(
+    BorshDeserialize,
+    BorshSchema,
+    BorshSerialize,
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    Hash,
+    Copy,
+)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Hash(pub [u8; 32]);
+
+impl Hash {
+    /// Create Hash from bytes
+    pub fn new(data: &[u8]) -> Self {
+        Self(Self::hash(data))
+    }
+
+    /// Create Hash for any serializable data
+    pub fn serialize<S: BorshSerialize + BorshSchema>(d: &S) -> Result<Self, Error> {
+        let ser = borsh::try_to_vec_with_schema(d)
+            .map_err(|err| Error::HashSerialize(format!("{}", err)))?;
+        Ok(Self(Self::hash(&ser[..])))
+    }
+
+    fn hash(input: &[u8]) -> [u8; 32] {
+        let mut output = [0; 32];
+        let mut sha3 = Sha3::v256();
+        sha3.update(input);
+        sha3.finalize(&mut output);
+        output
+    }
+
+    pub fn sha3_fips_256(input: &[u8]) -> Vec<u32> {
+        let mut output = [0; 32];
+        let mut sha3 = Sha3::v256();
+        sha3.update(input);
+        sha3.finalize(&mut output);
+        transmute_vec(output.to_vec()).expect("Failed to transform the vector")
+    }
+
+    pub fn ec_recover_public_key(message_hash: &[u8], vote_signature: &[u8]) -> Vec<u8> {
+        let r = &vote_signature[0..32];
+        let s = &vote_signature[32..64];
+        let v = &vote_signature[64..65];
+        let prefix: Vec<u8> = transmute_vec([0u8; 31].to_vec()).unwrap();
+        let message_hash: Vec<u8> = transmute_vec(message_hash.to_vec()).unwrap();
+        let input = encode_list(&[
+            BigEndian::read_u128(&message_hash),
+            BigEndian::read_u128(&prefix),
+            BigEndian::read_u128(v),
+            BigEndian::read_u128(r),
+            BigEndian::read_u128(s),
+        ])
+        .to_vec();
+        let mut output = [0; 32];
+        let mut sha3 = Sha3::v256();
+        sha3.update(&input);
+        sha3.finalize(&mut output);
+        transmute_vec(output.to_vec()).expect("Failed to transform the vector")
+    }
+}
+
+'''
+'''--- src/lib.rs ---
+//! Merkle Tree Accumulator
+
+#![feature(int_roundings)]
+
+/// Errors
+pub mod error;
+/// Hash
+pub mod hash;
+/// Merkle Tree Accumulator
+pub mod mta;
+/// Utils
+pub mod utils;
+
+'''
+'''--- src/mta.rs ---
+//! Merkle Tree Accumulator
+
+use super::{hash::Hash, utils::RlpItem};
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::serde::{Deserialize, Serialize};
+
+/// Struct for MTA
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct MerkleTreeAccumulator {
+    /// Height
+    pub height: u128,
+    /// Roots
+    pub roots: Vec<Hash>,
+    /// Offset
+    pub offset: usize,
+    /// Roots size
+    pub roots_size: usize,
+    /// Cache size
+    pub cache_size: usize,
+    /// Cache
+    pub cache: Vec<Hash>,
+    /// Is a newer witness allowed?
+    pub newer_witness_allowed: bool,
+}
+
+impl MerkleTreeAccumulator {
+    /// Initialize MTA from a serialized type
+    pub fn init_from_serialized(&mut self, rlp_bytes: &[u8]) {
+        let mut unpacked: Vec<RlpItem> = vec![];
+        let mut serialized_roots: Vec<RlpItem> = vec![];
+
+        if !rlp_bytes.is_empty() {
+            let rlp_item = RlpItem::to_rlp_item(rlp_bytes);
+            unpacked.push(rlp_item);
+        }
+        if !unpacked.is_empty() {
+            self.height = unpacked[0].len as u128;
+        }
+        if unpacked.len() > 1 {
+            serialized_roots.push(unpacked[1].clone());
+            for root in &serialized_roots {
+                let hash = Hash::new(&RlpItem::try_to_vec(root).expect("Failed to convert to vec"));
+                self.roots.push(hash);
+            }
+        }
+        if unpacked.len() > 2 {
+            self.offset = unpacked[2].len;
+        }
+        if unpacked.len() > 3 {
+            self.roots_size = unpacked[3].len;
+        }
+        if unpacked.len() > 4 {
+            self.cache_size = unpacked[4].len;
+        }
+        if unpacked.len() > 5 {
+            serialized_roots.clear();
+            serialized_roots.push(unpacked[5].clone());
+            for root in &serialized_roots {
+                let hash = Hash::new(&RlpItem::try_to_vec(root).expect("Failed to convert to vec"));
+                self.cache.push(hash);
+            }
+        }
+        if unpacked.len() > 6 {
+            self.newer_witness_allowed = unpacked[6].len != 0;
+        }
+        if self.height == 0 && self.offset == 0 {
+            self.height = self.offset as u128;
+        }
+    }
+
+    /// Set offset
+    pub fn set_offset(&mut self, offset: usize) {
+        self.offset = offset;
+        if self.height == 0 && self.offset > 0 {
+            self.height = self.offset as u128;
+        }
+    }
+
+    /// Get root
+    pub fn get_root(&self, idx: usize) -> Result<&Hash, &str> {
+        if idx >= self.roots.len() {
+            return Err("RevertInvalidBlockWitness: root index is out of range");
+        }
+        Ok(&self.roots[idx])
+    }
+
+    /// Check if the MTA includes a cache
+    pub fn includes_cache(&self, hash: &Hash) -> bool {
+        if hash.0.is_empty() {
+            return false;
+        }
+        for entry in &self.cache {
+            if entry == hash {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Set cache
+    pub fn set_cache(&mut self, hash: &Hash) {
+        if self.cache_size > 0 {
+            self.cache.push(*hash);
+        }
+        if self.cache.len() > self.cache_size {
+            let mut new_cache: Vec<Hash> = Vec::with_capacity(self.cache_size);
+            for i in 0..self.cache_size {
+                new_cache[i] = self.cache[i + self.cache.len() - self.cache_size];
+            }
+            self.cache.clear();
+            self.cache = new_cache;
+        }
+    }
+
+    /// Add
+    pub fn add(&mut self, mut hash: Hash) {
+        self.set_cache(&hash);
+        if self.height == 0 || self.roots.is_empty() {
+            self.roots.push(hash);
+        } else {
+            let mut root = Hash::default();
+            for i in 0..self.clone().roots.len() {
+                if self.roots[i].0.is_empty() {
+                    root = hash;
+                    self.roots[i] = root;
+                    break;
+                } else if self.roots_size > 0 && self.roots_size <= i + 1 {
+                    root = hash;
+                    self.roots[i] = root;
+                    self.offset += 2_usize.pow(i as u32);
+                    break;
+                } else {
+                    let index = self
+                        .roots
+                        .iter()
+                        .position(|x| *x == hash)
+                        .expect("Error in lookup");
+                    hash = Hash::default();
+                    let _ = self.roots.remove(index);
+                }
+            }
+            if root.0.is_empty() {
+                self.roots.push(hash);
+            }
+        }
+        self.height += 1;
+    }
+
+    /// Get root index by height
+    pub fn get_root_index_by_height(&self, height: u128) -> Result<usize, &str> {
+        let mut idx = (height - 1) as usize - self.offset;
+        let mut root_idx = 0;
+        let mut i = self.roots.len();
+        let mut bit_flag: usize;
+        while i > 0 {
+            i -= 1;
+            if self.roots[i].0.is_empty() {
+                continue;
+            }
+            bit_flag = 1 << i;
+            if idx < bit_flag {
+                root_idx = i;
+                break;
+            }
+            idx -= bit_flag;
+        }
+        Ok(root_idx)
+    }
+
+    /// Verify
+    pub fn verify(
+        &mut self,
+        proofs: &[Hash],
+        leaf: &Hash,
+        height: u128,
+        at: u128,
+    ) -> Result<(), &str> {
+        let root: Hash;
+        let root_idx: usize;
+        if self.height == at {
+            root = *self
+                .get_root(proofs.len())
+                .expect("Failed to retrieve root");
+            self.verify_internal(proofs, &root, leaf)
+                .expect("Failed to verify");
+        } else if self.height < at {
+            if !self.newer_witness_allowed {
+                return Err("RevertInvalidBlockWitness: newer witness not allowed.");
+            }
+            if self.height < height {
+                return Err("RevertInvalidBlockWitness: given witness for newer node.");
+            }
+            root_idx = self
+                .get_root_index_by_height(height)
+                .expect("Failed to retrieve root index by height");
+            root = *self.get_root(root_idx).expect("Failed to get root");
+            let mut slice_roots: Vec<Hash> = Vec::with_capacity(root_idx);
+            slice_roots[..root_idx].clone_from_slice(&proofs[..root_idx]);
+            self.verify_internal(slice_roots.as_slice(), &root, leaf)
+                .expect("Failed to verify");
+        } else if (self.height - height - 1) < self.cache_size as u128 && !self.includes_cache(leaf)
+        {
+            return Err("RevertInvalidBlockWitness: invalid old witness");
+        }
+        Ok(())
+    }
+
+    /// Convert MTA to bytes
+    pub fn to_bytes(&self) -> Vec<u8> {
+        Self::try_to_vec(self).expect("Failed to convert Merkle Tree Accumulator to bytes.")
+    }
+
+    fn verify_internal(
+        &mut self,
+        witnesses: &[Hash],
+        root: &Hash,
+        leaf: &Hash,
+    ) -> Result<(), &str> {
+        let mut hash = *leaf;
+        for witness in witnesses {
+            hash = Hash::serialize(witness).expect("Failed to serialize");
+        }
+        if &hash != root {
+            return Err("RevertInvalidBlockWitness: invalid witness");
+        }
+        Ok(())
+    }
+}
+
+'''
+'''--- src/utils.rs ---
+//! Utils
+
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::serde::{Deserialize, Serialize};
+
+/// RlpItem
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct RlpItem {
+    /// Length of the RlpItem
+    pub len: usize,
+    /// Memory pointer
+    pub mem_ptr: u32,
+}
+
+impl RlpItem {
+    /// Convert from bytes to RlpItem
+    pub fn to_rlp_item(bytes: &[u8]) -> Self {
+        let len = bytes.len();
+        let mem_ptr = bytes.as_ptr() as u32;
+        Self { len, mem_ptr }
+    }
+}
+
+'''

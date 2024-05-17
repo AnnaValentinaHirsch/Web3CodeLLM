@@ -1,0 +1,5761 @@
+*GitHub Repository "kuutamolabs/ldk-lsp-client"*
+
+'''--- .github/workflows/build.yml ---
+name: Continuous Integration Checks
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        platform: [ ubuntu-latest ]
+        toolchain: [ stable, beta ]
+        include:
+          - toolchain: stable
+            check-fmt: true
+          - toolchain: 1.63.0
+            platform: ubuntu-latest
+            msrv: true
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v2
+      - name: Install Rust ${{ matrix.toolchain }} toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          override: true
+          profile: minimal
+      - name: Pin crates for MSRV
+        if: matrix.msrv
+        run: |
+          # No need to pin currently
+      - name: Cargo check
+        run: cargo check --release
+      - name: Check documentation
+        run: |
+          cargo doc --release
+          cargo doc --no-default-features --features no-std
+          RUSTFLAGS="--cfg lsps1" cargo doc --release
+          RUSTFLAGS="--cfg lsps1" cargo doc --no-default-features --features no-std
+      - name: Build on Rust ${{ matrix.toolchain }}
+        run: cargo build --verbose --color always
+      - name: Check formatting
+        if: matrix.check-fmt
+        run: rustup component add rustfmt && cargo fmt --all -- --check
+      - name: Test on Rust ${{ matrix.toolchain }}
+        run: |
+          cargo test
+          RUSTFLAGS="--cfg lsps1" cargo test
+      - name: Test on Rust ${{ matrix.toolchain }} with no-std support
+        run: |
+          cargo test --no-default-features --features no-std
+          RUSTFLAGS="--cfg lsps1" cargo test --no-default-features --features no-std
+
+'''
+'''--- Cargo.toml ---
+[package]
+name = "lightning-liquidity"
+version = "0.1.0"
+authors = ["John Cantrell <johncantrell97@gmail.com>", "Elias Rohrer <dev@tnull.de>"]
+edition = "2021"
+description = "Types and primitives to integrate a spec-compliant LSP with an LDK-based node."
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[features]
+default = ["std"]
+std = ["lightning/std", "bitcoin/std"]
+no-std = ["hashbrown", "lightning/no-std", "bitcoin/no-std", "core2/alloc"]
+
+[dependencies]
+lightning = { version = "0.0.118", default-features = false, features = ["max_level_trace"] }
+lightning-invoice = "0.26.0"
+bitcoin = { version = "0.29.0", default-features = false }
+hashbrown = { version = "0.8", optional = true }
+core2 = { version = "0.3.0", optional = true, default-features = false }
+
+chrono = { version = "0.4", default-features = false, features = ["serde", "alloc"] }
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+serde_json = "1.0"
+
+'''
+'''--- LICENSE.md ---
+This software is licensed under [Apache 2.0](LICENSE-APACHE) or
+[MIT](LICENSE-MIT), at your option.
+
+Some files retain their own copyright notice, however, for full authorship
+information, see version control history.
+
+Except as otherwise noted in individual files, all files in this repository are
+licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+http://www.apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+http://opensource.org/licenses/MIT>, at your option.
+
+You may not use, copy, modify, merge, publish, distribute, sublicense, and/or
+sell copies of this software or any files in this repository except in
+accordance with one or both of these licenses.
+
+'''
+'''--- README.md ---
+# `lightning-liquidity`
+
+Types and primitives to integrate a [spec-compliant](https://github.com/BitcoinAndLightningLayerSpecs/lsp) LSP with an LDK-based node.
+
+'''
+'''--- rustfmt.toml ---
+hard_tabs = true # use tab characters for indentation, spaces for alignment
+use_field_init_shorthand = true
+max_width = 100
+use_small_heuristics = "Max"
+fn_args_layout = "Compressed"
+
+'''
+'''--- src/events.rs ---
+// This file is Copyright its original authors, visible in version control
+// history.
+//
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE
+// or http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option.
+// You may not use this file except in accordance with one or both of these
+// licenses.
+
+//! Events are surfaced by the library to indicate some action must be taken
+//! by the end-user.
+//!
+//! Because we don't have a built-in runtime, it's up to the end-user to poll
+//! [`LiquidityManager::get_and_clear_pending_events`] to receive events.
+//!
+//! [`LiquidityManager::get_and_clear_pending_events`]: crate::LiquidityManager::get_and_clear_pending_events
+
+use crate::lsps0;
+#[cfg(lsps1)]
+use crate::lsps1;
+use crate::lsps2;
+use crate::prelude::{Vec, VecDeque};
+use crate::sync::Mutex;
+
+/// The event queue for LSP clients/servers
+pub struct EventQueue {
+	queue: Mutex<VecDeque<Event>>,
+	#[cfg(feature = "std")]
+	condvar: std::sync::Condvar,
+}
+
+impl EventQueue {
+	/// New a queue
+	pub fn new() -> Self {
+		let queue = Mutex::new(VecDeque::new());
+		#[cfg(feature = "std")]
+		{
+			let condvar = std::sync::Condvar::new();
+			Self { queue, condvar }
+		}
+		#[cfg(not(feature = "std"))]
+		Self { queue }
+	}
+
+	/// Put the event inside the queue
+	pub fn enqueue(&self, event: Event) {
+		{
+			let mut queue = self.queue.lock().unwrap();
+			queue.push_back(event);
+		}
+
+		#[cfg(feature = "std")]
+		self.condvar.notify_one();
+	}
+
+	/// Get the text Event
+	pub fn next_event(&self) -> Option<Event> {
+		self.queue.lock().unwrap().pop_front()
+	}
+
+	/// Block and wait for the event
+	#[cfg(feature = "std")]
+	pub fn wait_next_event(&self) -> Event {
+		let mut queue =
+			self.condvar.wait_while(self.queue.lock().unwrap(), |queue| queue.is_empty()).unwrap();
+
+		let event = queue.pop_front().expect("non-empty queue");
+		let should_notify = !queue.is_empty();
+
+		drop(queue);
+
+		if should_notify {
+			self.condvar.notify_one();
+		}
+
+		event
+	}
+
+	/// Get all rest of the events and clean the queue
+	pub fn get_and_clear_pending_events(&self) -> Vec<Event> {
+		self.queue.lock().unwrap().drain(..).collect()
+	}
+}
+
+/// An event which you should probably take some action in response to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
+	/// An LSPS0 client event.
+	LSPS0Client(lsps0::event::LSPS0ClientEvent),
+	/// An LSPS1 (Channel Request) client event.
+	#[cfg(lsps1)]
+	LSPS1Client(lsps1::event::LSPS1ClientEvent),
+	/// An LSPS1 (Channel Request) server event.
+	#[cfg(lsps1)]
+	LSPS1Service(lsps1::event::LSPS1ServiceEvent),
+	/// An LSPS2 (JIT Channel) client event.
+	LSPS2Client(lsps2::event::LSPS2ClientEvent),
+	/// An LSPS2 (JIT Channel) server event.
+	LSPS2Service(lsps2::event::LSPS2ServiceEvent),
+}
+
+'''
+'''--- src/lib.rs ---
+// This file is Copyright its original authors, visible in version control
+// history.
+//
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE
+// or http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option.
+// You may not use this file except in accordance with one or both of these
+// licenses.
+#![crate_name = "lightning_liquidity"]
+
+//! # `lightning-liquidity`
+//! Types and primitives to integrate a spec-compliant LSP with an LDK-based node.
+#![deny(missing_docs)]
+#![deny(rustdoc::broken_intra_doc_links)]
+#![deny(rustdoc::private_intra_doc_links)]
+#![allow(bare_trait_objects)]
+#![allow(ellipsis_inclusive_range_patterns)]
+#![allow(clippy::drop_non_drop)]
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(not(feature = "std"), no_std)]
+#[cfg(not(any(feature = "std", feature = "no-std")))]
+compile_error!("at least one of the `std` or `no-std` features must be enabled");
+
+#[macro_use]
+extern crate alloc;
+
+mod prelude {
+	#[cfg(feature = "hashbrown")]
+	extern crate hashbrown;
+
+	#[cfg(feature = "hashbrown")]
+	pub use self::hashbrown::{hash_map, HashMap, HashSet};
+	pub use alloc::{boxed::Box, collections::VecDeque, string::String, vec, vec::Vec};
+	#[cfg(not(feature = "hashbrown"))]
+	pub use std::collections::{hash_map, HashMap, HashSet};
+
+	pub use alloc::borrow::ToOwned;
+	pub use alloc::string::ToString;
+}
+
+pub mod events;
+pub mod lsps0;
+#[cfg(lsps1)]
+pub mod lsps1;
+pub mod lsps2;
+mod manager;
+pub mod message_queue;
+mod sync;
+#[cfg(test)]
+mod tests;
+mod utils;
+
+pub use manager::{LiquidityClientConfig, LiquidityManager, LiquidityServiceConfig};
+
+'''
+'''--- src/lsps0/client.rs ---
+//! Contains the main LSPS2 client-side object, [`LSPS0ClientHandler`].
+//!
+//! Please refer to the [LSPS0
+//! specifcation](https://github.com/BitcoinAndLightningLayerSpecs/lsp/tree/main/LSPS0) for more
+//! information.
+
+use crate::events::{Event, EventQueue};
+use crate::lsps0::event::LSPS0ClientEvent;
+use crate::lsps0::msgs::{
+	LSPS0Message, LSPS0Request, LSPS0Response, ListProtocolsRequest, ListProtocolsResponse,
+	ProtocolMessageHandler, ResponseError,
+};
+use crate::message_queue::MessageQueue;
+use crate::sync::Arc;
+use crate::utils;
+
+use lightning::ln::msgs::{ErrorAction, LightningError};
+use lightning::sign::EntropySource;
+use lightning::util::logger::Level;
+
+use bitcoin::secp256k1::PublicKey;
+
+use core::ops::Deref;
+
+/// A message handler capable of sending and handling LSPS0 messages.
+pub struct LSPS0ClientHandler<ES: Deref, MQ: Deref>
+where
+	ES::Target: EntropySource,
+	MQ::Target: MessageQueue,
+{
+	entropy_source: ES,
+	pending_messages: MQ,
+	pending_events: Arc<EventQueue>,
+}
+
+impl<ES: Deref, MQ: Deref> LSPS0ClientHandler<ES, MQ>
+where
+	ES::Target: EntropySource,
+	MQ::Target: MessageQueue,
+{
+	/// Returns a new instance of [`LSPS0ClientHandler`].
+	pub(crate) fn new(
+		entropy_source: ES, pending_messages: MQ, pending_events: Arc<EventQueue>,
+	) -> Self {
+		Self { entropy_source, pending_messages, pending_events }
+	}
+
+	/// Calls LSPS0's `list_protocols`.
+	///
+	/// Please refer to the [LSPS0
+	/// specifcation](https://github.com/BitcoinAndLightningLayerSpecs/lsp/tree/main/LSPS0#lsps-specification-support-query)
+	/// for more information.
+	pub fn list_protocols(&self, counterparty_node_id: &PublicKey) {
+		let msg = LSPS0Message::Request(
+			utils::generate_request_id(&self.entropy_source),
+			LSPS0Request::ListProtocols(ListProtocolsRequest {}),
+		);
+
+		self.pending_messages.enqueue(counterparty_node_id, msg.into());
+	}
+
+	fn handle_response(
+		&self, response: LSPS0Response, counterparty_node_id: &PublicKey,
+	) -> Result<(), LightningError> {
+		match response {
+			LSPS0Response::ListProtocols(ListProtocolsResponse { protocols }) => {
+				self.pending_events.enqueue(Event::LSPS0Client(
+					LSPS0ClientEvent::ListProtocolsResponse {
+						counterparty_node_id: *counterparty_node_id,
+						protocols,
+					},
+				));
+				Ok(())
+			}
+			LSPS0Response::ListProtocolsError(ResponseError { code, message, data, .. }) => {
+				Err(LightningError {
+					err: format!(
+						"ListProtocols error received. code = {}, message = {}, data = {:?}",
+						code, message, data
+					),
+					action: ErrorAction::IgnoreAndLog(Level::Info),
+				})
+			}
+		}
+	}
+}
+
+impl<ES: Deref, MQ: Deref> ProtocolMessageHandler for LSPS0ClientHandler<ES, MQ>
+where
+	ES::Target: EntropySource,
+	MQ::Target: MessageQueue,
+{
+	type ProtocolMessage = LSPS0Message;
+	const PROTOCOL_NUMBER: Option<u16> = None;
+
+	fn handle_message(
+		&self, message: Self::ProtocolMessage, counterparty_node_id: &PublicKey,
+	) -> Result<(), LightningError> {
+		match message {
+			LSPS0Message::Response(_, response) => {
+				self.handle_response(response, counterparty_node_id)
+			}
+			LSPS0Message::Request(..) => {
+				debug_assert!(
+					false,
+					"Client handler received LSPS0 request message. This should never happen."
+				);
+				Err(LightningError { err: format!("Client handler received LSPS0 request message from node {:?}. This should never happen.", counterparty_node_id), action: ErrorAction::IgnoreAndLog(Level::Info)})
+			}
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+
+	use alloc::string::ToString;
+	use alloc::sync::Arc;
+
+	use crate::lsps0::msgs::{LSPSMessage, RequestId};
+	use crate::tests::utils::{TestEntropy, TestMessageQueue};
+
+	use super::*;
+
+	#[test]
+	fn test_list_protocols() {
+		let pending_messages = Arc::new(TestMessageQueue::new());
+		let entropy_source = Arc::new(TestEntropy {});
+		let event_queue = Arc::new(EventQueue::new());
+
+		let lsps0_handler = Arc::new(LSPS0ClientHandler::new(
+			entropy_source,
+			Arc::clone(&pending_messages),
+			event_queue,
+		));
+
+		let counterparty_node_id = utils::parse_pubkey(
+			"027100442c3b79f606f80f322d98d499eefcb060599efc5d4ecb00209c2cb54190",
+		)
+		.unwrap();
+
+		lsps0_handler.list_protocols(&counterparty_node_id);
+		let pending_messages = pending_messages.get_and_clear_pending_msgs();
+
+		assert_eq!(pending_messages.len(), 1);
+
+		let (pubkey, message) = &pending_messages[0];
+
+		assert_eq!(*pubkey, counterparty_node_id);
+		assert_eq!(
+			*message,
+			LSPSMessage::LSPS0(LSPS0Message::Request(
+				RequestId("00000000000000000000000000000000".to_string()),
+				LSPS0Request::ListProtocols(ListProtocolsRequest {})
+			))
+		);
+	}
+}
+
+'''
+'''--- src/lsps0/event.rs ---
+// This file is Copyright its original authors, visible in version control
+// history.
+//
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE
+// or http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option.
+// You may not use this file except in accordance with one or both of these
+// licenses.
+
+//! Contains LSPS0 event types
+
+use crate::prelude::Vec;
+use bitcoin::secp256k1::PublicKey;
+
+/// An event which an LSPS0 client may want to take some action in response to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LSPS0ClientEvent {
+	/// Information from the LSP about the protocols they support.
+	ListProtocolsResponse {
+		/// The node id of the LSP.
+		counterparty_node_id: PublicKey,
+		/// A list of supported protocols.
+		protocols: Vec<u16>,
+	},
+}
+
+'''
+'''--- src/lsps0/mod.rs ---
+// This file is Copyright its original authors, visible in version control
+// history.
+//
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE
+// or http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option.
+// You may not use this file except in accordance with one or both of these
+// licenses.
+
+//! Types and primitives that implement the LSPS0: Transport Layer specification.
+
+pub mod client;
+pub mod event;
+pub mod msgs;
+pub mod service;
+
+'''
+'''--- src/lsps0/msgs.rs ---
+//! Contains basic data types that allow for the (de-)seralization of LSPS messages in the JSON-RPC 2.0 format.
+//!
+//! Please refer to the [LSPS0 specification](https://github.com/BitcoinAndLightningLayerSpecs/lsp/tree/main/LSPS0) for more information.
+
+#[cfg(lsps1)]
+use crate::lsps1::msgs::{
+	LSPS1Message, LSPS1Request, LSPS1Response, LSPS1_CREATE_ORDER_METHOD_NAME,
+	LSPS1_GET_INFO_METHOD_NAME, LSPS1_GET_ORDER_METHOD_NAME,
+};
+use crate::lsps2::msgs::{
+	LSPS2Message, LSPS2Request, LSPS2Response, LSPS2_BUY_METHOD_NAME, LSPS2_GET_INFO_METHOD_NAME,
+	LSPS2_GET_VERSIONS_METHOD_NAME,
+};
+use crate::prelude::{HashMap, String, ToString, Vec};
+
+use lightning::impl_writeable_msg;
+use lightning::ln::msgs::LightningError;
+use lightning::ln::wire;
+
+use bitcoin::secp256k1::PublicKey;
+
+use serde::de;
+use serde::de::{MapAccess, Visitor};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::json;
+
+use core::convert::TryFrom;
+use core::fmt;
+
+const LSPS_MESSAGE_SERIALIZED_STRUCT_NAME: &str = "LSPSMessage";
+const JSONRPC_FIELD_KEY: &str = "jsonrpc";
+const JSONRPC_FIELD_VALUE: &str = "2.0";
+const JSONRPC_METHOD_FIELD_KEY: &str = "method";
+const JSONRPC_ID_FIELD_KEY: &str = "id";
+const JSONRPC_PARAMS_FIELD_KEY: &str = "params";
+const JSONRPC_RESULT_FIELD_KEY: &str = "result";
+const JSONRPC_ERROR_FIELD_KEY: &str = "error";
+const JSONRPC_INVALID_MESSAGE_ERROR_CODE: i32 = -32700;
+const JSONRPC_INVALID_MESSAGE_ERROR_MESSAGE: &str = "parse error";
+const LSPS0_LISTPROTOCOLS_METHOD_NAME: &str = "lsps0.list_protocols";
+
+/// The Lightning message type id for LSPS messages.
+pub const LSPS_MESSAGE_TYPE_ID: u16 = 37913;
+
+/// A trait used to implement a specific LSPS protocol.
+///
+/// The messages the protocol uses need to be able to be mapped
+/// from and into [`LSPSMessage`].
+pub(crate) trait ProtocolMessageHandler {
+	type ProtocolMessage: TryFrom<LSPSMessage> + Into<LSPSMessage>;
+	const PROTOCOL_NUMBER: Option<u16>;
+
+	fn handle_message(
+		&self, message: Self::ProtocolMessage, counterparty_node_id: &PublicKey,
+	) -> Result<(), LightningError>;
+}
+
+/// Lightning message type used by LSPS protocols.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawLSPSMessage {
+	/// The raw string payload that holds the actual message.
+	pub payload: String,
+}
+
+impl_writeable_msg!(RawLSPSMessage, { payload }, {});
+
+impl wire::Type for RawLSPSMessage {
+	fn type_id(&self) -> u16 {
+		LSPS_MESSAGE_TYPE_ID
+	}
+}
+
+/// A JSON-RPC request's `id`.
+///
+/// Please refer to the [JSON-RPC 2.0 specification](https://www.jsonrpc.org/specification#request_object) for
+/// more information.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RequestId(pub String);
+
+/// An error returned in response to an JSON-RPC request.
+///
+/// Please refer to the [JSON-RPC 2.0 specification](https://www.jsonrpc.org/specification#error_object) for
+/// more information.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ResponseError {
+	/// A number that indicates the error type that occurred.
+	pub code: i32,
+	/// A string providing a short description of the error.
+	pub message: String,
+	/// A primitive or structured value that contains additional information about the error.
+	pub data: Option<String>,
+}
+
+/// A `list_protocols` request.
+///
+/// Please refer to the [LSPS0 specification](https://github.com/BitcoinAndLightningLayerSpecs/lsp/tree/main/LSPS0#lsps-specification-support-query)
+/// for more information.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub struct ListProtocolsRequest {}
+
+/// A response to a `list_protocols` request.
+///
+/// Please refer to the [LSPS0 specification](https://github.com/BitcoinAndLightningLayerSpecs/lsp/tree/main/LSPS0#lsps-specification-support-query)
+/// for more information.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ListProtocolsResponse {
+	/// A list of supported protocols.
+	pub protocols: Vec<u16>,
+}
+
+/// An LSPS0 protocol request.
+///
+/// Please refer to the [LSPS0 specification](https://github.com/BitcoinAndLightningLayerSpecs/lsp/tree/main/LSPS0)
+/// for more information.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LSPS0Request {
+	/// A request calling `list_protocols`.
+	ListProtocols(ListProtocolsRequest),
+}
+
+impl LSPS0Request {
+	/// Returns the method name associated with the given request variant.
+	pub fn method(&self) -> &str {
+		match self {
+			LSPS0Request::ListProtocols(_) => LSPS0_LISTPROTOCOLS_METHOD_NAME,
+		}
+	}
+}
+
+/// An LSPS0 protocol request.
+///
+/// Please refer to the [LSPS0 specification](https://github.com/BitcoinAndLightningLayerSpecs/lsp/tree/main/LSPS0)
+/// for more information.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LSPS0Response {
+	/// A response to a `list_protocols` request.
+	ListProtocols(ListProtocolsResponse),
+	/// An error response to a `list_protocols` request.
+	ListProtocolsError(ResponseError),
+}
+
+/// An LSPS0 protocol message.
+///
+/// Please refer to the [LSPS0 specification](https://github.com/BitcoinAndLightningLayerSpecs/lsp/tree/main/LSPS0)
+/// for more information.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LSPS0Message {
+	/// A request variant.
+	Request(RequestId, LSPS0Request),
+	/// A response variant.
+	Response(RequestId, LSPS0Response),
+}
+
+impl TryFrom<LSPSMessage> for LSPS0Message {
+	type Error = ();
+
+	fn try_from(message: LSPSMessage) -> Result<Self, Self::Error> {
+		match message {
+			LSPSMessage::Invalid => Err(()),
+			LSPSMessage::LSPS0(message) => Ok(message),
+			#[cfg(lsps1)]
+			LSPSMessage::LSPS1(_) => Err(()),
+			LSPSMessage::LSPS2(_) => Err(()),
+		}
+	}
+}
+
+impl From<LSPS0Message> for LSPSMessage {
+	fn from(message: LSPS0Message) -> Self {
+		LSPSMessage::LSPS0(message)
+	}
+}
+
+/// A (de-)serializable LSPS message allowing to be sent over the wire.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LSPSMessage {
+	/// An invalid variant.
+	Invalid,
+	/// An LSPS0 message.
+	LSPS0(LSPS0Message),
+	/// An LSPS1 message.
+	#[cfg(lsps1)]
+	LSPS1(LSPS1Message),
+	/// An LSPS2 message.
+	LSPS2(LSPS2Message),
+}
+
+impl LSPSMessage {
+	/// A constructor returning an `LSPSMessage` from a raw JSON string.
+	///
+	/// The given `request_id_to_method` associates request ids with method names, as response objects
+	/// don't carry the latter.
+	pub fn from_str_with_id_map(
+		json_str: &str, request_id_to_method: &mut HashMap<String, String>,
+	) -> Result<Self, serde_json::Error> {
+		let deserializer = &mut serde_json::Deserializer::from_str(json_str);
+		let visitor = LSPSMessageVisitor { request_id_to_method };
+		deserializer.deserialize_any(visitor)
+	}
+
+	/// Returns the request id and the method.
+	pub fn get_request_id_and_method(&self) -> Option<(String, String)> {
+		match self {
+			LSPSMessage::LSPS0(LSPS0Message::Request(request_id, request)) => {
+				Some((request_id.0.clone(), request.method().to_string()))
+			}
+			#[cfg(lsps1)]
+			LSPSMessage::LSPS1(LSPS1Message::Request(request_id, request)) => {
+				Some((request_id.0.clone(), request.method().to_string()))
+			}
+			LSPSMessage::LSPS2(LSPS2Message::Request(request_id, request)) => {
+				Some((request_id.0.clone(), request.method().to_string()))
+			}
+			_ => None,
+		}
+	}
+}
+
+impl Serialize for LSPSMessage {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		let mut jsonrpc_object =
+			serializer.serialize_struct(LSPS_MESSAGE_SERIALIZED_STRUCT_NAME, 3)?;
+
+		jsonrpc_object.serialize_field(JSONRPC_FIELD_KEY, JSONRPC_FIELD_VALUE)?;
+
+		match self {
+			LSPSMessage::LSPS0(LSPS0Message::Request(request_id, request)) => {
+				jsonrpc_object.serialize_field(JSONRPC_METHOD_FIELD_KEY, request.method())?;
+				jsonrpc_object.serialize_field(JSONRPC_ID_FIELD_KEY, &request_id.0)?;
+
+				match request {
+					LSPS0Request::ListProtocols(params) => {
+						jsonrpc_object.serialize_field(JSONRPC_PARAMS_FIELD_KEY, params)?
+					}
+				};
+			}
+			LSPSMessage::LSPS0(LSPS0Message::Response(request_id, response)) => {
+				jsonrpc_object.serialize_field(JSONRPC_ID_FIELD_KEY, &request_id.0)?;
+
+				match response {
+					LSPS0Response::ListProtocols(result) => {
+						jsonrpc_object.serialize_field(JSONRPC_RESULT_FIELD_KEY, result)?;
+					}
+					LSPS0Response::ListProtocolsError(error) => {
+						jsonrpc_object.serialize_field(JSONRPC_ERROR_FIELD_KEY, error)?;
+					}
+				}
+			}
+			#[cfg(lsps1)]
+			LSPSMessage::LSPS1(LSPS1Message::Request(request_id, request)) => {
+				jsonrpc_object.serialize_field(JSONRPC_ID_FIELD_KEY, &request_id.0)?;
+				jsonrpc_object.serialize_field(JSONRPC_METHOD_FIELD_KEY, request.method())?;
+
+				match request {
+					LSPS1Request::GetInfo(params) => {
+						jsonrpc_object.serialize_field(JSONRPC_PARAMS_FIELD_KEY, params)?
+					}
+					LSPS1Request::CreateOrder(params) => {
+						jsonrpc_object.serialize_field(JSONRPC_PARAMS_FIELD_KEY, params)?
+					}
+					LSPS1Request::GetOrder(params) => {
+						jsonrpc_object.serialize_field(JSONRPC_PARAMS_FIELD_KEY, params)?
+					}
+				}
+			}
+			#[cfg(lsps1)]
+			LSPSMessage::LSPS1(LSPS1Message::Response(request_id, response)) => {
+				jsonrpc_object.serialize_field(JSONRPC_ID_FIELD_KEY, &request_id.0)?;
+
+				match response {
+					LSPS1Response::GetInfo(result) => {
+						jsonrpc_object.serialize_field(JSONRPC_RESULT_FIELD_KEY, result)?
+					}
+					LSPS1Response::CreateOrder(result) => {
+						jsonrpc_object.serialize_field(JSONRPC_ERROR_FIELD_KEY, result)?
+					}
+					LSPS1Response::CreateOrderError(error) => {
+						jsonrpc_object.serialize_field(JSONRPC_RESULT_FIELD_KEY, error)?
+					}
+					LSPS1Response::GetOrder(result) => {
+						jsonrpc_object.serialize_field(JSONRPC_ERROR_FIELD_KEY, result)?
+					}
+					LSPS1Response::GetOrderError(error) => {
+						jsonrpc_object.serialize_field(JSONRPC_ERROR_FIELD_KEY, &error)?
+					}
+				}
+			}
+			LSPSMessage::LSPS2(LSPS2Message::Request(request_id, request)) => {
+				jsonrpc_object.serialize_field(JSONRPC_ID_FIELD_KEY, &request_id.0)?;
+				jsonrpc_object.serialize_field(JSONRPC_METHOD_FIELD_KEY, request.method())?;
+
+				match request {
+					LSPS2Request::GetVersions(params) => {
+						jsonrpc_object.serialize_field(JSONRPC_PARAMS_FIELD_KEY, params)?
+					}
+					LSPS2Request::GetInfo(params) => {
+						jsonrpc_object.serialize_field(JSONRPC_PARAMS_FIELD_KEY, params)?
+					}
+					LSPS2Request::Buy(params) => {
+						jsonrpc_object.serialize_field(JSONRPC_PARAMS_FIELD_KEY, params)?
+					}
+				}
+			}
+			LSPSMessage::LSPS2(LSPS2Message::Response(request_id, response)) => {
+				jsonrpc_object.serialize_field(JSONRPC_ID_FIELD_KEY, &request_id.0)?;
+
+				match response {
+					LSPS2Response::GetVersions(result) => {
+						jsonrpc_object.serialize_field(JSONRPC_RESULT_FIELD_KEY, result)?
+					}
+					LSPS2Response::GetInfo(result) => {
+						jsonrpc_object.serialize_field(JSONRPC_RESULT_FIELD_KEY, result)?
+					}
+					LSPS2Response::GetInfoError(error) => {
+						jsonrpc_object.serialize_field(JSONRPC_ERROR_FIELD_KEY, error)?
+					}
+					LSPS2Response::Buy(result) => {
+						jsonrpc_object.serialize_field(JSONRPC_RESULT_FIELD_KEY, result)?
+					}
+					LSPS2Response::BuyError(error) => {
+						jsonrpc_object.serialize_field(JSONRPC_ERROR_FIELD_KEY, error)?
+					}
+				}
+			}
+			LSPSMessage::Invalid => {
+				let error = ResponseError {
+					code: JSONRPC_INVALID_MESSAGE_ERROR_CODE,
+					message: JSONRPC_INVALID_MESSAGE_ERROR_MESSAGE.to_string(),
+					data: None,
+				};
+
+				jsonrpc_object.serialize_field(JSONRPC_ID_FIELD_KEY, &serde_json::Value::Null)?;
+				jsonrpc_object.serialize_field(JSONRPC_ERROR_FIELD_KEY, &error)?;
+			}
+		}
+
+		jsonrpc_object.end()
+	}
+}
+
+struct LSPSMessageVisitor<'a> {
+	request_id_to_method: &'a mut HashMap<String, String>,
+}
+
+impl<'de, 'a> Visitor<'de> for LSPSMessageVisitor<'a> {
+	type Value = LSPSMessage;
+
+	fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+		formatter.write_str("JSON-RPC object")
+	}
+
+	fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+	where
+		A: MapAccess<'de>,
+	{
+		let mut id: Option<String> = None;
+		let mut method: Option<&str> = None;
+		let mut params = None;
+		let mut result = None;
+		let mut error: Option<ResponseError> = None;
+
+		while let Some(key) = map.next_key()? {
+			match key {
+				"id" => {
+					id = Some(map.next_value()?);
+				}
+				"method" => {
+					method = Some(map.next_value()?);
+				}
+				"params" => {
+					params = Some(map.next_value()?);
+				}
+				"result" => {
+					result = Some(map.next_value()?);
+				}
+				"error" => {
+					error = Some(map.next_value()?);
+				}
+				_ => {
+					let _: serde_json::Value = map.next_value()?;
+				}
+			}
+		}
+
+		match (id, method) {
+			(Some(id), Some(method)) => match method {
+				LSPS0_LISTPROTOCOLS_METHOD_NAME => {
+					self.request_id_to_method.insert(id.clone(), method.to_string());
+
+					Ok(LSPSMessage::LSPS0(LSPS0Message::Request(
+						RequestId(id),
+						LSPS0Request::ListProtocols(ListProtocolsRequest {}),
+					)))
+				}
+				#[cfg(lsps1)]
+				LSPS1_GET_INFO_METHOD_NAME => {
+					let request = serde_json::from_value(params.unwrap_or(json!({})))
+						.map_err(de::Error::custom)?;
+					Ok(LSPSMessage::LSPS1(LSPS1Message::Request(
+						RequestId(id),
+						LSPS1Request::GetInfo(request),
+					)))
+				}
+				#[cfg(lsps1)]
+				LSPS1_CREATE_ORDER_METHOD_NAME => {
+					let request = serde_json::from_value(params.unwrap_or(json!({})))
+						.map_err(de::Error::custom)?;
+					Ok(LSPSMessage::LSPS1(LSPS1Message::Request(
+						RequestId(id),
+						LSPS1Request::CreateOrder(request),
+					)))
+				}
+				#[cfg(lsps1)]
+				LSPS1_GET_ORDER_METHOD_NAME => {
+					let request = serde_json::from_value(params.unwrap_or(json!({})))
+						.map_err(de::Error::custom)?;
+					Ok(LSPSMessage::LSPS1(LSPS1Message::Request(
+						RequestId(id),
+						LSPS1Request::GetOrder(request),
+					)))
+				}
+				LSPS2_GET_VERSIONS_METHOD_NAME => {
+					let request = serde_json::from_value(params.unwrap_or(json!({})))
+						.map_err(de::Error::custom)?;
+					Ok(LSPSMessage::LSPS2(LSPS2Message::Request(
+						RequestId(id),
+						LSPS2Request::GetVersions(request),
+					)))
+				}
+				LSPS2_GET_INFO_METHOD_NAME => {
+					let request = serde_json::from_value(params.unwrap_or(json!({})))
+						.map_err(de::Error::custom)?;
+					Ok(LSPSMessage::LSPS2(LSPS2Message::Request(
+						RequestId(id),
+						LSPS2Request::GetInfo(request),
+					)))
+				}
+				LSPS2_BUY_METHOD_NAME => {
+					let request = serde_json::from_value(params.unwrap_or(json!({})))
+						.map_err(de::Error::custom)?;
+					Ok(LSPSMessage::LSPS2(LSPS2Message::Request(
+						RequestId(id),
+						LSPS2Request::Buy(request),
+					)))
+				}
+				_ => Err(de::Error::custom(format!(
+					"Received request with unknown method: {}",
+					method
+				))),
+			},
+			(Some(id), None) => match self.request_id_to_method.get(&id) {
+				Some(method) => match method.as_str() {
+					LSPS0_LISTPROTOCOLS_METHOD_NAME => {
+						if let Some(error) = error {
+							Ok(LSPSMessage::LSPS0(LSPS0Message::Response(
+								RequestId(id),
+								LSPS0Response::ListProtocolsError(error),
+							)))
+						} else if let Some(result) = result {
+							let list_protocols_response =
+								serde_json::from_value(result).map_err(de::Error::custom)?;
+							Ok(LSPSMessage::LSPS0(LSPS0Message::Response(
+								RequestId(id),
+								LSPS0Response::ListProtocols(list_protocols_response),
+							)))
+						} else {
+							Err(de::Error::custom("Received invalid JSON-RPC object: one of method, result, or error required"))
+						}
+					}
+					LSPS2_GET_VERSIONS_METHOD_NAME => {
+						if let Some(result) = result {
+							let response =
+								serde_json::from_value(result).map_err(de::Error::custom)?;
+							Ok(LSPSMessage::LSPS2(LSPS2Message::Response(
+								RequestId(id),
+								LSPS2Response::GetVersions(response),
+							)))
+						} else {
+							Err(de::Error::custom("Received invalid lsps2.get_versions response."))
+						}
+					}
+					#[cfg(lsps1)]
+					LSPS1_CREATE_ORDER_METHOD_NAME => {
+						if let Some(error) = error {
+							Ok(LSPSMessage::LSPS1(LSPS1Message::Response(
+								RequestId(id),
+								LSPS1Response::CreateOrderError(error),
+							)))
+						} else if let Some(result) = result {
+							let response =
+								serde_json::from_value(result).map_err(de::Error::custom)?;
+							Ok(LSPSMessage::LSPS1(LSPS1Message::Response(
+								RequestId(id),
+								LSPS1Response::CreateOrder(response),
+							)))
+						} else {
+							Err(de::Error::custom("Received invalid JSON-RPC object: one of method, result, or error required"))
+						}
+					}
+					#[cfg(lsps1)]
+					LSPS1_GET_ORDER_METHOD_NAME => {
+						if let Some(error) = error {
+							Ok(LSPSMessage::LSPS1(LSPS1Message::Response(
+								RequestId(id),
+								LSPS1Response::GetOrderError(error),
+							)))
+						} else if let Some(result) = result {
+							let response =
+								serde_json::from_value(result).map_err(de::Error::custom)?;
+							Ok(LSPSMessage::LSPS1(LSPS1Message::Response(
+								RequestId(id),
+								LSPS1Response::GetOrder(response),
+							)))
+						} else {
+							Err(de::Error::custom("Received invalid JSON-RPC object: one of method, result, or error required"))
+						}
+					}
+					LSPS2_GET_INFO_METHOD_NAME => {
+						if let Some(error) = error {
+							Ok(LSPSMessage::LSPS2(LSPS2Message::Response(
+								RequestId(id),
+								LSPS2Response::GetInfoError(error),
+							)))
+						} else if let Some(result) = result {
+							let response =
+								serde_json::from_value(result).map_err(de::Error::custom)?;
+							Ok(LSPSMessage::LSPS2(LSPS2Message::Response(
+								RequestId(id),
+								LSPS2Response::GetInfo(response),
+							)))
+						} else {
+							Err(de::Error::custom("Received invalid JSON-RPC object: one of method, result, or error required"))
+						}
+					}
+					LSPS2_BUY_METHOD_NAME => {
+						if let Some(error) = error {
+							Ok(LSPSMessage::LSPS2(LSPS2Message::Response(
+								RequestId(id),
+								LSPS2Response::BuyError(error),
+							)))
+						} else if let Some(result) = result {
+							let response =
+								serde_json::from_value(result).map_err(de::Error::custom)?;
+							Ok(LSPSMessage::LSPS2(LSPS2Message::Response(
+								RequestId(id),
+								LSPS2Response::Buy(response),
+							)))
+						} else {
+							Err(de::Error::custom("Received invalid JSON-RPC object: one of method, result, or error required"))
+						}
+					}
+					_ => Err(de::Error::custom(format!(
+						"Received response for an unknown request method: {}",
+						method
+					))),
+				},
+				None => Err(de::Error::custom(format!(
+					"Received response for unknown request id: {}",
+					id
+				))),
+			},
+			(None, Some(method)) => {
+				Err(de::Error::custom(format!("Received unknown notification: {}", method)))
+			}
+			(None, None) => Err(de::Error::custom(
+				"Received invalid JSON-RPC object: one of method or id required",
+			)),
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn deserializes_request() {
+		let json = r#"{
+			"jsonrpc": "2.0",
+			"id": "request:id:xyz123",
+			"method": "lsps0.list_protocols"
+		}"#;
+
+		let mut request_id_method_map = HashMap::new();
+
+		let msg = LSPSMessage::from_str_with_id_map(json, &mut request_id_method_map);
+		assert!(msg.is_ok());
+		let msg = msg.unwrap();
+		assert_eq!(
+			msg,
+			LSPSMessage::LSPS0(LSPS0Message::Request(
+				RequestId("request:id:xyz123".to_string()),
+				LSPS0Request::ListProtocols(ListProtocolsRequest {})
+			))
+		);
+	}
+
+	#[test]
+	fn serializes_request() {
+		let request = LSPSMessage::LSPS0(LSPS0Message::Request(
+			RequestId("request:id:xyz123".to_string()),
+			LSPS0Request::ListProtocols(ListProtocolsRequest {}),
+		));
+		let json = serde_json::to_string(&request).unwrap();
+		assert_eq!(
+			json,
+			r#"{"jsonrpc":"2.0","method":"lsps0.list_protocols","id":"request:id:xyz123","params":{}}"#
+		);
+	}
+
+	#[test]
+	fn deserializes_success_response() {
+		let json = r#"{
+	        "jsonrpc": "2.0",
+	        "id": "request:id:xyz123",
+	        "result": {
+	            "protocols": [1,2,3]
+	        }
+	    }"#;
+		let mut request_id_to_method_map = HashMap::new();
+		request_id_to_method_map
+			.insert("request:id:xyz123".to_string(), "lsps0.list_protocols".to_string());
+
+		let response =
+			LSPSMessage::from_str_with_id_map(json, &mut request_id_to_method_map).unwrap();
+
+		assert_eq!(
+			response,
+			LSPSMessage::LSPS0(LSPS0Message::Response(
+				RequestId("request:id:xyz123".to_string()),
+				LSPS0Response::ListProtocols(ListProtocolsResponse { protocols: vec![1, 2, 3] })
+			))
+		);
+	}
+
+	#[test]
+	fn deserializes_error_response() {
+		let json = r#"{
+	        "jsonrpc": "2.0",
+	        "id": "request:id:xyz123",
+	        "error": {
+	            "code": -32617,
+				"message": "Unknown Error"
+	        }
+	    }"#;
+		let mut request_id_to_method_map = HashMap::new();
+		request_id_to_method_map
+			.insert("request:id:xyz123".to_string(), "lsps0.list_protocols".to_string());
+
+		let response =
+			LSPSMessage::from_str_with_id_map(json, &mut request_id_to_method_map).unwrap();
+
+		assert_eq!(
+			response,
+			LSPSMessage::LSPS0(LSPS0Message::Response(
+				RequestId("request:id:xyz123".to_string()),
+				LSPS0Response::ListProtocolsError(ResponseError {
+					code: -32617,
+					message: "Unknown Error".to_string(),
+					data: None
+				})
+			))
+		);
+	}
+
+	#[test]
+	fn deserialize_fails_with_unknown_request_id() {
+		let json = r#"{
+	        "jsonrpc": "2.0",
+	        "id": "request:id:xyz124",
+	        "result": {
+	            "protocols": [1,2,3]
+	        }
+	    }"#;
+		let mut request_id_to_method_map = HashMap::new();
+		request_id_to_method_map
+			.insert("request:id:xyz123".to_string(), "lsps0.list_protocols".to_string());
+
+		let response = LSPSMessage::from_str_with_id_map(json, &mut request_id_to_method_map);
+		assert!(response.is_err());
+	}
+
+	#[test]
+	fn serializes_response() {
+		let response = LSPSMessage::LSPS0(LSPS0Message::Response(
+			RequestId("request:id:xyz123".to_string()),
+			LSPS0Response::ListProtocols(ListProtocolsResponse { protocols: vec![1, 2, 3] }),
+		));
+		let json = serde_json::to_string(&response).unwrap();
+		assert_eq!(
+			json,
+			r#"{"jsonrpc":"2.0","id":"request:id:xyz123","result":{"protocols":[1,2,3]}}"#
+		);
+	}
+}
+
+'''
+'''--- src/lsps0/service.rs ---
+// This file is Copyright its original authors, visible in version control
+// history.
+//
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE
+// or http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option.
+// You may not use this file except in accordance with one or both of these
+// licenses.
+
+//! Contains the main LSPS0 server-side object, [`LSPS0ServiceHandler`].
+//!
+//! Please refer to the [LSPS0
+//! specifcation](https://github.com/BitcoinAndLightningLayerSpecs/lsp/tree/main/LSPS0) for more
+//! information.
+
+use crate::lsps0::msgs::{
+	LSPS0Message, LSPS0Request, LSPS0Response, ListProtocolsResponse, ProtocolMessageHandler,
+	RequestId,
+};
+use crate::message_queue::MessageQueue;
+use crate::prelude::Vec;
+
+use lightning::ln::msgs::{ErrorAction, LightningError};
+use lightning::util::logger::Level;
+
+use bitcoin::secp256k1::PublicKey;
+
+use core::ops::Deref;
+
+/// The main server-side object allowing to send and receive LSPS0 messages.
+pub struct LSPS0ServiceHandler<MQ: Deref>
+where
+	MQ::Target: MessageQueue,
+{
+	pending_messages: MQ,
+	protocols: Vec<u16>,
+}
+
+impl<MQ: Deref> LSPS0ServiceHandler<MQ>
+where
+	MQ::Target: MessageQueue,
+{
+	/// Returns a new instance of [`LSPS0ServiceHandler`].
+	pub(crate) fn new(protocols: Vec<u16>, pending_messages: MQ) -> Self {
+		Self { protocols, pending_messages }
+	}
+
+	fn handle_request(
+		&self, request_id: RequestId, request: LSPS0Request, counterparty_node_id: &PublicKey,
+	) -> Result<(), lightning::ln::msgs::LightningError> {
+		match request {
+			LSPS0Request::ListProtocols(_) => {
+				let msg = LSPS0Message::Response(
+					request_id,
+					LSPS0Response::ListProtocols(ListProtocolsResponse {
+						protocols: self.protocols.clone(),
+					}),
+				);
+				self.pending_messages.enqueue(counterparty_node_id, msg.into());
+				Ok(())
+			}
+		}
+	}
+}
+
+impl<MQ: Deref> ProtocolMessageHandler for LSPS0ServiceHandler<MQ>
+where
+	MQ::Target: MessageQueue,
+{
+	type ProtocolMessage = LSPS0Message;
+	const PROTOCOL_NUMBER: Option<u16> = None;
+
+	fn handle_message(
+		&self, message: Self::ProtocolMessage, counterparty_node_id: &PublicKey,
+	) -> Result<(), LightningError> {
+		match message {
+			LSPS0Message::Request(request_id, request) => {
+				self.handle_request(request_id, request, counterparty_node_id)
+			}
+			LSPS0Message::Response(..) => {
+				debug_assert!(
+					false,
+					"Service handler received LSPS0 response message. This should never happen."
+				);
+				Err(LightningError { err: format!("Service handler received LSPS0 response message from node {:?}. This should never happen.", counterparty_node_id), action: ErrorAction::IgnoreAndLog(Level::Info)})
+			}
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+
+	use crate::lsps0::msgs::{LSPSMessage, ListProtocolsRequest};
+	use crate::tests::utils::TestMessageQueue;
+	use crate::utils;
+	use alloc::string::ToString;
+	use alloc::sync::Arc;
+
+	use super::*;
+
+	#[test]
+	fn test_handle_list_protocols_request() {
+		let protocols: Vec<u16> = vec![];
+		let pending_messages = Arc::new(TestMessageQueue::new());
+
+		let lsps0_handler = Arc::new(LSPS0ServiceHandler::new(protocols, pending_messages.clone()));
+
+		let list_protocols_request = LSPS0Message::Request(
+			RequestId("xyz123".to_string()),
+			LSPS0Request::ListProtocols(ListProtocolsRequest {}),
+		);
+		let counterparty_node_id = utils::parse_pubkey(
+			"027100442c3b79f606f80f322d98d499eefcb060599efc5d4ecb00209c2cb54190",
+		)
+		.unwrap();
+
+		lsps0_handler.handle_message(list_protocols_request, &counterparty_node_id).unwrap();
+		let pending_messages = pending_messages.get_and_clear_pending_msgs();
+
+		assert_eq!(pending_messages.len(), 1);
+
+		let (pubkey, message) = &pending_messages[0];
+
+		assert_eq!(*pubkey, counterparty_node_id);
+		assert_eq!(
+			*message,
+			LSPSMessage::LSPS0(LSPS0Message::Response(
+				RequestId("xyz123".to_string()),
+				LSPS0Response::ListProtocols(ListProtocolsResponse { protocols: vec![] })
+			))
+		);
+	}
+}
+
+'''
+'''--- src/lsps1/client.rs ---
+// This file is Copyright its original authors, visible in version contror
+// history.
+//
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE
+// or http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option.
+// You may not use this file except in accordance with one or both of these
+// licenses.
+
+//! Contains the main LSPS1 client object, [`LSPS1ClientHandler`].
+
+use super::event::LSPS1ClientEvent;
+use super::msgs::{
+	CreateOrderRequest, CreateOrderResponse, GetInfoRequest, GetInfoResponse, GetOrderRequest,
+	GetOrderResponse, LSPS1Message, LSPS1Request, LSPS1Response, OptionsSupported, OrderId,
+	OrderParams,
+};
+use super::utils::is_valid;
+use crate::message_queue::MessageQueue;
+
+use crate::events::EventQueue;
+use crate::lsps0::msgs::{ProtocolMessageHandler, RequestId};
+use crate::prelude::{HashMap, String, ToString, Vec};
+use crate::sync::{Arc, Mutex, RwLock};
+use crate::{events::Event, lsps0::msgs::ResponseError};
+
+use lightning::chain::Filter;
+use lightning::ln::channelmanager::AChannelManager;
+use lightning::ln::msgs::{ErrorAction, LightningError};
+use lightning::sign::EntropySource;
+use lightning::util::errors::APIError;
+use lightning::util::logger::Level;
+
+use bitcoin::secp256k1::PublicKey;
+
+use core::ops::Deref;
+
+const SUPPORTED_SPEC_VERSIONS: [u16; 1] = [1];
+
+/// Client-side configuration options for LSPS1 channel requests.
+#[derive(Clone, Debug)]
+pub struct LSPS1ClientConfig {
+	/// The maximally allowed channel fees.
+	pub max_channel_fees_msat: Option<u64>,
+}
+
+struct ChannelStateError(String);
+
+impl From<ChannelStateError> for LightningError {
+	fn from(value: ChannelStateError) -> Self {
+		LightningError { err: value.0, action: ErrorAction::IgnoreAndLog(Level::Info) }
+	}
+}
+
+#[derive(PartialEq, Debug)]
+enum InboundRequestState {
+	InfoRequested,
+	OptionsSupport { version: u16, options_supported: OptionsSupported },
+	OrderRequested { version: u16, order: OrderParams },
+	PendingPayment { order_id: OrderId },
+	AwaitingConfirmation { id: u128, order_id: OrderId },
+}
+
+impl InboundRequestState {
+	fn info_received(
+		&self, versions: Vec<u16>, options: OptionsSupported,
+	) -> Result<Self, ChannelStateError> {
+		let max_shared_version = versions
+			.iter()
+			.filter(|version| SUPPORTED_SPEC_VERSIONS.contains(version))
+			.max()
+			.cloned()
+			.ok_or(ChannelStateError(format!(
+			"LSP does not support any of our specification versions.  ours = {:?}. theirs = {:?}",
+			SUPPORTED_SPEC_VERSIONS, versions
+		)))?;
+
+		match self {
+			InboundRequestState::InfoRequested => Ok(InboundRequestState::OptionsSupport {
+				version: max_shared_version,
+				options_supported: options,
+			}),
+			state => Err(ChannelStateError(format!(
+				"Received unexpected get_versions response. Channel was in state: {:?}",
+				state
+			))),
+		}
+	}
+
+	fn order_requested(&self, order: OrderParams) -> Result<Self, ChannelStateError> {
+		match self {
+			InboundRequestState::OptionsSupport { version, options_supported } => {
+				if is_valid(&order, options_supported) {
+					Ok(InboundRequestState::OrderRequested { version: *version, order })
+				} else {
+					return Err(ChannelStateError(format!(
+						"The order created does not match options supported by LSP. Options Supported by LSP are {:?}. The order created was {:?}",
+						options_supported, order
+					)));
+				}
+			}
+			state => Err(ChannelStateError(format!(
+				"Received create order request for wrong channel. Channel was in state: {:?}",
+				state
+			))),
+		}
+	}
+
+	fn order_received(
+		&self, response_order: &OrderParams, order_id: OrderId,
+	) -> Result<Self, ChannelStateError> {
+		match self {
+			InboundRequestState::OrderRequested { version, order } => {
+				if response_order == order {
+					Ok(InboundRequestState::PendingPayment { order_id })
+				} else {
+					Err(ChannelStateError(format!(
+						"Received order is different from created order. The order created was : {:?}. Order Received from LSP is : {:?}",
+						order, response_order
+					)))
+				}
+			}
+			state => Err(ChannelStateError(format!(
+				"Received unexpected create order response. Channel was in state: {:?}",
+				state
+			))),
+		}
+	}
+
+	fn pay_for_channel(&self, channel_id: u128) -> Result<Self, ChannelStateError> {
+		match self {
+			InboundRequestState::PendingPayment { order_id } => {
+				Ok(InboundRequestState::AwaitingConfirmation {
+					id: channel_id,
+					order_id: order_id.clone(),
+				})
+			}
+			state => Err(ChannelStateError(format!(
+				"Received unexpected response. Channel was in state: {:?}",
+				state
+			))),
+		}
+	}
+}
+
+struct InboundCRChannel {
+	id: u128,
+	state: InboundRequestState,
+}
+
+impl InboundCRChannel {
+	fn new(id: u128) -> Self {
+		Self { id, state: InboundRequestState::InfoRequested }
+	}
+
+	fn info_received(
+		&mut self, versions: Vec<u16>, options: OptionsSupported,
+	) -> Result<u16, LightningError> {
+		self.state = self.state.info_received(versions, options)?;
+
+		match self.state {
+			InboundRequestState::OptionsSupport { version, .. } => Ok(version),
+			_ => Err(LightningError {
+				action: ErrorAction::IgnoreAndLog(Level::Error),
+				err: "impossible state transition".to_string(),
+			}),
+		}
+	}
+
+	fn order_requested(&mut self, order: OrderParams) -> Result<u16, LightningError> {
+		self.state = self.state.order_requested(order)?;
+
+		match self.state {
+			InboundRequestState::OrderRequested { version, .. } => Ok(version),
+			_ => {
+				return Err(LightningError {
+					action: ErrorAction::IgnoreAndLog(Level::Error),
+					err: "impossible state transition".to_string(),
+				});
+			}
+		}
+	}
+
+	fn order_received(
+		&mut self, order: &OrderParams, order_id: OrderId,
+	) -> Result<(), LightningError> {
+		self.state = self.state.order_received(order, order_id)?;
+		Ok(())
+	}
+
+	fn pay_for_channel(&mut self, channel_id: u128) -> Result<(), LightningError> {
+		self.state = self.state.pay_for_channel(channel_id)?;
+		Ok(())
+	}
+}
+
+#[derive(Default)]
+struct PeerState {
+	inbound_channels_by_id: HashMap<u128, InboundCRChannel>,
+	request_to_cid: HashMap<RequestId, u128>,
+	pending_requests: HashMap<RequestId, LSPS1Request>,
+}
+
+impl PeerState {
+	fn insert_inbound_channel(&mut self, id: u128, channel: InboundCRChannel) {
+		self.inbound_channels_by_id.insert(id, channel);
+	}
+
+	fn insert_request(&mut self, request_id: RequestId, channel_id: u128) {
+		self.request_to_cid.insert(request_id, channel_id);
+	}
+
+	fn remove_inbound_channel(&mut self, id: u128) {
+		self.inbound_channels_by_id.remove(&id);
+	}
+}
+
+/// The main object allowing to send and receive LSPS1 messages.
+pub struct LSPS1ClientHandler<ES: Deref, CM: Deref + Clone, MQ: Deref, C: Deref>
+where
+	ES::Target: EntropySource,
+	CM::Target: AChannelManager,
+	MQ::Target: MessageQueue,
+	C::Target: Filter,
+{
+	entropy_source: ES,
+	channel_manager: CM,
+	chain_source: Option<C>,
+	pending_messages: MQ,
+	pending_events: Arc<EventQueue>,
+	per_peer_state: RwLock<HashMap<PublicKey, Mutex<PeerState>>>,
+	config: LSPS1ClientConfig,
+}
+
+impl<ES: Deref, CM: Deref + Clone, MQ: Deref, C: Deref> LSPS1ClientHandler<ES, CM, MQ, C>
+where
+	ES::Target: EntropySource,
+	CM::Target: AChannelManager,
+	MQ::Target: MessageQueue,
+	C::Target: Filter,
+	ES::Target: EntropySource,
+{
+	pub(crate) fn new(
+		entropy_source: ES, pending_messages: MQ, pending_events: Arc<EventQueue>,
+		channel_manager: CM, chain_source: Option<C>, config: LSPS1ClientConfig,
+	) -> Self {
+		Self {
+			entropy_source,
+			channel_manager,
+			chain_source,
+			pending_messages,
+			pending_events,
+			per_peer_state: RwLock::new(HashMap::new()),
+			config,
+		}
+	}
+
+	fn request_for_info(&self, counterparty_node_id: PublicKey, channel_id: u128) {
+		let channel = InboundCRChannel::new(channel_id);
+
+		let mut outer_state_lock = self.per_peer_state.write().unwrap();
+		let inner_state_lock = outer_state_lock
+			.entry(counterparty_node_id)
+			.or_insert(Mutex::new(PeerState::default()));
+		let mut peer_state_lock = inner_state_lock.lock().unwrap();
+		peer_state_lock.insert_inbound_channel(channel_id, channel);
+
+		let request_id = crate::utils::generate_request_id(&self.entropy_source);
+		peer_state_lock.insert_request(request_id.clone(), channel_id);
+
+		self.pending_messages.enqueue(
+			&counterparty_node_id,
+			LSPS1Message::Request(request_id, LSPS1Request::GetInfo(GetInfoRequest {})).into(),
+		);
+	}
+
+	fn handle_get_info_response(
+		&self, request_id: RequestId, counterparty_node_id: &PublicKey, result: GetInfoResponse,
+	) -> Result<(), LightningError> {
+		let outer_state_lock = self.per_peer_state.write().unwrap();
+
+		match outer_state_lock.get(counterparty_node_id) {
+			Some(inner_state_lock) => {
+				let mut peer_state_lock = inner_state_lock.lock().unwrap();
+
+				let channel_id =
+					peer_state_lock.request_to_cid.remove(&request_id).ok_or(LightningError {
+						err: format!(
+							"Received get_info response for an unknown request: {:?}",
+							request_id
+						),
+						action: ErrorAction::IgnoreAndLog(Level::Info),
+					})?;
+
+				let inbound_channel = peer_state_lock
+					.inbound_channels_by_id
+					.get_mut(&channel_id)
+					.ok_or(LightningError {
+					err: format!(
+						"Received get_info response for an unknown channel: {:?}",
+						channel_id
+					),
+					action: ErrorAction::IgnoreAndLog(Level::Info),
+				})?;
+
+				let version = match inbound_channel
+					.info_received(result.supported_versions, result.options.clone())
+				{
+					Ok(version) => version,
+					Err(e) => {
+						peer_state_lock.remove_inbound_channel(channel_id);
+						return Err(e);
+					}
+				};
+
+				self.pending_events.enqueue(Event::LSPS1Client(LSPS1ClientEvent::GetInfoResponse {
+					id: channel_id,
+					request_id,
+					counterparty_node_id: *counterparty_node_id,
+					version,
+					website: result.website,
+					options_supported: result.options,
+				}))
+			}
+			None => {
+				return Err(LightningError {
+					err: format!(
+						"Received get_info response from unknown peer: {:?}",
+						counterparty_node_id
+					),
+					action: ErrorAction::IgnoreAndLog(Level::Info),
+				})
+			}
+		}
+		Ok(())
+	}
+
+	fn place_order(
+		&self, channel_id: u128, counterparty_node_id: &PublicKey, order: OrderParams,
+	) -> Result<(), APIError> {
+		let outer_state_lock = self.per_peer_state.write().unwrap();
+
+		match outer_state_lock.get(counterparty_node_id) {
+			Some(inner_state_lock) => {
+				let mut peer_state_lock = inner_state_lock.lock().unwrap();
+
+				let inbound_channel = peer_state_lock
+					.inbound_channels_by_id
+					.get_mut(&channel_id)
+					.ok_or(APIError::APIMisuseError {
+					err: format!("Channel with id {} not found", channel_id),
+				})?;
+
+				let version = match inbound_channel.order_requested(order.clone()) {
+					Ok(version) => version,
+					Err(e) => {
+						peer_state_lock.remove_inbound_channel(channel_id);
+						return Err(APIError::APIMisuseError { err: e.err });
+					}
+				};
+
+				let request_id = crate::utils::generate_request_id(&self.entropy_source);
+				peer_state_lock.insert_request(request_id.clone(), channel_id);
+
+				self.pending_messages.enqueue(
+					counterparty_node_id,
+					LSPS1Message::Request(
+						request_id,
+						LSPS1Request::CreateOrder(CreateOrderRequest { order, version }),
+					)
+					.into(),
+				);
+			}
+			None => {
+				return Err(APIError::APIMisuseError {
+					err: format!("No existing state with counterparty {}", counterparty_node_id),
+				})
+			}
+		}
+		Ok(())
+	}
+
+	fn handle_create_order_response(
+		&self, request_id: RequestId, counterparty_node_id: &PublicKey,
+		response: CreateOrderResponse,
+	) -> Result<(), LightningError> {
+		let outer_state_lock = self.per_peer_state.read().unwrap();
+		match outer_state_lock.get(&counterparty_node_id) {
+			Some(inner_state_lock) => {
+				let mut peer_state_lock = inner_state_lock.lock().unwrap();
+
+				let channel_id =
+					peer_state_lock.request_to_cid.remove(&request_id).ok_or(LightningError {
+						err: format!(
+							"Received create_order response for an unknown request: {:?}",
+							request_id
+						),
+						action: ErrorAction::IgnoreAndLog(Level::Info),
+					})?;
+
+				let inbound_channel = peer_state_lock
+					.inbound_channels_by_id
+					.get_mut(&channel_id)
+					.ok_or(LightningError {
+					err: format!(
+						"Received create_order response for an unknown channel: {:?}",
+						channel_id
+					),
+					action: ErrorAction::IgnoreAndLog(Level::Info),
+				})?;
+
+				if let Err(e) =
+					inbound_channel.order_received(&response.order, response.order_id.clone())
+				{
+					peer_state_lock.remove_inbound_channel(channel_id);
+					return Err(e);
+				}
+
+				let total_fees = response.payment.fee_total_sat + response.order.client_balance_sat;
+				let max_channel_fees_msat = self.config.max_channel_fees_msat.unwrap_or(u64::MAX);
+
+				if total_fees == response.payment.order_total_sat
+					&& total_fees < max_channel_fees_msat
+				{
+					self.pending_events.enqueue(Event::LSPS1Client(
+						LSPS1ClientEvent::DisplayOrder {
+							id: channel_id,
+							counterparty_node_id: *counterparty_node_id,
+							order: response.order,
+							payment: response.payment,
+							channel: response.channel,
+						},
+					));
+				} else {
+					peer_state_lock.remove_inbound_channel(channel_id);
+					return Err(LightningError {
+						err: format!("Fees are too high : {:?}", total_fees),
+						action: ErrorAction::IgnoreAndLog(Level::Info),
+					});
+				}
+			}
+			None => {
+				return Err(LightningError {
+					err: format!(
+						"Received create_order response from unknown peer: {}",
+						counterparty_node_id
+					),
+					action: ErrorAction::IgnoreAndLog(Level::Info),
+				})
+			}
+		}
+
+		Ok(())
+	}
+
+	fn handle_create_order_error(
+		&self, request_id: RequestId, counterparty_node_id: &PublicKey, error: ResponseError,
+	) -> Result<(), LightningError> {
+		let outer_state_lock = self.per_peer_state.read().unwrap();
+		match outer_state_lock.get(&counterparty_node_id) {
+			Some(inner_state_lock) => {
+				let mut peer_state_lock = inner_state_lock.lock().unwrap();
+
+				let channel_id =
+					peer_state_lock.request_to_cid.remove(&request_id).ok_or(LightningError {
+						err: format!(
+							"Received create order error for an unknown request: {:?}",
+							request_id
+						),
+						action: ErrorAction::IgnoreAndLog(Level::Info),
+					})?;
+
+				let inbound_channel = peer_state_lock
+					.inbound_channels_by_id
+					.get_mut(&channel_id)
+					.ok_or(LightningError {
+					err: format!(
+						"Received create order error for an unknown channel: {:?}",
+						channel_id
+					),
+					action: ErrorAction::IgnoreAndLog(Level::Info),
+				})?;
+				Ok(())
+			}
+			None => {
+				return Err(LightningError { err: format!("Received error response for a create order request from an unknown counterparty ({:?})",counterparty_node_id), action: ErrorAction::IgnoreAndLog(Level::Info)});
+			}
+		}
+	}
+
+	fn check_order_status(
+		&self, counterparty_node_id: &PublicKey, order_id: OrderId, channel_id: u128,
+	) -> Result<(), APIError> {
+		let outer_state_lock = self.per_peer_state.write().unwrap();
+		match outer_state_lock.get(&counterparty_node_id) {
+			Some(inner_state_lock) => {
+				let mut peer_state_lock = inner_state_lock.lock().unwrap();
+
+				if let Some(inbound_channel) =
+					peer_state_lock.inbound_channels_by_id.get_mut(&channel_id)
+				{
+					if let Err(e) = inbound_channel.pay_for_channel(channel_id) {
+						peer_state_lock.remove_inbound_channel(channel_id);
+						return Err(APIError::APIMisuseError { err: e.err });
+					}
+
+					let request_id = crate::utils::generate_request_id(&self.entropy_source);
+					peer_state_lock.insert_request(request_id.clone(), channel_id);
+
+					self.pending_messages.enqueue(
+						counterparty_node_id,
+						LSPS1Message::Request(
+							request_id,
+							LSPS1Request::GetOrder(GetOrderRequest { order_id: order_id.clone() }),
+						)
+						.into(),
+					);
+				} else {
+					return Err(APIError::APIMisuseError {
+						err: format!("Channel with id {} not found", channel_id),
+					});
+				}
+			}
+			None => {
+				return Err(APIError::APIMisuseError {
+					err: format!("No existing state with counterparty {}", counterparty_node_id),
+				})
+			}
+		}
+
+		Ok(())
+	}
+
+	fn handle_get_order_response(
+		&self, request_id: RequestId, counterparty_node_id: &PublicKey, params: GetOrderResponse,
+	) -> Result<(), LightningError> {
+		let outer_state_lock = self.per_peer_state.read().unwrap();
+		match outer_state_lock.get(&counterparty_node_id) {
+			Some(inner_state_lock) => {
+				let mut peer_state_lock = inner_state_lock.lock().unwrap();
+
+				let channel_id =
+					peer_state_lock.request_to_cid.remove(&request_id).ok_or(LightningError {
+						err: format!(
+							"Received get_versions response for an unknown request: {:?}",
+							request_id
+						),
+						action: ErrorAction::IgnoreAndLog(Level::Info),
+					})?;
+
+				let inbound_channel = peer_state_lock
+					.inbound_channels_by_id
+					.get_mut(&channel_id)
+					.ok_or(LightningError {
+					err: format!(
+						"Received get_versions response for an unknown channel: {:?}",
+						channel_id
+					),
+					action: ErrorAction::IgnoreAndLog(Level::Info),
+				})?;
+			}
+			None => {
+				return Err(LightningError {
+					err: format!(
+						"Received get_order response from unknown peer: {}",
+						counterparty_node_id
+					),
+					action: ErrorAction::IgnoreAndLog(Level::Info),
+				})
+			}
+		}
+
+		Ok(())
+	}
+
+	fn handle_get_order_error(
+		&self, request_id: RequestId, counterparty_node_id: &PublicKey, params: ResponseError,
+	) -> Result<(), LightningError> {
+		let outer_state_lock = self.per_peer_state.read().unwrap();
+		match outer_state_lock.get(&counterparty_node_id) {
+			Some(inner_state_lock) => {
+				let mut peer_state_lock = inner_state_lock.lock().unwrap();
+
+				let channel_id =
+					peer_state_lock.request_to_cid.remove(&request_id).ok_or(LightningError {
+						err: format!(
+							"Received get_order error for an unknown request: {:?}",
+							request_id
+						),
+						action: ErrorAction::IgnoreAndLog(Level::Info),
+					})?;
+
+				let _inbound_channel = peer_state_lock
+					.inbound_channels_by_id
+					.get_mut(&channel_id)
+					.ok_or(LightningError {
+						err: format!(
+							"Received get_order error for an unknown channel: {:?}",
+							channel_id
+						),
+						action: ErrorAction::IgnoreAndLog(Level::Info),
+					})?;
+				Ok(())
+			}
+			None => {
+				return Err(LightningError { err: format!("Received get_order response for a create order request from an unknown counterparty ({:?})",counterparty_node_id), action: ErrorAction::IgnoreAndLog(Level::Info)});
+			}
+		}
+	}
+}
+
+impl<ES: Deref, CM: Deref + Clone, MQ: Deref, C: Deref> ProtocolMessageHandler
+	for LSPS1ClientHandler<ES, CM, MQ, C>
+where
+	ES::Target: EntropySource,
+	CM::Target: AChannelManager,
+	MQ::Target: MessageQueue,
+	C::Target: Filter,
+{
+	type ProtocolMessage = LSPS1Message;
+	const PROTOCOL_NUMBER: Option<u16> = Some(1);
+
+	fn handle_message(
+		&self, message: Self::ProtocolMessage, counterparty_node_id: &PublicKey,
+	) -> Result<(), LightningError> {
+		match message {
+			LSPS1Message::Response(request_id, response) => match response {
+				LSPS1Response::GetInfo(params) => {
+					self.handle_get_info_response(request_id, counterparty_node_id, params)
+				}
+				LSPS1Response::CreateOrder(params) => {
+					self.handle_create_order_response(request_id, counterparty_node_id, params)
+				}
+				LSPS1Response::CreateOrderError(params) => {
+					self.handle_create_order_error(request_id, counterparty_node_id, params)
+				}
+				LSPS1Response::GetOrder(params) => {
+					self.handle_get_order_response(request_id, counterparty_node_id, params)
+				}
+				LSPS1Response::GetOrderError(error) => {
+					self.handle_get_order_error(request_id, counterparty_node_id, error)
+				}
+			},
+			_ => {
+				debug_assert!(
+					false,
+					"Client handler received LSPS1 request message. This should never happen."
+				);
+				Err(LightningError { err: format!("Client handler received LSPS1 request message from node {:?}. This should never happen.", counterparty_node_id), action: ErrorAction::IgnoreAndLog(Level::Info)})
+			}
+		}
+	}
+}
+
+'''
+'''--- src/lsps1/event.rs ---
+//! Contains LSPS1 event types
+
+use super::msgs::{ChannelInfo, OptionsSupported, OrderId, OrderParams, OrderPayment};
+
+use crate::lsps0::msgs::RequestId;
+use crate::prelude::String;
+
+use bitcoin::secp256k1::PublicKey;
+
+/// An event which an LSPS1 client should take some action in response to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LSPS1ClientEvent {
+	/// TODO
+	GetInfoResponse {
+		/// TODO
+		id: u128,
+		/// TODO
+		request_id: RequestId,
+		/// TODO
+		counterparty_node_id: PublicKey,
+		/// TODO
+		version: u16,
+		/// TODO
+		website: String,
+		/// TODO
+		options_supported: OptionsSupported,
+	},
+	/// TODO
+	DisplayOrder {
+		/// TODO
+		id: u128,
+		/// TODO
+		counterparty_node_id: PublicKey,
+		/// TODO
+		order: OrderParams,
+		/// TODO
+		payment: OrderPayment,
+		/// TODO
+		channel: Option<ChannelInfo>,
+	},
+}
+
+/// An event which an LSPS1 server should take some action in response to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LSPS1ServiceEvent {
+	/// TODO
+	CreateInvoice {
+		/// TODO
+		request_id: RequestId,
+		/// TODO
+		counterparty_node_id: PublicKey,
+		/// TODO
+		order: OrderParams,
+	},
+	/// TODO
+	CheckPaymentConfirmation {
+		/// TODO
+		request_id: RequestId,
+		/// TODO
+		counterparty_node_id: PublicKey,
+		/// TODO
+		order_id: OrderId,
+	},
+	/// TODO
+	Refund {
+		/// TODO
+		request_id: RequestId,
+		/// TODO
+		counterparty_node_id: PublicKey,
+		/// TODO
+		order_id: OrderId,
+	},
+}
+
+'''
+'''--- src/lsps1/mod.rs ---
+// This file is Copyright its original authors, visible in version control
+// history.
+//
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE
+// or http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option.
+// You may not use this file except in accordance with one or both of these
+// licenses.
+
+//! Types and primitives that implement the LSPS1: Channel Request specification.
+
+pub mod client;
+pub mod event;
+pub mod msgs;
+pub mod service;
+pub(crate) mod utils;
+
+'''
+'''--- src/lsps1/msgs.rs ---
+//! Message, request, and other primitive types used to implement LSPS1.
+
+use crate::lsps0::msgs::{LSPSMessage, RequestId, ResponseError};
+use crate::prelude::{String, Vec};
+
+use serde::{Deserialize, Serialize};
+
+use chrono::Utc;
+
+use core::convert::TryFrom;
+
+pub(crate) const LSPS1_GET_INFO_METHOD_NAME: &str = "lsps1.get_info";
+pub(crate) const LSPS1_CREATE_ORDER_METHOD_NAME: &str = "lsps1.create_order";
+pub(crate) const LSPS1_GET_ORDER_METHOD_NAME: &str = "lsps1.get_order";
+
+pub(crate) const LSPS1_CREATE_ORDER_REQUEST_INVALID_PARAMS_ERROR_CODE: i32 = -32602;
+pub(crate) const LSPS1_CREATE_ORDER_REQUEST_ORDER_MISMATCH_ERROR_CODE: i32 = 1000;
+pub(crate) const LSPS1_CREATE_ORDER_REQUEST_CLIENT_REJECTED_ERROR_CODE: i32 = 1001;
+pub(crate) const LSPS1_CREATE_ORDER_REQUEST_INVALID_VERSION_ERROR_CODE: i32 = 1;
+pub(crate) const LSPS1_CREATE_ORDER_REQUEST_INVALID_TOKEN_ERROR_CODE: i32 = 2;
+
+/// The identifier of an order.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Hash)]
+pub struct OrderId(pub String);
+
+/// A request made to an LSP to retrieve the supported options.
+///
+/// Please refer to the [LSPS1 specification](https://github.com/BitcoinAndLightningLayerSpecs/lsp/tree/main/LSPS1#1-lsps1info)
+/// for more information.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(default)]
+pub struct GetInfoRequest {}
+
+/// An object representing the supported protocol options.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct OptionsSupported {
+	/// The minimum number of block confirmations before the LSP accepts a channel as confirmed.
+	pub minimum_channel_confirmations: u8,
+	/// The minimum number of block confirmations before the LSP accepts an on-chain payment as confirmed.
+	pub minimum_onchain_payment_confirmations: u8,
+	/// Indicates if the LSP supports zero reserve.
+	pub supports_zero_channel_reserve: bool,
+	/// Indicates the minimum amount of satoshi that is required for the LSP to accept a payment
+	/// on-chain.
+	pub min_onchain_payment_size_sat: Option<u32>,
+	/// The maximum number of blocks a channel can be leased for.
+	pub max_channel_expiry_blocks: u32,
+	/// The minimum number of satoshi that the client MUST request.
+	pub min_initial_client_balance_sat: u64,
+	/// The maximum number of satoshi that the client MUST request.
+	pub max_initial_client_balance_sat: u64,
+	/// The minimum number of satoshi that the LSP will provide to the channel.
+	pub min_initial_lsp_balance_sat: u64,
+	/// The maximum number of satoshi that the LSP will provide to the channel.
+	pub max_initial_lsp_balance_sat: u64,
+	/// The minimal channel size.
+	pub min_channel_balance_sat: u64,
+	/// The maximal channel size.
+	pub max_channel_balance_sat: u64,
+}
+
+/// A response to an [`GetInfoRequest`].
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct GetInfoResponse {
+	/// A list of all supported API versions by the LSP.
+	pub supported_versions: Vec<u16>,
+	/// The website of the LSP.
+	pub website: String,
+	/// All options supported by the LSP.
+	pub options: OptionsSupported,
+}
+
+/// A request made to an LSP to create an order.
+///
+/// Please refer to the [LSPS1 specification](https://github.com/BitcoinAndLightningLayerSpecs/lsp/tree/main/LSPS1#2-lsps1create_order)
+/// for more information.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CreateOrderRequest {
+	/// TODO: this is superfluous and should likely be removed.
+	pub version: u16,
+	/// The order made.
+	pub order: OrderParams,
+}
+
+/// An object representing an LSPS1 channel order.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct OrderParams {
+	/// The API version that the client wants to work with.
+	pub api_version: u16,
+	/// Indicates how many satoshi the LSP will provide on their side.
+	pub lsp_balance_sat: u64,
+	/// Indicates how many satoshi the client will provide on their side.
+	///
+	/// The client sends these funds to the LSP, who will push them back to the client upon opening
+	/// the channel.
+	pub client_balance_sat: u64,
+	/// The number of blocks the client wants to wait maximally for the channel to be confirmed.
+	pub confirms_within_blocks: u32,
+	/// Indicates how long the channel is leased for in block time.
+	pub channel_expiry_blocks: u32,
+	/// May contain arbitrary associated data like a coupon code or a authentication token.
+	pub token: String,
+	/// The address where the LSP will send the funds if the order fails.
+	pub refund_onchain_address: Option<String>,
+	/// Indicates if the channel should be announced to the network.
+	pub announce_channel: bool,
+}
+
+/// A response to a [`CreateOrderRequest`].
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CreateOrderResponse {
+	/// The id of the channel order.
+	pub order_id: OrderId,
+	/// The parameters of channel order.
+	pub order: OrderParams,
+	/// The datetime when the order was created
+	pub created_at: chrono::DateTime<Utc>,
+	/// The datetime when the order expires.
+	pub expires_at: chrono::DateTime<Utc>,
+	/// The current state of the order.
+	pub order_state: OrderState,
+	/// Contains details about how to pay for the order.
+	pub payment: OrderPayment,
+	/// Contains information about the channel state.
+	pub channel: Option<ChannelInfo>,
+}
+
+/// An object representing the state of an order.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub enum OrderState {
+	/// TODO: this is superfluous and should likely be removed.
+	Requested,
+	/// The order has been created.
+	Created,
+	/// The LSP has opened the channel and published the funding transaction.
+	Completed,
+	/// The order failed.
+	Failed,
+}
+
+/// Details regarding how to pay for an order.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct OrderPayment {
+	/// Indicates the current state of the payment.
+	pub state: PaymentState,
+	/// The total fee the LSP will charge to open this channel in satoshi.
+	pub fee_total_sat: u64,
+	/// What the client needs to pay in total to open the requested channel.
+	pub order_total_sat: u64,
+	/// A BOLT11 invoice the client can pay to have to channel opened.
+	pub bolt11_invoice: String,
+	/// An on-chain address the client can send [`Self::order_total_sat`] to to have the channel
+	/// opened.
+	pub onchain_address: String,
+	/// The minimum number of block confirmations that are required for the on-chain payment to be
+	/// considered confirmed.
+	pub onchain_block_confirmations_required: u8,
+	/// The minimum fee rate for the on-chain payment in case the client wants the payment to be
+	/// confirmed without a confirmation.
+	pub minimum_fee_for_0conf: u8,
+	/// Details regarding a detected on-chain payment.
+	pub onchain_payment: OnchainPayment,
+}
+
+/// The state of an [`OrderPayment`].
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub enum PaymentState {
+	/// A payment is expected.
+	ExpectPayment,
+	/// A Lighting payment has arrived, but the preimage has not been released yet.
+	Hold,
+	/// A sufficient payment has been received.
+	Paid,
+	/// The payment has been refunded.
+	Refunded,
+}
+
+/// Details regarding a detected on-chain payment.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct OnchainPayment {
+	/// The outpoint of the payment.
+	pub outpoint: String,
+	/// The amount of satoshi paid.
+	pub sat: u64,
+	/// Indicates if the LSP regards the transaction as sufficiently confirmed.
+	pub confirmed: bool,
+}
+
+/// Details regarding the state of an ordered channel.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ChannelInfo {
+	/// The current state of the channel.
+	pub state: ChannelState,
+	/// The datetime when the funding transaction has been published.
+	pub funded_at: String,
+	/// The outpoint of the funding transaction.
+	pub funding_outpoint: String,
+	/// The channel's short channel id.
+	pub scid: Option<String>,
+	/// The earliest datetime when the channel may be closed by the LSP.
+	pub expires_at: String,
+	/// The transaction id of the channel.
+	pub closing_transaction: Option<String>,
+	/// The datetime when the closing transaction was published.
+	pub closed_at: Option<String>,
+}
+
+/// The current state of an ordered channel.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub enum ChannelState {
+	/// The funding transaction has been published.
+	Opening,
+	/// The channel has been opened.
+	Opened,
+	/// The channel has been closed.
+	Closed,
+}
+
+/// A request made to an LSP to retrieve information about an previously made order.
+///
+/// Please refer to the [LSPS1 specification](https://github.com/BitcoinAndLightningLayerSpecs/lsp/tree/main/LSPS1#21-lsps1get_order)
+/// for more information.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct GetOrderRequest {
+	/// The id of the order.
+	pub order_id: OrderId,
+}
+
+/// A response to an [`GetOrderRequest`].
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct GetOrderResponse {
+	/// The response to the order request.
+	pub response: CreateOrderResponse,
+}
+
+/// An enum that captures all the valid JSON-RPC requests in the LSPS1 protocol.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LSPS1Request {
+	/// A request to learn about the options supported by the LSP.
+	GetInfo(GetInfoRequest),
+	/// A request to create a channel order.
+	CreateOrder(CreateOrderRequest),
+	/// A request to query a previously created channel order.
+	GetOrder(GetOrderRequest),
+}
+
+impl LSPS1Request {
+	/// Get the JSON-RPC method name for the underlying request.
+	pub fn method(&self) -> &str {
+		match self {
+			LSPS1Request::GetInfo(_) => LSPS1_GET_INFO_METHOD_NAME,
+			LSPS1Request::CreateOrder(_) => LSPS1_CREATE_ORDER_METHOD_NAME,
+			LSPS1Request::GetOrder(_) => LSPS1_GET_ORDER_METHOD_NAME,
+		}
+	}
+}
+
+/// An enum that captures all the valid JSON-RPC responses in the LSPS1 protocol.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LSPS1Response {
+	/// A successful response to a [`GetInfoRequest`].
+	GetInfo(GetInfoResponse),
+	/// A successful response to a [`CreateOrderRequest`].
+	CreateOrder(CreateOrderResponse),
+	/// An error response to a [`CreateOrderRequest`].
+	CreateOrderError(ResponseError),
+	/// A successful response to a [`GetOrderRequest`].
+	GetOrder(GetOrderResponse),
+	/// An error response to a [`GetOrderRequest`].
+	GetOrderError(ResponseError),
+}
+
+/// An enum that captures all valid JSON-RPC messages in the LSPS1 protocol.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LSPS1Message {
+	/// An LSPS1 JSON-RPC request.
+	Request(RequestId, LSPS1Request),
+	/// An LSPS1 JSON-RPC response.
+	Response(RequestId, LSPS1Response),
+}
+
+impl TryFrom<LSPSMessage> for LSPS1Message {
+	type Error = ();
+
+	fn try_from(message: LSPSMessage) -> Result<Self, Self::Error> {
+		if let LSPSMessage::LSPS1(message) = message {
+			return Ok(message);
+		}
+
+		Err(())
+	}
+}
+
+impl From<LSPS1Message> for LSPSMessage {
+	fn from(message: LSPS1Message) -> Self {
+		LSPSMessage::LSPS1(message)
+	}
+}
+
+'''
+'''--- src/lsps1/service.rs ---
+// This file is Copyright its original authors, visible in version contror
+// history.
+//
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE
+// or http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option.
+// You may not use this file except in accordance with one or both of these
+// licenses.
+
+//! Contains the main LSPS1 server object, [`LSPS1ServiceHandler`].
+
+use super::event::LSPS1ServiceEvent;
+use super::msgs::{
+	ChannelInfo, CreateOrderRequest, CreateOrderResponse, GetInfoResponse, GetOrderRequest,
+	GetOrderResponse, LSPS1Message, LSPS1Request, LSPS1Response, OptionsSupported, OrderId,
+	OrderParams, OrderPayment, OrderState, LSPS1_CREATE_ORDER_REQUEST_INVALID_VERSION_ERROR_CODE,
+	LSPS1_CREATE_ORDER_REQUEST_ORDER_MISMATCH_ERROR_CODE,
+};
+use super::utils::is_valid;
+use crate::message_queue::MessageQueue;
+
+use crate::events::EventQueue;
+use crate::lsps0::msgs::{ProtocolMessageHandler, RequestId};
+use crate::prelude::{HashMap, String, ToString};
+use crate::sync::{Arc, Mutex, RwLock};
+use crate::utils;
+use crate::{events::Event, lsps0::msgs::ResponseError};
+
+use lightning::chain::Filter;
+use lightning::ln::channelmanager::AChannelManager;
+use lightning::ln::msgs::{ErrorAction, LightningError};
+use lightning::sign::EntropySource;
+use lightning::util::errors::APIError;
+use lightning::util::logger::Level;
+
+use bitcoin::secp256k1::PublicKey;
+
+use chrono::Utc;
+use core::ops::Deref;
+
+const SUPPORTED_SPEC_VERSIONS: [u16; 1] = [1];
+
+/// Server-side configuration options for LSPS1 channel requests.
+#[derive(Clone, Debug)]
+pub struct LSPS1ServiceConfig {
+	/// A token to be send with each channel request.
+	pub token: Option<String>,
+	/// The options supported by the LSP.
+	pub options_supported: Option<OptionsSupported>,
+	/// The LSP's website.
+	pub website: Option<String>,
+}
+
+struct ChannelStateError(String);
+
+impl From<ChannelStateError> for LightningError {
+	fn from(value: ChannelStateError) -> Self {
+		LightningError { err: value.0, action: ErrorAction::IgnoreAndLog(Level::Info) }
+	}
+}
+
+#[derive(PartialEq, Debug)]
+enum OutboundRequestState {
+	OrderCreated { order_id: OrderId },
+	WaitingPayment { order_id: OrderId },
+	Ready,
+}
+
+impl OutboundRequestState {
+	fn create_payment_invoice(&self) -> Result<Self, ChannelStateError> {
+		match self {
+			OutboundRequestState::OrderCreated { order_id } => {
+				Ok(OutboundRequestState::WaitingPayment { order_id: order_id.clone() })
+			}
+			state => Err(ChannelStateError(format!(
+				"Received unexpected get_versions response. JIT Channel was in state: {:?}",
+				state
+			))),
+		}
+	}
+}
+
+struct OutboundLSPS1Config {
+	order: OrderParams,
+	created_at: chrono::DateTime<Utc>,
+	expires_at: chrono::DateTime<Utc>,
+	payment: OrderPayment,
+}
+
+struct OutboundCRChannel {
+	state: OutboundRequestState,
+	config: OutboundLSPS1Config,
+}
+
+impl OutboundCRChannel {
+	fn new(
+		order: OrderParams, created_at: chrono::DateTime<Utc>, expires_at: chrono::DateTime<Utc>,
+		order_id: OrderId, payment: OrderPayment,
+	) -> Self {
+		Self {
+			state: OutboundRequestState::OrderCreated { order_id },
+			config: OutboundLSPS1Config { order, created_at, expires_at, payment },
+		}
+	}
+	fn create_payment_invoice(&mut self) -> Result<(), LightningError> {
+		self.state = self.state.create_payment_invoice()?;
+		Ok(())
+	}
+
+	fn check_order_validity(&self, options_supported: &OptionsSupported) -> bool {
+		let order = &self.config.order;
+
+		is_valid(order, options_supported)
+	}
+}
+
+#[derive(Default)]
+struct PeerState {
+	outbound_channels_by_order_id: HashMap<OrderId, OutboundCRChannel>,
+	request_to_cid: HashMap<RequestId, u128>,
+	pending_requests: HashMap<RequestId, LSPS1Request>,
+}
+
+impl PeerState {
+	fn insert_outbound_channel(&mut self, order_id: OrderId, channel: OutboundCRChannel) {
+		self.outbound_channels_by_order_id.insert(order_id, channel);
+	}
+
+	fn insert_request(&mut self, request_id: RequestId, channel_id: u128) {
+		self.request_to_cid.insert(request_id, channel_id);
+	}
+
+	fn remove_outbound_channel(&mut self, order_id: OrderId) {
+		self.outbound_channels_by_order_id.remove(&order_id);
+	}
+}
+
+/// The main object allowing to send and receive LSPS1 messages.
+pub struct LSPS1ServiceHandler<ES: Deref, CM: Deref + Clone, MQ: Deref, C: Deref>
+where
+	ES::Target: EntropySource,
+	CM::Target: AChannelManager,
+	MQ::Target: MessageQueue,
+	C::Target: Filter,
+{
+	entropy_source: ES,
+	channel_manager: CM,
+	chain_source: Option<C>,
+	pending_messages: MQ,
+	pending_events: Arc<EventQueue>,
+	per_peer_state: RwLock<HashMap<PublicKey, Mutex<PeerState>>>,
+	config: LSPS1ServiceConfig,
+}
+
+impl<ES: Deref, CM: Deref + Clone, MQ: Deref, C: Deref> LSPS1ServiceHandler<ES, CM, MQ, C>
+where
+	ES::Target: EntropySource,
+	CM::Target: AChannelManager,
+	MQ::Target: MessageQueue,
+	C::Target: Filter,
+	ES::Target: EntropySource,
+{
+	pub(crate) fn new(
+		entropy_source: ES, pending_messages: MQ, pending_events: Arc<EventQueue>,
+		channel_manager: CM, chain_source: Option<C>, config: LSPS1ServiceConfig,
+	) -> Self {
+		Self {
+			entropy_source,
+			channel_manager,
+			chain_source,
+			pending_messages,
+			pending_events,
+			per_peer_state: RwLock::new(HashMap::new()),
+			config,
+		}
+	}
+
+	fn handle_get_info_request(
+		&self, request_id: RequestId, counterparty_node_id: &PublicKey,
+	) -> Result<(), LightningError> {
+		let response = GetInfoResponse {
+			supported_versions: SUPPORTED_SPEC_VERSIONS.to_vec(),
+			website: self.config.website.clone().unwrap().to_string(),
+			options: self
+				.config
+				.options_supported
+				.clone()
+				.ok_or(LightningError {
+					err: format!("Configuration for LSP server not set."),
+					action: ErrorAction::IgnoreAndLog(Level::Info),
+				})
+				.unwrap(),
+		};
+
+		self.enqueue_response(counterparty_node_id, request_id, LSPS1Response::GetInfo(response));
+		Ok(())
+	}
+
+	fn handle_create_order_request(
+		&self, request_id: RequestId, counterparty_node_id: &PublicKey, params: CreateOrderRequest,
+	) -> Result<(), LightningError> {
+		if !SUPPORTED_SPEC_VERSIONS.contains(&params.version) {
+			self.enqueue_response(
+				counterparty_node_id,
+				request_id,
+				LSPS1Response::CreateOrderError(ResponseError {
+					code: LSPS1_CREATE_ORDER_REQUEST_INVALID_VERSION_ERROR_CODE,
+					message: format!("version {} is not supported", params.version),
+					data: Some(format!("Supported versions are {:?}", SUPPORTED_SPEC_VERSIONS)),
+				}),
+			);
+			return Err(LightningError {
+				err: format!("client requested unsupported version {}", params.version),
+				action: ErrorAction::IgnoreAndLog(Level::Info),
+			});
+		}
+
+		if !is_valid(&params.order, &self.config.options_supported.as_ref().unwrap()) {
+			self.enqueue_response(
+				counterparty_node_id,
+				request_id,
+				LSPS1Response::CreateOrderError(ResponseError {
+					code: LSPS1_CREATE_ORDER_REQUEST_ORDER_MISMATCH_ERROR_CODE,
+					message: format!("Order does not match options supported by LSP server"),
+					data: Some(format!(
+						"Supported options are {:?}",
+						&self.config.options_supported.as_ref().unwrap()
+					)),
+				}),
+			);
+			return Err(LightningError {
+				err: format!("client requested unsupported version {}", params.version),
+				action: ErrorAction::IgnoreAndLog(Level::Info),
+			});
+		}
+
+		let mut outer_state_lock = self.per_peer_state.write().unwrap();
+
+		let inner_state_lock = outer_state_lock
+			.entry(*counterparty_node_id)
+			.or_insert(Mutex::new(PeerState::default()));
+		let mut peer_state_lock = inner_state_lock.lock().unwrap();
+
+		peer_state_lock
+			.pending_requests
+			.insert(request_id.clone(), LSPS1Request::CreateOrder(params.clone()));
+
+		self.pending_events.enqueue(Event::LSPS1Service(LSPS1ServiceEvent::CreateInvoice {
+			request_id,
+			counterparty_node_id: *counterparty_node_id,
+			order: params.order,
+		}));
+
+		Ok(())
+	}
+
+	fn send_invoice_for_order(
+		&self, request_id: RequestId, counterparty_node_id: &PublicKey, payment: OrderPayment,
+		created_at: chrono::DateTime<Utc>, expires_at: chrono::DateTime<Utc>,
+	) -> Result<(), APIError> {
+		let outer_state_lock = self.per_peer_state.read().unwrap();
+
+		match outer_state_lock.get(counterparty_node_id) {
+			Some(inner_state_lock) => {
+				let mut peer_state_lock = inner_state_lock.lock().unwrap();
+
+				match peer_state_lock.pending_requests.remove(&request_id) {
+					Some(LSPS1Request::CreateOrder(params)) => {
+						let order_id = self.generate_order_id();
+						let channel = OutboundCRChannel::new(
+							params.order.clone(),
+							created_at.clone(),
+							expires_at.clone(),
+							order_id.clone(),
+							payment.clone(),
+						);
+
+						peer_state_lock.insert_outbound_channel(order_id.clone(), channel);
+
+						self.enqueue_response(
+							counterparty_node_id,
+							request_id,
+							LSPS1Response::CreateOrder(CreateOrderResponse {
+								order: params.order,
+								order_id,
+								order_state: OrderState::Created,
+								created_at,
+								expires_at,
+								payment,
+								channel: None,
+							}),
+						);
+					}
+
+					_ => {
+						return Err(APIError::APIMisuseError {
+							err: format!("No pending buy request for request_id: {:?}", request_id),
+						})
+					}
+				}
+			}
+			None => {
+				return Err(APIError::APIMisuseError {
+					err: format!(
+						"No state for the counterparty exists: {:?}",
+						counterparty_node_id
+					),
+				})
+			}
+		}
+
+		Ok(())
+	}
+
+	fn handle_get_order_request(
+		&self, request_id: RequestId, counterparty_node_id: &PublicKey, params: GetOrderRequest,
+	) -> Result<(), LightningError> {
+		let outer_state_lock = self.per_peer_state.read().unwrap();
+		match outer_state_lock.get(&counterparty_node_id) {
+			Some(inner_state_lock) => {
+				let mut peer_state_lock = inner_state_lock.lock().unwrap();
+
+				let outbound_channel = peer_state_lock
+					.outbound_channels_by_order_id
+					.get_mut(&params.order_id)
+					.ok_or(LightningError {
+						err: format!(
+							"Received get order request for unknown order id {:?}",
+							params.order_id
+						),
+						action: ErrorAction::IgnoreAndLog(Level::Info),
+					})?;
+
+				if let Err(e) = outbound_channel.create_payment_invoice() {
+					peer_state_lock.outbound_channels_by_order_id.remove(&params.order_id);
+					self.pending_events.enqueue(Event::LSPS1Service(LSPS1ServiceEvent::Refund {
+						request_id,
+						counterparty_node_id: *counterparty_node_id,
+						order_id: params.order_id,
+					}));
+					return Err(e);
+				}
+
+				peer_state_lock
+					.pending_requests
+					.insert(request_id.clone(), LSPS1Request::GetOrder(params.clone()));
+
+				self.pending_events.enqueue(Event::LSPS1Service(
+					LSPS1ServiceEvent::CheckPaymentConfirmation {
+						request_id,
+						counterparty_node_id: *counterparty_node_id,
+						order_id: params.order_id,
+					},
+				));
+			}
+			None => {
+				return Err(LightningError {
+					err: format!("Received error response for a create order request from an unknown counterparty ({:?})",counterparty_node_id),
+					action: ErrorAction::IgnoreAndLog(Level::Info),
+				});
+			}
+		}
+
+		Ok(())
+	}
+
+	fn update_order_status(
+		&self, request_id: RequestId, counterparty_node_id: PublicKey, order_id: OrderId,
+		order_state: OrderState, channel: Option<ChannelInfo>,
+	) -> Result<(), APIError> {
+		let outer_state_lock = self.per_peer_state.read().unwrap();
+
+		match outer_state_lock.get(&counterparty_node_id) {
+			Some(inner_state_lock) => {
+				let mut peer_state_lock = inner_state_lock.lock().unwrap();
+
+				if let Some(outbound_channel) =
+					peer_state_lock.outbound_channels_by_order_id.get_mut(&order_id)
+				{
+					let config = &outbound_channel.config;
+
+					self.enqueue_response(
+						&counterparty_node_id,
+						request_id,
+						LSPS1Response::GetOrder(GetOrderResponse {
+							response: CreateOrderResponse {
+								order_id,
+								order: config.order.clone(),
+								order_state,
+								created_at: config.created_at,
+								expires_at: config.expires_at,
+								payment: config.payment.clone(),
+								channel,
+							},
+						}),
+					)
+				} else {
+					return Err(APIError::APIMisuseError {
+						err: format!("Channel with order_id {} not found", order_id.0),
+					});
+				}
+			}
+			None => {
+				return Err(APIError::APIMisuseError {
+					err: format!("No existing state with counterparty {}", counterparty_node_id),
+				})
+			}
+		}
+		Ok(())
+	}
+
+	fn enqueue_response(
+		&self, counterparty_node_id: &PublicKey, request_id: RequestId, response: LSPS1Response,
+	) {
+		self.pending_messages
+			.enqueue(counterparty_node_id, LSPS1Message::Response(request_id, response).into());
+	}
+
+	fn generate_order_id(&self) -> OrderId {
+		let bytes = self.entropy_source.get_secure_random_bytes();
+		OrderId(utils::hex_str(&bytes[0..16]))
+	}
+}
+
+impl<ES: Deref, CM: Deref + Clone, MQ: Deref, C: Deref> ProtocolMessageHandler
+	for LSPS1ServiceHandler<ES, CM, MQ, C>
+where
+	ES::Target: EntropySource,
+	CM::Target: AChannelManager,
+	MQ::Target: MessageQueue,
+	C::Target: Filter,
+{
+	type ProtocolMessage = LSPS1Message;
+	const PROTOCOL_NUMBER: Option<u16> = Some(1);
+
+	fn handle_message(
+		&self, message: Self::ProtocolMessage, counterparty_node_id: &PublicKey,
+	) -> Result<(), LightningError> {
+		match message {
+			LSPS1Message::Request(request_id, request) => match request {
+				LSPS1Request::GetInfo(_) => {
+					self.handle_get_info_request(request_id, counterparty_node_id)
+				}
+				LSPS1Request::CreateOrder(params) => {
+					self.handle_create_order_request(request_id, counterparty_node_id, params)
+				}
+				LSPS1Request::GetOrder(params) => {
+					self.handle_get_order_request(request_id, counterparty_node_id, params)
+				}
+			},
+			_ => {
+				debug_assert!(
+					false,
+					"Service handler received LSPS1 response message. This should never happen."
+				);
+				Err(LightningError { err: format!("Service handler received LSPS1 response message from node {:?}. This should never happen.", counterparty_node_id), action: ErrorAction::IgnoreAndLog(Level::Info)})
+			}
+		}
+	}
+}
+
+'''
+'''--- src/lsps1/utils.rs ---
+use super::msgs::{OptionsSupported, OrderParams};
+
+pub fn check_range(min: u64, max: u64, value: u64) -> bool {
+	(value >= min) && (value <= max)
+}
+
+pub fn is_valid(order: &OrderParams, options: &OptionsSupported) -> bool {
+	let bool = check_range(
+		options.min_initial_client_balance_sat,
+		options.max_initial_client_balance_sat,
+		order.client_balance_sat,
+	) && check_range(
+		options.min_initial_lsp_balance_sat,
+		options.max_initial_lsp_balance_sat,
+		order.lsp_balance_sat,
+	) && check_range(
+		1,
+		options.max_channel_expiry_blocks.into(),
+		order.channel_expiry_blocks.into(),
+	);
+
+	bool
+}
+
+'''
+'''--- src/lsps2/client.rs ---
+// This file is Copyright its original authors, visible in version control
+// history.
+//
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE
+// or http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option.
+// You may not use this file except in accordance with one or both of these
+// licenses.
+
+//! Contains the main LSPS2 client object, [`LSPS2ClientHandler`].
+
+use crate::events::{Event, EventQueue};
+use crate::lsps0::msgs::{ProtocolMessageHandler, RequestId, ResponseError};
+use crate::lsps2::event::LSPS2ClientEvent;
+use crate::message_queue::MessageQueue;
+use crate::prelude::{HashMap, String, ToString, Vec};
+use crate::sync::{Arc, Mutex, RwLock};
+
+use lightning::ln::msgs::{ErrorAction, LightningError};
+use lightning::sign::EntropySource;
+use lightning::util::errors::APIError;
+use lightning::util::logger::Level;
+
+use bitcoin::secp256k1::PublicKey;
+
+use core::ops::Deref;
+
+use crate::lsps2::msgs::{
+	BuyRequest, BuyResponse, GetInfoRequest, GetInfoResponse, GetVersionsRequest,
+	GetVersionsResponse, JITChannelScid, LSPS2Message, LSPS2Request, LSPS2Response,
+	OpeningFeeParams,
+};
+
+/// Client-side configuration options for JIT channels.
+#[derive(Clone, Debug, Copy)]
+pub struct LSPS2ClientConfig {}
+
+const SUPPORTED_SPEC_VERSIONS: [u16; 1] = [1];
+
+struct ChannelStateError(String);
+
+impl From<ChannelStateError> for LightningError {
+	fn from(value: ChannelStateError) -> Self {
+		LightningError { err: value.0, action: ErrorAction::IgnoreAndLog(Level::Info) }
+	}
+}
+
+struct InboundJITChannelConfig {
+	pub user_id: u128,
+	pub token: Option<String>,
+	pub payment_size_msat: Option<u64>,
+}
+
+#[derive(PartialEq, Debug)]
+enum InboundJITChannelState {
+	VersionsRequested,
+	MenuRequested { version: u16 },
+	PendingMenuSelection { version: u16 },
+	BuyRequested { version: u16 },
+	PendingPayment { client_trusts_lsp: bool, short_channel_id: JITChannelScid },
+}
+
+impl InboundJITChannelState {
+	fn versions_received(&self, versions: Vec<u16>) -> Result<Self, ChannelStateError> {
+		let max_shared_version = versions
+			.iter()
+			.filter(|version| SUPPORTED_SPEC_VERSIONS.contains(version))
+			.max()
+			.cloned()
+			.ok_or(ChannelStateError(format!(
+			"LSP does not support any of our specification versions.  ours = {:?}. theirs = {:?}",
+			SUPPORTED_SPEC_VERSIONS, versions
+		)))?;
+
+		match self {
+			InboundJITChannelState::VersionsRequested => {
+				Ok(InboundJITChannelState::MenuRequested { version: max_shared_version })
+			}
+			state => Err(ChannelStateError(format!(
+				"Received unexpected get_versions response. JIT Channel was in state: {:?}",
+				state
+			))),
+		}
+	}
+
+	fn info_received(&self) -> Result<Self, ChannelStateError> {
+		match self {
+			InboundJITChannelState::MenuRequested { version } => {
+				Ok(InboundJITChannelState::PendingMenuSelection { version: *version })
+			}
+			state => Err(ChannelStateError(format!(
+				"Received unexpected get_info response.  JIT Channel was in state: {:?}",
+				state
+			))),
+		}
+	}
+
+	fn opening_fee_params_selected(&self) -> Result<Self, ChannelStateError> {
+		match self {
+			InboundJITChannelState::PendingMenuSelection { version } => {
+				Ok(InboundJITChannelState::BuyRequested { version: *version })
+			}
+			state => Err(ChannelStateError(format!(
+				"Opening fee params selected when JIT Channel was in state: {:?}",
+				state
+			))),
+		}
+	}
+
+	fn invoice_params_received(
+		&self, client_trusts_lsp: bool, short_channel_id: JITChannelScid,
+	) -> Result<Self, ChannelStateError> {
+		match self {
+			InboundJITChannelState::BuyRequested { .. } => {
+				Ok(InboundJITChannelState::PendingPayment { client_trusts_lsp, short_channel_id })
+			}
+			state => Err(ChannelStateError(format!(
+				"Invoice params received when JIT Channel was in state: {:?}",
+				state
+			))),
+		}
+	}
+}
+
+struct InboundJITChannel {
+	id: u128,
+	state: InboundJITChannelState,
+	config: InboundJITChannelConfig,
+}
+
+impl InboundJITChannel {
+	fn new(id: u128, user_id: u128, payment_size_msat: Option<u64>, token: Option<String>) -> Self {
+		Self {
+			id,
+			config: InboundJITChannelConfig { user_id, payment_size_msat, token },
+			state: InboundJITChannelState::VersionsRequested,
+		}
+	}
+
+	fn versions_received(&mut self, versions: Vec<u16>) -> Result<u16, LightningError> {
+		self.state = self.state.versions_received(versions)?;
+
+		match self.state {
+			InboundJITChannelState::MenuRequested { version } => Ok(version),
+			_ => Err(LightningError {
+				action: ErrorAction::IgnoreAndLog(Level::Error),
+				err: "impossible state transition".to_string(),
+			}),
+		}
+	}
+
+	fn info_received(&mut self) -> Result<(), LightningError> {
+		self.state = self.state.info_received()?;
+		Ok(())
+	}
+
+	fn opening_fee_params_selected(&mut self) -> Result<u16, LightningError> {
+		self.state = self.state.opening_fee_params_selected()?;
+
+		match self.state {
+			InboundJITChannelState::BuyRequested { version } => Ok(version),
+			_ => Err(LightningError {
+				action: ErrorAction::IgnoreAndLog(Level::Error),
+				err: "impossible state transition".to_string(),
+			}),
+		}
+	}
+
+	fn invoice_params_received(
+		&mut self, client_trusts_lsp: bool, jit_channel_scid: JITChannelScid,
+	) -> Result<(), LightningError> {
+		self.state = self.state.invoice_params_received(client_trusts_lsp, jit_channel_scid)?;
+		Ok(())
+	}
+}
+
+/// The peer state for LSPS2
+pub struct PeerState {
+	inbound_channels_by_id: HashMap<u128, InboundJITChannel>,
+	request_to_cid: HashMap<RequestId, u128>,
+}
+
+impl PeerState {
+	fn new() -> Self {
+		let inbound_channels_by_id = HashMap::new();
+		let request_to_cid = HashMap::new();
+		Self { inbound_channels_by_id, request_to_cid }
+	}
+
+	fn insert_inbound_channel(&mut self, jit_channel_id: u128, channel: InboundJITChannel) {
+		self.inbound_channels_by_id.insert(jit_channel_id, channel);
+	}
+
+	fn insert_request(&mut self, request_id: RequestId, jit_channel_id: u128) {
+		self.request_to_cid.insert(request_id, jit_channel_id);
+	}
+
+	fn remove_inbound_channel(&mut self, jit_channel_id: u128) {
+		self.inbound_channels_by_id.remove(&jit_channel_id);
+	}
+}
+
+/// The main object allowing to send and receive LSPS2 messages.
+pub struct LSPS2ClientHandler<ES: Deref, MQ: Deref>
+where
+	ES::Target: EntropySource,
+	MQ::Target: MessageQueue,
+{
+	entropy_source: ES,
+	pending_messages: MQ,
+	pending_events: Arc<EventQueue>,
+	per_peer_state: RwLock<HashMap<PublicKey, Mutex<PeerState>>>,
+	_config: LSPS2ClientConfig,
+}
+
+impl<ES: Deref, MQ: Deref> LSPS2ClientHandler<ES, MQ>
+where
+	ES::Target: EntropySource,
+	MQ::Target: MessageQueue,
+{
+	/// Constructs an `LSPS2ClientHandler`.
+	pub fn new(
+		entropy_source: ES, pending_messages: MQ, pending_events: Arc<EventQueue>,
+		config: LSPS2ClientConfig,
+	) -> Self {
+		Self {
+			entropy_source,
+			pending_messages,
+			pending_events,
+			per_peer_state: RwLock::new(HashMap::new()),
+			_config: config,
+		}
+	}
+
+	/// Initiate the creation of an invoice that when paid will open a channel
+	/// with enough inbound liquidity to be able to receive the payment.
+	///
+	/// `counterparty_node_id` is the node_id of the LSP you would like to use.
+	///
+	/// If `payment_size_msat` is [`Option::Some`] then the invoice will be for a fixed amount
+	/// and MPP can be used to pay it.
+	///
+	/// If `payment_size_msat` is [`Option::None`] then the invoice can be for an arbitrary amount
+	/// but MPP can no longer be used to pay it.
+	///
+	/// `token` is an optional String that will be provided to the LSP.
+	/// It can be used by the LSP as an API key, coupon code, or some other way to identify a user.
+	pub fn create_invoice(
+		&self, counterparty_node_id: PublicKey, payment_size_msat: Option<u64>,
+		token: Option<String>, user_channel_id: u128,
+	) {
+		let jit_channel_id = self.generate_jit_channel_id();
+		let channel =
+			InboundJITChannel::new(jit_channel_id, user_channel_id, payment_size_msat, token);
+
+		let mut outer_state_lock = self.per_peer_state.write().unwrap();
+		let inner_state_lock =
+			outer_state_lock.entry(counterparty_node_id).or_insert(Mutex::new(PeerState::new()));
+		let mut peer_state_lock = inner_state_lock.lock().unwrap();
+		peer_state_lock.insert_inbound_channel(jit_channel_id, channel);
+
+		let request_id = crate::utils::generate_request_id(&self.entropy_source);
+		peer_state_lock.insert_request(request_id.clone(), jit_channel_id);
+
+		self.pending_messages.enqueue(
+			&counterparty_node_id,
+			LSPS2Message::Request(request_id, LSPS2Request::GetVersions(GetVersionsRequest {}))
+				.into(),
+		);
+	}
+
+	/// Used by client to confirm which channel parameters to use for the JIT Channel buy request.
+	/// The client agrees to paying an opening fee equal to
+	/// `max(min_fee_msat, proportional*(payment_size_msat/1_000_000))`.
+	///
+	/// Should be called in response to receiving a [`LSPS2ClientEvent::GetInfoResponse`] event.
+	///
+	/// [`LSPS2ClientEvent::GetInfoResponse`]: crate::lsps2::event::LSPS2ClientEvent::GetInfoResponse
+	pub fn opening_fee_params_selected(
+		&self, counterparty_node_id: PublicKey, jit_channel_id: u128,
+		opening_fee_params: OpeningFeeParams,
+	) -> Result<(), APIError> {
+		let outer_state_lock = self.per_peer_state.read().unwrap();
+		match outer_state_lock.get(&counterparty_node_id) {
+			Some(inner_state_lock) => {
+				let mut peer_state = inner_state_lock.lock().unwrap();
+				if let Some(jit_channel) =
+					peer_state.inbound_channels_by_id.get_mut(&jit_channel_id)
+				{
+					let version = match jit_channel.opening_fee_params_selected() {
+						Ok(version) => version,
+						Err(e) => {
+							peer_state.remove_inbound_channel(jit_channel_id);
+							return Err(APIError::APIMisuseError { err: e.err });
+						}
+					};
+
+					let request_id = crate::utils::generate_request_id(&self.entropy_source);
+					let payment_size_msat = jit_channel.config.payment_size_msat;
+					peer_state.insert_request(request_id.clone(), jit_channel_id);
+
+					self.pending_messages.enqueue(
+						&counterparty_node_id,
+						LSPS2Message::Request(
+							request_id,
+							LSPS2Request::Buy(BuyRequest {
+								version,
+								opening_fee_params,
+								payment_size_msat,
+							}),
+						)
+						.into(),
+					);
+				} else {
+					return Err(APIError::APIMisuseError {
+						err: format!("Channel with id {} not found", jit_channel_id),
+					});
+				}
+			}
+			None => {
+				return Err(APIError::APIMisuseError {
+					err: format!("No existing state with counterparty {}", counterparty_node_id),
+				})
+			}
+		}
+
+		Ok(())
+	}
+
+	fn generate_jit_channel_id(&self) -> u128 {
+		let bytes = self.entropy_source.get_secure_random_bytes();
+		let mut id_bytes: [u8; 16] = [0; 16];
+		id_bytes.copy_from_slice(&bytes[0..16]);
+		u128::from_be_bytes(id_bytes)
+	}
+
+	fn handle_get_versions_response(
+		&self, request_id: RequestId, counterparty_node_id: &PublicKey, result: GetVersionsResponse,
+	) -> Result<(), LightningError> {
+		let outer_state_lock = self.per_peer_state.read().unwrap();
+		match outer_state_lock.get(counterparty_node_id) {
+			Some(inner_state_lock) => {
+				let mut peer_state = inner_state_lock.lock().unwrap();
+
+				let jit_channel_id =
+					peer_state.request_to_cid.remove(&request_id).ok_or(LightningError {
+						err: format!(
+							"Received get_versions response for an unknown request: {:?}",
+							request_id
+						),
+						action: ErrorAction::IgnoreAndLog(Level::Info),
+					})?;
+
+				let jit_channel = peer_state
+					.inbound_channels_by_id
+					.get_mut(&jit_channel_id)
+					.ok_or(LightningError {
+						err: format!(
+							"Received get_versions response for an unknown channel: {:?}",
+							jit_channel_id,
+						),
+						action: ErrorAction::IgnoreAndLog(Level::Info),
+					})?;
+
+				let token = jit_channel.config.token.clone();
+
+				let version = match jit_channel.versions_received(result.versions) {
+					Ok(version) => version,
+					Err(e) => {
+						peer_state.remove_inbound_channel(jit_channel_id);
+						return Err(e);
+					}
+				};
+
+				let request_id = crate::utils::generate_request_id(&self.entropy_source);
+				peer_state.insert_request(request_id.clone(), jit_channel_id);
+
+				self.pending_messages.enqueue(
+					counterparty_node_id,
+					LSPS2Message::Request(
+						request_id,
+						LSPS2Request::GetInfo(GetInfoRequest { version, token }),
+					)
+					.into(),
+				);
+			}
+			None => {
+				return Err(LightningError {
+					err: format!(
+						"Received get_versions response from unknown peer: {:?}",
+						counterparty_node_id
+					),
+					action: ErrorAction::IgnoreAndLog(Level::Info),
+				})
+			}
+		}
+
+		Ok(())
+	}
+
+	fn handle_get_info_response(
+		&self, request_id: RequestId, counterparty_node_id: &PublicKey, result: GetInfoResponse,
+	) -> Result<(), LightningError> {
+		let outer_state_lock = self.per_peer_state.read().unwrap();
+		match outer_state_lock.get(counterparty_node_id) {
+			Some(inner_state_lock) => {
+				let mut peer_state = inner_state_lock.lock().unwrap();
+
+				let jit_channel_id =
+					peer_state.request_to_cid.remove(&request_id).ok_or(LightningError {
+						err: format!(
+							"Received get_info response for an unknown request: {:?}",
+							request_id
+						),
+						action: ErrorAction::IgnoreAndLog(Level::Info),
+					})?;
+
+				let jit_channel = peer_state
+					.inbound_channels_by_id
+					.get_mut(&jit_channel_id)
+					.ok_or(LightningError {
+						err: format!(
+							"Received get_info response for an unknown channel: {:?}",
+							jit_channel_id
+						),
+						action: ErrorAction::IgnoreAndLog(Level::Info),
+					})?;
+
+				if let Err(e) = jit_channel.info_received() {
+					peer_state.remove_inbound_channel(jit_channel_id);
+					return Err(e);
+				}
+
+				self.pending_events.enqueue(Event::LSPS2Client(
+					LSPS2ClientEvent::GetInfoResponse {
+						counterparty_node_id: *counterparty_node_id,
+						opening_fee_params_menu: result.opening_fee_params_menu,
+						min_payment_size_msat: result.min_payment_size_msat,
+						max_payment_size_msat: result.max_payment_size_msat,
+						jit_channel_id,
+						user_channel_id: jit_channel.config.user_id,
+					},
+				));
+			}
+			None => {
+				return Err(LightningError {
+					err: format!(
+						"Received get_info response from unknown peer: {:?}",
+						counterparty_node_id
+					),
+					action: ErrorAction::IgnoreAndLog(Level::Info),
+				})
+			}
+		}
+
+		Ok(())
+	}
+
+	fn handle_get_info_error(
+		&self, request_id: RequestId, counterparty_node_id: &PublicKey, _error: ResponseError,
+	) -> Result<(), LightningError> {
+		let outer_state_lock = self.per_peer_state.read().unwrap();
+		match outer_state_lock.get(counterparty_node_id) {
+			Some(inner_state_lock) => {
+				let mut peer_state = inner_state_lock.lock().unwrap();
+
+				let jit_channel_id =
+					peer_state.request_to_cid.remove(&request_id).ok_or(LightningError {
+						err: format!(
+							"Received get_info error for an unknown request: {:?}",
+							request_id
+						),
+						action: ErrorAction::IgnoreAndLog(Level::Info),
+					})?;
+
+				peer_state.inbound_channels_by_id.remove(&jit_channel_id).ok_or(
+					LightningError {
+						err: format!(
+							"Received get_info error for an unknown channel: {:?}",
+							jit_channel_id
+						),
+						action: ErrorAction::IgnoreAndLog(Level::Info),
+					},
+				)?;
+				Ok(())
+			}
+			None => {
+				return Err(LightningError { err: format!("Received error response for a get_info request from an unknown counterparty ({:?})",counterparty_node_id), action: ErrorAction::IgnoreAndLog(Level::Info)});
+			}
+		}
+	}
+
+	fn handle_buy_response(
+		&self, request_id: RequestId, counterparty_node_id: &PublicKey, result: BuyResponse,
+	) -> Result<(), LightningError> {
+		let outer_state_lock = self.per_peer_state.read().unwrap();
+		match outer_state_lock.get(counterparty_node_id) {
+			Some(inner_state_lock) => {
+				let mut peer_state = inner_state_lock.lock().unwrap();
+
+				let jit_channel_id =
+					peer_state.request_to_cid.remove(&request_id).ok_or(LightningError {
+						err: format!(
+							"Received buy response for an unknown request: {:?}",
+							request_id
+						),
+						action: ErrorAction::IgnoreAndLog(Level::Info),
+					})?;
+
+				let jit_channel = peer_state
+					.inbound_channels_by_id
+					.get_mut(&jit_channel_id)
+					.ok_or(LightningError {
+						err: format!(
+							"Received buy response for an unknown channel: {:?}",
+							jit_channel_id
+						),
+						action: ErrorAction::IgnoreAndLog(Level::Info),
+					})?;
+
+				if let Err(e) = jit_channel.invoice_params_received(
+					result.client_trusts_lsp,
+					result.jit_channel_scid.clone(),
+				) {
+					peer_state.remove_inbound_channel(jit_channel_id);
+					return Err(e);
+				}
+
+				if let Ok(scid) = result.jit_channel_scid.to_scid() {
+					self.pending_events.enqueue(Event::LSPS2Client(
+						LSPS2ClientEvent::InvoiceGenerationReady {
+							counterparty_node_id: *counterparty_node_id,
+							scid,
+							cltv_expiry_delta: result.lsp_cltv_expiry_delta,
+							payment_size_msat: jit_channel.config.payment_size_msat,
+							client_trusts_lsp: result.client_trusts_lsp,
+							user_channel_id: jit_channel.config.user_id,
+						},
+					));
+				} else {
+					return Err(LightningError {
+						err: format!(
+							"Received buy response with an invalid scid {:?}",
+							result.jit_channel_scid
+						),
+						action: ErrorAction::IgnoreAndLog(Level::Info),
+					});
+				}
+			}
+			None => {
+				return Err(LightningError {
+					err: format!(
+						"Received buy response from unknown peer: {:?}",
+						counterparty_node_id
+					),
+					action: ErrorAction::IgnoreAndLog(Level::Info),
+				});
+			}
+		}
+		Ok(())
+	}
+
+	fn handle_buy_error(
+		&self, request_id: RequestId, counterparty_node_id: &PublicKey, _error: ResponseError,
+	) -> Result<(), LightningError> {
+		let outer_state_lock = self.per_peer_state.read().unwrap();
+		match outer_state_lock.get(counterparty_node_id) {
+			Some(inner_state_lock) => {
+				let mut peer_state = inner_state_lock.lock().unwrap();
+
+				let jit_channel_id =
+					peer_state.request_to_cid.remove(&request_id).ok_or(LightningError {
+						err: format!("Received buy error for an unknown request: {:?}", request_id),
+						action: ErrorAction::IgnoreAndLog(Level::Info),
+					})?;
+
+				let _jit_channel = peer_state
+					.inbound_channels_by_id
+					.remove(&jit_channel_id)
+					.ok_or(LightningError {
+						err: format!(
+							"Received buy error for an unknown channel: {:?}",
+							jit_channel_id
+						),
+						action: ErrorAction::IgnoreAndLog(Level::Info),
+					})?;
+				Ok(())
+			}
+			None => {
+				return Err(LightningError { err: format!("Received error response for a buy request from an unknown counterparty ({:?})",counterparty_node_id), action: ErrorAction::IgnoreAndLog(Level::Info)});
+			}
+		}
+	}
+}
+
+impl<ES: Deref, MQ: Deref> ProtocolMessageHandler for LSPS2ClientHandler<ES, MQ>
+where
+	ES::Target: EntropySource,
+	MQ::Target: MessageQueue,
+{
+	type ProtocolMessage = LSPS2Message;
+	const PROTOCOL_NUMBER: Option<u16> = Some(2);
+
+	fn handle_message(
+		&self, message: Self::ProtocolMessage, counterparty_node_id: &PublicKey,
+	) -> Result<(), LightningError> {
+		match message {
+			LSPS2Message::Response(request_id, response) => match response {
+				LSPS2Response::GetVersions(result) => {
+					self.handle_get_versions_response(request_id, counterparty_node_id, result)
+				}
+				LSPS2Response::GetInfo(result) => {
+					self.handle_get_info_response(request_id, counterparty_node_id, result)
+				}
+				LSPS2Response::GetInfoError(error) => {
+					self.handle_get_info_error(request_id, counterparty_node_id, error)
+				}
+				LSPS2Response::Buy(result) => {
+					self.handle_buy_response(request_id, counterparty_node_id, result)
+				}
+				LSPS2Response::BuyError(error) => {
+					self.handle_buy_error(request_id, counterparty_node_id, error)
+				}
+			},
+			_ => {
+				debug_assert!(
+					false,
+					"Client handler received LSPS2 request message. This should never happen."
+				);
+				Err(LightningError { err: format!("Client handler received LSPS2 request message from node {:?}. This should never happen.", counterparty_node_id), action: ErrorAction::IgnoreAndLog(Level::Info)})
+			}
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {}
+
+'''
+'''--- src/lsps2/event.rs ---
+// This file is Copyright its original authors, visible in version control
+// history.
+//
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE
+// or http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option.
+// You may not use this file except in accordance with one or both of these
+// licenses.
+
+//! Contains LSPS2 event types
+
+use super::msgs::OpeningFeeParams;
+use crate::lsps0::msgs::RequestId;
+use crate::prelude::{String, Vec};
+
+use bitcoin::secp256k1::PublicKey;
+
+/// An event which an LSPS2 client should take some action in response to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LSPS2ClientEvent {
+	/// Information from the LSP about their current fee rates and channel parameters.
+	///
+	/// You must call [`LSPS2ClientHandler::opening_fee_params_selected`] with the fee parameter
+	/// you want to use if you wish to proceed opening a channel.
+	///
+	/// [`LSPS2ClientHandler::opening_fee_params_selected`]: crate::lsps2::client::LSPS2ClientHandler::opening_fee_params_selected
+	GetInfoResponse {
+		/// This is a randomly generated identifier used to track the JIT channel state.
+		/// It is not related in anyway to the eventual lightning channel id.
+		/// It needs to be passed to [`LSPS2ClientHandler::opening_fee_params_selected`].
+		///
+		/// [`LSPS2ClientHandler::opening_fee_params_selected`]: crate::lsps2::client::LSPS2ClientHandler::opening_fee_params_selected
+		jit_channel_id: u128,
+		/// The node id of the LSP that provided this response.
+		counterparty_node_id: PublicKey,
+		/// The menu of fee parameters the LSP is offering at this time.
+		/// You must select one of these if you wish to proceed.
+		opening_fee_params_menu: Vec<OpeningFeeParams>,
+		/// The min payment size allowed when opening the channel.
+		min_payment_size_msat: u64,
+		/// The max payment size allowed when opening the channel.
+		max_payment_size_msat: u64,
+		/// The user_channel_id value passed in to [`LSPS2ClientHandler::create_invoice`].
+		///
+		/// [`LSPS2ClientHandler::create_invoice`]: crate::lsps2::client::LSPS2ClientHandler::create_invoice
+		user_channel_id: u128,
+	},
+	/// Use the provided fields to generate an invoice and give to payer.
+	///
+	/// When the invoice is paid the LSP will open a channel to you
+	/// with the previously agreed upon parameters.
+	InvoiceGenerationReady {
+		/// The node id of the LSP.
+		counterparty_node_id: PublicKey,
+		/// The short channel id to use in the route hint.
+		scid: u64,
+		/// The `cltv_expiry_delta` to use in the route hint.
+		cltv_expiry_delta: u32,
+		/// The initial payment size you specified.
+		payment_size_msat: Option<u64>,
+		/// The trust model the LSP expects.
+		client_trusts_lsp: bool,
+		/// The `user_channel_id` value passed in to [`LSPS2ClientHandler::create_invoice`].
+		///
+		/// [`LSPS2ClientHandler::create_invoice`]: crate::lsps2::client::LSPS2ClientHandler::create_invoice
+		user_channel_id: u128,
+	},
+}
+
+/// An event which an LSPS2 server should take some action in response to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LSPS2ServiceEvent {
+	/// A request from a client for information about JIT Channel parameters.
+	///
+	/// You must calculate the parameters for this client and pass them to
+	/// [`LSPS2ServiceHandler::opening_fee_params_generated`].
+	///
+	/// If an unrecognized or stale token is provided you can use
+	/// `[LSPS2ServiceHandler::invalid_token_provided`] to error the request.
+	///
+	/// [`LSPS2ServiceHandler::opening_fee_params_generated`]: crate::lsps2::service::LSPS2ServiceHandler::opening_fee_params_generated
+	/// [`LSPS2ServiceHandler::invalid_token_provided`]: crate::lsps2::service::LSPS2ServiceHandler::invalid_token_provided
+	GetInfo {
+		/// An identifier that must be passed to [`LSPS2ServiceHandler::opening_fee_params_generated`].
+		///
+		/// [`LSPS2ServiceHandler::opening_fee_params_generated`]: crate::lsps2::service::LSPS2ServiceHandler::opening_fee_params_generated
+		request_id: RequestId,
+		/// The node id of the client making the information request.
+		counterparty_node_id: PublicKey,
+		/// The protocol version they would like to use.
+		version: u16,
+		/// An optional token that can be used as an API key, coupon code, etc.
+		token: Option<String>,
+	},
+	/// A client has selected a opening fee parameter to use and would like to
+	/// purchase a channel with an optional initial payment size.
+	///
+	/// If `payment_size_msat` is [`Option::Some`] then the payer is allowed to use MPP.
+	/// If `payment_size_msat` is [`Option::None`] then the payer cannot use MPP.
+	///
+	/// You must generate an scid and `cltv_expiry_delta` for them to use
+	/// and call [`LSPS2ServiceHandler::invoice_parameters_generated`].
+	///
+	/// [`LSPS2ServiceHandler::invoice_parameters_generated`]: crate::lsps2::service::LSPS2ServiceHandler::invoice_parameters_generated
+	BuyRequest {
+		/// An identifier that must be passed into [`LSPS2ServiceHandler::invoice_parameters_generated`].
+		///
+		/// [`LSPS2ServiceHandler::invoice_parameters_generated`]: crate::lsps2::service::LSPS2ServiceHandler::invoice_parameters_generated
+		request_id: RequestId,
+		/// The client node id that is making this request.
+		counterparty_node_id: PublicKey,
+		/// The version of the protocol they would like to use.
+		version: u16,
+		/// The channel parameters they have selected.
+		opening_fee_params: OpeningFeeParams,
+		/// The size of the initial payment they would like to receive.
+		payment_size_msat: Option<u64>,
+	},
+	/// You should open a channel using [`ChannelManager::create_channel`].
+	///
+	/// [`ChannelManager::create_channel`]: lightning::ln::channelmanager::ChannelManager::create_channel
+	OpenChannel {
+		/// The node to open channel with.
+		their_network_key: PublicKey,
+		/// The amount to forward after fees.
+		amt_to_forward_msat: u64,
+		/// The fee earned for opening the channel.
+		opening_fee_msat: u64,
+		/// An internal id used to track channel open.
+		user_channel_id: u128,
+	},
+}
+
+'''
+'''--- src/lsps2/mod.rs ---
+// This file is Copyright its original authors, visible in version control
+// history.
+//
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE
+// or http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option.
+// You may not use this file except in accordance with one or both of these
+// licenses.
+
+//! Implementation of LSPS2: JIT Channel Negotiation specification.
+
+pub mod client;
+pub mod event;
+pub mod msgs;
+pub mod service;
+pub(crate) mod utils;
+
+'''
+'''--- src/lsps2/msgs.rs ---
+//! Message, request, and other primitive types used to implement LSPS2.
+
+use core::convert::TryFrom;
+
+use bitcoin::hashes::hmac::{Hmac, HmacEngine};
+use bitcoin::hashes::sha256::Hash as Sha256;
+use bitcoin::hashes::{Hash, HashEngine};
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+
+use crate::lsps0::msgs::{LSPSMessage, RequestId, ResponseError};
+use crate::prelude::{String, Vec};
+use crate::utils;
+
+pub(crate) const LSPS2_GET_VERSIONS_METHOD_NAME: &str = "lsps2.get_versions";
+pub(crate) const LSPS2_GET_INFO_METHOD_NAME: &str = "lsps2.get_info";
+pub(crate) const LSPS2_BUY_METHOD_NAME: &str = "lsps2.buy";
+
+pub(crate) const LSPS2_GET_INFO_REQUEST_INVALID_VERSION_ERROR_CODE: i32 = 1;
+pub(crate) const LSPS2_GET_INFO_REQUEST_UNRECOGNIZED_OR_STALE_TOKEN_ERROR_CODE: i32 = 2;
+
+pub(crate) const LSPS2_BUY_REQUEST_INVALID_VERSION_ERROR_CODE: i32 = 1;
+pub(crate) const LSPS2_BUY_REQUEST_INVALID_OPENING_FEE_PARAMS_ERROR_CODE: i32 = 2;
+pub(crate) const LSPS2_BUY_REQUEST_PAYMENT_SIZE_TOO_SMALL_ERROR_CODE: i32 = 3;
+pub(crate) const LSPS2_BUY_REQUEST_PAYMENT_SIZE_TOO_LARGE_ERROR_CODE: i32 = 4;
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
+/// A request made to an LSP to learn what versions of the protocol they support.
+pub struct GetVersionsRequest {}
+
+/// A response to a [`GetVersionsRequest`].
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct GetVersionsResponse {
+	/// The list of versions an LSP supports.
+	pub versions: Vec<u16>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+/// A request made to an LSP to learn their current channel fees and parameters.
+pub struct GetInfoRequest {
+	/// What version of the protocol we want to use.
+	pub version: u16,
+	/// An optional token to provide to the LSP.
+	pub token: Option<String>,
+}
+
+/// Fees and parameters for a JIT Channel without the promise.
+///
+/// The promise will be calculated automatically for the LSP and this type converted
+/// into an [`OpeningFeeParams`] for transit over the wire.
+pub struct RawOpeningFeeParams {
+	/// The minimum fee required for the channel open.
+	pub min_fee_msat: u64,
+	/// A fee proportional to the size of the initial payment.
+	pub proportional: u32,
+	/// An [`ISO8601`](https://www.iso.org/iso-8601-date-and-time-format.html) formatted date for which these params are valid.
+	pub valid_until: chrono::DateTime<Utc>,
+	/// The number of blocks after confirmation that the LSP promises it will keep the channel alive without closing.
+	pub min_lifetime: u32,
+	/// T maximum number of blocks that the client is allowed to set its `to_self_delay` parameter.
+	pub max_client_to_self_delay: u32,
+}
+
+impl RawOpeningFeeParams {
+	pub(crate) fn into_opening_fee_params(self, promise_secret: &[u8; 32]) -> OpeningFeeParams {
+		let mut hmac = HmacEngine::<Sha256>::new(promise_secret);
+		hmac.input(&self.min_fee_msat.to_be_bytes());
+		hmac.input(&self.proportional.to_be_bytes());
+		hmac.input(self.valid_until.to_rfc3339().as_bytes());
+		hmac.input(&self.min_lifetime.to_be_bytes());
+		hmac.input(&self.max_client_to_self_delay.to_be_bytes());
+		let promise_bytes = Hmac::from_engine(hmac).into_inner();
+		let promise = utils::hex_str(&promise_bytes[..]);
+		OpeningFeeParams {
+			min_fee_msat: self.min_fee_msat,
+			proportional: self.proportional,
+			valid_until: self.valid_until.clone(),
+			min_lifetime: self.min_lifetime,
+			max_client_to_self_delay: self.max_client_to_self_delay,
+			promise,
+		}
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+/// Fees and parameters for a JIT Channel including the promise.
+///
+/// The promise is an HMAC calculated using a secret known to the LSP and the rest of the fields as input.
+/// It exists so the LSP can verify the authenticity of a client provided OpeningFeeParams by recalculating
+/// the promise using the secret. Once verified they can be confident it was not modified by the client.
+pub struct OpeningFeeParams {
+	/// The minimum fee required for the channel open.
+	pub min_fee_msat: u64,
+	/// A fee proportional to the size of the initial payment.
+	pub proportional: u32,
+	/// An [`ISO8601`](https://www.iso.org/iso-8601-date-and-time-format.html) formatted date for which these params are valid.
+	pub valid_until: chrono::DateTime<Utc>,
+	/// The number of blocks after confirmation that the LSP promises it will keep the channel alive without closing.
+	pub min_lifetime: u32,
+	/// The maximum number of blocks that the client is allowed to set its `to_self_delay` parameter.
+	pub max_client_to_self_delay: u32,
+	/// The HMAC used to verify the authenticity of these parameters.
+	pub promise: String,
+}
+
+/// A response to a [`GetInfoRequest`]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct GetInfoResponse {
+	/// A set of opening fee parameters.
+	pub opening_fee_params_menu: Vec<OpeningFeeParams>,
+	/// The minimum payment size required to open a channel.
+	pub min_payment_size_msat: u64,
+	/// The maximum payment size the lsp will tolerate.
+	pub max_payment_size_msat: u64,
+}
+
+/// A request to buy a JIT channel.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct BuyRequest {
+	/// The version of the protocol to use.
+	pub version: u16,
+	/// The fee parameters you would like to use.
+	pub opening_fee_params: OpeningFeeParams,
+	/// The size of the initial payment you expect to receive.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub payment_size_msat: Option<u64>,
+}
+
+/// A newtype that holds a `short_channel_id` in human readable format of BBBxTTTx000.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct JITChannelScid(String);
+
+impl From<u64> for JITChannelScid {
+	fn from(scid: u64) -> Self {
+		let block = utils::block_from_scid(&scid);
+		let tx_index = utils::tx_index_from_scid(&scid);
+		let vout = utils::vout_from_scid(&scid);
+
+		Self(format!("{}x{}x{}", block, tx_index, vout))
+	}
+}
+
+impl JITChannelScid {
+	/// Try to convert a [`JITChannelScid`] into a u64 used by LDK.
+	pub fn to_scid(&self) -> Result<u64, ()> {
+		utils::scid_from_human_readable_string(&self.0)
+	}
+}
+
+/// A response to a [`BuyRequest`].
+///
+/// Includes information needed to construct an invoice.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct BuyResponse {
+	/// The short channel id used by LSP to identify need to open channel.
+	pub jit_channel_scid: JITChannelScid,
+	/// The locktime expiry delta the lsp requires.
+	pub lsp_cltv_expiry_delta: u32,
+	/// A flag that indicates who is trusting who.
+	#[serde(default)]
+	pub client_trusts_lsp: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// An enum that captures all the valid JSON-RPC requests in the LSPS2 protocol.
+pub enum LSPS2Request {
+	/// A request to learn what versions an LSP supports.
+	GetVersions(GetVersionsRequest),
+	/// A request to learn an LSP's channel fees and parameters.
+	GetInfo(GetInfoRequest),
+	/// A request to buy a JIT channel from an LSP.
+	Buy(BuyRequest),
+}
+
+impl LSPS2Request {
+	/// Get the JSON-RPC method name for the underlying request.
+	pub fn method(&self) -> &str {
+		match self {
+			LSPS2Request::GetVersions(_) => LSPS2_GET_VERSIONS_METHOD_NAME,
+			LSPS2Request::GetInfo(_) => LSPS2_GET_INFO_METHOD_NAME,
+			LSPS2Request::Buy(_) => LSPS2_BUY_METHOD_NAME,
+		}
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// An enum that captures all the valid JSON-RPC responses in the LSPS2 protocol.
+pub enum LSPS2Response {
+	/// A successful response to a [`LSPS2Request::GetVersions`] request.
+	GetVersions(GetVersionsResponse),
+	/// A successful response to a [`LSPS2Request::GetInfo`] request.
+	GetInfo(GetInfoResponse),
+	/// An error response to a [`LSPS2Request::GetInfo`] request.
+	GetInfoError(ResponseError),
+	/// A successful response to a [`LSPS2Request::Buy`] request.
+	Buy(BuyResponse),
+	/// An error response to a [`LSPS2Request::Buy`] request.
+	BuyError(ResponseError),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// An enum that captures all valid JSON-RPC messages in the LSPS2 protocol.
+pub enum LSPS2Message {
+	/// An LSPS2 JSON-RPC request.
+	Request(RequestId, LSPS2Request),
+	/// An LSPS2 JSON-RPC response.
+	Response(RequestId, LSPS2Response),
+}
+
+impl TryFrom<LSPSMessage> for LSPS2Message {
+	type Error = ();
+
+	fn try_from(message: LSPSMessage) -> Result<Self, Self::Error> {
+		if let LSPSMessage::LSPS2(message) = message {
+			return Ok(message);
+		}
+
+		Err(())
+	}
+}
+
+impl From<LSPS2Message> for LSPSMessage {
+	fn from(message: LSPS2Message) -> Self {
+		LSPSMessage::LSPS2(message)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::lsps2::utils::is_valid_opening_fee_params;
+
+	#[test]
+	fn into_opening_fee_params_produces_valid_promise() {
+		let min_fee_msat = 100;
+		let proportional = 21;
+		let valid_until: chrono::DateTime<Utc> =
+			chrono::DateTime::parse_from_rfc3339("2035-05-20T08:30:45Z").unwrap().into();
+		let min_lifetime = 144;
+		let max_client_to_self_delay = 128;
+
+		let raw = RawOpeningFeeParams {
+			min_fee_msat,
+			proportional,
+			valid_until: valid_until.clone().into(),
+			min_lifetime,
+			max_client_to_self_delay,
+		};
+
+		let promise_secret = [1u8; 32];
+
+		let opening_fee_params = raw.into_opening_fee_params(&promise_secret);
+
+		assert_eq!(opening_fee_params.min_fee_msat, min_fee_msat);
+		assert_eq!(opening_fee_params.proportional, proportional);
+		assert_eq!(opening_fee_params.valid_until, valid_until);
+		assert_eq!(opening_fee_params.min_lifetime, min_lifetime);
+		assert_eq!(opening_fee_params.max_client_to_self_delay, max_client_to_self_delay);
+
+		assert!(is_valid_opening_fee_params(&opening_fee_params, &promise_secret));
+	}
+
+	#[test]
+	fn changing_single_field_produced_invalid_params() {
+		let min_fee_msat = 100;
+		let proportional = 21;
+		let valid_until = chrono::DateTime::parse_from_rfc3339("2035-05-20T08:30:45Z").unwrap();
+		let min_lifetime = 144;
+		let max_client_to_self_delay = 128;
+
+		let raw = RawOpeningFeeParams {
+			min_fee_msat,
+			proportional,
+			valid_until: valid_until.into(),
+			min_lifetime,
+			max_client_to_self_delay,
+		};
+
+		let promise_secret = [1u8; 32];
+
+		let mut opening_fee_params = raw.into_opening_fee_params(&promise_secret);
+		opening_fee_params.min_fee_msat = min_fee_msat + 1;
+		assert!(!is_valid_opening_fee_params(&opening_fee_params, &promise_secret));
+	}
+
+	#[test]
+	fn wrong_secret_produced_invalid_params() {
+		let min_fee_msat = 100;
+		let proportional = 21;
+		let valid_until = chrono::DateTime::parse_from_rfc3339("2035-05-20T08:30:45Z").unwrap();
+		let min_lifetime = 144;
+		let max_client_to_self_delay = 128;
+
+		let raw = RawOpeningFeeParams {
+			min_fee_msat,
+			proportional,
+			valid_until: valid_until.into(),
+			min_lifetime,
+			max_client_to_self_delay,
+		};
+
+		let promise_secret = [1u8; 32];
+		let other_secret = [2u8; 32];
+
+		let opening_fee_params = raw.into_opening_fee_params(&promise_secret);
+		assert!(!is_valid_opening_fee_params(&opening_fee_params, &other_secret));
+	}
+
+	#[test]
+	#[cfg(feature = "std")]
+	// TODO: We need to find a way to check expiry times in no-std builds.
+	fn expired_params_produces_invalid_params() {
+		let min_fee_msat = 100;
+		let proportional = 21;
+		let valid_until = chrono::DateTime::parse_from_rfc3339("2023-05-20T08:30:45Z").unwrap();
+		let min_lifetime = 144;
+		let max_client_to_self_delay = 128;
+
+		let raw = RawOpeningFeeParams {
+			min_fee_msat,
+			proportional,
+			valid_until: valid_until.into(),
+			min_lifetime,
+			max_client_to_self_delay,
+		};
+
+		let promise_secret = [1u8; 32];
+
+		let opening_fee_params = raw.into_opening_fee_params(&promise_secret);
+		assert!(!is_valid_opening_fee_params(&opening_fee_params, &promise_secret));
+	}
+}
+
+'''
+'''--- src/lsps2/service.rs ---
+// This file is Copyright its original authors, visible in version control
+// history.
+//
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE
+// or http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option.
+// You may not use this file except in accordance with one or both of these
+// licenses.
+
+//! Contains the main LSPS2 server-side object, [`LSPS2ServiceHandler`].
+
+use crate::events::EventQueue;
+use crate::lsps0::msgs::{ProtocolMessageHandler, RequestId};
+use crate::lsps2::event::LSPS2ServiceEvent;
+use crate::lsps2::utils::{compute_opening_fee, is_valid_opening_fee_params};
+use crate::message_queue::MessageQueue;
+use crate::prelude::{HashMap, String, ToString, Vec};
+use crate::sync::{Arc, Mutex, RwLock};
+use crate::{events::Event, lsps0::msgs::ResponseError};
+
+use lightning::ln::channelmanager::{AChannelManager, InterceptId};
+use lightning::ln::msgs::{ErrorAction, LightningError};
+use lightning::ln::ChannelId;
+use lightning::util::errors::APIError;
+use lightning::util::logger::Level;
+
+use bitcoin::secp256k1::PublicKey;
+
+use core::convert::TryInto;
+use core::ops::Deref;
+
+use crate::lsps2::msgs::{
+	BuyRequest, BuyResponse, GetInfoRequest, GetInfoResponse, GetVersionsResponse, LSPS2Message,
+	LSPS2Request, LSPS2Response, OpeningFeeParams, RawOpeningFeeParams,
+	LSPS2_BUY_REQUEST_INVALID_OPENING_FEE_PARAMS_ERROR_CODE,
+	LSPS2_BUY_REQUEST_INVALID_VERSION_ERROR_CODE,
+	LSPS2_BUY_REQUEST_PAYMENT_SIZE_TOO_LARGE_ERROR_CODE,
+	LSPS2_BUY_REQUEST_PAYMENT_SIZE_TOO_SMALL_ERROR_CODE,
+	LSPS2_GET_INFO_REQUEST_INVALID_VERSION_ERROR_CODE,
+	LSPS2_GET_INFO_REQUEST_UNRECOGNIZED_OR_STALE_TOKEN_ERROR_CODE,
+};
+
+/// Server-side configuration options for JIT channels.
+#[derive(Clone, Debug)]
+pub struct LSPS2ServiceConfig {
+	/// Used to calculate the promise for channel parameters supplied to clients.
+	///
+	/// Note: If this changes then old promises given out will be considered invalid.
+	pub promise_secret: [u8; 32],
+	/// The minimum payment size you are willing to accept.
+	pub min_payment_size_msat: u64,
+	/// The maximum payment size you are willing to accept.
+	pub max_payment_size_msat: u64,
+}
+
+const SUPPORTED_SPEC_VERSIONS: [u16; 1] = [1];
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+struct InterceptedHTLC {
+	intercept_id: InterceptId,
+	expected_outbound_amount_msat: u64,
+}
+
+struct ChannelStateError(String);
+
+impl From<ChannelStateError> for LightningError {
+	fn from(value: ChannelStateError) -> Self {
+		LightningError { err: value.0, action: ErrorAction::IgnoreAndLog(Level::Info) }
+	}
+}
+
+#[derive(PartialEq, Debug)]
+enum OutboundJITChannelState {
+	AwaitingPayment {
+		min_fee_msat: u64,
+		proportional_fee: u32,
+		htlcs: Vec<InterceptedHTLC>,
+		payment_size_msat: Option<u64>,
+	},
+	PendingChannelOpen {
+		htlcs: Vec<InterceptedHTLC>,
+		opening_fee_msat: u64,
+		amt_to_forward_msat: u64,
+	},
+	ChannelReady {
+		htlcs: Vec<InterceptedHTLC>,
+		amt_to_forward_msat: u64,
+	},
+}
+
+impl OutboundJITChannelState {
+	fn new(payment_size_msat: Option<u64>, opening_fee_params: OpeningFeeParams) -> Self {
+		OutboundJITChannelState::AwaitingPayment {
+			min_fee_msat: opening_fee_params.min_fee_msat,
+			proportional_fee: opening_fee_params.proportional,
+			htlcs: vec![],
+			payment_size_msat,
+		}
+	}
+
+	fn htlc_intercepted(&self, htlc: InterceptedHTLC) -> Result<Self, ChannelStateError> {
+		match self {
+			OutboundJITChannelState::AwaitingPayment {
+				htlcs,
+				payment_size_msat,
+				min_fee_msat,
+				proportional_fee,
+			} => {
+				let mut htlcs = htlcs.clone();
+				htlcs.push(htlc);
+
+				let total_expected_outbound_amount_msat =
+					htlcs.iter().map(|htlc| htlc.expected_outbound_amount_msat).sum();
+
+				let expected_payment_size_msat =
+					payment_size_msat.unwrap_or(total_expected_outbound_amount_msat);
+
+				let opening_fee_msat = compute_opening_fee(
+					expected_payment_size_msat,
+					*min_fee_msat,
+					(*proportional_fee).into(),
+				).ok_or(ChannelStateError(
+					format!("Could not compute valid opening fee with min_fee_msat = {}, proportional = {}, and total_expected_outbound_amount_msat = {}", 
+						min_fee_msat,
+						proportional_fee,
+						total_expected_outbound_amount_msat
+					)
+				))?;
+
+				let amt_to_forward_msat =
+					expected_payment_size_msat.saturating_sub(opening_fee_msat);
+
+				if total_expected_outbound_amount_msat >= expected_payment_size_msat
+					&& amt_to_forward_msat > 0
+				{
+					Ok(OutboundJITChannelState::PendingChannelOpen {
+						htlcs,
+						opening_fee_msat,
+						amt_to_forward_msat,
+					})
+				} else {
+					// payment size being specified means MPP is supported
+					if payment_size_msat.is_some() {
+						Ok(OutboundJITChannelState::AwaitingPayment {
+							min_fee_msat: *min_fee_msat,
+							proportional_fee: *proportional_fee,
+							htlcs,
+							payment_size_msat: *payment_size_msat,
+						})
+					} else {
+						Err(ChannelStateError("HTLC is too small to pay opening fee".to_string()))
+					}
+				}
+			}
+			state => Err(ChannelStateError(format!(
+				"Invoice params received when JIT Channel was in state: {:?}",
+				state
+			))),
+		}
+	}
+
+	fn channel_ready(&self) -> Result<Self, ChannelStateError> {
+		match self {
+			OutboundJITChannelState::PendingChannelOpen { htlcs, amt_to_forward_msat, .. } => {
+				Ok(OutboundJITChannelState::ChannelReady {
+					htlcs: htlcs.clone(),
+					amt_to_forward_msat: *amt_to_forward_msat,
+				})
+			}
+			state => Err(ChannelStateError(format!(
+				"Channel ready received when JIT Channel was in state: {:?}",
+				state
+			))),
+		}
+	}
+}
+
+struct OutboundJITChannel {
+	state: OutboundJITChannelState,
+	scid: u64,
+	cltv_expiry_delta: u32,
+	client_trusts_lsp: bool,
+}
+
+impl OutboundJITChannel {
+	fn new(
+		scid: u64, cltv_expiry_delta: u32, client_trusts_lsp: bool, payment_size_msat: Option<u64>,
+		opening_fee_params: OpeningFeeParams,
+	) -> Self {
+		Self {
+			scid,
+			cltv_expiry_delta,
+			client_trusts_lsp,
+			state: OutboundJITChannelState::new(payment_size_msat, opening_fee_params),
+		}
+	}
+
+	fn htlc_intercepted(
+		&mut self, htlc: InterceptedHTLC,
+	) -> Result<Option<(u64, u64)>, LightningError> {
+		self.state = self.state.htlc_intercepted(htlc)?;
+
+		match &self.state {
+			OutboundJITChannelState::AwaitingPayment { htlcs, payment_size_msat, .. } => {
+				// TODO: log that we received an htlc but are still awaiting payment
+				Ok(None)
+			}
+			OutboundJITChannelState::PendingChannelOpen {
+				opening_fee_msat,
+				amt_to_forward_msat,
+				..
+			} => Ok(Some((*opening_fee_msat, *amt_to_forward_msat))),
+			impossible_state => Err(LightningError {
+				err: format!(
+					"Impossible state transition during htlc_intercepted to {:?}",
+					impossible_state
+				),
+				action: ErrorAction::IgnoreAndLog(Level::Info),
+			}),
+		}
+	}
+
+	fn channel_ready(&mut self) -> Result<(Vec<InterceptedHTLC>, u64), LightningError> {
+		self.state = self.state.channel_ready()?;
+
+		match &self.state {
+			OutboundJITChannelState::ChannelReady { htlcs, amt_to_forward_msat } => {
+				Ok((htlcs.clone(), *amt_to_forward_msat))
+			}
+			impossible_state => Err(LightningError {
+				err: format!(
+					"Impossible state transition during channel_ready to {:?}",
+					impossible_state
+				),
+				action: ErrorAction::IgnoreAndLog(Level::Info),
+			}),
+		}
+	}
+}
+
+struct PeerState {
+	outbound_channels_by_scid: HashMap<u64, OutboundJITChannel>,
+	pending_requests: HashMap<RequestId, LSPS2Request>,
+}
+
+impl PeerState {
+	fn new() -> Self {
+		let outbound_channels_by_scid = HashMap::new();
+		let pending_requests = HashMap::new();
+		Self { outbound_channels_by_scid, pending_requests }
+	}
+
+	fn insert_outbound_channel(&mut self, scid: u64, channel: OutboundJITChannel) {
+		self.outbound_channels_by_scid.insert(scid, channel);
+	}
+
+	fn remove_outbound_channel(&mut self, scid: u64) {
+		self.outbound_channels_by_scid.remove(&scid);
+	}
+}
+
+/// The main object allowing to send and receive LSPS2 messages.
+pub struct LSPS2ServiceHandler<CM: Deref + Clone, MQ: Deref>
+where
+	CM::Target: AChannelManager,
+	MQ::Target: MessageQueue,
+{
+	channel_manager: CM,
+	pending_messages: MQ,
+	pending_events: Arc<EventQueue>,
+	per_peer_state: RwLock<HashMap<PublicKey, Mutex<PeerState>>>,
+	peer_by_scid: RwLock<HashMap<u64, PublicKey>>,
+	config: LSPS2ServiceConfig,
+}
+
+impl<CM: Deref + Clone, MQ: Deref> LSPS2ServiceHandler<CM, MQ>
+where
+	CM::Target: AChannelManager,
+	MQ::Target: MessageQueue,
+{
+	/// Constructs a `LSPS2ServiceHandler`.
+	pub(crate) fn new(
+		pending_messages: MQ, pending_events: Arc<EventQueue>, channel_manager: CM,
+		config: LSPS2ServiceConfig,
+	) -> Self {
+		Self {
+			pending_messages,
+			pending_events,
+			per_peer_state: RwLock::new(HashMap::new()),
+			peer_by_scid: RwLock::new(HashMap::new()),
+			channel_manager,
+			config,
+		}
+	}
+
+	/// Used by LSP to inform a client requesting a JIT Channel the token they used is invalid.
+	///
+	/// Should be called in response to receiving a [`LSPS2ServiceEvent::GetInfo`] event.
+	///
+	/// [`LSPS2ServiceEvent::GetInfo`]: crate::lsps2::event::LSPS2ServiceEvent::GetInfo
+	pub fn invalid_token_provided(
+		&self, counterparty_node_id: &PublicKey, request_id: RequestId,
+	) -> Result<(), APIError> {
+		let outer_state_lock = self.per_peer_state.read().unwrap();
+
+		match outer_state_lock.get(counterparty_node_id) {
+			Some(inner_state_lock) => {
+				let mut peer_state = inner_state_lock.lock().unwrap();
+
+				match peer_state.pending_requests.remove(&request_id) {
+					Some(LSPS2Request::GetInfo(_)) => {
+						let response = LSPS2Response::GetInfoError(ResponseError {
+							code: LSPS2_GET_INFO_REQUEST_UNRECOGNIZED_OR_STALE_TOKEN_ERROR_CODE,
+							message: "an unrecognized or stale token was provided".to_string(),
+							data: None,
+						});
+						self.enqueue_response(counterparty_node_id, request_id, response);
+						Ok(())
+					}
+					_ => Err(APIError::APIMisuseError {
+						err: format!(
+							"No pending get_info request for request_id: {:?}",
+							request_id
+						),
+					}),
+				}
+			}
+			None => Err(APIError::APIMisuseError {
+				err: format!("No state for the counterparty exists: {:?}", counterparty_node_id),
+			}),
+		}
+	}
+
+	/// Used by LSP to provide fee parameters to a client requesting a JIT Channel.
+	///
+	/// Should be called in response to receiving a [`LSPS2ServiceEvent::GetInfo`] event.
+	///
+	/// [`LSPS2ServiceEvent::GetInfo`]: crate::lsps2::event::LSPS2ServiceEvent::GetInfo
+	pub fn opening_fee_params_generated(
+		&self, counterparty_node_id: &PublicKey, request_id: RequestId,
+		opening_fee_params_menu: Vec<RawOpeningFeeParams>,
+	) -> Result<(), APIError> {
+		let outer_state_lock = self.per_peer_state.read().unwrap();
+
+		match outer_state_lock.get(counterparty_node_id) {
+			Some(inner_state_lock) => {
+				let mut peer_state = inner_state_lock.lock().unwrap();
+
+				match peer_state.pending_requests.remove(&request_id) {
+					Some(LSPS2Request::GetInfo(_)) => {
+						let response = LSPS2Response::GetInfo(GetInfoResponse {
+							opening_fee_params_menu: opening_fee_params_menu
+								.into_iter()
+								.map(|param| {
+									param.into_opening_fee_params(&self.config.promise_secret)
+								})
+								.collect(),
+							min_payment_size_msat: self.config.min_payment_size_msat,
+							max_payment_size_msat: self.config.max_payment_size_msat,
+						});
+						self.enqueue_response(counterparty_node_id, request_id, response);
+						Ok(())
+					}
+					_ => Err(APIError::APIMisuseError {
+						err: format!(
+							"No pending get_info request for request_id: {:?}",
+							request_id
+						),
+					}),
+				}
+			}
+			None => Err(APIError::APIMisuseError {
+				err: format!("No state for the counterparty exists: {:?}", counterparty_node_id),
+			}),
+		}
+	}
+
+	/// Used by LSP to provide client with the scid and cltv_expiry_delta to use in their invoice.
+	///
+	/// Should be called in response to receiving a [`LSPS2ServiceEvent::BuyRequest`] event.
+	///
+	/// [`LSPS2ServiceEvent::BuyRequest`]: crate::lsps2::event::LSPS2ServiceEvent::BuyRequest
+	pub fn invoice_parameters_generated(
+		&self, counterparty_node_id: &PublicKey, request_id: RequestId, scid: u64,
+		cltv_expiry_delta: u32, client_trusts_lsp: bool,
+	) -> Result<(), APIError> {
+		let outer_state_lock = self.per_peer_state.read().unwrap();
+
+		match outer_state_lock.get(counterparty_node_id) {
+			Some(inner_state_lock) => {
+				let mut peer_state = inner_state_lock.lock().unwrap();
+
+				match peer_state.pending_requests.remove(&request_id) {
+					Some(LSPS2Request::Buy(buy_request)) => {
+						{
+							let mut peer_by_scid = self.peer_by_scid.write().unwrap();
+							peer_by_scid.insert(scid, *counterparty_node_id);
+						}
+
+						let outbound_jit_channel = OutboundJITChannel::new(
+							scid,
+							cltv_expiry_delta,
+							client_trusts_lsp,
+							buy_request.payment_size_msat,
+							buy_request.opening_fee_params,
+						);
+
+						peer_state.insert_outbound_channel(scid, outbound_jit_channel);
+
+						self.enqueue_response(
+							counterparty_node_id,
+							request_id,
+							LSPS2Response::Buy(BuyResponse {
+								jit_channel_scid: scid.into(),
+								lsp_cltv_expiry_delta: cltv_expiry_delta,
+								client_trusts_lsp,
+							}),
+						);
+
+						Ok(())
+					}
+					_ => Err(APIError::APIMisuseError {
+						err: format!("No pending buy request for request_id: {:?}", request_id),
+					}),
+				}
+			}
+			None => Err(APIError::APIMisuseError {
+				err: format!("No state for the counterparty exists: {:?}", counterparty_node_id),
+			}),
+		}
+	}
+
+	/// Forward [`Event::HTLCIntercepted`] event parameters into this function.
+	///
+	/// Will fail the intercepted HTLC if the scid matches a payment we are expecting
+	/// but the payment amount is incorrect or the expiry has passed.
+	///
+	/// Will generate a [`LSPS2ServiceEvent::OpenChannel`] event if the scid matches a payment we are expected
+	/// and the payment amount is correct and the offer has not expired.
+	///
+	/// Will do nothing if the scid does not match any of the ones we gave out.
+	///
+	/// [`Event::HTLCIntercepted`]: lightning::events::Event::HTLCIntercepted
+	/// [`LSPS2ServiceEvent::OpenChannel`]: crate::lsps2::event::LSPS2ServiceEvent::OpenChannel
+	pub fn htlc_intercepted(
+		&self, scid: u64, intercept_id: InterceptId, expected_outbound_amount_msat: u64,
+	) -> Result<(), APIError> {
+		let peer_by_scid = self.peer_by_scid.read().unwrap();
+		if let Some(counterparty_node_id) = peer_by_scid.get(&scid) {
+			let outer_state_lock = self.per_peer_state.read().unwrap();
+			match outer_state_lock.get(counterparty_node_id) {
+				Some(inner_state_lock) => {
+					let mut peer_state = inner_state_lock.lock().unwrap();
+					if let Some(jit_channel) = peer_state.outbound_channels_by_scid.get_mut(&scid) {
+						let htlc = InterceptedHTLC { intercept_id, expected_outbound_amount_msat };
+						match jit_channel.htlc_intercepted(htlc) {
+							Ok(Some((opening_fee_msat, amt_to_forward_msat))) => {
+								self.enqueue_event(Event::LSPS2Service(
+									LSPS2ServiceEvent::OpenChannel {
+										their_network_key: counterparty_node_id.clone(),
+										amt_to_forward_msat,
+										opening_fee_msat,
+										user_channel_id: scid as u128,
+									},
+								));
+							}
+							Ok(None) => {}
+							Err(e) => {
+								self.channel_manager
+									.get_cm()
+									.fail_intercepted_htlc(intercept_id)?;
+								peer_state.outbound_channels_by_scid.remove(&scid);
+								// TODO: cleanup peer_by_scid
+								return Err(APIError::APIMisuseError { err: e.err });
+							}
+						}
+					}
+				}
+				None => {
+					return Err(APIError::APIMisuseError {
+						err: format!("No counterparty found for scid: {}", scid),
+					});
+				}
+			}
+		}
+
+		Ok(())
+	}
+
+	/// Forward [`Event::ChannelReady`] event parameters into this function.
+	///
+	/// Will forward the intercepted HTLC if it matches a channel
+	/// we need to forward a payment over otherwise it will be ignored.
+	///
+	/// [`Event::ChannelReady`]: lightning::events::Event::ChannelReady
+	pub fn channel_ready(
+		&self, user_channel_id: u128, channel_id: &ChannelId, counterparty_node_id: &PublicKey,
+	) -> Result<(), APIError> {
+		if let Ok(scid) = user_channel_id.try_into() {
+			let outer_state_lock = self.per_peer_state.read().unwrap();
+			match outer_state_lock.get(counterparty_node_id) {
+				Some(inner_state_lock) => {
+					let mut peer_state = inner_state_lock.lock().unwrap();
+					if let Some(jit_channel) = peer_state.outbound_channels_by_scid.get_mut(&scid) {
+						match jit_channel.channel_ready() {
+							Ok((htlcs, total_amt_to_forward_msat)) => {
+								let amounts_to_forward_msat = calculate_amount_to_forward_per_htlc(
+									&htlcs,
+									total_amt_to_forward_msat,
+								);
+
+								for (intercept_id, amount_to_forward_msat) in
+									amounts_to_forward_msat
+								{
+									self.channel_manager.get_cm().forward_intercepted_htlc(
+										intercept_id,
+										channel_id,
+										*counterparty_node_id,
+										amount_to_forward_msat,
+									)?;
+								}
+							}
+							Err(e) => {
+								return Err(APIError::APIMisuseError {
+									err: format!(
+										"Failed to transition to channel ready: {}",
+										e.err
+									),
+								})
+							}
+						}
+					} else {
+						return Err(APIError::APIMisuseError {
+							err: format!(
+								"Could not find a channel with user_channel_id {}",
+								user_channel_id
+							),
+						});
+					}
+				}
+				None => {
+					return Err(APIError::APIMisuseError {
+						err: format!("No counterparty state for: {}", counterparty_node_id),
+					});
+				}
+			}
+		}
+
+		Ok(())
+	}
+
+	fn enqueue_response(
+		&self, counterparty_node_id: &PublicKey, request_id: RequestId, response: LSPS2Response,
+	) {
+		self.pending_messages
+			.enqueue(counterparty_node_id, LSPS2Message::Response(request_id, response).into());
+	}
+
+	fn enqueue_event(&self, event: Event) {
+		self.pending_events.enqueue(event);
+	}
+
+	fn handle_get_versions_request(
+		&self, request_id: RequestId, counterparty_node_id: &PublicKey,
+	) -> Result<(), LightningError> {
+		self.enqueue_response(
+			counterparty_node_id,
+			request_id,
+			LSPS2Response::GetVersions(GetVersionsResponse {
+				versions: SUPPORTED_SPEC_VERSIONS.to_vec(),
+			}),
+		);
+		Ok(())
+	}
+
+	fn handle_get_info_request(
+		&self, request_id: RequestId, counterparty_node_id: &PublicKey, params: GetInfoRequest,
+	) -> Result<(), LightningError> {
+		if !SUPPORTED_SPEC_VERSIONS.contains(&params.version) {
+			self.enqueue_response(
+				counterparty_node_id,
+				request_id,
+				LSPS2Response::GetInfoError(ResponseError {
+					code: LSPS2_GET_INFO_REQUEST_INVALID_VERSION_ERROR_CODE,
+					message: format!("version {} is not supported", params.version),
+					data: Some(format!("Supported versions are {:?}", SUPPORTED_SPEC_VERSIONS)),
+				}),
+			);
+			return Err(LightningError {
+				err: format!("client requested unsupported version {}", params.version),
+				action: ErrorAction::IgnoreAndLog(Level::Info),
+			});
+		}
+
+		let mut outer_state_lock = self.per_peer_state.write().unwrap();
+		let inner_state_lock: &mut Mutex<PeerState> =
+			outer_state_lock.entry(*counterparty_node_id).or_insert(Mutex::new(PeerState::new()));
+		let mut peer_state_lock = inner_state_lock.lock().unwrap();
+		peer_state_lock
+			.pending_requests
+			.insert(request_id.clone(), LSPS2Request::GetInfo(params.clone()));
+
+		self.enqueue_event(Event::LSPS2Service(LSPS2ServiceEvent::GetInfo {
+			request_id,
+			counterparty_node_id: *counterparty_node_id,
+			version: params.version,
+			token: params.token,
+		}));
+		Ok(())
+	}
+
+	fn handle_buy_request(
+		&self, request_id: RequestId, counterparty_node_id: &PublicKey, params: BuyRequest,
+	) -> Result<(), LightningError> {
+		if !SUPPORTED_SPEC_VERSIONS.contains(&params.version) {
+			self.enqueue_response(
+				counterparty_node_id,
+				request_id,
+				LSPS2Response::BuyError(ResponseError {
+					code: LSPS2_BUY_REQUEST_INVALID_VERSION_ERROR_CODE,
+					message: format!("version {} is not supported", params.version),
+					data: Some(format!("Supported versions are {:?}", SUPPORTED_SPEC_VERSIONS)),
+				}),
+			);
+			return Err(LightningError {
+				err: format!("client requested unsupported version {}", params.version),
+				action: ErrorAction::IgnoreAndLog(Level::Info),
+			});
+		}
+
+		if let Some(payment_size_msat) = params.payment_size_msat {
+			if payment_size_msat < self.config.min_payment_size_msat {
+				self.enqueue_response(
+					counterparty_node_id,
+					request_id,
+					LSPS2Response::BuyError(ResponseError {
+						code: LSPS2_BUY_REQUEST_PAYMENT_SIZE_TOO_SMALL_ERROR_CODE,
+						message: "payment size is below our minimum supported payment size"
+							.to_string(),
+						data: None,
+					}),
+				);
+				return Err(LightningError {
+					err: "payment size is below our minimum supported payment size".to_string(),
+					action: ErrorAction::IgnoreAndLog(Level::Info),
+				});
+			}
+
+			if payment_size_msat > self.config.max_payment_size_msat {
+				self.enqueue_response(
+					counterparty_node_id,
+					request_id,
+					LSPS2Response::BuyError(ResponseError {
+						code: LSPS2_BUY_REQUEST_PAYMENT_SIZE_TOO_LARGE_ERROR_CODE,
+						message: "payment size is above our maximum supported payment size"
+							.to_string(),
+						data: None,
+					}),
+				);
+				return Err(LightningError {
+					err: "payment size is above our maximum supported payment size".to_string(),
+					action: ErrorAction::IgnoreAndLog(Level::Info),
+				});
+			}
+
+			match compute_opening_fee(
+				payment_size_msat,
+				params.opening_fee_params.min_fee_msat,
+				params.opening_fee_params.proportional.into(),
+			) {
+				Some(opening_fee) => {
+					if opening_fee >= payment_size_msat {
+						self.enqueue_response(
+							counterparty_node_id,
+							request_id,
+							LSPS2Response::BuyError(ResponseError {
+								code: LSPS2_BUY_REQUEST_PAYMENT_SIZE_TOO_SMALL_ERROR_CODE,
+								message: "payment size is too small to cover the opening fee"
+									.to_string(),
+								data: None,
+							}),
+						);
+						return Err(LightningError {
+							err: "payment size is too small to cover the opening fee".to_string(),
+							action: ErrorAction::IgnoreAndLog(Level::Info),
+						});
+					}
+				}
+				None => {
+					self.enqueue_response(
+						counterparty_node_id,
+						request_id,
+						LSPS2Response::BuyError(ResponseError {
+							code: LSPS2_BUY_REQUEST_PAYMENT_SIZE_TOO_LARGE_ERROR_CODE,
+							message: "overflow error when calculating opening_fee".to_string(),
+							data: None,
+						}),
+					);
+					return Err(LightningError {
+						err: "overflow error when calculating opening_fee".to_string(),
+						action: ErrorAction::IgnoreAndLog(Level::Info),
+					});
+				}
+			}
+		}
+
+		// TODO: if payment_size_msat is specified, make sure our node has sufficient incoming liquidity from public network to receive it.
+
+		if !is_valid_opening_fee_params(&params.opening_fee_params, &self.config.promise_secret) {
+			self.enqueue_response(
+				counterparty_node_id,
+				request_id,
+				LSPS2Response::BuyError(ResponseError {
+					code: LSPS2_BUY_REQUEST_INVALID_OPENING_FEE_PARAMS_ERROR_CODE,
+					message: "valid_until is already past OR the promise did not match the provided parameters".to_string(),
+					data: None,
+				}),
+			);
+			return Err(LightningError {
+				err: "invalid opening fee parameters were supplied by client".to_string(),
+				action: ErrorAction::IgnoreAndLog(Level::Info),
+			});
+		}
+
+		let mut outer_state_lock = self.per_peer_state.write().unwrap();
+		let inner_state_lock =
+			outer_state_lock.entry(*counterparty_node_id).or_insert(Mutex::new(PeerState::new()));
+		let mut peer_state_lock = inner_state_lock.lock().unwrap();
+		peer_state_lock
+			.pending_requests
+			.insert(request_id.clone(), LSPS2Request::Buy(params.clone()));
+
+		self.enqueue_event(Event::LSPS2Service(LSPS2ServiceEvent::BuyRequest {
+			request_id,
+			version: params.version,
+			counterparty_node_id: *counterparty_node_id,
+			opening_fee_params: params.opening_fee_params,
+			payment_size_msat: params.payment_size_msat,
+		}));
+
+		Ok(())
+	}
+}
+
+impl<CM: Deref + Clone, MQ: Deref> ProtocolMessageHandler for LSPS2ServiceHandler<CM, MQ>
+where
+	CM::Target: AChannelManager,
+	MQ::Target: MessageQueue,
+{
+	type ProtocolMessage = LSPS2Message;
+	const PROTOCOL_NUMBER: Option<u16> = Some(2);
+
+	fn handle_message(
+		&self, message: Self::ProtocolMessage, counterparty_node_id: &PublicKey,
+	) -> Result<(), LightningError> {
+		match message {
+			LSPS2Message::Request(request_id, request) => match request {
+				LSPS2Request::GetVersions(_) => {
+					self.handle_get_versions_request(request_id, counterparty_node_id)
+				}
+				LSPS2Request::GetInfo(params) => {
+					self.handle_get_info_request(request_id, counterparty_node_id, params)
+				}
+				LSPS2Request::Buy(params) => {
+					self.handle_buy_request(request_id, counterparty_node_id, params)
+				}
+			},
+			_ => {
+				debug_assert!(
+					false,
+					"Service handler received LSPS2 response message. This should never happen."
+				);
+				Err(LightningError { err: format!("Service handler received LSPS2 response message from node {:?}. This should never happen.", counterparty_node_id), action: ErrorAction::IgnoreAndLog(Level::Info)})
+			}
+		}
+	}
+}
+
+fn calculate_amount_to_forward_per_htlc(
+	htlcs: &[InterceptedHTLC], total_amt_to_forward_msat: u64,
+) -> Vec<(InterceptId, u64)> {
+	let total_received_msat: u64 =
+		htlcs.iter().map(|htlc| htlc.expected_outbound_amount_msat).sum();
+
+	let mut fee_remaining_msat = total_received_msat - total_amt_to_forward_msat;
+	let total_fee_msat = fee_remaining_msat;
+
+	let mut per_htlc_forwards = vec![];
+
+	for (index, htlc) in htlcs.iter().enumerate() {
+		let proportional_fee_amt_msat =
+			total_fee_msat * htlc.expected_outbound_amount_msat / total_received_msat;
+
+		let mut actual_fee_amt_msat = core::cmp::min(fee_remaining_msat, proportional_fee_amt_msat);
+		fee_remaining_msat -= actual_fee_amt_msat;
+
+		if index == htlcs.len() - 1 {
+			actual_fee_amt_msat += fee_remaining_msat;
+		}
+
+		let amount_to_forward_msat = htlc.expected_outbound_amount_msat - actual_fee_amt_msat;
+
+		per_htlc_forwards.push((htlc.intercept_id, amount_to_forward_msat))
+	}
+
+	per_htlc_forwards
+}
+
+#[cfg(test)]
+mod tests {
+
+	use super::*;
+
+	#[test]
+	fn test_calculate_amount_to_forward() {
+		// TODO: Use proptest to generate random allocations
+		let htlcs = vec![
+			InterceptedHTLC {
+				intercept_id: InterceptId([0; 32]),
+				expected_outbound_amount_msat: 1000,
+			},
+			InterceptedHTLC {
+				intercept_id: InterceptId([1; 32]),
+				expected_outbound_amount_msat: 2000,
+			},
+			InterceptedHTLC {
+				intercept_id: InterceptId([2; 32]),
+				expected_outbound_amount_msat: 3000,
+			},
+		];
+
+		let total_amt_to_forward_msat = 5000;
+
+		let result = calculate_amount_to_forward_per_htlc(&htlcs, total_amt_to_forward_msat);
+
+		assert_eq!(result[0].0, htlcs[0].intercept_id);
+		assert_eq!(result[0].1, 834);
+
+		assert_eq!(result[1].0, htlcs[1].intercept_id);
+		assert_eq!(result[1].1, 1667);
+
+		assert_eq!(result[2].0, htlcs[2].intercept_id);
+		assert_eq!(result[2].1, 2499);
+	}
+}
+
+'''
+'''--- src/lsps2/utils.rs ---
+use crate::lsps2::msgs::OpeningFeeParams;
+use crate::utils;
+
+use bitcoin::hashes::hmac::{Hmac, HmacEngine};
+use bitcoin::hashes::sha256::Hash as Sha256;
+use bitcoin::hashes::{Hash, HashEngine};
+
+#[cfg(feature = "std")]
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Determines if the given parameters are valid given the secret used to generate the promise.
+pub fn is_valid_opening_fee_params(
+	fee_params: &OpeningFeeParams, promise_secret: &[u8; 32],
+) -> bool {
+	#[cfg(feature = "std")]
+	{
+		// TODO: We need to find a way to check expiry times in no-std builds.
+		let seconds_since_epoch = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.expect("system clock to be ahead of the unix epoch")
+			.as_secs();
+		let valid_until_seconds_since_epoch = fee_params
+			.valid_until
+			.timestamp()
+			.try_into()
+			.expect("expiration to be ahead of unix epoch");
+		if seconds_since_epoch > valid_until_seconds_since_epoch {
+			return false;
+		}
+	}
+
+	let mut hmac = HmacEngine::<Sha256>::new(promise_secret);
+	hmac.input(&fee_params.min_fee_msat.to_be_bytes());
+	hmac.input(&fee_params.proportional.to_be_bytes());
+	hmac.input(fee_params.valid_until.to_rfc3339().as_bytes());
+	hmac.input(&fee_params.min_lifetime.to_be_bytes());
+	hmac.input(&fee_params.max_client_to_self_delay.to_be_bytes());
+	let promise_bytes = Hmac::from_engine(hmac).into_inner();
+	let promise = utils::hex_str(&promise_bytes[..]);
+	promise == fee_params.promise
+}
+
+/// Computes the opening fee given a payment size and the fee parameters.
+///
+/// Returns [`Option::None`] when the computation overflows.
+///
+/// See the [`specification`](https://github.com/BitcoinAndLightningLayerSpecs/lsp/tree/main/LSPS2#computing-the-opening_fee) for more details.
+pub fn compute_opening_fee(
+	payment_size_msat: u64, opening_fee_min_fee_msat: u64, opening_fee_proportional: u64,
+) -> Option<u64> {
+	payment_size_msat
+		.checked_mul(opening_fee_proportional)
+		.and_then(|f| f.checked_add(999999))
+		.and_then(|f| f.checked_div(1000000))
+		.map(|f| core::cmp::max(f, opening_fee_min_fee_msat))
+}
+
+'''
+'''--- src/manager.rs ---
+use crate::events::{Event, EventQueue};
+use crate::lsps0::client::LSPS0ClientHandler;
+use crate::lsps0::msgs::{
+	LSPS0Message, LSPSMessage, ProtocolMessageHandler, RawLSPSMessage, LSPS_MESSAGE_TYPE_ID,
+};
+use crate::lsps0::service::LSPS0ServiceHandler;
+use crate::message_queue::{DefaultMessageQueue, MessageQueue};
+
+#[cfg(lsps1)]
+use crate::lsps1::client::{LSPS1ClientConfig, LSPS1ClientHandler};
+#[cfg(lsps1)]
+use crate::lsps1::msgs::LSPS1Message;
+#[cfg(lsps1)]
+use crate::lsps1::service::{LSPS1ServiceConfig, LSPS1ServiceHandler};
+
+use crate::lsps2::client::{LSPS2ClientConfig, LSPS2ClientHandler};
+use crate::lsps2::msgs::LSPS2Message;
+use crate::lsps2::service::{LSPS2ServiceConfig, LSPS2ServiceHandler};
+use crate::prelude::{HashMap, String, Vec};
+use crate::sync::{Arc, Mutex, RwLock};
+
+use lightning::chain::{self, BestBlock, Confirm, Filter, Listen};
+use lightning::ln::channelmanager::{AChannelManager, ChainParameters};
+use lightning::ln::features::{InitFeatures, NodeFeatures};
+use lightning::ln::msgs::{ErrorAction, LightningError};
+use lightning::ln::peer_handler::{APeerManager, CustomMessageHandler};
+use lightning::ln::wire::CustomMessageReader;
+use lightning::sign::EntropySource;
+use lightning::util::logger::Level;
+use lightning::util::ser::Readable;
+
+use bitcoin::secp256k1::PublicKey;
+
+use core::ops::Deref;
+const LSPS_FEATURE_BIT: usize = 729;
+
+/// A server-side configuration for [`LiquidityManager`].
+///
+/// Allows end-users to configure options when using the [`LiquidityManager`]
+/// to provide liquidity services to clients.
+pub struct LiquidityServiceConfig {
+	/// Optional server-side configuration for LSPS1 channel requests.
+	#[cfg(lsps1)]
+	pub lsps1_service_config: Option<LSPS1ServiceConfig>,
+	/// Optional server-side configuration for JIT channels
+	/// should you want to support them.
+	pub lsps2_service_config: Option<LSPS2ServiceConfig>,
+}
+
+/// A client-side configuration for [`LiquidityManager`].
+///
+/// Allows end-user to configure options when using the [`LiquidityManager`]
+/// to access liquidity services from a provider.
+pub struct LiquidityClientConfig {
+	/// Optional client-side configuration for LSPS1 channel requests.
+	#[cfg(lsps1)]
+	pub lsps1_client_config: Option<LSPS1ClientConfig>,
+	/// Optional client-side configuration for JIT channels.
+	pub lsps2_client_config: Option<LSPS2ClientConfig>,
+}
+
+/// The main interface into LSP functionality.
+///
+/// Should be used as a [`CustomMessageHandler`] for your
+/// [`PeerManager`]'s [`MessageHandler`].
+///
+/// Should provide a reference to your [`PeerManager`] by calling
+/// [`LiquidityManager::set_peer_manager`] post construction.  This allows the [`LiquidityManager`] to
+/// wake the [`PeerManager`] when there are pending messages to be sent.
+///
+/// Users need to continually poll [`LiquidityManager::get_and_clear_pending_events`] in order to surface
+/// [`Event`]'s that likely need to be handled.
+///
+/// If configured, users must forward the [`Event::HTLCIntercepted`] event parameters to [`LSPS2ServiceHandler::htlc_intercepted`]
+/// and the [`Event::ChannelReady`] event parameters to [`LSPS2ServiceHandler::channel_ready`].
+///
+/// [`PeerManager`]: lightning::ln::peer_handler::PeerManager
+/// [`MessageHandler`]: lightning::ln::peer_handler::MessageHandler
+/// [`Event::HTLCIntercepted`]: lightning::events::Event::HTLCIntercepted
+/// [`Event::ChannelReady`]: lightning::events::Event::ChannelReady
+pub struct LiquidityManager<
+	ES: Deref + Clone,
+	CM: Deref + Clone,
+	PM: Deref + Clone,
+	C: Deref + Clone,
+> where
+	ES::Target: EntropySource,
+	CM::Target: AChannelManager,
+	PM::Target: APeerManager,
+	C::Target: Filter,
+{
+	pending_messages: Arc<DefaultMessageQueue<PM>>,
+	pending_events: Arc<EventQueue>,
+	request_id_to_method_map: Mutex<HashMap<String, String>>,
+	lsps0_client_handler: LSPS0ClientHandler<ES, Arc<DefaultMessageQueue<PM>>>,
+	lsps0_service_handler: Option<LSPS0ServiceHandler<Arc<DefaultMessageQueue<PM>>>>,
+	#[cfg(lsps1)]
+	lsps1_service_handler: Option<LSPS1ServiceHandler<ES, CM, Arc<DefaultMessageQueue<PM>>, C>>,
+	#[cfg(lsps1)]
+	lsps1_client_handler: Option<LSPS1ClientHandler<ES, CM, Arc<DefaultMessageQueue<PM>>, C>>,
+	lsps2_service_handler: Option<LSPS2ServiceHandler<CM, Arc<DefaultMessageQueue<PM>>>>,
+	lsps2_client_handler: Option<LSPS2ClientHandler<ES, Arc<DefaultMessageQueue<PM>>>>,
+	service_config: Option<LiquidityServiceConfig>,
+	_client_config: Option<LiquidityClientConfig>,
+	best_block: Option<RwLock<BestBlock>>,
+	_chain_source: Option<C>,
+}
+
+impl<ES: Deref + Clone, CM: Deref + Clone, PM: Deref + Clone, C: Deref + Clone>
+	LiquidityManager<ES, CM, PM, C>
+where
+	ES::Target: EntropySource,
+	CM::Target: AChannelManager,
+	PM::Target: APeerManager,
+	C::Target: Filter,
+{
+	/// Constructor for the [`LiquidityManager`].
+	///
+	/// Sets up the required protocol message handlers based on the given
+	/// [`LiquidityClientConfig`] and [`LiquidityServiceConfig`].
+	pub fn new(
+		entropy_source: ES, channel_manager: CM, chain_source: Option<C>,
+		chain_params: Option<ChainParameters>, service_config: Option<LiquidityServiceConfig>,
+		client_config: Option<LiquidityClientConfig>,
+	) -> Self
+where {
+		let pending_messages = Arc::new(DefaultMessageQueue::new());
+		let pending_events = Arc::new(EventQueue::new());
+
+		let lsps0_client_handler = LSPS0ClientHandler::new(
+			entropy_source.clone(),
+			Arc::clone(&pending_messages),
+			Arc::clone(&pending_events),
+		);
+
+		let lsps0_service_handler = if service_config.is_some() {
+			Some(LSPS0ServiceHandler::new(vec![], Arc::clone(&pending_messages)))
+		} else {
+			None
+		};
+
+		let lsps2_client_handler = client_config.as_ref().and_then(|config| {
+			config.lsps2_client_config.map(|config| {
+				LSPS2ClientHandler::new(
+					entropy_source.clone(),
+					Arc::clone(&pending_messages),
+					Arc::clone(&pending_events),
+					config.clone(),
+				)
+			})
+		});
+		let lsps2_service_handler = service_config.as_ref().and_then(|config| {
+			config.lsps2_service_config.as_ref().map(|config| {
+				LSPS2ServiceHandler::new(
+					Arc::clone(&pending_messages),
+					Arc::clone(&pending_events),
+					channel_manager.clone(),
+					config.clone(),
+				)
+			})
+		});
+
+		#[cfg(lsps1)]
+		let lsps1_client_handler = client_config.as_ref().and_then(|config| {
+			config.lsps1_client_config.as_ref().map(|config| {
+				LSPS1ClientHandler::new(
+					entropy_source.clone(),
+					Arc::clone(&pending_messages),
+					Arc::clone(&pending_events),
+					channel_manager.clone(),
+					chain_source.clone(),
+					config.clone(),
+				)
+			})
+		});
+
+		#[cfg(lsps1)]
+		let lsps1_service_handler = service_config.as_ref().and_then(|config| {
+			config.lsps1_service_config.as_ref().map(|config| {
+				LSPS1ServiceHandler::new(
+					entropy_source.clone(),
+					Arc::clone(&pending_messages),
+					Arc::clone(&pending_events),
+					channel_manager.clone(),
+					chain_source.clone(),
+					config.clone(),
+				)
+			})
+		});
+
+		Self {
+			pending_messages,
+			pending_events,
+			request_id_to_method_map: Mutex::new(HashMap::new()),
+			lsps0_client_handler,
+			lsps0_service_handler,
+			#[cfg(lsps1)]
+			lsps1_client_handler,
+			#[cfg(lsps1)]
+			lsps1_service_handler,
+			lsps2_client_handler,
+			lsps2_service_handler,
+			service_config,
+			_client_config: client_config,
+			best_block: chain_params.map(|chain_params| RwLock::new(chain_params.best_block)),
+			_chain_source: chain_source,
+		}
+	}
+
+	/// Returns a reference to the LSPS0 client-side handler.
+	pub fn lsps0_client_handler(&self) -> &LSPS0ClientHandler<ES, Arc<DefaultMessageQueue<PM>>> {
+		&self.lsps0_client_handler
+	}
+
+	/// Returns a reference to the LSPS0 server-side handler.
+	pub fn lsps0_service_handler(
+		&self,
+	) -> Option<&LSPS0ServiceHandler<Arc<DefaultMessageQueue<PM>>>> {
+		self.lsps0_service_handler.as_ref()
+	}
+
+	/// Returns a reference to the LSPS1 client-side handler.
+	#[cfg(lsps1)]
+	pub fn lsps1_client_handler(
+		&self,
+	) -> Option<&LSPS1ClientHandler<ES, CM, Arc<DefaultMessageQueue<PM>>, C>> {
+		self.lsps1_client_handler.as_ref()
+	}
+
+	/// Returns a reference to the LSPS1 server-side handler.
+	#[cfg(lsps1)]
+	pub fn lsps1_service_handler(
+		&self,
+	) -> Option<&LSPS1ServiceHandler<ES, CM, Arc<DefaultMessageQueue<PM>>, C>> {
+		self.lsps1_service_handler.as_ref()
+	}
+
+	/// Returns a reference to the LSPS2 client-side handler.
+	pub fn lsps2_client_handler(
+		&self,
+	) -> Option<&LSPS2ClientHandler<ES, Arc<DefaultMessageQueue<PM>>>> {
+		self.lsps2_client_handler.as_ref()
+	}
+
+	/// Returns a reference to the LSPS2 server-side handler.
+	pub fn lsps2_service_handler(
+		&self,
+	) -> Option<&LSPS2ServiceHandler<CM, Arc<DefaultMessageQueue<PM>>>> {
+		self.lsps2_service_handler.as_ref()
+	}
+
+	/// Blocks the current thread until next event is ready and returns it.
+	///
+	/// Typically you would spawn a thread or task that calls this in a loop.
+	#[cfg(feature = "std")]
+	pub fn wait_next_event(&self) -> Event {
+		self.pending_events.wait_next_event()
+	}
+
+	/// Returns `Some` if an event is ready.
+	///
+	/// Typically you would spawn a thread or task that calls this in a loop.
+	pub fn next_event(&self) -> Option<Event> {
+		self.pending_events.next_event()
+	}
+
+	/// Returns and clears all events without blocking.
+	///
+	/// Typically you would spawn a thread or task that calls this in a loop.
+	pub fn get_and_clear_pending_events(&self) -> Vec<Event> {
+		self.pending_events.get_and_clear_pending_events()
+	}
+
+	/// Set a [`PeerManager`] reference for all configured message handlers.
+	///
+	/// This allows the message handlers to wake the [`PeerManager`] by calling
+	/// [`PeerManager::process_events`] after enqueing messages to be sent.
+	///
+	/// Without this the messages will be sent based on whatever polling interval
+	/// your background processor uses.
+	///
+	/// [`PeerManager`]: lightning::ln::peer_handler::PeerManager
+	/// [`PeerManager::process_events`]: lightning::ln::peer_handler::PeerManager::process_events
+	pub fn set_peer_manager(&self, peer_manager: PM) {
+		self.pending_messages.set_peer_manager(peer_manager);
+	}
+
+	fn handle_lsps_message(
+		&self, msg: LSPSMessage, sender_node_id: &PublicKey,
+	) -> Result<(), lightning::ln::msgs::LightningError> {
+		match msg {
+			LSPSMessage::Invalid => {
+				return Err(LightningError { err: format!("{} did not understand a message we previously sent, maybe they don't support a protocol we are trying to use?", sender_node_id), action: ErrorAction::IgnoreAndLog(Level::Error)});
+			}
+			LSPSMessage::LSPS0(msg @ LSPS0Message::Response(..)) => {
+				self.lsps0_client_handler.handle_message(msg, sender_node_id)?;
+			}
+			LSPSMessage::LSPS0(msg @ LSPS0Message::Request(..)) => {
+				match &self.lsps0_service_handler {
+					Some(lsps0_service_handler) => {
+						lsps0_service_handler.handle_message(msg, sender_node_id)?;
+					}
+					None => {
+						return Err(LightningError { err: format!("Received LSPS0 request message without LSPS0 service handler configured. From node = {:?}", sender_node_id), action: ErrorAction::IgnoreAndLog(Level::Info)});
+					}
+				}
+			}
+			#[cfg(lsps1)]
+			LSPSMessage::LSPS1(msg @ LSPS1Message::Response(..)) => match &self.lsps1_client_handler {
+				Some(lsps1_client_handler) => {
+					lsps1_client_handler.handle_message(msg, sender_node_id)?;
+				}
+				None => {
+					return Err(LightningError { err: format!("Received LSPS1 response message without LSPS1 client handler configured. From node = {:?}", sender_node_id), action: ErrorAction::IgnoreAndLog(Level::Info)});
+				}
+			},
+			#[cfg(lsps1)]
+			LSPSMessage::LSPS1(msg @ LSPS1Message::Request(..)) => match &self.lsps1_service_handler {
+				Some(lsps1_service_handler) => {
+					lsps1_service_handler.handle_message(msg, sender_node_id)?;
+				}
+				None => {
+					return Err(LightningError { err: format!("Received LSPS1 request message without LSPS1 service handler configured. From node = {:?}", sender_node_id), action: ErrorAction::IgnoreAndLog(Level::Info)});
+				}
+			},
+			LSPSMessage::LSPS2(msg @ LSPS2Message::Response(..)) => {
+				match &self.lsps2_client_handler {
+					Some(lsps2_client_handler) => {
+						lsps2_client_handler.handle_message(msg, sender_node_id)?;
+					}
+					None => {
+						return Err(LightningError { err: format!("Received LSPS2 response message without LSPS2 client handler configured. From node = {:?}", sender_node_id), action: ErrorAction::IgnoreAndLog(Level::Info)});
+					}
+				}
+			}
+			LSPSMessage::LSPS2(msg @ LSPS2Message::Request(..)) => {
+				match &self.lsps2_service_handler {
+					Some(lsps2_service_handler) => {
+						lsps2_service_handler.handle_message(msg, sender_node_id)?;
+					}
+					None => {
+						return Err(LightningError { err: format!("Received LSPS2 request message without LSPS2 service handler configured. From node = {:?}", sender_node_id), action: ErrorAction::IgnoreAndLog(Level::Info)});
+					}
+				}
+			}
+		}
+		Ok(())
+	}
+}
+
+impl<ES: Deref + Clone + Clone, CM: Deref + Clone, PM: Deref + Clone, C: Deref + Clone>
+	CustomMessageReader for LiquidityManager<ES, CM, PM, C>
+where
+	ES::Target: EntropySource,
+	CM::Target: AChannelManager,
+	PM::Target: APeerManager,
+	C::Target: Filter,
+{
+	type CustomMessage = RawLSPSMessage;
+
+	fn read<RD: lightning::io::Read>(
+		&self, message_type: u16, buffer: &mut RD,
+	) -> Result<Option<Self::CustomMessage>, lightning::ln::msgs::DecodeError> {
+		match message_type {
+			LSPS_MESSAGE_TYPE_ID => Ok(Some(RawLSPSMessage::read(buffer)?)),
+			_ => Ok(None),
+		}
+	}
+}
+
+impl<ES: Deref + Clone, CM: Deref + Clone, PM: Deref + Clone, C: Deref + Clone> CustomMessageHandler
+	for LiquidityManager<ES, CM, PM, C>
+where
+	ES::Target: EntropySource,
+	CM::Target: AChannelManager,
+	PM::Target: APeerManager,
+	C::Target: Filter,
+{
+	fn handle_custom_message(
+		&self, msg: Self::CustomMessage, sender_node_id: &PublicKey,
+	) -> Result<(), lightning::ln::msgs::LightningError> {
+		let message = {
+			let mut request_id_to_method_map = self.request_id_to_method_map.lock().unwrap();
+			LSPSMessage::from_str_with_id_map(&msg.payload, &mut request_id_to_method_map)
+		};
+
+		match message {
+			Ok(msg) => self.handle_lsps_message(msg, sender_node_id),
+			Err(_) => {
+				self.pending_messages.enqueue(sender_node_id, LSPSMessage::Invalid);
+				Ok(())
+			}
+		}
+	}
+
+	fn get_and_clear_pending_msg(&self) -> Vec<(PublicKey, Self::CustomMessage)> {
+		let mut request_id_to_method_map = self.request_id_to_method_map.lock().unwrap();
+		self.pending_messages
+			.get_and_clear_pending_msgs()
+			.iter()
+			.map(|(public_key, lsps_message)| {
+				if let Some((request_id, method_name)) = lsps_message.get_request_id_and_method() {
+					request_id_to_method_map.insert(request_id, method_name);
+				}
+				(
+					*public_key,
+					RawLSPSMessage { payload: serde_json::to_string(&lsps_message).unwrap() },
+				)
+			})
+			.collect()
+	}
+
+	fn provided_node_features(&self) -> NodeFeatures {
+		let mut features = NodeFeatures::empty();
+
+		if self.service_config.is_some() {
+			features.set_optional_custom_bit(LSPS_FEATURE_BIT).unwrap();
+		}
+
+		features
+	}
+
+	fn provided_init_features(&self, _their_node_id: &PublicKey) -> InitFeatures {
+		let mut features = InitFeatures::empty();
+
+		if self.service_config.is_some() {
+			features.set_optional_custom_bit(LSPS_FEATURE_BIT).unwrap();
+		}
+
+		features
+	}
+}
+
+impl<ES: Deref + Clone, CM: Deref + Clone, PM: Deref + Clone, C: Deref + Clone> Listen
+	for LiquidityManager<ES, CM, PM, C>
+where
+	ES::Target: EntropySource,
+	CM::Target: AChannelManager,
+	PM::Target: APeerManager,
+	C::Target: Filter,
+{
+	fn filtered_block_connected(
+		&self, header: &bitcoin::BlockHeader, txdata: &chain::transaction::TransactionData,
+		height: u32,
+	) {
+		if let Some(best_block) = &self.best_block {
+			let best_block = best_block.read().unwrap();
+			assert_eq!(best_block.block_hash(), header.prev_blockhash,
+			"Blocks must be connected in chain-order - the connected header must build on the last connected header");
+			assert_eq!(best_block.height(), height - 1,
+			"Blocks must be connected in chain-order - the connected block height must be one greater than the previous height");
+		}
+
+		self.transactions_confirmed(header, txdata, height);
+		self.best_block_updated(header, height);
+	}
+
+	fn block_disconnected(&self, header: &bitcoin::BlockHeader, height: u32) {
+		let new_height = height - 1;
+		if let Some(best_block) = &self.best_block {
+			let mut best_block = best_block.write().unwrap();
+			assert_eq!(best_block.block_hash(), header.block_hash(),
+				"Blocks must be disconnected in chain-order - the disconnected header must be the last connected header");
+			assert_eq!(best_block.height(), height,
+				"Blocks must be disconnected in chain-order - the disconnected block must have the correct height");
+			*best_block = BestBlock::new(header.prev_blockhash, new_height)
+		}
+
+		// TODO: Call block_disconnected on all sub-modules that require it, e.g., LSPS1MessageHandler.
+		// Internally this should call transaction_unconfirmed for all transactions that were
+		// confirmed at a height <= the one we now disconnected.
+	}
+}
+
+impl<ES: Deref + Clone, CM: Deref + Clone, PM: Deref + Clone, C: Deref + Clone> Confirm
+	for LiquidityManager<ES, CM, PM, C>
+where
+	ES::Target: EntropySource,
+	CM::Target: AChannelManager,
+	PM::Target: APeerManager,
+	C::Target: Filter,
+{
+	fn transactions_confirmed(
+		&self, header: &bitcoin::BlockHeader, txdata: &chain::transaction::TransactionData,
+		height: u32,
+	) {
+		// TODO: Call transactions_confirmed on all sub-modules that require it, e.g., LSPS1MessageHandler.
+	}
+
+	fn transaction_unconfirmed(&self, txid: &bitcoin::Txid) {
+		// TODO: Call transaction_unconfirmed on all sub-modules that require it, e.g., LSPS1MessageHandler.
+		// Internally this should call transaction_unconfirmed for all transactions that were
+		// confirmed at a height <= the one we now unconfirmed.
+	}
+
+	fn best_block_updated(&self, header: &bitcoin::BlockHeader, height: u32) {
+		// TODO: Call best_block_updated on all sub-modules that require it, e.g., LSPS1MessageHandler.
+	}
+
+	fn get_relevant_txids(&self) -> Vec<(bitcoin::Txid, Option<bitcoin::BlockHash>)> {
+		// TODO: Collect relevant txids from all sub-modules that, e.g., LSPS1MessageHandler.
+		Vec::new()
+	}
+}
+
+'''
+'''--- src/message_queue.rs ---
+//! Holds types and traits used to implement message queues for [`LSPSMessage`]s.
+
+use crate::lsps0::msgs::LSPSMessage;
+use crate::prelude::{Vec, VecDeque};
+use crate::sync::Mutex;
+
+use lightning::ln::peer_handler::APeerManager;
+
+use bitcoin::secp256k1::PublicKey;
+
+use core::ops::Deref;
+
+/// Represents a simple message queue that the LSPS message handlers use to send messages to a given counterparty.
+pub trait MessageQueue {
+	/// Enqueues an LSPS message to be sent to the counterparty with the given node id.
+	///
+	/// Implementations need to take care of message delivery to the counterparty via the
+	/// LSPS0/BOLT8 transport protocol.
+	fn enqueue(&self, counterparty_node_id: &PublicKey, msg: LSPSMessage);
+}
+
+/// The default [`MessageQueue`] Implementation used by [`LiquidityManager`].
+///
+/// [`LiquidityManager`]: crate::LiquidityManager
+pub struct DefaultMessageQueue<PM: Deref>
+where
+	PM::Target: APeerManager,
+{
+	queue: Mutex<VecDeque<(PublicKey, LSPSMessage)>>,
+	peer_manager: Mutex<Option<PM>>,
+}
+
+impl<PM: Deref> DefaultMessageQueue<PM>
+where
+	PM::Target: APeerManager,
+{
+	pub(crate) fn new() -> Self {
+		let queue = Mutex::new(VecDeque::new());
+		let peer_manager = Mutex::new(None);
+		Self { queue, peer_manager }
+	}
+
+	pub(crate) fn get_and_clear_pending_msgs(&self) -> Vec<(PublicKey, LSPSMessage)> {
+		self.queue.lock().unwrap().drain(..).collect()
+	}
+
+	pub(crate) fn set_peer_manager(&self, peer_manager: PM) {
+		*self.peer_manager.lock().unwrap() = Some(peer_manager);
+	}
+}
+
+impl<PM: Deref> MessageQueue for DefaultMessageQueue<PM>
+where
+	PM::Target: APeerManager,
+{
+	fn enqueue(&self, counterparty_node_id: &PublicKey, msg: LSPSMessage) {
+		{
+			let mut queue = self.queue.lock().unwrap();
+			queue.push_back((*counterparty_node_id, msg));
+		}
+
+		if let Some(peer_manager) = self.peer_manager.lock().unwrap().as_ref() {
+			peer_manager.as_ref().process_events();
+		}
+	}
+}
+
+'''
+'''--- src/sync/mod.rs ---
+#[cfg(feature = "std")]
+pub use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+#[cfg(not(feature = "std"))]
+mod nostd_sync;
+#[cfg(not(feature = "std"))]
+pub use nostd_sync::*;
+
+'''
+'''--- src/sync/nostd_sync.rs ---
+//! This file was copied from `rust-lightning`.
+pub use ::alloc::sync::Arc;
+use core::cell::{Ref, RefCell, RefMut};
+use core::ops::{Deref, DerefMut};
+
+pub type LockResult<Guard> = Result<Guard, ()>;
+
+pub struct Mutex<T: ?Sized> {
+	inner: RefCell<T>,
+}
+
+#[must_use = "if unused the Mutex will immediately unlock"]
+pub struct MutexGuard<'a, T: ?Sized + 'a> {
+	lock: RefMut<'a, T>,
+}
+
+impl<T: ?Sized> Deref for MutexGuard<'_, T> {
+	type Target = T;
+
+	fn deref(&self) -> &T {
+		&self.lock.deref()
+	}
+}
+
+impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
+	fn deref_mut(&mut self) -> &mut T {
+		self.lock.deref_mut()
+	}
+}
+
+impl<T> Mutex<T> {
+	pub fn new(inner: T) -> Mutex<T> {
+		Mutex { inner: RefCell::new(inner) }
+	}
+
+	pub fn lock<'a>(&'a self) -> LockResult<MutexGuard<'a, T>> {
+		Ok(MutexGuard { lock: self.inner.borrow_mut() })
+	}
+
+	pub fn try_lock<'a>(&'a self) -> LockResult<MutexGuard<'a, T>> {
+		Ok(MutexGuard { lock: self.inner.borrow_mut() })
+	}
+
+	pub fn into_inner(self) -> LockResult<T> {
+		Ok(self.inner.into_inner())
+	}
+}
+
+pub struct RwLock<T: ?Sized> {
+	inner: RefCell<T>,
+}
+
+pub struct RwLockReadGuard<'a, T: ?Sized + 'a> {
+	lock: Ref<'a, T>,
+}
+
+pub struct RwLockWriteGuard<'a, T: ?Sized + 'a> {
+	lock: RefMut<'a, T>,
+}
+
+impl<T: ?Sized> Deref for RwLockReadGuard<'_, T> {
+	type Target = T;
+
+	fn deref(&self) -> &T {
+		&self.lock.deref()
+	}
+}
+
+impl<T: ?Sized> Deref for RwLockWriteGuard<'_, T> {
+	type Target = T;
+
+	fn deref(&self) -> &T {
+		&self.lock.deref()
+	}
+}
+
+impl<T: ?Sized> DerefMut for RwLockWriteGuard<'_, T> {
+	fn deref_mut(&mut self) -> &mut T {
+		self.lock.deref_mut()
+	}
+}
+
+impl<T> RwLock<T> {
+	pub fn new(inner: T) -> RwLock<T> {
+		RwLock { inner: RefCell::new(inner) }
+	}
+
+	pub fn read<'a>(&'a self) -> LockResult<RwLockReadGuard<'a, T>> {
+		Ok(RwLockReadGuard { lock: self.inner.borrow() })
+	}
+
+	pub fn write<'a>(&'a self) -> LockResult<RwLockWriteGuard<'a, T>> {
+		Ok(RwLockWriteGuard { lock: self.inner.borrow_mut() })
+	}
+
+	pub fn try_write<'a>(&'a self) -> LockResult<RwLockWriteGuard<'a, T>> {
+		match self.inner.try_borrow_mut() {
+			Ok(lock) => Ok(RwLockWriteGuard { lock }),
+			Err(_) => Err(()),
+		}
+	}
+}
+
+'''
+'''--- src/tests/mod.rs ---
+pub mod utils;
+
+'''
+'''--- src/tests/utils.rs ---
+use crate::lsps0::msgs::LSPSMessage;
+use crate::message_queue::MessageQueue;
+use crate::prelude::{Vec, VecDeque};
+use crate::sync::Mutex;
+
+use lightning::sign::EntropySource;
+
+use bitcoin::secp256k1::PublicKey;
+
+pub(crate) struct TestMessageQueue {
+	queue: Mutex<VecDeque<(PublicKey, LSPSMessage)>>,
+}
+
+impl TestMessageQueue {
+	pub(crate) fn new() -> Self {
+		let queue = Mutex::new(VecDeque::new());
+		Self { queue }
+	}
+
+	pub(crate) fn get_and_clear_pending_msgs(&self) -> Vec<(PublicKey, LSPSMessage)> {
+		self.queue.lock().unwrap().drain(..).collect()
+	}
+}
+
+impl MessageQueue for TestMessageQueue {
+	fn enqueue(&self, counterparty_node_id: &PublicKey, msg: LSPSMessage) {
+		{
+			let mut queue = self.queue.lock().unwrap();
+			queue.push_back((*counterparty_node_id, msg));
+		}
+	}
+}
+
+pub struct TestEntropy {}
+impl EntropySource for TestEntropy {
+	fn get_secure_random_bytes(&self) -> [u8; 32] {
+		[0; 32]
+	}
+}
+
+'''
+'''--- src/utils.rs ---
+use bitcoin::secp256k1::PublicKey;
+use core::{fmt::Write, ops::Deref};
+use lightning::io;
+use lightning::sign::EntropySource;
+
+use crate::lsps0::msgs::RequestId;
+use crate::prelude::{String, Vec};
+
+/// Maximum transaction index that can be used in a `short_channel_id`.
+/// This value is based on the 3-bytes available for tx index.
+pub const MAX_SCID_TX_INDEX: u64 = 0x00ffffff;
+
+/// Maximum vout index that can be used in a `short_channel_id`. This
+/// value is based on the 2-bytes available for the vout index.
+pub const MAX_SCID_VOUT_INDEX: u64 = 0xffff;
+
+/// Extracts the block height (most significant 3-bytes) from the `short_channel_id`.
+pub fn block_from_scid(short_channel_id: &u64) -> u32 {
+	(short_channel_id >> 40) as u32
+}
+
+/// Extracts the tx index (bytes [2..4]) from the `short_channel_id`.
+pub fn tx_index_from_scid(short_channel_id: &u64) -> u32 {
+	((short_channel_id >> 16) & MAX_SCID_TX_INDEX) as u32
+}
+
+/// Extracts the vout (bytes [0..2]) from the `short_channel_id`.
+pub fn vout_from_scid(short_channel_id: &u64) -> u16 {
+	((short_channel_id) & MAX_SCID_VOUT_INDEX) as u16
+}
+
+pub fn scid_from_human_readable_string(human_readable_scid: &str) -> Result<u64, ()> {
+	let mut parts = human_readable_scid.split('x');
+
+	let block: u64 = parts.next().ok_or(())?.parse().map_err(|_e| ())?;
+	let tx_index: u64 = parts.next().ok_or(())?.parse().map_err(|_e| ())?;
+	let vout_index: u64 = parts.next().ok_or(())?.parse().map_err(|_e| ())?;
+
+	Ok((block << 40) | (tx_index << 16) | vout_index)
+}
+
+pub(crate) fn generate_request_id<ES: Deref>(entropy_source: &ES) -> RequestId
+where
+	ES::Target: EntropySource,
+{
+	let bytes = entropy_source.get_secure_random_bytes();
+	RequestId(hex_str(&bytes[0..16]))
+}
+
+#[inline]
+pub fn hex_str(value: &[u8]) -> String {
+	let mut res = String::with_capacity(2 * value.len());
+	for v in value {
+		write!(&mut res, "{:02x}", v).expect("Unable to write");
+	}
+	res
+}
+
+pub fn to_vec(hex: &str) -> Option<Vec<u8>> {
+	let mut out = Vec::with_capacity(hex.len() / 2);
+
+	let mut b = 0;
+	for (idx, c) in hex.as_bytes().iter().enumerate() {
+		b <<= 4;
+		match *c {
+			b'A'..=b'F' => b |= c - b'A' + 10,
+			b'a'..=b'f' => b |= c - b'a' + 10,
+			b'0'..=b'9' => b |= c - b'0',
+			_ => return None,
+		}
+		if (idx & 1) == 1 {
+			out.push(b);
+			b = 0;
+		}
+	}
+
+	Some(out)
+}
+
+pub fn to_compressed_pubkey(hex: &str) -> Option<PublicKey> {
+	if hex.len() != 33 * 2 {
+		return None;
+	}
+	let data = match to_vec(&hex[0..33 * 2]) {
+		Some(bytes) => bytes,
+		None => return None,
+	};
+	match PublicKey::from_slice(&data) {
+		Ok(pk) => Some(pk),
+		Err(_) => None,
+	}
+}
+
+pub fn parse_pubkey(pubkey_str: &str) -> Result<PublicKey, io::Error> {
+	let pubkey = to_compressed_pubkey(pubkey_str);
+	if pubkey.is_none() {
+		return Err(io::Error::new(
+			io::ErrorKind::Other,
+			"ERROR: unable to parse given pubkey for node",
+		));
+	}
+
+	Ok(pubkey.unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn parses_human_readable_scid_correctly() {
+		let block = 140;
+		let tx_index = 123;
+		let vout = 22;
+
+		let human_readable_scid = format!("{}x{}x{}", block, tx_index, vout);
+
+		let scid = scid_from_human_readable_string(&human_readable_scid).unwrap();
+
+		assert_eq!(block_from_scid(&scid), block);
+		assert_eq!(tx_index_from_scid(&scid), tx_index);
+		assert_eq!(vout_from_scid(&scid), vout);
+	}
+}
+
+'''

@@ -1,0 +1,1605 @@
+*GitHub Repository "gagdiez/influences"*
+
+'''--- README.md ---
+# Influences
+
+![banner](imgs/banner.png)
+
+Influences is a decentralized social network that allow fans to subscribe to their favourite influencers for a monthly fee. Influencers in turn share images and videos.
+
+The main advantage of Influences is that it's completely decentralized. It's front-end is hosted in skynet, the decentralized storage platform of SIA. Moreover, all the content that the influencers upload also goes to skynet! Meanwhile, the back-end is implemented as a smart contract hosted in NEAR (currently in the testnet).
+
+Visit it now at: [Influences](https://siasky.net/hns/influences)
+
+See the video of how it works here: [video](https://siasky.net/AAAC6btJgA0btFFpdz5zIaTxCdkeJgxIzX8G_Y_1Rmtr7w)
+
+'''
+'''--- as-pect.config.js ---
+module.exports = require('near-sdk-as/imports')
+'''
+'''--- asconfig.json ---
+{
+  "extends": "near-sdk-as/asconfig.json",
+  "entry": "assembly/main.ts",
+  "options": {
+    "binaryFile": "out/main.wasm"
+  }
+}
+'''
+'''--- assembly/__tests__/as-pect.d.ts ---
+/// <reference types="@as-pect/assembly/types/as-pect" />
+'''
+'''--- assembly/__tests__/main.spec.ts ---
+import { setGreeting } from '../main';
+import { storage, Context } from "near-sdk-as";
+
+describe("Greeting ", () => {
+    it("should be set and read", () => {
+        setGreeting("hello world");
+        const greeting = storage.get<string>(Context.sender);
+    });
+});
+
+'''
+'''--- assembly/as_types.d.ts ---
+/// <reference types="near-sdk-as/assembly/as_types" />
+'''
+'''--- assembly/main.ts ---
+import {context, env, u128, ContractPromiseBatch, logging} from "near-sdk-as";
+import {subscribed, influencers_content, influencers_profile,
+        influencers_of_fan, influencer_nbr_fans, Profile, ContentList,
+        Content, InfluencerList, promoted_vector} from "./model"
+
+function hasAccessTo(influencer:string): bool{
+  // Returns if you have access to the input influencer
+
+  if (context.sender == influencer){
+      // You have access to your own content
+      return true
+  }
+
+  // Key to denote influencer + user
+  let key:string = influencer + "@" + context.sender
+  
+  if (!subscribed.contains(key)){
+      // You are not subscribed to the influencer
+      return false
+  }
+  
+  // You are in the list... but lets check if one month has passed
+  let when:u64 = subscribed.getSome(key)
+  let now:u64 = env.block_timestamp()
+  let one_month:u64 = 2592000000000000 //one_minute:u64 = 60000000000
+
+  if (now - when < one_month){return true}
+    
+  // More than a month has passed since the last payment, you are not subs.
+  return false
+}
+
+export function subscribeTo(influencer: string): void {
+  // Allows you to subscribe to an influencer
+  let profile = influencers_profile.get(influencer)
+ 
+  if(!profile){
+    // The influencer doesn't exists, return the money
+    ContractPromiseBatch.create(context.sender).transfer(context.attachedDeposit)
+    return
+  }
+
+  let key = influencer + "@" + context.sender // Key for dict
+  let time: u64 = env.block_timestamp()
+
+  if (context.attachedDeposit >= profile.price){
+    subscribed.set(key, time) // record the time at which you paid
+    ContractPromiseBatch.create(influencer).transfer(profile.price) // pay influencer  
+    addFan_addInfluencer(influencer) // fans++, and add influencer to your list
+  }else{
+    ContractPromiseBatch.create(context.sender).transfer(context.attachedDeposit)
+  }
+}
+
+// CONTENT HANDLING
+
+function getContentOf(influencer:string):Array<Content>{
+  // Called by fans/influencers to get the influencer's content
+  if (!hasAccessTo(influencer)){return new Array<Content>()}
+
+  let links = influencers_content.get(influencer)
+  if (!links){return new Array<Content>()}
+  return links.content
+}
+
+export function addToMyContent(sialink:string, description:string):bool{
+  // The influencer (context.sender) wanst to add content (a sialink)
+  let links = getContentOf(context.sender)
+  let time: u64 = env.block_timestamp()
+  let new_content = new Content(sialink, time, description)
+
+  links.push(new_content)
+  let new_links = new ContentList(links)
+  influencers_content.set(context.sender, new_links)
+  return true
+}
+
+export function deleteFromMyContent(sialink:string):bool{
+  // The influencer (context.sender) wants to delete content (a sialink)
+  const links = getContentOf(context.sender)
+
+  for (let i = 0; i < links.length; i++) {
+    if (sialink == links[i].sialink) links.splice(i, 1);
+  }
+
+  let new_links = new ContentList(links)
+  influencers_content.set(context.sender, new_links)
+  return true
+}
+
+// PROFILE HANDLING
+
+export function getProfileOf(influencer:string): Profile | null{
+  // get profile of an influencer  
+  let profile = influencers_profile.get(influencer)
+
+  if(!profile){return null}
+  
+  profile.hasAccess = hasAccessTo(influencer)
+
+  let content = getContentOf(influencer)
+  profile.content = content
+
+  let fans = influencer_nbr_fans.getSome(influencer)
+  profile.fans = fans
+
+  return profile
+}
+
+export function updateMyProfile(name:string, banner:string, avatar:string,
+                                description: string, price:u128):bool{
+  let new_profile = new Profile(context.sender, name, banner, avatar,
+                                description, price, [], 0, false)
+
+  //Copy number of fans if the profiled existed already
+  let my_profile = influencers_profile.get(context.sender)
+  if (!my_profile){influencer_nbr_fans.set(context.sender, 0)}
+
+  influencers_profile.set(context.sender, new_profile)
+
+  return true
+}
+
+// Influencers/fans interaction handling
+export function getMyInfluencers():Array<Profile>{
+  
+  let links = influencers_of_fan.get(context.sender)
+  if (!links){
+      return new Array<Profile>()
+  }
+  
+  let profiles = new Array<Profile>();
+  for (let i = 0; i < links.influencers.length; i++) {
+    let aprofile = getProfileOf(links.influencers[i])
+    if(aprofile){profiles.push(aprofile)}
+  }
+  return profiles
+}
+
+function addFan_addInfluencer(influencer:string):void{
+  let influencers = influencers_of_fan.get(context.sender)
+  let my_influencers: Array<string>
+  
+  if (!influencers){my_influencers = new Array<string>()}
+  else{my_influencers=influencers.influencers}
+
+  for (let i = 0; i < my_influencers.length; i++) {
+    // If we have already subscribed at some point, return
+    if (influencer == my_influencers[i]) return;
+  }
+
+  // Add influencer to my influencers
+  my_influencers.push(influencer)
+  let new_list = new InfluencerList(my_influencers)
+  influencers_of_fan.set(context.sender, new_list)
+  
+  // Add me as fan of influencer
+  let fans = influencer_nbr_fans.getSome(influencer)
+  influencer_nbr_fans.set(influencer, fans+1)
+}
+
+// PROMOTED HANDLING
+
+export function getPromoted():Array<Profile>{
+  let promoted:Array<Profile> = new Array<Profile>()
+
+  for (let i=0; i < promoted_vector.length; i++){
+    let profile = getProfileOf(promoted_vector[i])
+    if(profile){
+      promoted.push(profile)
+    }
+  }
+
+  return promoted
+}
+
+export function promoteMe():void{
+  let price:u128 = u128.from('10000000000000000000000000') // 10N
+
+  if (context.attachedDeposit >= price){
+    promoted_vector.push(context.sender)
+  }else{
+    ContractPromiseBatch.create(context.sender).transfer(context.attachedDeposit)
+  }
+}
+
+'''
+'''--- assembly/model.ts ---
+import { PersistentVector, PersistentMap, u128 } from "near-sdk-as";
+
+// MAP "fan,influencer" -> timestamp, so we can cut them after one month
+export const subscribed = new PersistentMap<string, u64>("Sub")
+
+// MAP influencer -> [{link, upload_time, description}]
+@nearBindgen
+export class Content {
+  constructor(public sialink: string, public creationDate:u64, 
+              public description:string){}
+}
+
+@nearBindgen
+export class ContentList {
+  constructor(public content: Array<Content>) {}
+}
+
+export const influencers_content = new PersistentMap<string, ContentList>("Con")
+
+// MAP: influencer -> Profile
+@nearBindgen
+export class Profile {
+  constructor(public id:string, public name:string, public banner:string,
+              public avatar: string, public description:string,
+              public price:u128, public content:Array<Content>,
+              public fans:u16=0, public hasAccess:bool=false){}
+}
+
+export const influencers_profile = new PersistentMap<string, Profile>("Pro")
+
+// MAP: influencer
+
+@nearBindgen
+export class InfluencerList {
+  constructor(public influencers: Array<string>) {}
+}
+export const influencers_of_fan = new PersistentMap<string, InfluencerList>("Inf")
+
+export const influencer_nbr_fans = new PersistentMap<string, u16>('Fan')
+
+// MAP: promoted influencers
+export let promoted_vector = new PersistentVector<string>("Promot")
+
+'''
+'''--- assembly/tsconfig.json ---
+{
+  "extends": "assemblyscript/std/assembly.json",
+  "include": [
+    "./**/*.ts"
+  ]
+}
+
+'''
+'''--- package.json ---
+{
+  "name": "new-awesome-project",
+  "version": "0.0.1",
+  "license": "UNLICENSED",
+  "scripts": {
+    "build": "npm run build:web",
+    "build:web": "parcel build src/index.html --public-url ./",
+    "deploy:pages": "gh-pages -d dist/",
+    "deploy": "npm run build && npm run deploy:pages",
+    "prestart": "",
+    "start": "echo The app is starting! It will automatically open in your browser when ready && env-cmd -f ./neardev/dev-account.env parcel src/index.html --open",
+    "dev": "nodemon --watch assembly -e ts --exec \"npm run start\"",
+    "test": ""
+  },
+  "devDependencies": {
+    "env-cmd": "^10.1.0",
+    "gh-pages": "^3.0.0",
+    "jest": "^26.0.1",
+    "jest-environment-node": "^26.0.0",
+    "near-sdk-as": "^1.0.1",
+    "near-cli": "^1.0.1",
+    "nodemon": "^2.0.3",
+    "parcel-bundler": "^1.12.4"
+  },
+  "dependencies": {
+    "near-api-js": "^0.29.0",
+    "regenerator-runtime": "^0.13.5"
+  },
+  "jest": {
+    "testEnvironment": "near-cli/test_environment",
+    "testPathIgnorePatterns": [
+      "<rootDir>/assembly/",
+      "<rootDir>/node_modules/"
+    ]
+  }
+}
+
+'''
+'''--- src/assets/style.css ---
+/* HTML ELEMS*/
+a,
+a:hover,
+a:focus {
+  color: inherit;
+  text-decoration: none;
+  transition: all 0.3s;
+  cursor:pointer;
+}
+
+@import "https://fonts.googleapis.com/css?family=Poppins:300,400,500,600,700";
+body {
+  font-family: 'Poppins', sans-serif;
+}
+
+.navbar {
+  padding: 5px 10px;
+  background: #fff;
+  border: none;
+  border-radius: 0;
+  box-shadow: 1px 1px 10px rgba(0, 0, 0, 0.1);
+  border-bottom: 1px solid #dbdbdb;
+}
+
+nav .btn{
+  font-size:1.3rem;
+}
+
+p {
+  font-family: 'Poppins', sans-serif;
+  font-size: 1.1em;
+  font-weight: 300;
+  line-height: 1.7em;
+  color: #999;
+}
+
+/*CLASSES*/
+.avatar {
+  position: relative;
+  top:-105px;
+  margin-bottom:-105px;
+}
+
+.avatar img {
+  width: 200px;
+  height: 200px;
+  object-fit: cover;
+  -webkit-border-radius: 25%;
+  -moz-border-radius: 25%;
+  border-radius: 25%;
+  border: 5px solid rgba(255,255,255,0.5);
+}
+
+.carousel-caption{
+  bottom:3px;
+  right:auto;
+  left:50%;
+  transform: translateX(-50%);
+  background-color: #212529;
+  padding:0 10px;
+}
+
+.featured-avatar {
+  position: absolute;
+  bottom: 19px;
+  transform: translateX(-50%);
+  left: 50%;
+}
+
+.featured-avatar img {
+  width: 135px;
+  height: 135px;
+  object-fit: cover;
+  -webkit-border-radius: 25%;
+  -moz-border-radius: 25%;
+  border-radius: 25%;
+  border: 5px solid rgba(255,255,255,0.5);
+}
+
+.banner{
+  overflow:hidden;
+  background-color:"#cccccc";
+  height:350px;
+  margin: 0px -10px 0 -10px;
+  border-radius: 4px 4px 0 0;  
+}
+
+.banner img{
+  width:100%;
+  /*translate:0 -50%;*/
+}
+
+.btn-upload {
+  width: 400px;
+  height: 400px;
+  font-size: xxx-large;
+  border-radius: 5%;
+}
+
+.carousel-item-next, .carousel-item-prev, .carousel-item.active {
+  transition: transform 2s ease;
+  width:100%;
+  overflow:hidden;
+  min-height: 150px;
+}
+
+.container{
+  max-width:80%;
+}
+
+.content-container {
+  background-color:#fff; 
+  padding-top:5px;
+  margin-top:15px;
+  min-height: 100vh;
+  height: 100%;
+  border:1px solid #dbdbdb;
+  border-bottom:none;
+  border-radius:4px;
+}
+
+.content-preview {
+  max-width: 700px;
+  max-height: 700px;
+  border-radius: 5%;
+}
+
+#ctitle{
+  font-size: 80%;
+  font-weight: 400;
+  margin-top:10px;
+}
+
+.h-v-centered{
+  width:100%;
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50% -50%);
+  -webkit-transform: translate(-50%,-50%);
+}
+
+.featured-container {
+  background-color:#fff; 
+  padding:5px;
+  margin-top:15px;
+  border:1px solid #dbdbdb;
+  border-radius:4px;
+  max-width:30%
+}
+
+.footer{
+  margin:10px 0 0 0;
+}
+
+.grid-item--width2 { max-width: 50%; }
+
+.grid-content {
+  background: #fff;
+  padding: 12px;
+  box-shadow: 0 0.2rem 1.2rem rgba(0,0,0,0.2);
+}
+
+.grid-content .content-info {
+  /*font-size: 1.8rem;*/
+  text-align: center;
+  line-height: 2em;
+}
+
+.landing-img{
+  max-width:100%;
+  padding:5px;
+}
+
+.line {
+  width: 100%;
+  height: 1px;
+  border-bottom: 1px dashed #ddd;
+  margin: 40px 0;
+}
+
+#logged-in{
+  background-image: url('./background.jpg');
+}
+
+.navbar-btn {
+  box-shadow: none;
+  outline: none !important;
+  border: none;
+}
+
+.navbar-brand{
+  color:#484848 !important;
+}
+
+.navbar-collapse{
+  flex:0;
+}
+
+.promo-text{
+  position:absolute;
+  color:#212529;
+  bottom:5px;
+  right:5px;
+  background-color:#ffffff50;
+  padding:0 5px;
+}
+
+.tcontent{
+  margin: -10px 0 4px 0;
+}
+
+'''
+'''--- src/blockchain.js ---
+import * as nearAPI from 'near-api-js'
+import getConfig from './config'
+
+const nearConfig = getConfig('development')
+
+// ===== API =====
+
+export function login() {
+  window.walletConnection.requestSignIn(nearConfig.contractName)
+}
+
+export function logout() {
+  window.walletConnection.signOut()
+  // reload page
+  window.location.replace(window.location.origin + window.location.pathname)
+}
+
+export async function initNEAR() {
+  // Initialize connection to the NEAR testnet - CALL IT ON LOAD
+  window.near = await nearAPI.connect(
+      Object.assign(nearConfig,
+                    {deps:{keyStore: new nearAPI.keyStores.BrowserLocalStorageKeyStore()}})
+  )
+
+  // Initializing Wallet based Account
+  window.walletConnection = await new nearAPI.WalletConnection(window.near,
+                                                               nearConfig.contractName)
+  try{
+    console.log("trying")
+    await walletConnection._completeSignInWithAccessKey()
+  }catch{
+    // weird fix for when the keys were not set up
+    console.log("catching")
+    walletConnection.signOut()
+    document.getElementById("near_error").style.display = "block"
+  }
+
+  // Getting the Account ID
+  window.walletAccount = window.walletConnection.account()
+
+  // Initializing contract APIs
+  window.contract = await near.loadContract(
+    nearConfig.contractName,
+    {viewMethods: [],
+     changeMethods: ['subscribeTo', 'getMyInfluencers', 'addToMyContent',
+                     'deleteFromMyContent', 'updateMyProfile', 'getProfileOf',
+                     'promoteMe', 'getPromoted'],
+     sender: window.walletAccount.accountId}
+  )
+}
+
+export async function getPromoted(){
+  // Returns array of Profiles
+  let account = window.walletConnection.account()
+  let result = await account.functionCall(nearConfig.contractName,
+                                          'getPromoted', {}, 120000000000000, 0)
+  let promoted_profiles = nearAPI.providers.getTransactionLastResult(result)
+
+  for(let i=0; i<promoted_profiles.length; i++){
+    let price = nearAPI.utils.format.formatNearAmount(promoted_profiles[i].price).toString()
+    promoted_profiles[i].price = price
+  }
+  return promoted_profiles
+}
+
+window.nearConfig = nearConfig
+window.providers = nearAPI.providers
+
+export async function promoteMe(money_amount){
+  let amount = nearAPI.utils.format.parseNearAmount(money_amount.toString())
+  let account = window.walletConnection.account()
+  account.functionCall(nearConfig.contractName, 'promoteMe', {}, 0, amount)
+}
+
+// CONTENT
+export async function hasAccessTo(influencer){
+  // Returns true if the user is subscribed to the influencer
+  return await contract.hasAccessTo({influencer})
+}
+
+export async function subscribeTo(influencer, money_amount){
+  // OPENS another webpage to pay
+  let amount = nearAPI.utils.format.parseNearAmount(money_amount.toString())
+  let account = window.walletConnection.account()
+  account.functionCall(nearConfig.contractName, 'subscribeTo',
+               {influencer}, 0, amount)
+}
+
+export async function getContentOf(influencer){
+  // Returns a list of {sialink:str, creationDate:int, description:str)}
+  return await contract.getContentOf({influencer})
+}
+
+export async function addToMyContent(sialink,description){
+  // Returns true if everything goes right  
+  return await contract.addToMyContent({sialink,description})
+}
+
+export async function deleteFromMyContent(sialink){
+  // Returns true if everything goes right  
+  return await contract.deleteFromMyContent({sialink})
+}
+
+// PROFILE
+export async function updateMyProfile(name, banner, avatar, description, price){
+  // Returns true if everything goes right
+  price = nearAPI.utils.format.parseNearAmount(price? price : "0");
+  return await contract.updateMyProfile({name, banner, avatar,
+                                         description, price})
+}
+
+export async function getProfileOf(influencer){
+  // Returns NULL or {name:str, banner:str, avatar:str, description:str, price:str, fans:int}
+  let profile = await contract.getProfileOf({influencer})
+  if(!profile){console.error("Profile does not exist"); return;}
+  profile.price = nearAPI.utils.format.formatNearAmount(profile.price).toString()
+
+  return profile
+}
+
+export async function getMyInfluencers(){
+  // Returns a list of strings (representing each influencer-id)
+  let account = window.walletConnection.account()
+  let result = await account.functionCall(nearConfig.contractName, 'getMyInfluencers', {}, 120000000000000, 0)
+  return nearAPI.providers.getTransactionLastResult(result)
+}
+
+// SIA
+export function generateUUID() {
+  let uuid = ''
+  const cs = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+  for (let i = 0; i < 16; i++) {
+    uuid += cs.charAt(Math.floor(Math.random() * cs.length))
+  }
+  return uuid;
+}
+
+export async function upload_file_to_sia(file){
+  const uuid = generateUUID()
+
+  var formData = new FormData()
+  formData.append("file", file)
+
+  let response = await fetch('https://siasky.net/skynet/skyfile/'+uuid,
+                             {method:"POST", body:formData})
+                .then(response => response.json())
+                .then(success => {return success.skylink})
+                .catch(error => {console.log(error)})
+  return response
+}
+
+'''
+'''--- src/config.js ---
+const CONTRACT_NAME = process.env.CONTRACT_NAME ||'new-awesome-project'
+
+function getConfig(env) {
+  switch (env) {
+
+  case 'production':
+  case 'mainnet':
+    return {
+      networkId: 'mainnet',
+      nodeUrl: 'https://rpc.mainnet.near.org',
+      contractName: CONTRACT_NAME,
+      walletUrl: 'https://wallet.near.org',
+      helperUrl: 'https://helper.mainnet.near.org',
+      explorerUrl: 'https://explorer.mainnet.near.org',
+    }
+  case 'development':
+  case 'testnet':
+    return {
+      networkId: 'testnet',
+      nodeUrl: 'https://rpc.testnet.near.org',
+      contractName: CONTRACT_NAME,
+      walletUrl: 'https://wallet.testnet.near.org',
+      helperUrl: 'https://helper.testnet.near.org',
+      explorerUrl: 'https://explorer.testnet.near.org',
+    }
+  }
+}
+
+module.exports = getConfig
+
+'''
+'''--- src/index.html ---
+
+<!DOCTYPE html>
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <title>Influences &mdash; Create content. Share it. Earn Money. </title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Influences is a social network on the blockchain." />
+  <meta name="keywords" content="blockchain, social network, siacoin, near, influencer" />
+  <meta name="author" content="lunefromthemoon & gagdiez" />
+  <meta name="og:image" content="https://siasky.net/_A4NSxErGomTaaoRDC3beglvHzWMqVf6vkTIhmmTczX3pg/landing.f921c0e2.jpg">
+
+  <!-- Place favicon.ico and apple-touch-icon.png in the root directory -->
+  <link rel="shortcut icon" href="assets/logo.png">
+
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/twitter-bootstrap/4.3.1/css/bootstrap.min.css">
+  <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/font-awesome/4.7.0/css/font-awesome.min.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/ekko-lightbox/5.3.0/ekko-lightbox.css" integrity="sha512-Velp0ebMKjcd9RiCoaHhLXkR1sFoCCWXNp6w4zj1hfMifYB5441C+sKeBl/T/Ka6NjBiRfBBQRaQq65ekYz3UQ==" crossorigin="anonymous" />
+  <!-- Scrollbar Custom CSS -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/malihu-custom-scrollbar-plugin/3.1.5/jquery.mCustomScrollbar.min.css">
+
+  <!-- Our Custom CSS -->
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+
+<body>
+  <section id="starting">
+    <div class="h-v-centered text-center">
+      <img src="assets/logo.png"/>
+      <h1 class="display-4">Influences</h1>
+      <p class="font-italic text-muted mb-4">Loading <i class="fas fa-sync fa-spin"></i> </p>
+   </div>
+  </section>
+
+  </section>
+  <section id='logged-out' style="display:none">
+    <div class="container">
+      <div class="row" style="height:100vh">
+        <div class="col-lg">
+          <img src="assets/landing.jpg" class="landing-img h-v-centered">
+        </div>
+        <div class="col-lg-4">
+          <div class="h-v-centered text-center">
+            <img style="max-width:calc(min(30vh, 30vw));"
+                 src="assets/logo.png"/>
+            <h1 class="display-4">Influences</h1>
+            <p class="font-italic text-muted mb-4">
+              Create content. Share it. Earn Money.
+            </p>
+
+            <p id="near_error" class="small text-danger" style="display:none">
+            NEAR returned an error, please try again :)
+            </p>
+            <button type="button" class="btn btn-primary btn-lg mt-4"
+                    id="login-btn" onclick="login()">
+              Login with NEAR
+            </button>
+            
+            <div class="footer small">
+              Powered by 
+              <a style="color:#4e9a06" href="https://siasky.net/"> SIA </a>
+              and <a style="color:#41788d" href="https://near.org/">NEAR</a>.
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div id='logged-in' style="display:none">
+    <nav class="navbar navbar-expand-lg navbar-light bg-white">
+      <div class="container">  
+
+        <a class="navbar-brand" href="#" onclick="showSubscriptionContent()">
+          <img src="/assets/logo.png" alt="" style="height: 50px; width: 50px">
+          Influences
+        </a>
+
+        <ul class="navbar-nav justify-content-center">
+          <li class="nav-item">
+            <input class="form-inline my-2 my-lg-0" type="text" placeholder="Enter Influencer ID"
+                   id="influencerSearch" aria-label="Search">
+          </li>
+        </ul>
+
+        <button class="navbar-toggler" type="button" data-toggle="collapse"
+                data-target="#navbarResponsive" aria-controls="navbarResponsive"
+                aria-expanded="false" aria-label="Toggle navigation">
+          <span class="navbar-toggler-icon"></span>
+        </button>
+
+        <div class="collapse navbar-collapse navbar-nav" id="navbarResponsive">
+          <ul class="navbar-nav mr-auto mt-2 mt-lg-0">
+            <li class="nav-item active">
+              <a class="btn btn-outline-ligh" onclick="showSubscriptionContent()" href="#">
+                <i class="fas fa-home"></i>
+              </a>
+            </li>
+          </ul>
+          <div class="dropdown">
+            <button class="btn" type="button" id="dropdownMenuButton" data-toggle="dropdown" aria-haspopup="true" aria-expanded="false">
+              <i class="fas fa-user-circle"></i>
+              <i class="fas fa-caret-down"></i>
+            </button>
+            <div class="dropdown-menu" aria-labelledby="dropdownMenuButton">
+              <a id="menu_loading" class="dropdown-item text-muted text-center"> <i class="fas fa-sync fa-spin"></i></a>
+              <a class="dropdown-item" data-toggle="modal" data-target="#edit-profile-modal" href="#" id="become-influencer-btn" style="display: none">Become an influencer</a>
+              <a class="dropdown-item influencer-btn" onclick="showProfile()" href="#" style="display: none">My Profile</a>
+              <a class="dropdown-item influencer-btn" type="button" onclick="editProfile()" href="#" style="display: none">Edit Profile</a>
+              <a class="dropdown-item influencer-btn" data-toggle="modal" data-target="#featured-modal" href="#" style="display: none">Get featured</a>
+              <a class="dropdown-item" onclick="logout()" href="#">Logout</a>
+            </div>
+          </div>
+        </div>
+      </div>
+    </nav>
+
+    <section class="container featured-container" id="featured-influencers">
+      <div id="carouselIndicators" class="carousel slide"
+           data-interval="8000" data-ride="carousel">
+        <div class="carousel-inner text-center" id="featured-influencers-carousel">
+          <p id="load_promo" style="margin-bottom: 0px;">
+            Loading promoted influencers <i class="fas fa-sync fa-spin"></i>
+          </p>
+        </div>
+        <a class="carousel-control-prev" href="#carouselIndicators"
+           role="button" data-slide="prev">
+          <span class="carousel-control-prev-icon" aria-hidden="true"></span>
+          <span class="sr-only">Previous</span>
+        </a>
+        <a class="carousel-control-next" href="#carouselIndicators"
+            role="button" data-slide="next">
+          <span class="carousel-control-next-icon" aria-hidden="true"></span>
+          <span class="sr-only">Next</span>
+        </a>
+      </div>
+    </section>
+
+    <div class="container content-container">
+      <section id="my-subs-banner" style="text-align:center; margin:50px auto 35px auto;">
+        <h1 class="display-5 text-black">Welcome back!</h1>
+        <p class="lead loading-subs">
+            Finding your subscription content... Please wait a little
+            <i class="fas fa-sync fa-spin"></i>
+        </p>
+        <p class="lead has-subs">This is what your favourite influencers have been up to.</p>
+        <p class="lead has-no-subs">You're not following anyone yet. Find some influencers and become a fan!</p>
+      </section>
+
+      <section class="pt-0 pb-4 header text-center" id="influencer-profile" style="display: none">
+        <div class="banner" >
+          <img src="assets/bannerplaceholder.png" id="influencer-banner" class="img-fluid">
+        </div>
+          <div class="avatar">
+            <img alt="" id="influencer-avatar" src="assets/avatarplaceholder.png">
+          </div>
+          <h1 class="display-5 influencer-name">Influencer</h1>
+          <span class="badge badge-pill badge-light">Followed by <span id="influencer-followers"></span> fans!</span>
+          <p class="font-italic text-muted mb-1 influencer-description">Influencer Profile</p>
+
+          <button type="button" class="btn btn-secondary btn-lg subscribe-btn mt-3" onclick="subscribeToInfluencer()" target="influencerId">Subscribe!</button>
+      </section>
+
+      <div id="templates" class="d-none">
+
+        <div class="col-lg-4 col-md-6 grid-item mb-3 content-template">
+          <div class="w-100 mb-2 img-thumbnail rounded-2">
+            <a href="#" class="main-content mb-2" data-toggle="lightbox" data-type="image">
+              <img src="#" class="img-fluid">
+              <video class="img-fluid" controls="controls"/>
+            </a>
+            <div class="content-info mb-2">
+              <p id="ctitle" class="text-muted font-italic">Content Title</h2>
+
+            <p class="tcontent small text-muted font-italic">Uploaded on</p>
+            <button class="btn btn-outline-secondary remove-content-btn">Remove</button>
+            </div>
+          </div>
+
+        </div>
+
+        <div class="col-lg-4 col-md-6 grid-item mb-3 add-content-template" >
+          <div class="grid-content w-100 mb-2 img-thumbnail rounded-2">
+            <img class="img-fluid mb-2" src="assets/logo.png">
+            <div class="content-info mb-2">
+              <button class="btn btn-outline-secondary remove-content-btn" data-toggle="modal" data-target="#add-content-modal">Add new content</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="carousel-item featured-influencer-template">
+          <div class="banner" style="height:160px;" >
+            <img src="assets/bannerplaceholder.png" id="featured-banner"
+                 class="img-fluid">
+          </div>
+          <div class="featured-avatar">
+            <img alt="" id="featured-avatar" src="assets/avatarplaceholder.png">
+          </div>
+          <div class="carousel-caption d-none small d-md-block">
+            <a>INFLUENCER NAME</a>
+          </div>
+          <div class="small promo-text">PROMOTED</div>
+        </div>
+      </div>
+
+      <section class="pb-6" id="influencer-content">
+        <div class=" text-center">
+          <div class="alert alert-dark" role="alert" style="display: none" id="loading-influencer-content"></div>
+          <!-- Masonry grid -->
+          <div class="gallery-wrapper content-gallery">
+            <!-- Grid sizer -->
+            <div class="grid-sizer col-lg-4 col-md-6"></div>
+          </div>
+        </div>
+      </section>
+
+      <div id="modals">
+        <div class="modal fade" id="edit-profile-modal" tabindex="-1" role="dialog">
+          <div class="modal-dialog modal-lg" role="document">
+            <div class="modal-content">
+              <div class="modal-header">
+                <h5 class="modal-title">Edit profile</h5>
+                <button type="button" class="close" data-dismiss="modal" aria-label="Close">
+                  <span aria-hidden="true">&times;</span>
+                </button>
+              </div>
+              <div class="modal-body">
+                <div id="loading-profile-content" class="text-center" style="display: none">
+                  <i class="fas fa-sync fa-spin"></i>
+                </div>
+                <div id="edit-profile-content">
+                  <button type="button" id="edit-banner-btn" class="btn  btn-icon btn-secondary" style="position: absolute; margin: 10px" onclick="document.getElementById('upload-banner-input').click();">
+                    <i class="fas fa-edit"></i>
+                  </button>
+
+                  <img src="assets/bannerplaceholder.png" id="edit-banner-img" class="img-fluid">
+
+                  <div class="avatar text-center">
+                    <img alt="" src="assets/avatarplaceholder.png" id="edit-avatar-img">
+                    <button type="button" id="edit-avatar-btn" class="btn btn-icon btn-secondary" onclick="document.getElementById('upload-avatar-input').click();">
+                      <i class="fas fa-edit"></i>
+                    </button>
+
+                  </div>
+                  <input id="upload-avatar-input" type="file" accept="image/*" name="upload-avatar" style="display: none;" />
+                  <input id="upload-banner-input" type="file" accept="image/*" name="upload-banner" style="display: none;" />
+                  <form>
+                    <div class="form-group">
+                      <label for="influencer-name-input">Influencer name</label>
+                      <input type="text" class="form-control" id="influencer-name-input" aria-describedby="nameHelp" placeholder="Enter your influencer name">
+                      <small id="nameHelp" class="form-text text-muted">Choose a name to display in your profile page.</small>
+                    </div>
+                    <div class="form-group">
+                      <label for="influencer-profile-input">Profile</label>
+                      <input type="text" class="form-control" id="influencer-profile-input" aria-describedby="profileHelp" placeholder="About myself...">
+                      <small id="profileHelp" class="form-text text-muted">Tell your fans something about yourself.</small>
+                    </div>
+                    <div class="form-group">
+                      <label for="influencer-price-input">Your fees</label>
+                      <input type="number" class="form-control" id="influencer-price-input" aria-describedby="priceHelp" value="30">
+                      <small id="priceHelp" class="form-text text-muted">How much will you charge your fans monthly.</small>
+                    </div>
+
+                  </form>
+                </div>
+
+              </div>
+              <div class="modal-footer">
+                <button type="button" class="btn btn-light" data-dismiss="modal">Close</button>
+                <button type="button" class="btn btn-secondary" id='edit-profile-save'>Save changes</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="modal fade" id="featured-modal" tabindex="-1" role="dialog">
+          <div class="modal-dialog modal-lg" role="document">
+            <div class="modal-content">
+              <div class="modal-header">
+                <h5 class="modal-title">Get featured</h5>
+                <button type="button" class="close" data-dismiss="modal" aria-label="Close">
+                  <span aria-hidden="true">&times;</span>
+                </button>
+              </div>
+              <div class="modal-body">
+                <p>Promote your profile for only <span id="promotion-price">5</span>N!
+                   We will show you in the main page of all users for a whole month.</p>
+                <p>Become a featured influencer and reach more people now!.</p>
+              </div>
+              <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-dismiss="modal">Close</button>
+                <button type="button" class="btn btn-primary" onclick="promoteUser()">Become Featured</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="modal fade" id="add-content-modal" tabindex="-1" role="dialog">
+          <div class="modal-dialog modal-lg" role="document">
+            <div class="modal-content">
+              <div class="modal-header">
+                <h5 class="modal-title">Add Content</h5>
+                <button type="button" class="close" data-dismiss="modal" aria-label="Close">
+                  <span aria-hidden="true">&times;</span>
+                </button>
+              </div>
+              <div class="modal-body">
+                <div class="text-center" >
+                  <button class="btn btn-secondary btn-upload" onclick="document.getElementById('upload-content-input').click();">
+                    <i class="fas fa-photo-video"></i>
+                  </button>
+                  <img src="" id="upload-content-preview-image" class="content-preview" >
+                  <video class="content-preview" id="upload-content-preview-video" controls="controls"/>
+                </div>
+                  <input id="upload-content-input" type="file" accept="image/*|video/*" name="upload-content" style="display: none;" />
+                  <!--  -->
+                  <div class="form-group mt-3">
+                    <input type="text" class="form-control" id="content-title-input" aria-describedby="captionHelp" placeholder="Caption...">
+                    <small id="captionHelp" class="form-text text-muted">Choose a caption that reflects the nature of the content.</small>
+                  </div>
+              </div>
+              <div class="modal-footer">
+                <button type="button" class="btn btn-light" data-dismiss="modal">Close</button>
+                <button type="button" class="btn btn-secondary" id='add-content-btn'>Add content</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>	
+  <!-- jQuery -->
+  <script src="https://code.jquery.com/jquery-3.5.1.min.js"></script>
+  <!-- Bootstrap -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/twitter-bootstrap/4.3.1/js/bootstrap.bundle.min.js"></script>
+
+  <script src="https://unpkg.com/imagesloaded@4/imagesloaded.pkgd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/masonry/4.2.2/masonry.pkgd.min.js"></script>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/ekko-lightbox/5.3.0/ekko-lightbox.min.js" integrity="sha512-Y2IiVZeaBwXG1wSV7f13plqlmFOx8MdjuHyYFVoYzhyRr3nH/NMDjTBSswijzADdNzMyWNetbLMfOpIPl6Cv9g==" crossorigin="anonymous"></script>
+
+  <!-- Font Awesome JS -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.14.0/css/all.min.css" integrity="sha512-1PKOgIY59xJ8Co8+NE6FZ+LOAZKjy+KY8iq0G4B3CyeY6wYHN3yt9PW0XpSriVlkMXe40PTKnXrLnZ9+fkDaog==" crossorigin="anonymous" />
+  <script defer src="https://use.fontawesome.com/releases/v5.0.13/js/fontawesome.js" integrity="sha384-6OIrr52G08NpOFSZdxxz1xdNSndlD4vdcf/q2myIUVO0VsqaGHJsB0RaBE01VTOY" crossorigin="anonymous"></script>
+
+  <!-- Popper.JS -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/popper.js/1.14.0/umd/popper.min.js" integrity="sha384-cs/chFZiN24E4KMATLdqdvsezGxaGsi4hLGOzlXwp5UZB1LY//20VyM2taTB4QvJ" crossorigin="anonymous"></script>
+
+  <!-- jQuery Custom Scroller CDN -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/malihu-custom-scrollbar-plugin/3.1.5/jquery.mCustomScrollbar.concat.min.js"></script>
+
+  <script type="text/javascript" src="index.js"></script>
+
+</body>
+</html>
+
+'''
+'''--- src/index.js ---
+import 'regenerator-runtime/runtime'
+
+import {initNEAR, login, logout,
+		getProfileOf, getMyInfluencers,
+        subscribeTo, upload_file_to_sia, updateMyProfile,
+        addToMyContent,deleteFromMyContent, generateUUID,
+        promoteMe, getPromoted} from './blockchain'
+
+window.login = login;
+window.logout = logout;
+
+// Harcoded influencer for now
+const spinner = '<i class="fas fa-sync fa-spin"></i>'; 
+const promotionPrice = 10;
+window.$contentGrid = null;
+window.currentSection = "subscriptionContent"
+let avatarPlaceholder, bannerPlaceholder, subs = null;
+
+$(document).ready(function () {
+
+    // ------------------------------------------------------
+    // ADD CONTENT EVENTS
+    // ------------------------------------------------------
+    
+    $("#upload-content-input").change(function() {
+    	uploadFilePreview(this,(preview,type)=>{
+    		$(`#upload-content-preview-${type}`).attr('src', preview);
+	      	$(`#upload-content-preview-${type}`).show();
+		    $('.btn-upload').hide();
+    	});
+	});
+
+	$("#promotion-price").html(promotionPrice);
+
+	avatarPlaceholder = $('#influencer-avatar').attr('src');
+	bannerPlaceholder = $('#influencer-banner').attr('src');
+
+	$("#add-content-btn").click(async function(){
+		let contentFile = $("#upload-content-input").prop('files');
+		if (contentFile && contentFile[0]){
+			$("#add-content-btn").html('Uploading... '+spinner);
+			let link = await upload_file_to_sia(contentFile[0])
+			var caption = $("#content-title-input").val();
+			await addToMyContent('https://siasky.net/'+link,caption);
+			// show new content on profile
+			$("#add-content-modal").modal('hide');
+			$("#add-content-btn").html('Add content');
+			showProfile();
+			// var img = $('#upload-content-preview').attr('src');
+			// should upload to sia
+			// serverAddContent(img,$("#content-title-input").val());
+			// show new content on profile
+			// showProfile()
+		}
+	});
+
+	$("#add-content-modal").on("show.bs.modal", function () { 
+		$('#upload-content-preview-image').attr('src',"#");
+		$('#upload-content-preview-video').attr('src',"#");
+		$('#upload-content-preview-image').hide();
+		$('#upload-content-preview-video').hide();
+        $("#upload-content-input").val('');
+        $('.btn-upload').show();
+	})
+
+	// ------------------------------------------------------
+    // EDIT PROFILE EVENTS
+    // ------------------------------------------------------
+
+    $("#upload-banner-input").change(function() {
+		uploadFilePreview(this,(preview)=>{
+			$('#edit-banner-img').attr('src', preview);
+    	});
+	});
+
+	$("#upload-avatar-input").change(function() {
+		uploadFilePreview(this,(preview)=>{
+			$('#edit-avatar-img').attr('src', preview);
+    	});
+	});
+
+	$("#edit-profile-save").click(function(){
+		$("#edit-profile-save").html("Saving... "+spinner);
+		var name = $("#influencer-name-input").val();
+		var description = $("#influencer-profile-input").val();
+		var price = $("#influencer-price-input").val();
+		var avatar = accountProfile ? accountProfile.avatar : $('#edit-avatar-img').attr('src');
+		var banner = accountProfile ? accountProfile.banner : $('#edit-banner-img').attr('src');
+
+		async function updateProfile(){
+			await updateMyProfile(name, banner, avatar, description, price)
+			accountProfile = await getProfileOf(accountId);
+			$("#edit-profile-modal").modal('hide');
+			$("#edit-profile-save").html("Save changes");
+			$("#become-influencer-btn").hide();
+    		$(".influencer-btn").show();
+			showProfile();
+		}
+
+		var avatarFiles = $("#upload-avatar-input").prop('files');
+		var bannerFiles = $("#upload-banner-input").prop('files');
+		var uploads = {keys:{},files:[]};
+		if (avatarFiles && avatarFiles[0]){
+			uploads.keys.avatar = true;
+			uploads.files.push(upload_file_to_sia(avatarFiles[0]))
+		}
+		if (bannerFiles && bannerFiles[0]){
+			uploads.keys.banner = true;
+			uploads.files.push(upload_file_to_sia(bannerFiles[0]))
+		}
+		if (uploads.files.length==0){
+			// nothing to upload;
+			return updateProfile();
+		}
+		Promise.all(uploads.files).then(async links => {
+			
+			if (uploads.keys.avatar){
+				avatar = 'https://siasky.net/'+links[0];
+				if (uploads.keys.banner){
+					banner = 'https://siasky.net/'+links[1];
+				}
+			} else {
+				banner = 'https://siasky.net/'+links[0];
+			}
+			updateProfile();
+		})
+	});
+
+	// ------------------------------------------------------
+    // SEARCH BAR
+    // ------------------------------------------------------
+
+	$("#influencerSearch").on('keyup', function (e) {
+	    if (e.key === 'Enter' || e.keyCode === 13) {
+	        searchInfluencers()
+	    }
+	});
+
+	// ------------------------------------------------------
+    // INIT GRIDS 
+    // ------------------------------------------------------
+
+    $contentGrid = $('.content-gallery').masonry({
+        temSelector: '.grid-item',
+        columnWidth: '.grid-sizer',
+        percentPosition: true,
+    });
+
+    // Initate imagesLoaded
+    $contentGrid.imagesLoaded().progress( function() {
+        $contentGrid.masonry('layout');
+    });
+
+	// ------------------------------------------------------
+    // INIT LIGHTBOX GALLERY 
+    // ------------------------------------------------------
+    
+    $(document).on('click', '[data-toggle="lightbox"]', function(event) {
+        event.preventDefault();
+        $(this).ekkoLightbox();
+    });
+        	
+
+    window.nearInitPromise = initNEAR()
+    .then(flow)
+    .catch(console.error)
+});
+
+// ------------------------------------------------------
+// USER LOGGED IN
+// ------------------------------------------------------
+
+function flow(){
+  if (!window.walletAccount.accountId){
+    logoutFlow()
+  }else{
+    window.accountId = window.walletAccount.accountId
+    loginFlow()  
+  }
+}
+
+async function loginFlow() {
+  $("#starting").hide();
+  $("#logged-in").show();
+  $(".logged-user-name").html(accountId);
+
+  getProfileOf(accountId).then(
+    profile => {
+      window.accountProfile = profile;
+      document.getElementById('menu_loading').style.display="none"
+      if (accountProfile) {
+        $(".influencer-btn").show();
+      } else {
+        $("#become-influencer-btn").show();
+      }
+    }
+  )
+
+  await showSubscriptionContent();
+}
+
+function logoutFlow(){
+	$("#starting").hide();
+  $("#logged-out").show();
+}
+
+// ------------------------------------------------------
+// FILE MANAGEMENT
+// ------------------------------------------------------
+
+function uploadFilePreview(uploader,callback){
+	// upload file in frontend and show preview
+	if (uploader.files && uploader.files[0]) {
+		if (uploader.files[0].type.includes('video')){
+			var fileUrl = URL.createObjectURL(uploader.files[0]);
+   			
+   			callback(fileUrl,'video')
+		} else {
+			var reader = new FileReader();
+		    reader.onload = function(e) {
+		      callback(e.target.result,'image')
+		    }
+		    reader.readAsDataURL(uploader.files[0]); // convert to base64 string
+		}
+    }
+}
+
+// ------------------------------------------------------
+// FIND INFLUENCERS
+// ------------------------------------------------------
+
+window.searchInfluencers = async function(){
+	var name = $('#influencerSearch').val();
+	$('#influencerSearch').val("Searching...");
+	// $('#search-btn').html('Searching... '+spinner)
+	
+	var influencerProfile = await getProfileOf(name);
+	// $('#search-btn').html('Search');
+	$('#influencerSearch').val("")
+	if (influencerProfile) {
+		showProfile(name,influencerProfile);
+	} 
+}
+
+async function showFeaturedInfluencers(){
+    let featuredInfluencers = await getPromoted()
+        
+    document.getElementById('load_promo').style.display = "none";
+    window.featuredInfluencers = featuredInfluencers;
+
+	featuredInfluencers.forEach(influencer => {
+		var template = $(".featured-influencer-template").clone();
+		template.removeClass("featured-influencer-template");
+		template.addClass("featured-influencer");
+		template.find("#featured-banner").attr("src",influencer.banner)
+		template.find("#featured-avatar").attr("src",influencer.avatar)
+		template.find("a").html(influencer.name)
+
+		template.find("a").click(()=>{
+            showFeaturedInfluencer(influencer.id);
+		})
+		$("#featured-influencers-carousel").append(template)
+	})
+	
+    $(".carousel-item")[0].classList.add("active");
+}
+
+window.showFeaturedInfluencer = function(influencerId){
+	let profile = featuredInfluencers.find(featured=> featured.id == influencerId)
+	if (profile) {
+		showProfile(influencerId,profile);
+	}
+}
+
+window.becomeFeatured = function(){
+	// BECOME FEATURED
+}
+
+window.subscribeToInfluencer = async function(){
+	var target = $(".subscribe-btn").attr('target');
+	var price = $(".subscribe-btn").attr('price');
+	await subscribeTo(target,price);
+	var influencerProfile = await getProfileOf(target);
+	showProfile(target,influencerProfile);
+}
+
+// ------------------------------------------------------
+// PAGE NAVIGATION
+// ------------------------------------------------------
+
+window.showSubscriptionContent = async function showSubscriptionContent() {
+	var nextSection = generateUUID();
+	currentSection = nextSection.toString();
+	$("#loading-influencer-content").hide();
+	$("#featured-influencers").show();
+	$("#influencer-profile").hide();
+	$("#influencer-content").hide();
+	$("#my-subs-banner").show();
+
+	$("#my-subs-banner").find(".lead").hide();
+	$("#my-subs-banner").find(".loading-subs").show();
+
+	if (!subs){
+		subs = await getMyInfluencers();
+	}
+
+    showFeaturedInfluencers();
+
+	$("#featured-influencers").show();
+	if (!subs.length){
+		$("#my-subs-banner").find(".loading-subs").hide();
+		$("#my-subs-banner").find(".has-no-subs").show();
+		return;
+	}
+	
+	$("#my-subs-banner").show();
+	let content = [];
+	subs.forEach(profile=>{
+		content = content.concat(addOwner(profile.content,profile.id,profile.name))
+	});
+
+	$("#my-subs-banner").find(".loading-subs").hide();
+	$("#my-subs-banner").find(".has-subs").show();
+	showContentInGrid(content,false,nextSection.toString());
+
+}
+
+function profileChanged(p1,p2){
+	var props = ['name','description','banner','avatar','fans'];
+	var isEqual = props.reduce((prev,prop)=> {return prev && p1[prop]===p2[prop]},true);
+	function sameContent(c1,c2){
+		if (c1.length != c2.length) return false;
+		return c1.reduce((prev,c,i)=>{return prev && c1[i].sialink === c2[i].sialink},true)
+	}
+	return !isEqual || !(sameContent(p1.content, p2.content)); 
+}
+
+window.editProfile = async function editProfile(){
+	$("#loading-profile-content").show()
+	$("#edit-profile-content").hide();
+	$("#edit-profile-save").hide();
+	$("#edit-profile-modal").modal('show');
+	let influencerProfile = await getProfileOf(accountId);
+	if (!influencerProfile){
+		influencerProfile = {
+			name: "",
+			description: "",
+			price: 30,
+			avatar: avatarPlaceholder,
+			banner: bannerPlaceholder
+		}
+	} 
+	$("#influencer-name-input").val(influencerProfile.name)
+	$("#influencer-profile-input").val(influencerProfile.description)
+	$("#influencer-price-input").val(influencerProfile.price)
+	var loaderCounter = 0;
+	function showAfterTwo(){
+		loaderCounter++;
+		if(loaderCounter==2){
+			$("#loading-profile-content").hide()
+			$("#edit-profile-content").show();
+			$("#edit-profile-save").show();
+		}
+	}
+	$("#edit-avatar-img").attr('src',influencerProfile.avatar).on('load', showAfterTwo);
+	$("#edit-banner-img").attr('src',influencerProfile.banner).on('load', showAfterTwo);
+}
+
+window.showProfile = async function showProfile(influencerId,influencerProfile) {
+	var nextSection = generateUUID();
+	currentSection = nextSection.toString();
+	if (!influencerId){
+		influencerId = accountId;
+		influencerProfile = accountProfile;
+		getProfileOf(accountId).then(profile=>{
+			// show profile as it is but look for changes
+			if (profileChanged(accountProfile,profile)){
+				accountProfile = profile;
+				showProfile(accountId,accountProfile);
+			} 
+		});
+	}
+	$("#my-subs-banner").hide();
+	$("#featured-influencers").hide();
+	$(".influencer-name").html(influencerProfile.name);
+	$(".influencer-description").html(influencerProfile.description);
+	$("#influencer-followers").html(influencerProfile.fans);
+	
+	
+	$(".subscribe-btn").attr('target',influencerId);
+	$(".subscribe-btn").attr('price',influencerProfile.price);
+	$(".subscribe-btn").html(`Subscribe for ${influencerProfile.price}(N) per month to see all the content!`);
+	$(".subscribe-btn").hide();
+
+	$(".single-content").remove();
+	$("#influencer-content").show();
+	$('#loading-influencer-content').hide();
+
+	var loaderCounter = 0;
+	function showAfterTwo(){
+		loaderCounter++;
+		if(loaderCounter==2){
+			$("#influencer-profile").show();
+			if (!influencerProfile.hasAccess) {
+				$(".subscribe-btn").show();
+			} else {
+				var content = influencerProfile.content;
+				if (!content.length){
+					$('#loading-influencer-content').show()
+					$('#loading-influencer-content').html(`${influencerProfile.name} doesn't have any content yet!`)
+				} else {
+					showContentInGrid(addOwner(content,influencerId,influencerProfile.name),true,nextSection);
+				}
+				if (influencerId == accountId){
+					// it's my profile
+					var addNewContent = $(".add-content-template").clone();
+					addNewContent.addClass("single-content");
+					$contentGrid.prepend(addNewContent).masonry( 'prepended', addNewContent );
+				}
+			}
+		}
+	}
+	$("#influencer-avatar").attr('src',influencerProfile.avatar).on('load', showAfterTwo);
+	$("#influencer-banner").attr('src',influencerProfile.banner).on('load', showAfterTwo);
+}
+
+window.promoteUser = function promoteUser(){promoteMe(promotionPrice);}
+
+function addOwner(content, id,name){
+	if (!name) name = id;
+	return content.map(c=>{return {ownerId:id,ownerName:name,...c} })
+}
+
+function showContentInGrid(content,inProfile,section) {
+	if (section === currentSection){
+		content.sort((c1,c2)=>c1.creationDate<c2.creationDate);
+		$(".single-content").remove();
+		$("#influencer-content").show();
+		content.forEach(c=>showSingleContent(c,inProfile));
+	    $contentGrid.masonry();
+	}
+	
+}
+
+function checkSiaLinkType(sialink){
+	return new Promise(resolve=>{
+		$.ajax({
+		  type: "HEAD",
+		  url : sialink,
+		  success: function(message,text,response){
+		  	resolve(response.getResponseHeader('Content-Type'))
+		  } 
+		});
+	})
+	
+}
+
+function showSingleContent(content,inProfile) {
+	var newContent = $(".content-template").clone();
+	newContent.find('.main-content').attr('href',content.sialink)
+	checkSiaLinkType(content.sialink).then(contentType=>{
+		if (contentType.includes('image')){
+			newContent.find('video').remove();	
+			newContent.find('img').attr('src',content.sialink).on('load', function () {
+				// if (this.width > this.height){
+					// newContent.addClass("grid-item--width2")
+					
+				// }
+				newContent.removeClass("d-none");
+				$contentGrid.masonry();
+			});
+		} else {
+			newContent.find('img').remove();
+			newContent.find('video').attr('type',contentType);
+			newContent.find('video').attr('src',content.sialink).on('loadeddata', function () {
+				newContent.removeClass("d-none");
+				$contentGrid.masonry();
+	
+			})
+			
+			
+		}
+	})
+	
+	
+	newContent.find('#ctitle').html(content.description);
+	let date = new Date(content.creationDate/1000000)
+	if (!inProfile){
+    let small = newContent.find('.tcontent');
+		small.attr('target',content.ownerId);
+		small.html("Uploaded on " + date.toDateString() + " by "+content.ownerName);
+		newContent.find('.remove-content-btn').remove();
+		newContent.find('.visit-influencer-btn').click(async function(){
+			var target = $(this).attr('target');
+			var influencerProfile = await getProfileOf(target)
+			showProfile(target,influencerProfile);
+		});
+	} else {
+    newContent.find('.small').html("Uploaded on "+date.toDateString());
+		newContent.find('.visit-influencer-btn').remove();
+		if (content.ownerId != accountId){
+			newContent.find('.remove-content-btn').remove();
+		} else {
+			newContent.find('.remove-content-btn').attr('target',content.sialink);
+			newContent.find('.remove-content-btn').click(function(){
+				var target = $(this).attr('target');
+				deleteFromMyContent(target).then(()=>{
+					showProfile()
+				});
+			});
+		}
+	}
+	newContent.addClass("single-content");
+	newContent.removeClass("content-template");
+	
+	$contentGrid.append(newContent).masonry( 'appended', newContent ).masonry();;
+}
+
+'''

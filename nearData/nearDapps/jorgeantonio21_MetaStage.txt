@@ -1,0 +1,3115 @@
+*GitHub Repository "jorgeantonio21/MetaStage"*
+
+'''--- README.md ---
+# MetaStage
+
+MetaStage is a web3 platform for NFT creation and crowd funding. Using
+the highly scalable Near blockchain, we implement code that allows creators
+to:
+
+1. Register and request funds from community (per epoch);
+2. Build their portfolios and share their reputation.
+
+At the funding level, users can use our platform to:
+
+1. Support and funding any project a user sees fit;
+2. Build their community status as creative art ventures.
+
+Our main goal is to improve the content creation, in the digital era. This
+is only possible if the majority of the revenues of content creation is
+allocated to the actual creators, and not big corporations. For this reason,
+we welcome inclusiveness of ideas, creative thinking and passion for
+decentralization.
+
+'''
+'''--- contracts/CHANGELOG.md ---
+
+'''
+'''--- contracts/Cargo.toml ---
+[package]
+name = "metastage-contract"
+version = "0.1.0"
+authors = ["MetaStage-dev-members"]
+edition = "2021"
+
+[dependencies]
+near-contract-standards = "4.0.0"
+near-sdk = "4.0.0"
+near-units = "0.2.0"
+thiserror = "1.0.26"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dev-dependencies]
+anyhow = "1.0"
+near-units = "0.2.0"
+near-primitives = { git = "https://github.com/nearprotocol/nearcore.git" }
+serde_json = { version = "1.0", features = ["arbitrary_precision"] }
+tokio = { version = "1.18.1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+workspaces = { version = "0.6.0", features = ["unstable"] }
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+# Opt into extra safety checks on arithmetic operations https://stackoverflow.com/a/64136471/249801
+overflow-checks = true
+
+'''
+'''--- contracts/README.md ---
+On a high level the contract API boils down to the following: 
+
+1. Check the epoch timeline of creator registration, followed by posterior funding by users. More explicitly, the contract
+operates per `Epoch`. Each time a new epoch starts, there is a period of creator registration, where creators can register
+their work/projects, and establish all the metadata related to this. During this period, all the data necessary for NFT minting
+is provided. After creator registration ends, the funding period starts. In this case, users are incentivized to come to the
+platform and fund the projects they consider to have more potential. The epoch changing and inner-epoch dynamics is orchestrated
+by an admin. This is the sole role of the admin in the entire protocol.
+
+2. Creator registration process. The creator registration process is done via the platform by means of an RPC call to the contract.
+The relevant method is `creator_registration`. It receives as input a `Metadata` type. Notice, that each project has `3` tiers of NFTs.
+Each tier represents the scarcity of the NFT associated to the project (namely `Common`, `Uncommon`, `Rare`)
+ Internally it consists of the following parameters
+
+ - An array of size `3` of type `u128` (big integer) with the price of each NFT, for each tier;
+ - An array of size `3` of type `String` with the Token/Project title, for each tier;
+ - An array of size `3` of type `String` with the Token/Project description, for each tier;
+ - An array of size `3` of type `String` with the Token/Project media link (either IPFS, or own cloud storage), for each tier;
+ - An array of size `3` of type `u32` (integer) with the number of copies for each NFT, for each tier;
+ - An array of size `3` of type `String` with extra metadata associated with the Creator project, for each tier;
+ - An array of size `3` of type `String` with references associated with the Creator project, for each tier.
+
+The above input data, must be retrieved directly from the Creator, via the platform. 
+
+3. User funding. After creators have registered their projects, a new phase begins (in the current epoch). Namely, users are incentivized
+to fund their favorite projects, via the platform. If done via the platform, users are promp to connect their wallets and make a transfer
+call to a fungible contract (e.g., `USDT` or `wNear`). The fungible contract call has to be provided with the following data:
+
+ - A `receiver_id`, in this case the `AccountId` of the `MetaDao` contract;
+ - An `amount`, a `u128` value of the number of tokens the user is willing to provide to the creator. In exchange, it shall receive
+ a NFT, corresponding to the tier in which `amount` fits in. Notice that, if the user funds a value inferior to the least tier, it
+ will not receive a NFT back.
+ - A `msg`, a plain `String` which specifies what is the actual creator project the user is funding and what is the tier to choose.
+
+'''
+'''--- contracts/build.sh ---
+#!/bin/bash
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/*.wasm ./res/
+
+'''
+'''--- contracts/deploy.md ---
+To deploy the contract on mainnet, one has to perform the following actions:
+
+1. Install Rust on your machine (see Rust documentation);
+2. Install wasm-pack on your machine, this can be achieved by executing
+
+  -- rustup target add wasm32-unknown-unknown
+
+3. Build the target wasm compiled code by executing
+
+  -- ./build.sh
+
+4. Create a Near mainnet account and deposit some NEAR tokens on it
+(around 2.5 NEAR tokens should be sufficient)
+5. Install the near-cli, by executing
+
+  -- npm install i near-cli
+
+6. Set near env variable to mainnet (otherwise it will default to testnet)
+
+  -- export NEAR_ENV=mainnet
+
+7. Login into your Near account, via the cli
+
+  -- near login
+
+and follow the instructions.
+'''
+'''--- contracts/src/consts.rs ---
+use near_sdk::{Gas, StorageUsage};
+
+/// Currently, we allow three different types of NFTs per Creator, namely
+/// Common, Uncommon, Rare
+pub const NFT_RANKING: usize = 3;
+/// The storage cost of an AccountId type (8 bytes)
+pub const ACCOUNT_ID_STORAGE_COST: StorageUsage = 8;
+/// The storage cost of creator registry 2 * AccountId + CreatorMetadata (which we allow to be at least 1kb)
+pub const CREATOR_REGISTRY_STORAGE_COST: StorageUsage = 1_016;
+/// The gas cost of a fungible token transfer
+pub const GAS_FOR_FT_TRANSFER: Gas = Gas(20_000_000_000_000u64);
+
+'''
+'''--- contracts/src/error.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+#[derive(BorshDeserialize, BorshSerialize, Deserialize, Serialize, Debug, Error)]
+#[serde(crate = "near_sdk::serde")]
+pub enum MetaDaoError {
+    #[error("Invalid Admin call")]
+    InvalidAdminCall,
+    #[error("Unable to create a new epoch, while previous epoch is still ongoing")]
+    UnableToCreateNewEpoch,
+    #[error("Creator is not registered for current epoch")]
+    CreatorIsNotRegistered,
+    #[error("Invalid current epoch")]
+    InvalidCurrentEpoch,
+    #[error("Currently, epoch is off")]
+    EpochIsOff,
+    #[error("Not in funding period")]
+    NotInFundingPeriod,
+    #[error("User did not attach enough funds to contract call")]
+    UserDidNotAttachEnoughFunds,
+    #[error("User already registered funds to creator")]
+    UserAlreadyRegisteredFundsToCreator,
+    #[error("Already in funding period")]
+    AlreadyInFunding,
+    #[error("Already in Registration period")]
+    AlreadyInRegistration,
+    #[error("Not in Registration period")]
+    NotInRegistrationPeriod,
+    #[error("Invalid initialization of epoch")]
+    InvalidInitializationOfEpoch,
+    #[error("Invalid Fungible token id")]
+    InvalidFTTokenId,
+    #[error("Uncovered storage costs")]
+    UncoveredStorageCosts,
+}
+
+impl AsRef<str> for MetaDaoError {
+    fn as_ref(&self) -> &str {
+        match self {
+            Self::InvalidAdminCall => "Invalid Admin call",
+            Self::UnableToCreateNewEpoch => {
+                "Unable to create a new epoch, while previous epoch is still ongoing"
+            }
+            Self::CreatorIsNotRegistered => "Creator is not registered for current epoch",
+            Self::InvalidCurrentEpoch => "Invalid current epoch",
+            Self::EpochIsOff => "Currently, epoch is off",
+            Self::NotInFundingPeriod => "Not in funding period",
+            Self::UserDidNotAttachEnoughFunds => {
+                "User did not attach enough funds to contract call"
+            }
+            Self::UserAlreadyRegisteredFundsToCreator => "User already registered funds to creator",
+            Self::AlreadyInFunding => "Already in funding period",
+            Self::AlreadyInRegistration => "Already in Registration period",
+            Self::NotInRegistrationPeriod => "Not in Registration period",
+            Self::InvalidInitializationOfEpoch => "Invalid initialization of epoch",
+            Self::InvalidFTTokenId => "Invalid Fungible token id",
+            Self::UncoveredStorageCosts => "Uncovered storage costs",
+        }
+    }
+}
+
+'''
+'''--- contracts/src/fund_creators.rs ---
+use crate::{consts::GAS_FOR_FT_TRANSFER, *};
+use near_contract_standards::fungible_token::core::ext_ft_core;
+use near_sdk::json_types::U128;
+use near_sdk::{env, Promise, PromiseResult};
+
+#[near_bindgen]
+impl MetaDaoContract {
+    #[private]
+    pub fn on_external_send_ft_tokens_callback(
+        &mut self,
+        creator_account_id: &CreatorAccountId,
+        user_id: &UserAccountId,
+    ) {
+        if env::promise_results_count() != 1 {
+            env::panic_str("MetaDaoContract::external_send_ft_tokens::Invalid promise result count, one should only have one promise result");
+        }
+
+        if !matches!(env::promise_result(0), PromiseResult::Successful(_)) {
+            env::panic_str("MetaDaoContract::external_send_ft_tokens::Promise failed");
+        }
+
+        let mut creator_fundings = self
+            .creator_funding
+            .get(&self.epoch)
+            .ok_or(MetaDaoError::InvalidCurrentEpoch)
+            .expect("MetaDaoContract::external_send_ft_tokens::Invalid current epoch id");
+
+        let creator_funding = creator_fundings
+            .get(creator_account_id)
+            .ok_or(MetaDaoError::CreatorIsNotRegistered)
+            .expect("MetaDaoContract::external_send_ft_tokens::Creator is not registered");
+
+        let creator_funding = creator_funding
+            .iter()
+            .map(|ot| {
+                if ot.user_id == *user_id {
+                    ObtainedTokenAmounts {
+                        user_id: ot.user_id.clone(),
+                        already_funded: true,
+                        amount: ot.amount,
+                        nft_rank: ot.nft_rank.clone(),
+                        ft_token_id: ot.ft_token_id.clone(),
+                    }
+                } else {
+                    ot.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+
+        creator_fundings.insert(creator_account_id, &creator_funding);
+        self.creator_funding.insert(&self.epoch, &creator_fundings);
+    }
+}
+
+#[near_bindgen]
+impl MetaDaoContract {
+    #[payable]
+    #[private]
+    pub fn external_send_ft_tokens(
+        &mut self,
+        creator_account_id: CreatorAccountId,
+        user_id: &UserAccountId,
+        ft_account_id: FTAccountId,
+        amount: u128,
+    ) -> Promise {
+        ext_ft_core::ext(ft_account_id)
+            .with_static_gas(GAS_FOR_FT_TRANSFER)
+            .with_attached_deposit(1)
+            .ft_transfer(creator_account_id.clone(), U128(amount), None)
+            .then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(GAS_FOR_FT_TRANSFER)
+                    .on_external_send_ft_tokens_callback(&creator_account_id, user_id),
+            )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::tests::get_registry_metadata;
+
+    use super::*;
+    use near_sdk::{
+        test_utils::{accounts, VMContextBuilder},
+        testing_env, Gas, MockedBlockchain, PromiseResult, RuntimeFeesConfig, VMConfig, VMContext,
+    };
+
+    /// utility function for testing callbacks logic
+    #[allow(dead_code)]
+    pub fn testing_env_with_promise_results(
+        context: VMContext,
+        promise_results: Vec<PromiseResult>,
+    ) {
+        near_sdk::env::set_blockchain_interface(MockedBlockchain::new(
+            context,
+            VMConfig::test(),
+            RuntimeFeesConfig::test(),
+            promise_results,
+            Default::default(),
+            Default::default(),
+            None,
+        ));
+    }
+
+    pub fn to_yocto(value: &str) -> u128 {
+        let vals: Vec<_> = value.split('.').collect();
+        let part1 = vals[0].parse::<u128>().unwrap() * 10u128.pow(24);
+        if vals.len() > 1 {
+            let power = vals[1].len() as u32;
+            let part2 = vals[1].parse::<u128>().unwrap() * 10u128.pow(24 - power);
+            part1 + part2
+        } else {
+            part1
+        }
+    }
+
+    fn get_context_with_storage(storage: u128) -> VMContext {
+        let contract_account_id: AccountId = "conliq.testnet".to_string().try_into().unwrap();
+
+        VMContextBuilder::new()
+            .current_account_id(contract_account_id)
+            .attached_deposit(to_yocto("1000"))
+            .signer_account_id(accounts(1))
+            .predecessor_account_id(accounts(1))
+            .prepaid_gas(Gas(300 * 10u64.pow(16)))
+            .attached_deposit(storage)
+            .build()
+    }
+
+    #[test]
+    fn test_on_external_send_ft_tokens_callback_works() {
+        let admin: AccountId = accounts(1);
+        let storage = parse_near!("0.1 N");
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context.clone());
+
+        testing_env_with_promise_results(context, vec![PromiseResult::Successful(vec![0u8, 1, 2])]);
+
+        let mut contract = MetaDaoContract::new(admin.clone());
+
+        let mut protocol_accounts_fees = HashMap::<FTAccountId, f64>::new();
+
+        protocol_accounts_fees.insert("wrap.near".to_string().try_into().unwrap(), 0.05);
+        protocol_accounts_fees.insert("usn".to_string().try_into().unwrap(), 0.03);
+
+        contract
+            .create_new_epoch(Some(protocol_accounts_fees))
+            .unwrap();
+
+        contract.set_registration().unwrap();
+        let metadata = get_registry_metadata();
+
+        contract.creator_registration(metadata).unwrap();
+
+        contract.set_funding().unwrap();
+
+        let user_id: AccountId = "user.near".to_string().try_into().unwrap();
+        let creator_account_id: AccountId = accounts(1);
+
+        let mut creator_fundings = contract.creator_funding.get(&contract.epoch).unwrap();
+        creator_fundings.insert(
+            &creator_account_id,
+            &vec![ObtainedTokenAmounts {
+                user_id: user_id.clone(),
+                amount: 100_u128,
+                nft_rank: UserNFTRank::Common,
+                ft_token_id: "wrap.near".to_string().try_into().unwrap(),
+                already_funded: false,
+            }],
+        );
+
+        contract
+            .creator_funding
+            .insert(&contract.epoch, &creator_fundings);
+
+        contract.on_external_send_ft_tokens_callback(&creator_account_id, &user_id);
+
+        assert_eq!(
+            contract
+                .creator_funding
+                .get(&Epoch(1))
+                .unwrap()
+                .get(&creator_account_id)
+                .unwrap(),
+            vec![ObtainedTokenAmounts {
+                amount: 100_u128,
+                user_id,
+                nft_rank: UserNFTRank::Common,
+                ft_token_id: "wrap.near".to_string().try_into().unwrap(),
+                already_funded: true,
+            }]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "MetaDaoContract::external_send_ft_tokens::Promise failed")]
+    fn test_on_external_send_ft_tokens_callback_fails_if_not_successful_promise() {
+        let admin: AccountId = accounts(1);
+        let storage = parse_near!("0.1 N");
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context.clone());
+
+        testing_env_with_promise_results(context, vec![PromiseResult::Failed]);
+
+        let mut contract = MetaDaoContract::new(admin.clone());
+
+        let mut protocol_accounts_fees = HashMap::<FTAccountId, f64>::new();
+
+        protocol_accounts_fees.insert("wrap.near".to_string().try_into().unwrap(), 0.05);
+        protocol_accounts_fees.insert("usn".to_string().try_into().unwrap(), 0.03);
+
+        contract
+            .create_new_epoch(Some(protocol_accounts_fees))
+            .unwrap();
+
+        contract.set_registration().unwrap();
+        let metadata = get_registry_metadata();
+
+        contract.creator_registration(metadata).unwrap();
+
+        contract.set_funding().unwrap();
+
+        let user_id: AccountId = "user.near".to_string().try_into().unwrap();
+        let creator_account_id: AccountId = accounts(1);
+
+        contract.on_external_send_ft_tokens_callback(&creator_account_id, &user_id);
+    }
+
+    #[test]
+    #[should_panic(expected = "MetaDaoContract::external_send_ft_tokens::Promise failed")]
+    fn test_on_external_send_ft_tokens_callback_fails_if_not_successful_promise2() {
+        let admin: AccountId = accounts(1);
+        let storage = parse_near!("0.1 N");
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context.clone());
+
+        testing_env_with_promise_results(context, vec![PromiseResult::NotReady]);
+
+        let mut contract = MetaDaoContract::new(admin.clone());
+
+        let mut protocol_accounts_fees = HashMap::<FTAccountId, f64>::new();
+
+        protocol_accounts_fees.insert("wrap.near".to_string().try_into().unwrap(), 0.05);
+        protocol_accounts_fees.insert("usn".to_string().try_into().unwrap(), 0.03);
+
+        contract
+            .create_new_epoch(Some(protocol_accounts_fees))
+            .unwrap();
+
+        contract.set_registration().unwrap();
+        let metadata = get_registry_metadata();
+
+        contract.creator_registration(metadata).unwrap();
+
+        contract.set_funding().unwrap();
+
+        let user_id: AccountId = "user.near".to_string().try_into().unwrap();
+        let creator_account_id: AccountId = accounts(1);
+
+        contract.on_external_send_ft_tokens_callback(&creator_account_id, &user_id);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "MetaDaoContract::external_send_ft_tokens::Invalid promise result count, one should only have one promise result"
+    )]
+    fn test_on_external_send_ft_tokens_callback_fails_if_more_than_one_promise() {
+        let admin: AccountId = accounts(1);
+        let storage = parse_near!("0.1 N");
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context.clone());
+
+        testing_env_with_promise_results(
+            context,
+            vec![
+                PromiseResult::Successful(vec![0_u8, 1, 2]),
+                PromiseResult::Successful(vec![0_u8, 1]),
+            ],
+        );
+
+        let mut contract = MetaDaoContract::new(admin.clone());
+
+        let mut protocol_accounts_fees = HashMap::<FTAccountId, f64>::new();
+
+        protocol_accounts_fees.insert("wrap.near".to_string().try_into().unwrap(), 0.05);
+        protocol_accounts_fees.insert("usn".to_string().try_into().unwrap(), 0.03);
+
+        contract
+            .create_new_epoch(Some(protocol_accounts_fees))
+            .unwrap();
+
+        contract.set_registration().unwrap();
+        let metadata = get_registry_metadata();
+
+        contract.creator_registration(metadata).unwrap();
+
+        contract.set_funding().unwrap();
+
+        let user_id: AccountId = "user.near".to_string().try_into().unwrap();
+        let creator_account_id: AccountId = accounts(1);
+
+        contract.on_external_send_ft_tokens_callback(&creator_account_id, &user_id);
+    }
+
+    #[test]
+    #[should_panic(expected = "MetaDaoContract::external_send_ft_tokens::Invalid current epoch id")]
+    fn test_on_external_send_ft_tokens_callback_fails_if_epoch_is_invalid() {
+        let admin: AccountId = accounts(1);
+        let storage = parse_near!("0.1 N");
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context.clone());
+
+        testing_env_with_promise_results(
+            context,
+            vec![PromiseResult::Successful(vec![0_u8, 1, 2])],
+        );
+
+        let mut contract = MetaDaoContract::new(admin.clone());
+
+        let mut protocol_accounts_fees = HashMap::<FTAccountId, f64>::new();
+
+        protocol_accounts_fees.insert("wrap.near".to_string().try_into().unwrap(), 0.05);
+        protocol_accounts_fees.insert("usn".to_string().try_into().unwrap(), 0.03);
+
+        contract
+            .create_new_epoch(Some(protocol_accounts_fees))
+            .unwrap();
+
+        contract.set_registration().unwrap();
+        let metadata = get_registry_metadata();
+
+        contract.creator_registration(metadata).unwrap();
+
+        contract.set_funding().unwrap();
+
+        let user_id: AccountId = "user.near".to_string().try_into().unwrap();
+        let creator_account_id: AccountId = accounts(1);
+
+        contract.epoch = Epoch(0);
+
+        contract.on_external_send_ft_tokens_callback(&creator_account_id, &user_id);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "MetaDaoContract::external_send_ft_tokens::Creator is not registered"
+    )]
+    fn test_on_external_send_ft_tokens_callback_fails_if_creator_is_not_registered() {
+        let admin: AccountId = accounts(1);
+        let storage = parse_near!("0.1 N");
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context.clone());
+
+        testing_env_with_promise_results(
+            context,
+            vec![PromiseResult::Successful(vec![0_u8, 1, 2])],
+        );
+
+        let mut contract = MetaDaoContract::new(admin.clone());
+
+        let mut protocol_accounts_fees = HashMap::<FTAccountId, f64>::new();
+
+        protocol_accounts_fees.insert("wrap.near".to_string().try_into().unwrap(), 0.05);
+        protocol_accounts_fees.insert("usn".to_string().try_into().unwrap(), 0.03);
+
+        contract
+            .create_new_epoch(Some(protocol_accounts_fees))
+            .unwrap();
+
+        contract.set_registration().unwrap();
+        let metadata = get_registry_metadata();
+
+        contract.creator_registration(metadata).unwrap();
+
+        contract.set_funding().unwrap();
+
+        let user_id: AccountId = "user.near".to_string().try_into().unwrap();
+        let creator_account_id: AccountId = "creator.near".to_string().try_into().unwrap();
+
+        contract.on_external_send_ft_tokens_callback(&creator_account_id, &user_id);
+    }
+}
+
+'''
+'''--- contracts/src/lib.rs ---
+use std::collections::HashMap;
+
+use near_contract_standards::non_fungible_token::metadata::NFTContractMetadata;
+use near_contract_standards::non_fungible_token::NonFungibleToken;
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::{LazyOption, UnorderedMap, UnorderedSet};
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{env, near_bindgen, AccountId, BorshStorageKey, PanicOnDefault};
+use near_units::parse_near;
+use registry::CreatorMetadata;
+
+use crate::{error::MetaDaoError, nft::UserNFTRank};
+
+mod consts;
+mod error;
+mod fund_creators;
+mod nft;
+mod registry;
+mod tests;
+mod token_receiver;
+mod views;
+
+pub type CreatorAccountId = AccountId;
+pub type UserAccountId = AccountId;
+pub type FTAccountId = AccountId;
+
+#[derive(
+    BorshDeserialize, BorshSerialize, Deserialize, Serialize, Debug, Clone, Copy, Eq, PartialEq,
+)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Epoch(u16);
+
+impl Epoch {
+    fn count(&self) -> u16 {
+        self.0
+    }
+
+    #[allow(dead_code)]
+    fn next_epoch(&self) -> Epoch {
+        Self(self.0 + 1)
+    }
+
+    #[allow(dead_code)]
+    fn previous_epoch(&self) -> Option<Epoch> {
+        self.0.checked_sub(1).map(Epoch)
+    }
+
+    fn update_epoch(&mut self) {
+        self.0 += 1
+    }
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Deserialize, Serialize, Clone, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct FundedTokenAmount {
+    pub creator_id: CreatorAccountId,
+    pub ft_token_id: FTAccountId,
+    pub amount: u128,
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Deserialize, Serialize, Clone, Debug, PartialEq)]
+#[serde(crate = "near_sdk::serde")]
+pub struct ObtainedTokenAmounts {
+    pub user_id: UserAccountId,
+    pub ft_token_id: FTAccountId,
+    pub amount: u128,
+    pub nft_rank: UserNFTRank,
+    pub already_funded: bool,
+}
+
+/// [`StorageKey`] provides a suitable interface to deal with
+/// the position NFT minting metadata key metadata
+#[derive(BorshSerialize, BorshStorageKey)]
+enum StorageKey {
+    NonFungibleToken,
+    Metadata,
+    TokenMetadata,
+    Enumeration,
+    Approval,
+}
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct MetaDaoContract {
+    /// AccountId of admin of contract
+    pub admin: AccountId, // TODO: can we do it without an admin ?
+    /// Current epoch of contract
+    pub epoch: Epoch,
+    /// Container for each Creator's botained funds, per epoch
+    pub creator_funding:
+        UnorderedMap<Epoch, UnorderedMap<CreatorAccountId, Vec<ObtainedTokenAmounts>>>,
+    /// Container for each User's funded funds, per epoch
+    pub user_funds: UnorderedMap<Epoch, UnorderedMap<UserAccountId, Vec<FundedTokenAmount>>>,
+    /// Container for Creators account ids, per epoch
+    pub creators_per_epoch_set: UnorderedMap<Epoch, UnorderedSet<CreatorAccountId>>,
+    /// Container for each Creator NFT metadata, per epoch
+    pub creators_metadata: UnorderedMap<Epoch, UnorderedMap<CreatorAccountId, CreatorMetadata>>,
+    /// Tracks if epoch is on
+    pub is_epoch_on: bool,
+    /// Tracks if contract is in registration period
+    pub in_registration: bool,
+    /// Tracks if contract is in funding period
+    pub in_funding: bool,
+    /// Tracks if contract is in minting period
+    pub in_minting: bool,
+    /// MetaDao protocol fee
+    pub protocol_allowed_tokens_fees: UnorderedMap<FTAccountId, f64>,
+    /// A Non Fungible Token interface
+    pub tokens: NonFungibleToken,
+    /// A Non Fungible Token interface for Metadata
+    pub metadata: LazyOption<NFTContractMetadata>,
+    /// A unique nft identifier
+    pub nft_id: u32,
+}
+
+#[near_bindgen]
+impl MetaDaoContract {
+    #[init]
+    pub fn new(admin: AccountId) -> Self {
+        let creator_funding = UnorderedMap::<
+            Epoch,
+            UnorderedMap<CreatorAccountId, Vec<ObtainedTokenAmounts>>,
+        >::new(b"a".to_vec());
+        let user_funds =
+            UnorderedMap::<Epoch, UnorderedMap<UserAccountId, Vec<FundedTokenAmount>>>::new(
+                b"b".to_vec(),
+            );
+
+        let creators_per_epoch_set =
+            UnorderedMap::<Epoch, UnorderedSet<CreatorAccountId>>::new(b"f".to_vec());
+
+        let creators_metadata = UnorderedMap::<
+            Epoch,
+            UnorderedMap<CreatorAccountId, CreatorMetadata>,
+        >::new(b"h".to_vec());
+
+        let protocol_allowed_tokens_fees = UnorderedMap::<FTAccountId, f64>::new(b"g".to_vec());
+
+        let tokens = NonFungibleToken::new(
+            StorageKey::NonFungibleToken,
+            admin.clone(),
+            Some(StorageKey::TokenMetadata),
+            Some(StorageKey::Enumeration),
+            Some(StorageKey::Approval),
+        );
+
+        let metadata = LazyOption::new(
+            StorageKey::Metadata,
+            Some(&NFTContractMetadata {
+                spec: "nft-1.0.0".to_string(),
+                name: "MetaDaoContract".to_string(),
+                symbol: "MetaDao".to_string(),
+                icon: None,
+                base_uri: None,
+                reference: None,
+                reference_hash: None,
+            }),
+        );
+
+        Self {
+            admin,
+            epoch: Epoch(0u16),
+            creator_funding,
+            user_funds,
+            is_epoch_on: false,
+            in_registration: false,
+            in_funding: false,
+            in_minting: false,
+            creators_per_epoch_set,
+            creators_metadata,
+            protocol_allowed_tokens_fees,
+            tokens,
+            metadata,
+            nft_id: 0u32,
+        }
+    }
+
+    #[handle_result]
+    pub fn set_funding(&mut self) -> Result<(), MetaDaoError> {
+        if env::predecessor_account_id() != self.admin {
+            return Err(MetaDaoError::InvalidAdminCall);
+        }
+
+        if !self.is_epoch_on {
+            return Err(MetaDaoError::EpochIsOff);
+        }
+
+        if self.in_funding {
+            return Err(MetaDaoError::AlreadyInFunding);
+        }
+
+        if !self.in_registration {
+            return Err(MetaDaoError::NotInRegistrationPeriod);
+        }
+
+        self.in_registration = false;
+        self.in_funding = true;
+
+        Ok(())
+    }
+
+    #[handle_result]
+    pub fn set_registration(&mut self) -> Result<(), MetaDaoError> {
+        if env::predecessor_account_id() != self.admin {
+            return Err(MetaDaoError::InvalidAdminCall);
+        }
+
+        if !self.is_epoch_on {
+            return Err(MetaDaoError::EpochIsOff);
+        }
+
+        if self.in_funding {
+            return Err(MetaDaoError::AlreadyInFunding);
+        }
+
+        if self.in_registration {
+            return Err(MetaDaoError::AlreadyInRegistration);
+        }
+
+        self.in_registration = true;
+
+        Ok(())
+    }
+
+    #[handle_result]
+    pub fn create_new_epoch(
+        &mut self,
+        protocol_tokens_fees: Option<HashMap<FTAccountId, f64>>,
+    ) -> Result<(), MetaDaoError> {
+        if env::predecessor_account_id() != self.admin {
+            return Err(MetaDaoError::InvalidAdminCall);
+        }
+
+        // it is enough to check this, as if epoch is set to false
+        // Registration and funding should also be set to false
+        if self.is_epoch_on {
+            return Err(MetaDaoError::UnableToCreateNewEpoch);
+        }
+
+        // update epoch
+        self.epoch.update_epoch();
+
+        // create new entries for other contract fields, for new epoch
+        self.user_funds.insert(
+            &self.epoch,
+            &UnorderedMap::<UserAccountId, Vec<FundedTokenAmount>>::new(
+                format!("user_funds for epoch: {}", self.epoch.count())
+                    .as_bytes()
+                    .to_vec(),
+            ),
+        );
+        self.creator_funding.insert(
+            &self.epoch,
+            &UnorderedMap::<CreatorAccountId, Vec<ObtainedTokenAmounts>>::new(
+                format!("creator_funding for epoch: {}", self.epoch.count())
+                    .as_bytes()
+                    .to_vec(),
+            ),
+        );
+        self.creators_metadata.insert(
+            &self.epoch,
+            &UnorderedMap::<CreatorAccountId, CreatorMetadata>::new(
+                format!("creator nft rankings for epoch: {}", self.epoch.count())
+                    .as_bytes()
+                    .to_vec(),
+            ),
+        );
+        self.creators_per_epoch_set.insert(
+            &self.epoch,
+            &UnorderedSet::<CreatorAccountId>::new(
+                format!("Creator per epoch set for epoch: {}", self.epoch.count())
+                    .as_bytes()
+                    .to_vec(),
+            ),
+        );
+        let mut protocol_allowed_tokens_fees = UnorderedMap::<FTAccountId, f64>::new(
+            format!("allowed_ft_acc_ids for epoch: {}", self.epoch.count())
+                .as_bytes()
+                .to_vec(),
+        );
+
+        if let Some(ft_acc_ids_fees) = protocol_tokens_fees {
+            for (ft_acc_id, fee) in &ft_acc_ids_fees {
+                protocol_allowed_tokens_fees.insert(&ft_acc_id, &fee);
+            }
+
+            self.protocol_allowed_tokens_fees = protocol_allowed_tokens_fees;
+        }
+
+        self.is_epoch_on = true;
+
+        Ok(())
+    }
+
+    #[handle_result]
+    pub fn end_epoch(&mut self) -> Result<(), MetaDaoError> {
+        if env::predecessor_account_id() != self.admin {
+            return Err(MetaDaoError::InvalidAdminCall);
+        }
+
+        if !self.is_epoch_on {
+            return Err(MetaDaoError::EpochIsOff);
+        }
+
+        if self.in_registration {
+            return Err(MetaDaoError::AlreadyInRegistration);
+        }
+
+        if self.in_funding {
+            return Err(MetaDaoError::AlreadyInFunding);
+        }
+
+        self.is_epoch_on = false;
+        self.in_funding = false;
+        self.in_registration = false;
+
+        Ok(())
+    }
+
+    #[payable]
+    #[private]
+    #[handle_result]
+    pub fn user_funding_creator(
+        &mut self,
+        user_id: UserAccountId,
+        creator_account_id: CreatorAccountId,
+        nft_rank: UserNFTRank,
+        amount: u128,
+        ft_token_id: FTAccountId,
+    ) -> Result<(), MetaDaoError> {
+        if env::attached_deposit() < parse_near!("0.01 N") {
+            return Err(MetaDaoError::UserDidNotAttachEnoughFunds);
+        }
+
+        if !self.is_epoch_on {
+            return Err(MetaDaoError::EpochIsOff);
+        }
+
+        if !self.in_funding {
+            return Err(MetaDaoError::NotInFundingPeriod);
+        }
+
+        if self.creators_per_epoch_set.get(&self.epoch).is_none() {
+            return Err(MetaDaoError::CreatorIsNotRegistered);
+        }
+
+        let funded_token_amount = FundedTokenAmount {
+            creator_id: creator_account_id.clone(),
+            ft_token_id: ft_token_id.clone(),
+            amount,
+        };
+
+        let mut user_funds = self
+            .user_funds
+            .get(&self.epoch)
+            .ok_or(MetaDaoError::InvalidCurrentEpoch)?;
+
+        match user_funds.get(&user_id) {
+            None => {
+                user_funds.insert(&user_id, &vec![funded_token_amount]);
+            }
+            Some(mut funds) => {
+                funds.push(funded_token_amount);
+                user_funds.insert(&user_id, &funds);
+            }
+        }
+
+        self.user_funds.insert(&self.epoch, &user_funds);
+
+        let obtained_token_amount = ObtainedTokenAmounts {
+            user_id,
+            ft_token_id,
+            amount,
+            nft_rank,
+            already_funded: false,
+        };
+
+        let mut creator_fundings = self
+            .creator_funding
+            .get(&self.epoch)
+            .ok_or(MetaDaoError::InvalidCurrentEpoch)?;
+
+        match creator_fundings.get(&creator_account_id) {
+            None => {
+                let amounts = vec![obtained_token_amount];
+                creator_fundings.insert(&creator_account_id, &amounts);
+            }
+            Some(mut amounts) => {
+                amounts.push(obtained_token_amount);
+                creator_fundings.insert(&creator_account_id, &amounts);
+            }
+        }
+
+        self.creator_funding.insert(&self.epoch, &creator_fundings);
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::{
+        testing_env, AccountId, Gas, MockedBlockchain, PromiseResult, RuntimeFeesConfig, VMConfig,
+        VMContext,
+    };
+    use std::convert::TryInto;
+
+    /// utility function for testing callbacks logic
+    #[allow(dead_code)]
+    pub fn testing_env_with_promise_results(
+        context: VMContext,
+        promise_results: Vec<PromiseResult>,
+    ) {
+        near_sdk::env::set_blockchain_interface(MockedBlockchain::new(
+            context,
+            VMConfig::test(),
+            RuntimeFeesConfig::test(),
+            promise_results,
+            Default::default(),
+            Default::default(),
+            None,
+        ));
+    }
+
+    pub fn to_yocto(value: &str) -> u128 {
+        let vals: Vec<_> = value.split('.').collect();
+        let part1 = vals[0].parse::<u128>().unwrap() * 10u128.pow(24);
+        if vals.len() > 1 {
+            let power = vals[1].len() as u32;
+            let part2 = vals[1].parse::<u128>().unwrap() * 10u128.pow(24 - power);
+            part1 + part2
+        } else {
+            part1
+        }
+    }
+
+    fn get_context_with_storage(storage: u128) -> VMContext {
+        let contract_account_id: AccountId = "conliq.testnet".to_string().try_into().unwrap();
+
+        VMContextBuilder::new()
+            .current_account_id(contract_account_id)
+            .attached_deposit(to_yocto("1000"))
+            .signer_account_id(accounts(1))
+            .predecessor_account_id(accounts(1))
+            .prepaid_gas(Gas(300 * 10u64.pow(16)))
+            .attached_deposit(storage)
+            .build()
+    }
+
+    #[test]
+    fn test_new_works() {
+        let admin: AccountId = "admin.near".to_string().try_into().unwrap();
+        let contract = MetaDaoContract::new(admin.clone());
+
+        assert_eq!(contract.epoch, Epoch(0u16));
+
+        assert!(!contract.is_epoch_on);
+        assert!(!contract.in_registration);
+        assert!(!contract.in_funding);
+        assert!(!contract.in_minting);
+
+        assert_eq!(contract.admin, admin);
+        assert!(contract.creator_funding.is_empty());
+        assert!(contract.user_funds.is_empty());
+
+        assert!(contract.creators_per_epoch_set.is_empty());
+        assert!(contract.creators_metadata.is_empty());
+
+        assert!(contract.protocol_allowed_tokens_fees.is_empty());
+        assert_eq!(contract.nft_id, 0u32);
+    }
+
+    #[test]
+    fn test_set_funding_works() {
+        let admin: AccountId = accounts(1);
+        let storage = 1u128;
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context);
+
+        let mut contract = MetaDaoContract::new(admin.clone());
+
+        contract.is_epoch_on = true;
+        contract.in_registration = true;
+
+        contract.set_funding().unwrap();
+
+        assert!(contract.in_funding);
+        assert!(!contract.in_registration);
+        assert!(contract.is_epoch_on);
+    }
+
+    #[test]
+    fn test_set_funding_fails_if_not_admin() {
+        let admin: AccountId = "admin.near".to_string().try_into().unwrap();
+        let storage = 1u128;
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context);
+
+        let mut contract = MetaDaoContract::new(admin.clone());
+
+        contract.is_epoch_on = true;
+        contract.in_registration = true;
+
+        assert!(contract
+            .set_funding()
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid Admin call"));
+    }
+
+    #[test]
+    fn test_set_funding_fails_if_epoch_is_off() {
+        let admin = accounts(1);
+        let storage = 1u128;
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context);
+
+        let mut contract = MetaDaoContract::new(admin.clone());
+
+        contract.is_epoch_on = false;
+        contract.in_registration = true;
+
+        assert!(contract
+            .set_funding()
+            .unwrap_err()
+            .to_string()
+            .contains("Currently, epoch is off"));
+    }
+
+    #[test]
+    fn test_set_funding_fails_if_registration_off() {
+        let admin = accounts(1);
+        let storage = 1u128;
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context);
+
+        let mut contract = MetaDaoContract::new(admin.clone());
+
+        contract.is_epoch_on = true;
+        contract.in_registration = false;
+
+        assert!(contract
+            .set_funding()
+            .unwrap_err()
+            .to_string()
+            .contains("Not in Registration period"));
+    }
+
+    #[test]
+    fn test_set_funding_fails_if_already_in_funding() {
+        let admin = accounts(1);
+        let storage = 1u128;
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context);
+
+        let mut contract = MetaDaoContract::new(admin.clone());
+
+        contract.is_epoch_on = true;
+        contract.in_registration = true;
+        contract.in_funding = true;
+
+        assert!(contract
+            .set_funding()
+            .unwrap_err()
+            .to_string()
+            .contains("Already in funding period"));
+    }
+
+    #[test]
+    fn test_set_registration_works() {
+        let admin = accounts(1);
+        let storage = 1u128;
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context);
+
+        let mut contract = MetaDaoContract::new(admin.clone());
+
+        contract.is_epoch_on = true;
+
+        contract.set_registration().unwrap();
+
+        assert!(contract.in_registration);
+        assert!(contract.is_epoch_on);
+        assert!(!contract.in_funding);
+    }
+
+    #[test]
+    fn test_set_registration_fails_if_not_admin() {
+        let admin: AccountId = "admin.near".to_string().try_into().unwrap();
+        let storage = 1u128;
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context);
+
+        let mut contract = MetaDaoContract::new(admin.clone());
+
+        contract.is_epoch_on = true;
+        contract.in_registration = true;
+
+        assert!(contract
+            .set_registration()
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid Admin call"));
+    }
+
+    #[test]
+    fn test_set_registration_fails_if_epoch_is_off() {
+        let admin = accounts(1);
+        let storage = 1u128;
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context);
+
+        let mut contract = MetaDaoContract::new(admin.clone());
+
+        contract.is_epoch_on = false;
+        contract.in_registration = true;
+
+        assert!(contract
+            .set_registration()
+            .unwrap_err()
+            .to_string()
+            .contains("Currently, epoch is off"));
+    }
+
+    #[test]
+    fn test_set_registration_fails_if_registration_on() {
+        let admin = accounts(1);
+        let storage = 1u128;
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context);
+
+        let mut contract = MetaDaoContract::new(admin.clone());
+
+        contract.is_epoch_on = true;
+        contract.in_registration = true;
+        contract.in_funding = false;
+
+        assert!(contract
+            .set_registration()
+            .unwrap_err()
+            .to_string()
+            .contains("Already in Registration period"));
+    }
+
+    #[test]
+    fn test_set_registration_fails_if_already_in_funding() {
+        let admin = accounts(1);
+        let storage = 1u128;
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context);
+
+        let mut contract = MetaDaoContract::new(admin.clone());
+
+        contract.is_epoch_on = true;
+        contract.in_registration = true;
+        contract.in_funding = true;
+
+        assert!(contract
+            .set_registration()
+            .unwrap_err()
+            .to_string()
+            .contains("Already in funding period"));
+    }
+
+    #[test]
+    fn test_end_epoch_works() {
+        let admin = accounts(1);
+        let storage = 1u128;
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context);
+
+        let mut contract = MetaDaoContract::new(admin.clone());
+
+        contract.is_epoch_on = true;
+
+        contract.end_epoch().unwrap();
+
+        assert!(!contract.is_epoch_on);
+        assert!(!contract.in_funding);
+        assert!(!contract.in_registration);
+    }
+
+    #[test]
+    fn test_end_epoch_fails_if_not_call_by_admin() {
+        let admin: AccountId = "admin.near".to_string().try_into().unwrap();
+        let storage = 1u128;
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context);
+
+        let mut contract = MetaDaoContract::new(admin.clone());
+
+        assert!(contract
+            .end_epoch()
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid Admin call"));
+    }
+
+    #[test]
+    fn test_end_epoch_fails_if_epoch_off() {
+        let admin: AccountId = accounts(1);
+        let storage = 1u128;
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context);
+
+        let mut contract = MetaDaoContract::new(admin.clone());
+
+        contract.is_epoch_on = false;
+
+        assert!(contract
+            .end_epoch()
+            .unwrap_err()
+            .to_string()
+            .contains("Currently, epoch is off"));
+    }
+
+    #[test]
+    fn test_end_epoch_fails_if_registration_on() {
+        let admin: AccountId = accounts(1);
+        let storage = 1u128;
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context);
+
+        let mut contract = MetaDaoContract::new(admin.clone());
+
+        contract.is_epoch_on = true;
+        contract.in_registration = true;
+
+        assert!(contract
+            .end_epoch()
+            .unwrap_err()
+            .to_string()
+            .contains("Already in Registration"));
+    }
+
+    #[test]
+    fn test_end_epoch_fails_if_funding_on() {
+        let admin: AccountId = accounts(1);
+        let storage = 1u128;
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context);
+
+        let mut contract = MetaDaoContract::new(admin.clone());
+
+        contract.is_epoch_on = true;
+        contract.in_registration = false;
+        contract.in_funding = true;
+
+        assert!(contract
+            .end_epoch()
+            .unwrap_err()
+            .to_string()
+            .contains("Already in funding"));
+    }
+
+    #[test]
+    fn test_create_epoch_works() {
+        let admin: AccountId = accounts(1);
+        let storage = 1u128;
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context);
+
+        let mut contract = MetaDaoContract::new(admin.clone());
+
+        let mut ft_acc_ids_fees = HashMap::<FTAccountId, f64>::new();
+
+        ft_acc_ids_fees.insert("wrap.near".to_string().try_into().unwrap(), 0.05);
+        ft_acc_ids_fees.insert("usn".to_string().try_into().unwrap(), 0.03);
+
+        contract.create_new_epoch(Some(ft_acc_ids_fees)).unwrap();
+
+        assert_eq!(contract.epoch, Epoch(1u16));
+        assert!(contract.is_epoch_on);
+        assert!(!contract.in_funding);
+        assert!(!contract.in_registration);
+
+        let epoch = Epoch(1u16);
+
+        assert!(contract.creator_funding.get(&epoch).unwrap().is_empty());
+        assert!(contract.creators_metadata.get(&epoch).unwrap().is_empty());
+        assert!(contract.user_funds.get(&epoch).unwrap().is_empty());
+
+        assert!(contract
+            .creators_per_epoch_set
+            .get(&epoch)
+            .unwrap()
+            .is_empty());
+        assert_eq!(contract.protocol_allowed_tokens_fees.len(), 2u64);
+        assert_eq!(
+            contract
+                .protocol_allowed_tokens_fees
+                .get(&AccountId::try_from(String::from("wrap.near")).unwrap())
+                .unwrap(),
+            0.05_f64
+        );
+        assert_eq!(
+            contract
+                .protocol_allowed_tokens_fees
+                .get(&AccountId::try_from(String::from("usn")).unwrap())
+                .unwrap(),
+            0.03_f64
+        );
+    }
+
+    #[test]
+    fn test_create_new_epoch_fails_if_not_admin_call() {
+        let admin: AccountId = "admin.near".to_string().try_into().unwrap();
+        let storage = 1u128;
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context);
+
+        let mut contract = MetaDaoContract::new(admin.clone());
+
+        let mut protocol_accounts_fees = HashMap::<FTAccountId, f64>::new();
+
+        protocol_accounts_fees.insert("wrap.near".to_string().try_into().unwrap(), 0.05);
+        protocol_accounts_fees.insert("usn".to_string().try_into().unwrap(), 0.03);
+
+        contract
+            .create_new_epoch(Some(protocol_accounts_fees))
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid Admin call");
+    }
+
+    #[test]
+    fn test_create_new_epoch_fails_if_epoch_on() {
+        let admin: AccountId = accounts(1);
+        let storage = 1u128;
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context);
+
+        let mut contract = MetaDaoContract::new(admin.clone());
+
+        contract.is_epoch_on = true;
+
+        let mut protocol_accounts_fees = HashMap::<FTAccountId, f64>::new();
+
+        protocol_accounts_fees.insert("wrap.near".to_string().try_into().unwrap(), 0.05);
+        protocol_accounts_fees.insert("usn".to_string().try_into().unwrap(), 0.03);
+
+        contract
+            .create_new_epoch(Some(protocol_accounts_fees))
+            .unwrap_err()
+            .to_string()
+            .contains("Unable to create a new epoch, while previous epoch is still ongoing");
+    }
+
+    #[test]
+    fn test_user_funding_creator_works() {
+        let admin: AccountId = accounts(1);
+        let storage = parse_near!("0.1 N");
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context);
+
+        let mut contract = MetaDaoContract::new(admin.clone());
+
+        let mut protocol_accounts_fees = HashMap::<FTAccountId, f64>::new();
+
+        protocol_accounts_fees.insert("wrap.near".to_string().try_into().unwrap(), 0.05);
+        protocol_accounts_fees.insert("usn".to_string().try_into().unwrap(), 0.03);
+
+        contract
+            .create_new_epoch(Some(protocol_accounts_fees))
+            .unwrap();
+
+        contract.set_registration().unwrap();
+
+        let user_id: AccountId = "user.near".to_string().try_into().unwrap();
+        let creator_account_id = accounts(1);
+        let nft_rank = UserNFTRank::Common;
+        let ft_token_id: AccountId = "wrap.near".to_string().try_into().unwrap();
+        let amount = 100_u128;
+
+        use crate::tests::get_registry_metadata;
+
+        let metadata = get_registry_metadata();
+
+        contract.creator_registration(metadata).unwrap();
+
+        contract.set_funding().unwrap();
+
+        contract
+            .user_funding_creator(
+                user_id.clone(),
+                creator_account_id.clone(),
+                nft_rank,
+                amount,
+                ft_token_id.clone(),
+            )
+            .unwrap();
+
+        let creator_fundings = contract.creator_funding.get(&contract.epoch).unwrap();
+        let creator_funding = creator_fundings.get(&creator_account_id).unwrap();
+
+        assert_eq!(creator_funding.len(), 1_usize);
+        assert_eq!(
+            creator_funding[0],
+            ObtainedTokenAmounts {
+                user_id,
+                amount,
+                already_funded: false,
+                nft_rank: UserNFTRank::Common,
+                ft_token_id
+            }
+        );
+
+        let user_id: AccountId = "other_user.near".to_string().try_into().unwrap();
+        let creator_account_id = accounts(1);
+        let nft_rank = UserNFTRank::Uncommon;
+        let ft_token_id: AccountId = "wrap.near".to_string().try_into().unwrap();
+        let amount = 250_u128;
+
+        contract
+            .user_funding_creator(
+                user_id.clone(),
+                creator_account_id.clone(),
+                nft_rank,
+                amount,
+                ft_token_id.clone(),
+            )
+            .unwrap();
+
+        let creator_fundings = contract.creator_funding.get(&contract.epoch).unwrap();
+        let creator_funding = creator_fundings.get(&creator_account_id).unwrap();
+
+        assert_eq!(creator_funding.len(), 2_usize);
+        assert_eq!(
+            creator_funding[1],
+            ObtainedTokenAmounts {
+                user_id,
+                amount,
+                already_funded: false,
+                nft_rank: UserNFTRank::Uncommon,
+                ft_token_id
+            }
+        );
+
+        let user_id: AccountId = "encore_user.near".to_string().try_into().unwrap();
+        let creator_account_id = accounts(1);
+        let nft_rank = UserNFTRank::Rare;
+        let ft_token_id: AccountId = "wrap.near".to_string().try_into().unwrap();
+        let amount = 500_u128;
+
+        contract
+            .user_funding_creator(
+                user_id.clone(),
+                creator_account_id.clone(),
+                nft_rank,
+                amount,
+                ft_token_id.clone(),
+            )
+            .unwrap();
+
+        let creator_fundings = contract.creator_funding.get(&contract.epoch).unwrap();
+        let creator_funding = creator_fundings.get(&creator_account_id).unwrap();
+
+        assert_eq!(creator_funding.len(), 3_usize);
+        assert_eq!(
+            creator_funding[2],
+            ObtainedTokenAmounts {
+                user_id,
+                amount,
+                already_funded: false,
+                nft_rank: UserNFTRank::Rare,
+                ft_token_id
+            }
+        );
+    }
+}
+
+'''
+'''--- contracts/src/nft.rs ---
+use near_contract_standards::non_fungible_token::metadata::{
+    NFTContractMetadata, NonFungibleTokenMetadataProvider, TokenMetadata,
+};
+use near_contract_standards::non_fungible_token::{Token, TokenId};
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::{
+    serde::{Deserialize, Serialize},
+    AccountId, Promise, PromiseOrValue,
+};
+use std::collections::HashMap;
+
+use crate::{error::MetaDaoError, FTAccountId, *};
+
+#[derive(BorshDeserialize, BorshSerialize, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[serde(crate = "near_sdk::serde")]
+pub enum UserNFTRank {
+    Common,
+    Uncommon,
+    Rare,
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[serde(crate = "near_sdk::serde")]
+pub enum CreatorNFTRanking {
+    Common(HashMap<FTAccountId, u128>),
+    Uncommon(HashMap<FTAccountId, u128>),
+    Rare(HashMap<FTAccountId, u128>),
+}
+
+impl CreatorNFTRanking {
+    pub fn get_amount_from_nft_rank(
+        &self,
+        ft_token_id: &FTAccountId,
+    ) -> Result<u128, MetaDaoError> {
+        let inner = match self {
+            Self::Common(i) => i,
+            Self::Uncommon(i) => i,
+            Self::Rare(i) => i,
+        };
+
+        let amount = *inner
+            .get(ft_token_id)
+            .ok_or(MetaDaoError::InvalidFTTokenId)?;
+        Ok(amount)
+    }
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[serde(crate = "near_sdk::serde")]
+pub enum CreatorNFTTitle {
+    Common(String),
+    Uncommon(String),
+    Rare(String),
+}
+
+impl CreatorNFTTitle {
+    pub fn get_title(&self) -> &str {
+        match self {
+            Self::Common(t) | Self::Uncommon(t) | Self::Rare(t) => t,
+        }
+    }
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[serde(crate = "near_sdk::serde")]
+pub enum CreatorNFTDescription {
+    Common(String),
+    Uncommon(String),
+    Rare(String),
+}
+
+impl CreatorNFTDescription {
+    pub fn get_description(&self) -> &str {
+        match self {
+            Self::Common(t) | Self::Uncommon(t) | Self::Rare(t) => t,
+        }
+    }
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[serde(crate = "near_sdk::serde")]
+pub enum CreatorNFTMedia {
+    Common(String),
+    Uncommon(String),
+    Rare(String),
+}
+
+impl CreatorNFTMedia {
+    pub fn get_media(&self) -> &str {
+        match self {
+            Self::Common(t) | Self::Uncommon(t) | Self::Rare(t) => t,
+        }
+    }
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[serde(crate = "near_sdk::serde")]
+pub enum CreatorNFTCopies {
+    Common(u64),
+    Uncommon(u64),
+    Rare(u64),
+}
+
+impl CreatorNFTCopies {
+    pub fn get_copies(&self) -> u64 {
+        match self {
+            Self::Common(u) | Self::Uncommon(u) | Self::Rare(u) => *u,
+        }
+    }
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[serde(crate = "near_sdk::serde")]
+pub enum CreatorNFTExtra {
+    Common(String),
+    Uncommon(String),
+    Rare(String),
+}
+
+impl CreatorNFTExtra {
+    pub fn get_extra(&self) -> &str {
+        match self {
+            Self::Common(t) | Self::Uncommon(t) | Self::Rare(t) => t,
+        }
+    }
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[serde(crate = "near_sdk::serde")]
+pub enum CreatorNFTReference {
+    Common(Option<String>),
+    Uncommon(Option<String>),
+    Rare(Option<String>),
+}
+
+impl CreatorNFTReference {
+    pub fn get_reference(&self) -> Option<String> {
+        match self {
+            Self::Common(t) | Self::Uncommon(t) | Self::Rare(t) => t.clone(),
+        }
+    }
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[serde(crate = "near_sdk::serde")]
+pub struct CreatorNFTRankings {
+    rankings: Vec<CreatorNFTRanking>,
+}
+
+impl CreatorNFTRankings {
+    pub fn get_ranking(&self, user_nft_rank: UserNFTRank) -> CreatorNFTRanking {
+        match user_nft_rank {
+            UserNFTRank::Common => self.rankings[0].clone(),
+            UserNFTRank::Uncommon => self.rankings[1].clone(),
+            UserNFTRank::Rare => self.rankings[2].clone(),
+        }
+    }
+}
+
+pub fn get_metadata(copies: u64, description: String, title: String) -> TokenMetadata {
+    TokenMetadata {
+        title: Some(title),
+        description: Some(description),
+        media: None,
+        media_hash: None,
+        copies: Some(copies),
+        issued_at: None,
+        expires_at: None,
+        starts_at: None,
+        updated_at: None,
+        extra: None,
+        reference: None,
+        reference_hash: None,
+    }
+}
+
+#[near_bindgen]
+impl MetaDaoContract {
+    #[payable]
+    #[private]
+    pub fn nft_mint(
+        &mut self,
+        token_id: TokenId,
+        receiver_id: AccountId,
+        token_metadata: TokenMetadata,
+    ) -> Token {
+        self.tokens
+            .internal_mint(token_id, receiver_id, Some(token_metadata))
+    }
+}
+
+#[near_bindgen]
+impl MetaDaoContract {
+    pub fn get_token_id(
+        &self,
+        user_id: &UserAccountId,
+        nft_rank: &UserNFTRank,
+        creator_metadata: &CreatorMetadata,
+    ) -> TokenId {
+        let nft_id = self.nft_id;
+        let titles = creator_metadata.get_titles();
+        let title = match nft_rank {
+            UserNFTRank::Common => titles[0].get_title(),
+            UserNFTRank::Uncommon => titles[1].get_title(),
+            UserNFTRank::Rare => titles[2].get_title(),
+        };
+        let nft_rank = match nft_rank {
+            UserNFTRank::Common => "common",
+            UserNFTRank::Uncommon => "uncommon",
+            UserNFTRank::Rare => "rare",
+        };
+
+        format!("MetaDao|{}|{}|{}|{}|", nft_id, title, nft_rank, user_id)
+    }
+
+    #[payable]
+    #[handle_result]
+    pub fn mint_nfts_for_users(
+        &mut self,
+        creator_account_id: CreatorAccountId,
+    ) -> Result<(), MetaDaoError> {
+        let creators_metadata = self
+            .creators_metadata
+            .get(&self.epoch)
+            .ok_or(MetaDaoError::InvalidCurrentEpoch)?;
+
+        let creator_metadata = creators_metadata
+            .get(&creator_account_id)
+            .ok_or(MetaDaoError::CreatorIsNotRegistered)?;
+
+        let creators_obtained_funds = self
+            .creator_funding
+            .get(&self.epoch)
+            .ok_or(MetaDaoError::InvalidCurrentEpoch)?;
+
+        let creator_obtained_funds = creators_obtained_funds
+            .get(&creator_account_id)
+            .ok_or(MetaDaoError::CreatorIsNotRegistered)?;
+
+        for ObtainedTokenAmounts {
+            user_id,
+            ft_token_id,
+            amount,
+            nft_rank,
+            ..
+        } in creator_obtained_funds
+        {
+            let token_id = self.get_token_id(&user_id, &nft_rank, &creator_metadata);
+            let token_metadata = creator_metadata.get_token_metadata(nft_rank)?;
+
+            // minf nft for current user
+            self.nft_mint(token_id, user_id.clone(), token_metadata);
+
+            // get protocol fee
+            let protocol_fee = self
+                .protocol_allowed_tokens_fees
+                .get(&ft_token_id)
+                .ok_or(MetaDaoError::InvalidFTTokenId)?;
+
+            let creator_amount_to_receive = (amount as f64) * (1.0 - protocol_fee);
+
+            self.external_send_ft_tokens(
+                creator_account_id.clone(),
+                &user_id,
+                ft_token_id,
+                creator_amount_to_receive as u128,
+            );
+
+            // update nft id
+            self.nft_id += 1;
+        }
+
+        Ok(())
+    }
+}
+
+impl NonFungibleTokenMetadataProvider for MetaDaoContract {
+    fn nft_metadata(&self) -> NFTContractMetadata {
+        self.metadata.get().unwrap()
+    }
+}
+
+// Implements the Near NFT interface for the MetaDaoContract
+near_contract_standards::impl_non_fungible_token_approval!(MetaDaoContract, tokens);
+near_contract_standards::impl_non_fungible_token_core!(MetaDaoContract, tokens);
+near_contract_standards::impl_non_fungible_token_enumeration!(MetaDaoContract, tokens);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mint_nfts_for_users_works() {}
+}
+
+'''
+'''--- contracts/src/registry.rs ---
+use near_contract_standards::non_fungible_token::metadata::TokenMetadata;
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::json_types::Base64VecU8;
+use near_sdk::serde::{Deserialize, Serialize};
+
+use crate::consts::CREATOR_REGISTRY_STORAGE_COST;
+use crate::{
+    error::MetaDaoError,
+    nft::{
+        CreatorNFTCopies, CreatorNFTDescription, CreatorNFTExtra, CreatorNFTMedia,
+        CreatorNFTRanking, CreatorNFTReference, CreatorNFTTitle,
+    },
+    *,
+};
+
+#[derive(BorshDeserialize, BorshSerialize, Deserialize, Serialize, Clone, Debug, PartialEq)]
+#[serde(crate = "near_sdk::serde")]
+pub struct CreatorMetadata {
+    nft_ranks: Vec<CreatorNFTRanking>,
+    titles: Vec<CreatorNFTTitle>,
+    descriptions: Vec<CreatorNFTDescription>,
+    medias: Vec<CreatorNFTMedia>,
+    copies: Vec<CreatorNFTCopies>,
+    extras: Vec<CreatorNFTExtra>,
+    references: Vec<CreatorNFTReference>,
+}
+
+impl CreatorMetadata {
+    pub fn new(
+        nft_ranks: Vec<CreatorNFTRanking>,
+        titles: Vec<CreatorNFTTitle>,
+        descriptions: Vec<CreatorNFTDescription>,
+        medias: Vec<CreatorNFTMedia>,
+        copies: Vec<CreatorNFTCopies>,
+        extras: Vec<CreatorNFTExtra>,
+        references: Vec<CreatorNFTReference>,
+    ) -> Self {
+        Self {
+            nft_ranks,
+            titles,
+            descriptions,
+            medias,
+            copies,
+            extras,
+            references,
+        }
+    }
+
+    pub fn nft_rank(&self, user_nft_rank: UserNFTRank) -> CreatorNFTRanking {
+        match user_nft_rank {
+            UserNFTRank::Common => self.nft_ranks[0].clone(),
+            UserNFTRank::Uncommon => self.nft_ranks[1].clone(),
+            UserNFTRank::Rare => self.nft_ranks[2].clone(),
+        }
+    }
+
+    pub fn get_nft_ranks(&self) -> Vec<CreatorNFTRanking> {
+        self.nft_ranks.clone()
+    }
+
+    pub fn get_titles(&self) -> Vec<CreatorNFTTitle> {
+        self.titles.clone()
+    }
+
+    pub fn get_descriptions(&self) -> Vec<CreatorNFTDescription> {
+        self.descriptions.clone()
+    }
+
+    pub fn get_medias(&self) -> Vec<CreatorNFTMedia> {
+        self.medias.clone()
+    }
+
+    pub fn get_copies(&self) -> Vec<CreatorNFTCopies> {
+        self.copies.clone()
+    }
+
+    pub fn get_extras(&self) -> Vec<CreatorNFTExtra> {
+        self.extras.clone()
+    }
+
+    pub fn get_references(&self) -> Vec<CreatorNFTReference> {
+        self.references.clone()
+    }
+
+    pub fn get_token_metadata(&self, nft_rank: UserNFTRank) -> Result<TokenMetadata, MetaDaoError> {
+        let index = match nft_rank {
+            UserNFTRank::Common => 0_usize,
+            UserNFTRank::Uncommon => 1_usize,
+            UserNFTRank::Rare => 2_usize,
+        };
+
+        let title = Some(String::from(self.get_titles()[index].get_title()));
+        let description = Some(String::from(
+            self.get_descriptions()[index].get_description(),
+        ));
+        let media = Some(String::from(self.get_medias()[index].get_media()));
+        let media_hash = env::sha256(media.clone().unwrap().as_bytes());
+        let media_hash = Some(Base64VecU8::from(media_hash));
+        let copies = Some(self.get_copies()[index].get_copies());
+        let issued_at = Some(format!("block_timestamp: {}", env::block_timestamp()));
+        let extra = Some(String::from(self.get_extras()[index].get_extra()));
+        let reference = self.get_references()[index].get_reference();
+        let reference_hash = if reference.is_none() {
+            Some(Base64VecU8::from(env::sha256(
+                reference.clone().unwrap().as_bytes(),
+            )))
+        } else {
+            None
+        };
+
+        let token_metadata = TokenMetadata {
+            title,
+            description,
+            media,
+            media_hash,
+            copies,
+            issued_at,
+            expires_at: None,
+            starts_at: None,
+            updated_at: None,
+            extra,
+            reference,
+            reference_hash,
+        };
+
+        Ok(token_metadata)
+    }
+}
+
+#[near_bindgen]
+impl MetaDaoContract {
+    #[payable]
+    #[handle_result]
+    pub fn creator_registration(&mut self, metadata: CreatorMetadata) -> Result<(), MetaDaoError> {
+        let creator_account_id = env::predecessor_account_id();
+
+        if env::attached_deposit()
+            < (CREATOR_REGISTRY_STORAGE_COST as u128) * env::STORAGE_PRICE_PER_BYTE
+        {
+            return Err(MetaDaoError::UncoveredStorageCosts);
+        }
+
+        if !self.is_epoch_on {
+            return Err(MetaDaoError::EpochIsOff);
+        }
+
+        if !self.in_registration {
+            return Err(MetaDaoError::NotInRegistrationPeriod);
+        }
+
+        let mut creator_funding = self
+            .creator_funding
+            .get(&self.epoch)
+            .ok_or(MetaDaoError::EpochIsOff)?;
+
+        let mut creators_metadata = self
+            .creators_metadata
+            .get(&self.epoch)
+            .ok_or(MetaDaoError::EpochIsOff)?;
+
+        let mut creators_per_epoch = self
+            .creators_per_epoch_set
+            .get(&self.epoch)
+            .ok_or(MetaDaoError::EpochIsOff)?;
+
+        creator_funding.insert(&creator_account_id, &vec![]);
+        creators_metadata.insert(&creator_account_id, &metadata);
+        creators_per_epoch.insert(&creator_account_id);
+
+        self.creator_funding.insert(&self.epoch, &creator_funding);
+        self.creators_metadata
+            .insert(&self.epoch, &creators_metadata);
+        self.creators_per_epoch_set
+            .insert(&self.epoch, &creators_per_epoch);
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::{
+        testing_env, AccountId, Gas, MockedBlockchain, PromiseResult, RuntimeFeesConfig, VMConfig,
+        VMContext,
+    };
+    use std::convert::TryInto;
+
+    /// utility function for testing callbacks logic
+    #[allow(dead_code)]
+    pub fn testing_env_with_promise_results(
+        context: VMContext,
+        promise_results: Vec<PromiseResult>,
+    ) {
+        near_sdk::env::set_blockchain_interface(MockedBlockchain::new(
+            context,
+            VMConfig::test(),
+            RuntimeFeesConfig::test(),
+            promise_results,
+            Default::default(),
+            Default::default(),
+            None,
+        ));
+    }
+
+    pub fn to_yocto(value: &str) -> u128 {
+        let vals: Vec<_> = value.split('.').collect();
+        let part1 = vals[0].parse::<u128>().unwrap() * 10u128.pow(24);
+        if vals.len() > 1 {
+            let power = vals[1].len() as u32;
+            let part2 = vals[1].parse::<u128>().unwrap() * 10u128.pow(24 - power);
+            part1 + part2
+        } else {
+            part1
+        }
+    }
+
+    fn get_context_with_storage(storage: u128) -> VMContext {
+        let contract_account_id: AccountId = "conliq.testnet".to_string().try_into().unwrap();
+
+        VMContextBuilder::new()
+            .current_account_id(contract_account_id)
+            .attached_deposit(to_yocto("1000"))
+            .signer_account_id(accounts(0))
+            .predecessor_account_id(accounts(0))
+            .prepaid_gas(Gas(300 * 10u64.pow(16)))
+            .attached_deposit(storage)
+            .build()
+    }
+
+    fn get_registry_metadata() -> CreatorMetadata {
+        CreatorMetadata {
+            nft_ranks: vec![
+                CreatorNFTRanking::Common(HashMap::<FTAccountId, u128>::from_iter([(
+                    "ft_account_id.near".to_string().try_into().unwrap(),
+                    100_u128,
+                )])),
+                CreatorNFTRanking::Uncommon(HashMap::<FTAccountId, u128>::from_iter([(
+                    "ft_account_id.near".to_string().try_into().unwrap(),
+                    250_u128,
+                )])),
+                CreatorNFTRanking::Rare(HashMap::<FTAccountId, u128>::from_iter([(
+                    "ft_account_id.near".to_string().try_into().unwrap(),
+                    500_u128,
+                )])),
+            ],
+            titles: vec![
+                CreatorNFTTitle::Common("common".to_string()),
+                CreatorNFTTitle::Uncommon("uncommon".to_string()),
+                CreatorNFTTitle::Rare("rare".to_string()),
+            ],
+            descriptions: vec![
+                CreatorNFTDescription::Common("common".to_string()),
+                CreatorNFTDescription::Uncommon("uncommon".to_string()),
+                CreatorNFTDescription::Rare("rare".to_string()),
+            ],
+            medias: vec![
+                CreatorNFTMedia::Common("media_common".to_string()),
+                CreatorNFTMedia::Uncommon("media_uncommon".to_string()),
+                CreatorNFTMedia::Rare("media_rare".to_string()),
+            ],
+            copies: vec![
+                CreatorNFTCopies::Common(100_u64),
+                CreatorNFTCopies::Uncommon(50_u64),
+                CreatorNFTCopies::Rare(5_u64),
+            ],
+            extras: vec![
+                CreatorNFTExtra::Common("extra_common".to_string()),
+                CreatorNFTExtra::Uncommon("extra_uncommon".to_string()),
+                CreatorNFTExtra::Rare("extra_rare".to_string()),
+            ],
+            references: vec![
+                CreatorNFTReference::Common(None),
+                CreatorNFTReference::Uncommon(None),
+                CreatorNFTReference::Rare(None),
+            ],
+        }
+    }
+
+    #[test]
+    fn it_works_registry() {
+        let admin: AccountId = accounts(0);
+        let storage = (CREATOR_REGISTRY_STORAGE_COST as u128) * env::STORAGE_PRICE_PER_BYTE;
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context);
+
+        let mut contract = MetaDaoContract::new(admin.clone());
+
+        let mut protocol_accounts_fees = HashMap::<FTAccountId, f64>::new();
+
+        protocol_accounts_fees.insert("wrap.near".to_string().try_into().unwrap(), 0.05);
+        protocol_accounts_fees.insert("usn".to_string().try_into().unwrap(), 0.03);
+
+        contract
+            .create_new_epoch(Some(protocol_accounts_fees))
+            .unwrap();
+
+        contract.is_epoch_on = true;
+
+        contract.set_registration().unwrap();
+
+        let creator_account_id = accounts(0);
+
+        let metadata = get_registry_metadata();
+
+        contract.creator_registration(metadata.clone()).unwrap();
+
+        let creator_funding = contract
+            .creator_funding
+            .get(&contract.epoch)
+            .ok_or(MetaDaoError::EpochIsOff)
+            .unwrap();
+
+        let creators_metadata = contract
+            .creators_metadata
+            .get(&contract.epoch)
+            .ok_or(MetaDaoError::EpochIsOff)
+            .unwrap();
+
+        let creators_per_epoch = contract
+            .creators_per_epoch_set
+            .get(&contract.epoch)
+            .ok_or(MetaDaoError::EpochIsOff)
+            .unwrap();
+
+        assert_eq!(creator_funding.get(&creator_account_id).unwrap(), vec![]);
+        assert_eq!(
+            creators_metadata.get(&creator_account_id).unwrap(),
+            metadata
+        );
+        assert_eq!(creators_per_epoch.len(), 1);
+        assert!(creators_per_epoch.contains(&creator_account_id));
+    }
+
+    #[test]
+    fn it_fails_creator_registry_if_not_enough_funds_for_storage() {
+        let admin: AccountId = accounts(0);
+        let storage = (CREATOR_REGISTRY_STORAGE_COST as u128) * env::STORAGE_PRICE_PER_BYTE - 1u128;
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context);
+
+        let mut contract = MetaDaoContract::new(admin.clone());
+
+        let mut protocol_accounts_fees = HashMap::<FTAccountId, f64>::new();
+
+        protocol_accounts_fees.insert("wrap.near".to_string().try_into().unwrap(), 0.05);
+        protocol_accounts_fees.insert("usn".to_string().try_into().unwrap(), 0.03);
+
+        contract
+            .create_new_epoch(Some(protocol_accounts_fees))
+            .unwrap();
+
+        contract.is_epoch_on = true;
+
+        contract.set_registration().unwrap();
+
+        let metadata = get_registry_metadata();
+
+        contract.is_epoch_on = false;
+
+        assert!(contract
+            .creator_registration(metadata.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("Uncovered storage costs"));
+    }
+
+    #[test]
+    fn it_fails_creator_registry_if_epoch_is_on() {
+        let admin: AccountId = accounts(0);
+        let storage = (CREATOR_REGISTRY_STORAGE_COST as u128) * env::STORAGE_PRICE_PER_BYTE;
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context);
+
+        let mut contract = MetaDaoContract::new(admin.clone());
+
+        let mut protocol_accounts_fees = HashMap::<FTAccountId, f64>::new();
+
+        protocol_accounts_fees.insert("wrap.near".to_string().try_into().unwrap(), 0.05);
+        protocol_accounts_fees.insert("usn".to_string().try_into().unwrap(), 0.03);
+
+        contract
+            .create_new_epoch(Some(protocol_accounts_fees))
+            .unwrap();
+
+        contract.is_epoch_on = true;
+
+        contract.set_registration().unwrap();
+
+        let metadata = get_registry_metadata();
+
+        contract.is_epoch_on = false;
+
+        assert!(contract
+            .creator_registration(metadata.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("Currently, epoch is off"));
+    }
+
+    #[test]
+    fn it_fails_creator_registry_if_not_in_registration() {
+        let admin: AccountId = accounts(0);
+        let storage = (CREATOR_REGISTRY_STORAGE_COST as u128) * env::STORAGE_PRICE_PER_BYTE;
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context);
+
+        let mut contract = MetaDaoContract::new(admin.clone());
+
+        let mut protocol_accounts_fees = HashMap::<FTAccountId, f64>::new();
+
+        protocol_accounts_fees.insert("wrap.near".to_string().try_into().unwrap(), 0.05);
+        protocol_accounts_fees.insert("usn".to_string().try_into().unwrap(), 0.03);
+
+        contract
+            .create_new_epoch(Some(protocol_accounts_fees))
+            .unwrap();
+
+        contract.is_epoch_on = true;
+
+        let metadata = get_registry_metadata();
+
+        assert!(contract
+            .creator_registration(metadata.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("Not in Registration period"));
+    }
+}
+
+'''
+'''--- contracts/src/tests.rs ---
+// use std::collections::HashMap;
+
+// use anyhow::*;
+// use near_primitives::transaction;
+// use near_sdk::ONE_YOCTO;
+// use near_sdk::{env::STORAGE_PRICE_PER_BYTE, json_types::U128};
+// use near_units::{parse_gas, parse_near};
+// use workspaces::{network::Sandbox, Account, AccountId, Contract, Worker};
+
+// use near_primitives::borsh::de;
+
+use crate::{
+    nft::{
+        CreatorNFTCopies, CreatorNFTDescription, CreatorNFTExtra, CreatorNFTMedia,
+        CreatorNFTRanking, CreatorNFTReference, CreatorNFTTitle,
+    },
+    *,
+};
+
+pub fn get_registry_metadata() -> CreatorMetadata {
+    let nft_ranks = vec![
+        CreatorNFTRanking::Common(HashMap::<FTAccountId, u128>::from_iter([
+            ("wrap.near".to_string().try_into().unwrap(), 100_u128),
+            ("usn".to_string().try_into().unwrap(), 1_000_u128),
+        ])),
+        CreatorNFTRanking::Uncommon(HashMap::<FTAccountId, u128>::from_iter([
+            ("wrap.near".to_string().try_into().unwrap(), 250_u128),
+            ("usn".to_string().try_into().unwrap(), 2_500_u128),
+        ])),
+        CreatorNFTRanking::Rare(HashMap::<FTAccountId, u128>::from_iter([
+            ("wrap.near".to_string().try_into().unwrap(), 500_u128),
+            ("usn".to_string().try_into().unwrap(), 5_000_u128),
+        ])),
+    ];
+    let titles = vec![
+        CreatorNFTTitle::Common("common".to_string()),
+        CreatorNFTTitle::Uncommon("uncommon".to_string()),
+        CreatorNFTTitle::Rare("rare".to_string()),
+    ];
+    let descriptions = vec![
+        CreatorNFTDescription::Common("common".to_string()),
+        CreatorNFTDescription::Uncommon("uncommon".to_string()),
+        CreatorNFTDescription::Rare("rare".to_string()),
+    ];
+    let medias = vec![
+        CreatorNFTMedia::Common("media_common".to_string()),
+        CreatorNFTMedia::Uncommon("media_uncommon".to_string()),
+        CreatorNFTMedia::Rare("media_rare".to_string()),
+    ];
+    let copies = vec![
+        CreatorNFTCopies::Common(100_u64),
+        CreatorNFTCopies::Uncommon(50_u64),
+        CreatorNFTCopies::Rare(5_u64),
+    ];
+    let extras = vec![
+        CreatorNFTExtra::Common("extra_common".to_string()),
+        CreatorNFTExtra::Uncommon("extra_uncommon".to_string()),
+        CreatorNFTExtra::Rare("extra_rare".to_string()),
+    ];
+    let references = vec![
+        CreatorNFTReference::Common(None),
+        CreatorNFTReference::Uncommon(None),
+        CreatorNFTReference::Rare(None),
+    ];
+    CreatorMetadata::new(
+        nft_ranks,
+        titles,
+        descriptions,
+        medias,
+        copies,
+        extras,
+        references,
+    )
+}
+
+// pub async fn init() -> anyhow::Result<(
+//     Contract,
+//     Account,
+//     Contract,
+//     Contract,
+//     Account,
+//     Account,
+//     Account,
+//     Worker<Sandbox>,
+// )> {
+//     // get worker
+//     let worker = &workspaces::sandbox().await?;
+
+//     // get accounts registered on the fungible token contracts
+//     let owner = worker.root_account().unwrap();
+
+//     let admin = owner
+//         .create_subaccount("admin")
+//         .initial_balance(parse_near!("10,000,000 N"))
+//         .transact()
+//         .await?
+//         .into_result()
+//         .unwrap();
+
+//     // get alpha fungible token contract
+//     let alpha_ft_contract = worker
+//         .dev_deploy(&include_bytes!("../res/fungible_token.wasm").to_vec())
+//         .await?;
+
+//     // initial balance for fungible tokens
+//     let initial_balance = parse_near!("1,000,000,000,000 N").to_string();
+
+//     let alice = owner
+//         .create_subaccount("alice")
+//         .initial_balance(parse_near!("10,000,000 N"))
+//         .transact()
+//         .await?
+//         .into_result()
+//         .unwrap();
+
+//     // get alpha fungible token contract
+//     let res = alice
+//         .call(alpha_ft_contract.id(), "new_default_meta")
+//         .args_json(serde_json::json!({
+//             "owner_id": owner.id(),
+//             "total_supply": initial_balance
+//         }))
+//         .gas(300_000_000_000_000)
+//         .transact()
+//         .await?;
+
+//     // result is successful
+//     assert!(res.is_success());
+
+//     // get beta fungible token contract
+//     let beta_ft_contract = worker
+//         .dev_deploy(&include_bytes!("../res/fungible_token.wasm").to_vec())
+//         .await?;
+
+//     let bob = owner
+//         .create_subaccount("bob")
+//         .initial_balance(parse_near!("10,000,000 N"))
+//         .transact()
+//         .await?
+//         .into_result()
+//         .unwrap();
+
+//     // get beta fungible token contract
+//     let res = bob
+//         .call(beta_ft_contract.id(), "new_default_meta")
+//         .args_json(serde_json::json!({
+//             "owner_id": owner.id(),
+//             "total_supply": initial_balance
+//         }))
+//         .gas(300_000_000_000_000)
+//         .transact()
+//         .await?;
+
+//     // result is successful
+//     assert!(res.is_success());
+
+//     // get concentrated liquidity contract
+//     let metadao_contract = worker
+//         .dev_deploy(&workspaces::compile_project("./").await?)
+//         .await?;
+
+//     let charlie = owner
+//         .create_subaccount("charlie")
+//         .initial_balance(parse_near!("10,000,000 N"))
+//         .transact()
+//         .await?
+//         .into_result()
+//         .unwrap();
+
+//     let res = charlie
+//         .call(metadao_contract.id(), "new")
+//         .args_json(serde_json::json!({
+//             "admin": admin.id()
+//         }))
+//         .gas(300_000_000_000_000)
+//         .transact()
+//         .await?;
+
+//     assert!(res.is_success());
+
+//     // register alice as user in both alpha and beta ft contracts
+//     register_and_transfer_funds_to_account_id(&owner, &alpha_ft_contract, alice.id()).await?;
+//     register_and_transfer_funds_to_account_id(&owner, &beta_ft_contract, alice.id()).await?;
+
+//     // register our contract in both alpha and beta ft contracts
+//     register_and_transfer_funds_to_account_id(&owner, &alpha_ft_contract, metadao_contract.id())
+//         .await?;
+//     register_and_transfer_funds_to_account_id(&owner, &beta_ft_contract, metadao_contract.id())
+//         .await?;
+
+//     // register our contract in both alpha and beta ft contracts
+//     register_and_transfer_funds_to_account_id(&owner, &alpha_ft_contract, charlie.id()).await?;
+//     register_and_transfer_funds_to_account_id(&owner, &beta_ft_contract, charlie.id()).await?;
+
+//     Ok((
+//         metadao_contract,
+//         admin,
+//         alpha_ft_contract,
+//         beta_ft_contract,
+//         alice,
+//         bob,
+//         charlie,
+//         worker.clone(),
+//     ))
+// }
+
+// pub async fn register_and_transfer_funds_to_account_id(
+//     owner: &Account,
+//     contract: &Contract,
+//     account_id: &AccountId,
+// ) -> anyhow::Result<()> {
+//     // register user
+//     let res = owner
+//         .call(contract.id(), "storage_deposit")
+//         .args_json(serde_json::json!({ "account_id": account_id }))
+//         .gas(300_000_000_000_000)
+//         .deposit(parse_near!("1 N"))
+//         .transact()
+//         .await?;
+//     assert!(res.is_success());
+
+//     // send funds to user
+//     // after registering alice account, we have to send tokens to it
+//     let res = owner
+//         .call(contract.id(), "ft_transfer")
+//         .args_json(serde_json::json!({
+//             "receiver_id": account_id,
+//             "amount": parse_near!("1,000,000,000 N").to_string().as_str()
+//         }))
+//         .deposit(1)
+//         .transact()
+//         .await?;
+//     assert!(res.is_success());
+
+//     Ok(())
+// }
+
+// pub async fn ft_transfer_call(
+//     ft_contract: &Contract,
+//     user: &Account,
+//     receiver: &Contract,
+//     amount: u128,
+//     msg: &str,
+// ) -> anyhow::Result<()> {
+//     let res = user
+//         .call(ft_contract.id(), "ft_transfer")
+//         .args_json(serde_json::json!({
+//             "receiver_id": receiver.id(),
+//             "amount": amount.to_string().as_str(),
+//             "msg": msg
+//         }))
+//         .gas(parse_gas!("100 Tgas") as u64)
+//         .deposit(ONE_YOCTO)
+//         .transact()
+//         .await?;
+
+//     assert!(res.is_success());
+
+//     let res = ft_contract
+//         .as_account()
+//         .call(receiver.id(), "ft_on_transfer")
+//         .args_json(serde_json::json!({
+//             "sender_id": user.id(),
+//             "amount": amount.to_string().as_str(),
+//             "msg": msg
+//         }))
+//         .gas(parse_gas!("300 Tgas") as u64)
+//         .transact()
+//         .await?;
+
+//     assert!(res.is_success());
+
+//     Ok(())
+// }
+
+// #[tokio::test]
+// async fn on_epoch_start() -> anyhow::Result<()> {
+//     let (metadao_contract, admin, alpha_ft_contract, beta_ft_contract, alice, bob, charlie, worker) =
+//         init().await?;
+
+//     let allowed_ft_account_ids = vec![*alpha_ft_contract.id(), *beta_ft_contract.id()];
+//     let mut protocol_fee = HashMap::<FTAccountId, f64>::new();
+
+//     protocol_fee.insert(alpha_ft_contract.id().clone().into(), 0.001);
+//     protocol_fee.insert(beta_ft_contract.id().clone().into(), 0.001);
+
+//     let res = admin
+//         .call(metadao_contract, "create_new_epoch")
+//         .args_json(serde_json::json!({
+//             "allowed_ft_account_ids": Some(allowed_ft_account_ids),
+//             "protocol_fee": protocol_fee
+//         }))
+//         .gas(300_000_000_000_000)
+//         .transact()
+//         .await?;
+
+//     Ok(())
+// }
+
+'''
+'''--- contracts/src/token_receiver.rs ---
+use near_contract_standards::fungible_token::receiver::FungibleTokenReceiver;
+use near_sdk::json_types::U128;
+use near_sdk::{env, near_bindgen, PromiseOrValue};
+
+use crate::*;
+
+#[near_bindgen]
+impl MetaDaoContract {}
+
+#[near_bindgen]
+impl FungibleTokenReceiver for MetaDaoContract {
+    #[payable]
+    fn ft_on_transfer(
+        &mut self,
+        sender_id: AccountId,
+        amount: near_sdk::json_types::U128,
+        msg: String,
+    ) -> PromiseOrValue<near_sdk::json_types::U128> {
+        if !self.in_funding {
+            env::panic_str(
+                format!(
+                    "MetadaoContract::ft_contract: Funding is not currently open for epoch {}",
+                    self.epoch.count()
+                )
+                .as_str(),
+            );
+        }
+
+        let ft_token_id = env::predecessor_account_id();
+
+        let metadata = msg.split('_').collect::<Vec<_>>();
+        let creator_account_id = AccountId::try_from(metadata[0].to_string())
+            .expect("MetaDaoContract::ft_on_transfer: failed to parse creator account id");
+
+        let amount = amount.0;
+        let epoch = self.epoch;
+
+        let creators_metadata = self
+            .creators_metadata
+            .get(&epoch)
+            .expect("MetaDaoContract::ft_on_transfer: Invalid epoch");
+
+        let creator_metadata = creators_metadata.get(&creator_account_id).expect(
+            "MetaDaoContract::ft_on_transfer: Invalid creator account id for current epoch",
+        );
+
+        let user_nft_rank = match metadata[1] {
+            "common" => UserNFTRank::Common,
+            "uncommon" => UserNFTRank::Uncommon,
+            "rare" => UserNFTRank::Rare,
+            _ => return PromiseOrValue::Value(U128(amount)),
+        };
+
+        let min_fund_amount = creator_metadata
+            .nft_rank(user_nft_rank.clone())
+            .get_amount_from_nft_rank(&ft_token_id)
+            .expect("ft_on_transfer::Invalid fungible token id");
+
+        if amount < min_fund_amount {
+            env::panic_str(
+                "ft_on_transfer::User did not provide enough funds to obtain the chosen NFT",
+            );
+        }
+
+        // TODO: 1. assert that the user sent enough funds to buy the NFTs
+        // 2. return the value to the user, if transaction failed
+        match self.user_funding_creator(
+            sender_id,
+            creator_account_id,
+            user_nft_rank,
+            amount,
+            ft_token_id,
+        ) {
+            Err(_) => PromiseOrValue::Value(U128(amount)),
+            _ => PromiseOrValue::Value(U128(0)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consts::CREATOR_REGISTRY_STORAGE_COST;
+    use crate::tests::get_registry_metadata;
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::{
+        testing_env, AccountId, Gas, MockedBlockchain, PromiseResult, RuntimeFeesConfig, VMConfig,
+        VMContext,
+    };
+    use std::collections::HashMap;
+    use std::convert::TryInto;
+
+    /// utility function for testing callbacks logic
+    #[allow(dead_code)]
+    pub fn testing_env_with_promise_results(
+        context: VMContext,
+        promise_results: Vec<PromiseResult>,
+    ) {
+        near_sdk::env::set_blockchain_interface(MockedBlockchain::new(
+            context,
+            VMConfig::test(),
+            RuntimeFeesConfig::test(),
+            promise_results,
+            Default::default(),
+            Default::default(),
+            None,
+        ));
+    }
+
+    pub fn to_yocto(value: &str) -> u128 {
+        let vals: Vec<_> = value.split('.').collect();
+        let part1 = vals[0].parse::<u128>().unwrap() * 10u128.pow(24);
+        if vals.len() > 1 {
+            let power = vals[1].len() as u32;
+            let part2 = vals[1].parse::<u128>().unwrap() * 10u128.pow(24 - power);
+            part1 + part2
+        } else {
+            part1
+        }
+    }
+
+    fn get_context_with_storage(storage: u128) -> VMContext {
+        let contract_account_id: AccountId = "conliq.testnet".to_string().try_into().unwrap();
+
+        let account: AccountId = "wrap.near".to_string().try_into().unwrap();
+
+        VMContextBuilder::new()
+            .current_account_id(contract_account_id)
+            .attached_deposit(to_yocto("1000"))
+            .signer_account_id(account.clone())
+            .predecessor_account_id(account)
+            .prepaid_gas(Gas(300 * 10u64.pow(16)))
+            .attached_deposit(storage)
+            .build()
+    }
+
+    #[test]
+    fn test_ft_on_transfer_is_successful() {
+        let account: AccountId = "wrap.near".to_string().try_into().unwrap();
+        let admin = account.clone();
+
+        let storage = (CREATOR_REGISTRY_STORAGE_COST as u128) * env::STORAGE_PRICE_PER_BYTE;
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context.clone());
+
+        let sender_id = accounts(2);
+        let amount = U128(1_000_000_000_u128);
+        let msg = format!("{}_common", account.clone(),);
+
+        let mut contract = MetaDaoContract::new(admin);
+
+        let mut protocol_tokens_fees = HashMap::new();
+
+        protocol_tokens_fees.insert("wrap.near".to_string().try_into().unwrap(), 0.001);
+        protocol_tokens_fees.insert("usn".to_string().try_into().unwrap(), 0.0005);
+
+        contract
+            .create_new_epoch(Some(protocol_tokens_fees))
+            .unwrap();
+
+        contract.set_registration().unwrap();
+
+        let metadata = get_registry_metadata();
+
+        contract.creator_registration(metadata).unwrap();
+
+        assert!(contract
+            .creators_per_epoch_set
+            .get(&Epoch(1u16))
+            .unwrap()
+            .contains(&account));
+
+        contract.set_funding().unwrap();
+
+        let amount = contract.ft_on_transfer(sender_id, amount, msg.to_string());
+        assert!(matches!(amount, PromiseOrValue::Value(U128(0_u128))));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "MetadaoContract::ft_contract: Funding is not currently open for epoch 1"
+    )]
+    fn test_ft_on_transfer_panics_if_not_in_funding() {
+        let account: AccountId = "wrap.near".to_string().try_into().unwrap();
+        let admin = account.clone();
+
+        let storage = (CREATOR_REGISTRY_STORAGE_COST as u128) * env::STORAGE_PRICE_PER_BYTE;
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context.clone());
+
+        let sender_id = accounts(2);
+        let amount = U128(1_000_000_000_u128);
+        let msg = format!("{}_common", account.clone(),);
+
+        let mut contract = MetaDaoContract::new(admin);
+
+        let mut protocol_tokens_fees = HashMap::new();
+
+        protocol_tokens_fees.insert("wrap.near".to_string().try_into().unwrap(), 0.001);
+        protocol_tokens_fees.insert("usn".to_string().try_into().unwrap(), 0.0005);
+
+        contract
+            .create_new_epoch(Some(protocol_tokens_fees))
+            .unwrap();
+
+        contract.set_registration().unwrap();
+
+        let metadata = get_registry_metadata();
+
+        contract.creator_registration(metadata).unwrap();
+
+        assert!(contract
+            .creators_per_epoch_set
+            .get(&Epoch(1u16))
+            .unwrap()
+            .contains(&account));
+
+        contract.ft_on_transfer(sender_id, amount, msg.to_string());
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "MetaDaoContract::ft_on_transfer: failed to parse creator account id"
+    )]
+    fn test_ft_on_transfer_panics_if_cannot_parse_account_id() {
+        let account: AccountId = "wrap.near".to_string().try_into().unwrap();
+        let admin = account.clone();
+
+        let storage = (CREATOR_REGISTRY_STORAGE_COST as u128) * env::STORAGE_PRICE_PER_BYTE;
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context.clone());
+
+        let sender_id = accounts(2);
+        let amount = U128(1_000_000_000_u128);
+        let msg = format!("-/lj_common",);
+
+        let mut contract = MetaDaoContract::new(admin);
+
+        let mut protocol_tokens_fees = HashMap::new();
+
+        protocol_tokens_fees.insert("wrap.near".to_string().try_into().unwrap(), 0.001);
+        protocol_tokens_fees.insert("usn".to_string().try_into().unwrap(), 0.0005);
+
+        contract
+            .create_new_epoch(Some(protocol_tokens_fees))
+            .unwrap();
+
+        contract.set_registration().unwrap();
+
+        let metadata = get_registry_metadata();
+
+        contract.creator_registration(metadata).unwrap();
+
+        assert!(contract
+            .creators_per_epoch_set
+            .get(&Epoch(1u16))
+            .unwrap()
+            .contains(&account));
+
+        contract.set_funding().unwrap();
+
+        contract.ft_on_transfer(sender_id, amount, msg.to_string());
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "MetaDaoContract::ft_on_transfer: Invalid creator account id for current epoch"
+    )]
+    fn test_ft_on_transfer_panics_if_invalid_creator_account_id() {
+        let account: AccountId = "wrap.near".to_string().try_into().unwrap();
+        let admin = account.clone();
+
+        let storage = (CREATOR_REGISTRY_STORAGE_COST as u128) * env::STORAGE_PRICE_PER_BYTE;
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context.clone());
+
+        let sender_id = accounts(2);
+        let amount = U128(1_000_000_000_u128);
+        let msg = format!("lotus_common",);
+
+        let mut contract = MetaDaoContract::new(admin);
+
+        let mut protocol_tokens_fees = HashMap::new();
+
+        protocol_tokens_fees.insert("wrap.near".to_string().try_into().unwrap(), 0.001);
+        protocol_tokens_fees.insert("usn".to_string().try_into().unwrap(), 0.0005);
+
+        contract
+            .create_new_epoch(Some(protocol_tokens_fees))
+            .unwrap();
+
+        contract.set_registration().unwrap();
+
+        let metadata = get_registry_metadata();
+
+        contract.creator_registration(metadata).unwrap();
+
+        assert!(contract
+            .creators_per_epoch_set
+            .get(&Epoch(1u16))
+            .unwrap()
+            .contains(&account));
+
+        contract.set_funding().unwrap();
+
+        contract.ft_on_transfer(sender_id, amount, msg.to_string());
+    }
+
+    #[test]
+    #[should_panic(expected = "MetaDaoContract::ft_on_transfer: Invalid epoch")]
+    fn test_ft_on_transfer_panics_if_invalid_epoch() {
+        let account: AccountId = "wrap.near".to_string().try_into().unwrap();
+        let admin = account.clone();
+
+        let storage = (CREATOR_REGISTRY_STORAGE_COST as u128) * env::STORAGE_PRICE_PER_BYTE;
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context.clone());
+
+        let sender_id = accounts(2);
+        let amount = U128(1_000_000_000_u128);
+        let msg = format!("lotus_common",);
+
+        let mut contract = MetaDaoContract::new(admin);
+
+        let mut protocol_tokens_fees = HashMap::new();
+
+        protocol_tokens_fees.insert("wrap.near".to_string().try_into().unwrap(), 0.001);
+        protocol_tokens_fees.insert("usn".to_string().try_into().unwrap(), 0.0005);
+
+        contract
+            .create_new_epoch(Some(protocol_tokens_fees))
+            .unwrap();
+
+        contract.set_registration().unwrap();
+
+        let metadata = get_registry_metadata();
+
+        contract.creator_registration(metadata).unwrap();
+
+        assert!(contract
+            .creators_per_epoch_set
+            .get(&Epoch(1u16))
+            .unwrap()
+            .contains(&account));
+
+        contract.set_funding().unwrap();
+
+        contract.epoch = Epoch(0_u16);
+
+        contract.ft_on_transfer(sender_id, amount, msg.to_string());
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "MetaDaoContract::ft_on_transfer: Invalid creator account id for current epoch"
+    )]
+    fn test_ft_on_transfer_panics_if_invalid_ft_account_id() {
+        let account: AccountId = "usn".to_string().try_into().unwrap();
+        let admin = "wrap.near".to_string().try_into().unwrap();
+
+        let storage = (CREATOR_REGISTRY_STORAGE_COST as u128) * env::STORAGE_PRICE_PER_BYTE;
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context.clone());
+
+        let sender_id = accounts(2);
+        let amount = U128(1_000_000_000_u128);
+        let msg = format!("{}_common", account);
+
+        let mut contract = MetaDaoContract::new(admin);
+
+        let mut protocol_tokens_fees = HashMap::new();
+
+        protocol_tokens_fees.insert("wrap.near".to_string().try_into().unwrap(), 0.001);
+        protocol_tokens_fees.insert("usn".to_string().try_into().unwrap(), 0.0005);
+
+        contract
+            .create_new_epoch(Some(protocol_tokens_fees))
+            .unwrap();
+
+        contract.set_registration().unwrap();
+
+        let metadata = get_registry_metadata();
+
+        contract.creator_registration(metadata).unwrap();
+
+        contract.set_funding().unwrap();
+
+        contract.ft_on_transfer(sender_id, amount, msg.to_string());
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "ft_on_transfer::User did not provide enough funds to obtain the chosen NFT"
+    )]
+    fn test_ft_on_transfer_panics_if_sender_did_not_provide_enough_amount() {
+        let account: AccountId = "wrap.near".to_string().try_into().unwrap();
+        let admin = "wrap.near".to_string().try_into().unwrap();
+
+        let storage = (CREATOR_REGISTRY_STORAGE_COST as u128) * env::STORAGE_PRICE_PER_BYTE;
+
+        let context = get_context_with_storage(storage);
+        testing_env!(context.clone());
+
+        let sender_id = accounts(2);
+        let amount = U128(1_u128);
+        let msg = format!("{}_common", account);
+
+        let mut contract = MetaDaoContract::new(admin);
+
+        let mut protocol_tokens_fees = HashMap::new();
+
+        protocol_tokens_fees.insert("wrap.near".to_string().try_into().unwrap(), 0.001);
+        protocol_tokens_fees.insert("usn".to_string().try_into().unwrap(), 0.0005);
+
+        contract
+            .create_new_epoch(Some(protocol_tokens_fees))
+            .unwrap();
+
+        contract.set_registration().unwrap();
+
+        let metadata = get_registry_metadata();
+
+        contract.creator_registration(metadata).unwrap();
+
+        contract.set_funding().unwrap();
+
+        contract.ft_on_transfer(sender_id, amount, msg.to_string());
+    }
+}
+
+'''
+'''--- contracts/src/views.rs ---
+use near_sdk::near_bindgen;
+
+use crate::{error::MetaDaoError, *};
+
+#[near_bindgen]
+impl MetaDaoContract {
+    #[handle_result]
+    pub fn creator_total_funds(&self, creator_id: CreatorAccountId) -> Result<u128, MetaDaoError> {
+        let creator_funds_map = self
+            .creator_funding
+            .get(&self.epoch)
+            .ok_or(MetaDaoError::CreatorIsNotRegistered)?;
+
+        if let Some(funds) = creator_funds_map.get(&creator_id) {
+            Ok(funds.iter().rfold(0u128, |a, b| a + b.amount))
+        } else {
+            env::panic_str("creator accound id is not registered");
+        }
+    }
+
+    // #[handle_result]
+    // pub fn user_is_registered(&self, user_id: UserAccountId) -> Result<bool, MetaDaoError> {
+    //     let votes_mapping = self
+    //         .user_votes_mapping
+    //         .get(&self.epoch)
+    //         .ok_or(MetaDaoError::InvalidCurrentEpoch)?;
+    //     Ok(votes_mapping.contains_key(&user_id))
+    // }
+}
+
+#[cfg(test)]
+mod tests {}
+
+'''
+'''--- contracts/test.sh ---
+#!/bin/bash
+set -e
+
+cargo test -- --nocapture
+
+'''

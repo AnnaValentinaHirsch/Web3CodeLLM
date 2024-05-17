@@ -1,0 +1,1629 @@
+*GitHub Repository "JMario1/election-is-near"*
+
+'''--- .gitpod.yml ---
+tasks:
+  - init: yarn
+    command: yarn dev
+ports:
+  - port: 1234
+    onOpen: open-browser
+
+'''
+'''--- README.md ---
+Election-is-near
+==================
+
+Election-is-near allows user to create election for various positions and ensure each user can only vote once per every election.
+
+[Live Demo](https://election-is-near.surge.sh)
+
+Quick Start
+===========
+
+To run this project locally:
+
+1. Prerequisites: Make sure you've installed [Node.js] ≥ 12
+2. Install dependencies: `yarn install`
+3. Run the local development server: `yarn dev` (see `package.json` for a
+   full list of `scripts` you can run with `yarn`)
+
+Now you'll have a local development environment backed by the NEAR TestNet!
+
+Go ahead and play with the app and the code. As you make code changes, the app will automatically reload.
+
+Exploring The Code
+==================
+
+1. The "backend" code lives in the `/contract` folder. See the README there for
+   more info.
+2. The frontend code lives in the `/src` folder. `/src/index.html` is a great
+   place to start exploring. Note that it loads in `/src/index.js`, where you
+   can learn how the frontend connects to the NEAR blockchain.
+3. Tests: there are different kinds of tests for the frontend and the smart
+   contract. See `contract/README` for info about how it's tested. The frontend
+   code gets tested with [jest]. You can run both of these at once with `yarn run test` or just the contract with `yarn run test-contract`.
+
+'''
+'''--- contract/Cargo.toml ---
+[package]
+name = "voting"
+version = "0.1.0"
+authors = ["Jude Omenai"]
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "3.1.0"
+
+[profile.release]
+codegen-units = 1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+
+[workspace]
+members = []
+
+'''
+'''--- contract/README.md ---
+Voting Smart Contract
+==================
+
+A [smart contract] written in [Rust] for an app initialized with [create-near-app]
+
+Quick Start
+===========
+
+Before you compile this code, you will need to install Rust with [correct target]
+
+Exploring The Code
+==================
+
+1. The main smart contract code lives in `src/lib.rs`. You can compile it with
+   the `./compile` script.
+2. Tests: You can run smart contract tests with the `./test` script. This runs
+   standard Rust tests using [cargo] with a `--nocapture` flag so that you
+   can see any debug info you print to the console.
+
+  [smart contract]: https://docs.near.org/docs/develop/contracts/overview
+  [Rust]: https://www.rust-lang.org/
+  [create-near-app]: https://github.com/near/create-near-app
+  [correct target]: https://github.com/near/near-sdk-rs#pre-requisites
+  [cargo]: https://doc.rust-lang.org/book/ch01-03-hello-cargo.html
+
+'''
+'''--- contract/compile.js ---
+// This file does two things:
+//
+// 1. Compile the Rust contract using cargo (see buildCmd below). This will
+//    create a wasm file in the 'build' folder.
+// 2. Create a symbolic link (symlink) to the generated wasm file in the root
+//    project's `out` folder, for easy use with near-cli.
+//
+// First, import some helper libraries. `shelljs` is included in the
+// devDependencies of the root project, which is why it's available here. It
+// makes it easy to use *NIX-style scripting (which works on Linux distros,
+// macOS, and Unix systems) on Windows as well.
+const sh = require('shelljs')
+
+// Figure out which directory the user called this script from, which we'll use
+// later to set up the symlink.
+const calledFromDir = sh.pwd().toString()
+
+// For the duration of this script, we want to operate from within the
+// Rust project's folder. Let's change into that directory.
+sh.cd(__dirname)
+
+// You can call this script with `node compile.js` or `node compile.js
+// --debug`. Let's set a variable to track whether `--debug` was used.
+const debug = process.argv.pop() === '--debug'
+
+// You can call this script with `node compile.js` or `node compile.js --debug`.
+// Let's set a variable to track whether `--debug` was used.
+// Note: see other flags in ./cargo/config. Unfortunately, you cannot set the
+// `--target option` in Cargo.toml.
+const buildCmd = debug
+  ? 'cargo build --target wasm32-unknown-unknown'
+  : 'cargo build --target wasm32-unknown-unknown --release'
+
+// Execute the build command, storing exit code for later use
+const { code } = sh.exec(buildCmd)
+
+// Assuming this is compiled from the root project directory, link the compiled
+// contract to the `out` folder –
+// When running commands like `near deploy`, near-cli looks for a contract at
+// <CURRENT_DIRECTORY>/out/main.wasm
+if (code === 0 && calledFromDir !== __dirname) {
+  const linkDir = `${calledFromDir}/out`
+  const link = `${calledFromDir}/out/main.wasm`
+  const packageName = require('fs').readFileSync(`${__dirname}/Cargo.toml`).toString().match(/name = "([^"]+)"/)[1]
+  const outFile = `./target/wasm32-unknown-unknown/${debug ? 'debug' : 'release'}/${packageName}.wasm`
+  sh.mkdir('-p', linkDir)
+  sh.rm('-f', link)
+  //fixes #831: copy-update instead of linking .- sometimes sh.ln does not work on Windows
+  sh.cp('-u',outFile,link)
+}
+
+// exit script with the same code as the build command
+process.exit(code)
+
+'''
+'''--- contract/src/election.rs ---
+use std::collections::HashMap;
+
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::{env, AccountId};
+use near_sdk::collections::{LookupMap};
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Election {
+    pub id: u32,
+    pub candidates: Vec<String>,
+    scores: LookupMap<String, u32>,
+    pub position: String,
+    pub description: String,
+    pub votes: u64,
+    pub is_active: bool,
+    voted: LookupMap<AccountId, bool>,
+    pub end_time: u64,
+    pub owner: AccountId,
+
+}
+
+impl Election {
+
+    pub fn new(
+        id: u32, 
+        candidates: Vec<String>, 
+        description: String,
+        end_time: u64,
+        position: String
+    ) -> Self {
+
+        let election = Self{
+            id,
+            is_active: false,
+            candidates,
+            scores: LookupMap::new(format!("s{}", id).as_bytes()),
+            voted: LookupMap::new(format!("ve{}", id).as_bytes()),
+            votes: 0,
+            position,
+            description,
+            end_time,
+            owner: env::signer_account_id()
+        };
+        election
+    }
+
+    pub fn vote(&mut self, candidate: String) {
+        assert!(&self.is_active, "Election is yet to start");
+        assert!(&self.end_time > &(env::block_timestamp()/1000000), "Election is closed");
+        assert!(!&self.voted.contains_key(&env::signer_account_id()), "Already voted");
+        let vote =  match  &self.scores.get(&candidate) {
+
+           Some(v) =>  v +1,
+           None => 1
+
+        };
+        let _ = &self.scores.insert(&candidate, &vote);
+        self.votes = self.votes + 1;
+        let _ = &self.voted.insert(&env::signer_account_id(), &true);
+
+    }
+
+    pub fn start_election(&mut self) {
+        assert_eq!(&self.owner, &env::signer_account_id(), "Not Authourized");
+        assert!(!self.is_active, "Already Started");
+        self.end_time = env::block_timestamp()/1000000 + (self.end_time * (60 * 60 * 1000));
+        self.is_active = true;
+
+    }
+
+    pub fn get_votes(&self) -> HashMap<String, u32> {
+        let mut scores: HashMap<String, u32> = HashMap::new();
+        for candidate in &self.candidates {
+            let vote = match &self.scores.get(candidate) {
+                Some(v) => *v,
+                None => 0
+            };
+            scores.insert(candidate.to_string(), vote);
+        }
+
+        scores
+    }
+}
+'''
+'''--- contract/src/lib.rs ---
+
+mod election;
+
+use std::collections::HashMap;
+
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::{near_bindgen, setup_alloc, AccountId, env};
+use near_sdk::collections::{UnorderedMap};
+use election::*;
+
+setup_alloc!();
+
+// Structs in Rust are similar to other languages, and may include impl keyword as shown below
+// Note: the names of the structs are not important when calling the smart contract, but the function names are
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Contract {
+  elections: UnorderedMap<u32, Election>,
+  counter: u32
+}
+
+impl Default for Contract {
+    fn default() -> Self {
+        Self { 
+          elections: UnorderedMap::new(b'v'), 
+          counter: 0 
+        }
+    }
+}
+
+#[near_bindgen]
+impl Contract {
+    
+    pub fn create_election(
+      &mut self,
+      candidates: Vec<String>,
+      end_time: u64,
+      description: String,
+      position: String
+    ) {
+      let id = self.counter;
+      assert!(candidates.len() >= 2, "Minimum of 2 candidates needed");
+      let election = Election::new(id, candidates, description, end_time, position);
+      let _ = &self.elections.insert(&id, &election);
+      self.counter += 1;
+    }
+    
+    pub fn get_election(&self, id: u32) -> (u32, Vec<String>, String, String, u64, u64, bool, AccountId) {
+      let election = self.elections.get(&id).unwrap();
+      (
+        election.id,
+        election.candidates,
+        election.position,
+        election.description,
+        election.end_time,
+        election.votes,
+        election.is_active,
+        election.owner
+      )
+    }
+
+    pub fn get_elections(&self) -> Vec<(u32, Vec<String>, String, String, u64, u64, bool, AccountId)> {
+
+      let mut elections = Vec::new();
+      for (_, election) in self.elections.iter() {
+        elections.push(
+          (
+        election.id,
+        election.candidates,
+        election.position,
+        election.description,
+        election.end_time,
+        election.votes,
+        election.is_active,
+        election.owner
+      )
+        )
+      };
+      elections
+    }
+
+    pub fn vote(&mut self, id: u32, candidate: String) {
+      if let  Some(mut e) = self.elections.get(&id) {
+          e.vote(candidate);
+          let _ = &self.elections.insert(&id, &e);
+      }else {
+          env::panic(b"could not vote");
+      }
+    }
+
+    pub fn get_votes(&self, id: u32) -> Option<HashMap<String, u32>> {
+      if let  Some(e) = &self.elections.get(&id) {
+          Option::Some(e.get_votes())
+      }else {
+          Option::None
+      }
+      
+    }
+
+    pub fn start_election(&mut self, id: u32) {
+      if let  Some(mut e) = self.elections.get(&id) {
+          e.start_election();
+          let _ = &self.elections.insert(&id, &e);
+
+      }else {
+          env::panic(b"could not start");
+      }
+    }
+
+    pub fn delete_election(&mut self, id: u32) {
+      if let  Some(e) = self.elections.get(&id) {
+         assert_eq!(&e.owner, &env::signer_account_id(), "Not Authourized");
+          let _ = &self.elections.remove(&id);
+      }else {
+          env::panic(b"could not delete");
+      }
+    }
+  
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use near_sdk::MockedBlockchain;
+    use near_sdk::{testing_env, VMContext};
+
+    // mock the context for testing, notice "signer_account_id" that was accessed above from env::
+    fn get_context(input: Vec<u8>, is_view: bool) -> VMContext {
+        VMContext {
+            current_account_id: "alice_near".to_string(),
+            signer_account_id: "bob_near".to_string(),
+            signer_account_pk: vec![0, 1, 2],
+            predecessor_account_id: "carol_near".to_string(),
+            input,
+            block_index: 0,
+            block_timestamp: 0,
+            account_balance: 0,
+            account_locked_balance: 0,
+            storage_usage: 0,
+            attached_deposit: 0,
+            prepaid_gas: 10u64.pow(18),
+            random_seed: vec![0, 1, 2],
+            is_view,
+            output_data_receivers: vec![],
+            epoch_height: 19,
+        }
+    }
+
+    #[test]
+    fn set_then_get_election() {
+        let context = get_context(vec![], false);
+        testing_env!(context);
+        let mut contract = Contract::default();
+        contract.create_election(vec!["Ben".to_string(), "sam".to_string()], 3,"presidency electio".to_string(), "president".to_string());
+        let election = contract.get_election(0);
+        assert_eq!(
+            vec!["Ben", "sam"],
+            election.1
+        );
+        assert_eq!(
+            "president".to_string(),
+            election.2
+        );
+    }
+
+    #[test]
+    #[should_panic(expected="Election is yet to start")]
+    fn vote_should_panic() {
+        let context = get_context(vec![], false);
+        testing_env!(context);
+        let mut contract = Contract::default();
+        contract.create_election(vec!["Paul".to_string(), "Ken".to_string()], 3,"presidency electio".to_string(), "president".to_string());
+        contract.vote(0, "Paul".to_string());
+     
+       
+    }
+
+    #[test]
+    fn vote_then_get_votes() {
+        let context = get_context(vec![], false);
+        testing_env!(context);
+        let mut contract = Contract::default();
+        contract.create_election(vec!["Paul".to_string(), "Ken".to_string()], 3,"presidency electio".to_string(), "president".to_string());
+        contract.start_election(0,);
+        contract.vote(0, "Paul".to_string());
+        let result = contract.get_votes(0).unwrap();
+        assert_eq!(
+            1,
+            result["Paul"]
+        );
+     
+       
+    }
+}
+
+'''
+'''--- package.json ---
+{
+  "name": "Voting",
+  "version": "0.1.0",
+  "license": "UNLICENSED",
+  "scripts": {
+    "build": "npm run build:contract && npm run build:web",
+    "build:contract": "node contract/compile.js",
+    "build:contract:debug": "node contract/compile.js --debug",
+    "build:web": "parcel build src/index.html --public-url ./",
+    "dev:deploy:contract": "near dev-deploy",
+    "deploy:contract": "near deploy",
+    "deploy:pages": "surge dist/ election-is-near.surge.sh/",
+    "deploy": "npm run build && npm run deploy:contract && npm run deploy:pages",
+    "prestart": "npm run build:contract:debug && npm run dev:deploy:contract",
+    "start": "echo The app is starting! It will automatically open in your browser when ready && env-cmd -f ./neardev/dev-account.env parcel src/index.html --open",
+    "dev": "nodemon --watch contract/src -e rs --exec \"npm run start\"",
+    "test": "npm run build:contract:debug && cd contract && cargo test -- --nocapture && cd .. && jest test --runInBand"
+  },
+ "devDependencies": {
+    "@babel/core": "~7.14.0",
+    "@babel/preset-env": "~7.14.0",
+    "@babel/preset-react": "~7.13.13",
+    "babel-jest": "~26.6.2",
+    "env-cmd": "~10.1.0",
+    "gh-pages": "~3.1.0",
+    "jest": "~26.6.2",
+    "jest-environment-node": "~26.6.2",
+    "near-cli": "~2.1.1",
+    "nodemon": "~2.0.3",
+    "parcel": "~2.5.0",
+    "process": "^0.11.10",
+    "react-test-renderer": "~17.0.1",
+    "shelljs": "~0.8.4",
+    "surge": "^0.23.1"
+  },
+  "dependencies": {
+    "@ant-design/icons": "^4.7.0",
+    "@popperjs/core": "^2.10.2",
+    "@types/react": ">=16.14.8",
+    "antd": "^4.20.6",
+    "bootstrap": "^5.1.3",
+    "bootstrap-icons": "^1.8.2",
+    "near-api-js": "~0.43.1",
+    "prop-types": "^15.8.1",
+    "react": "~17.0.1",
+    "react-bootstrap": "^2.4.0",
+    "react-dom": "~17.0.1",
+    "react-router-dom": "^6.3.0",
+    "react-toastify": "^9.0.1",
+    "regenerator-runtime": "~0.13.5"
+  },
+  "resolutions": {
+    "@babel/preset-env": "7.13.8"
+  },
+  "jest": {
+    "moduleNameMapper": {
+      "\\.(jpg|ico|jpeg|png|gif|eot|otf|webp|svg|ttf|woff|woff2|mp4|webm|wav|mp3|m4a|aac|oga)$": "<rootDir>/src/__mocks__/fileMock.js",
+      "\\.(css|less)$": "<rootDir>/src/__mocks__/fileMock.js"
+    },
+    "setupFiles": [
+      "<rootDir>/src/jest.init.js"
+    ],
+    "testEnvironment": "near-cli/test_environment",
+    "testPathIgnorePatterns": [
+      "<rootDir>/contract/",
+      "<rootDir>/node_modules/"
+    ]
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  }
+}
+'''
+'''--- src/App.css ---
+* {
+  box-sizing: border-box;
+}
+
+html {
+  --bg: #efefef;
+  --fg: #1e1e1e;
+  --gray: #555;
+  --light-gray: #ccc;
+  --shadow: #e6e6e6;
+  --success: rgb(90, 206, 132);
+  --primary: #FF585D;
+  --secondary: #0072CE;
+
+  background-color: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+  font-size: calc(0.9em + 0.5vw);
+  line-height: 1.3;
+}
+
+body {
+  margin: 0;
+  padding: 1em;
+}
+
+main {
+  margin: 0 auto;
+  max-width: 25em;
+}
+
+h1 {
+  background-image: url(assets/logo-black.svg);
+  background-position: center 1em;
+  background-repeat: no-repeat;
+  background-size: auto 1.5em;
+  margin-top: 0;
+  padding: 3.5em 0 0.5em;
+  text-align: center;
+}
+
+a,
+.link {
+  color: var(--primary);
+  text-decoration: none;
+}
+a:hover,
+a:focus,
+.link:hover,
+.link:focus {
+  text-decoration: underline;
+}
+a:active,
+.link:active {
+  color: var(--secondary);
+}
+
+button, input {
+  font: inherit;
+  outline: none;
+}
+
+button {
+  background-color: var(--secondary);
+  border-radius: 5px;
+  border: none;
+  color: #efefef;
+  cursor: pointer;
+  padding: 0.3em 0.75em;
+  transition: transform 30ms;
+}
+button:hover, button:focus {
+  box-shadow: 0 0 10em rgba(255, 255, 255, 0.2) inset;
+}
+button:active {
+  box-shadow: 0 0 10em rgba(0, 0, 0, 0.1) inset;
+}
+button.link {
+  background: none;
+  border: none;
+  box-shadow: none;
+  display: inline;
+}
+[disabled] button, button[disabled] {
+  box-shadow: none;
+  background-color: var(--light-gray);
+  color: gray;
+  cursor: not-allowed;
+  transform: none;
+}
+[disabled] button {
+  text-indent: -900em;
+  width: 2em;
+  position: relative;
+}
+[disabled] button:after {
+  content: " ";
+  display: block;
+  width: 0.8em;
+  height: 0.8em;
+  border-radius: 50%;
+  border: 2px solid #fff;
+  border-color: var(--fg) transparent var(--fg) transparent;
+  animation: loader 1.2s linear infinite;
+  position: absolute;
+  top: 0.45em;
+  right: 0.5em;
+}
+@keyframes loader {
+  0% { transform: rotate(0deg) }
+  100% { transform: rotate(360deg) }
+}
+
+fieldset {
+  border: none;
+  padding: 2em 0;
+}
+
+input {
+  background-color: var(--shadow);
+  border: none;
+  border-radius: 5px 0 0 5px;
+  caret-color: var(--primary);
+  color: inherit;
+  padding: 0.25em 1em;
+}
+input::selection {
+  background-color: var(--secondary);
+  color: #efefef;
+}
+input:focus {
+  box-shadow: 0 0 10em rgba(0, 0, 0, 0.02) inset;
+}
+
+code {
+  color: var(--gray);
+}
+
+li {
+  padding-bottom: 1em;
+}
+
+aside {
+  animation: notify ease-in-out 10s;
+  background-color: var(--shadow);
+  border-radius: 5px;
+  bottom: 0;
+  font-size: 0.8em;
+  margin: 1em;
+  padding: 1em;
+  position: fixed;
+  transform: translateY(10em);
+  right: 0;
+}
+aside footer {
+  display: flex;
+  font-size: 0.9em;
+  justify-content: space-between;
+  margin-top: 0.5em;
+}
+aside footer *:first-child {
+  color: var(--success);
+}
+aside footer *:last-child {
+  color: var(--gray);
+}
+@keyframes notify {
+  0% { transform: translateY(10em) }
+  5% { transform: translateY(0) }
+  95% { transform: translateY(0) }
+  100% { transform: translateY(10em) }
+}
+
+@media (prefers-color-scheme: dark) {
+  html {
+    --bg: #1e1e1e;
+    --fg: #efefef;
+    --gray: #aaa;
+    --shadow: #2a2a2a;
+    --light-gray: #444;
+  }
+  h1 {
+    background-image: url(assets/logo-white.svg);
+  }
+  input:focus {
+    box-shadow: 0 0 10em rgba(255, 255, 255, 0.02) inset;
+  }
+}
+
+'''
+'''--- src/App.js ---
+import React, { useEffect, useCallback, useState } from "react";
+import { Container, Nav, Navbar } from "react-bootstrap";
+import { login, logout, accountBalance } from "./utils/near";
+import Wallet from "./components/Wallet";
+import { Notification } from "./components/Notifications";
+import Cover from "./components/Cover";
+import "./App.css";
+import Elections from "./components/Elections";
+import image from "./assets/img/c1.jpg"
+
+export default function App() {
+  const account = window.walletConnection.account();
+  const [balance, setBalance] = useState("0");
+  const getBalance = useCallback(async () => {
+    if (account.accountId) {
+      setBalance(await accountBalance());
+    }
+  });
+
+  useEffect(() => {
+    getBalance();
+  }, [getBalance]);
+
+    return (
+    <>
+   
+      {account.accountId ? (
+              <div style={{ backgroundImage: `url(${image})`, backgroundSize: "cover",  minHeight: "100vh"} }>
+                <Container fluid="md">
+                <Navbar>
+                  <Navbar.Brand>
+                    <h2 style={{color: "white"}}>Election-is-near</h2>
+                  </Navbar.Brand>
+                  <Navbar.Collapse className="justify-content-end">
+                    <Nav>
+                      <Nav.Item>
+                        <Wallet
+                          address={account.accountId}
+                          amount={balance}
+                          symbol="NEAR"
+                          logout={logout}
+                        />
+                      </Nav.Item>
+                    </Nav>
+                  </Navbar.Collapse>
+                </Navbar>
+                <Elections />
+              </Container>
+              </div>
+            ) : (
+              <Cover />
+            )} 
+    </>
+  );
+};
+'''
+'''--- src/__mocks__/fileMock.js ---
+// NOTE: This is used to mock resource imports in JSX for tests
+module.exports = '' 
+
+'''
+'''--- src/assets/logo-black.svg ---
+<svg viewBox="0 0 288 288" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><linearGradient id="a" gradientUnits="userSpaceOnUse" x1="76.81" x2="211.16" y1="211.17" y2="76.81"><stop offset=".21" stop-color="#24272a"/><stop offset=".42" stop-color="#24272a" stop-opacity="0"/><stop offset=".59" stop-color="#24272a" stop-opacity="0"/><stop offset=".81" stop-color="#24272a"/></linearGradient><path d="m88.46 216a16.45 16.45 0 0 0 12.46-5.71l112.56-130.57a16.42 16.42 0 0 0 -13.94-7.72 16.46 16.46 0 0 0 -12.41 5.65l-113.13 129.8a16.46 16.46 0 0 0 14.46 8.55z" fill="url(#a)"/><path d="m88.46 216a16.46 16.46 0 0 0 7.54-1.83v-109l87.45 104.94a16.44 16.44 0 0 0 12.64 5.89h3.45a16.46 16.46 0 0 0 16.46-16.46v-111.08a16.46 16.46 0 0 0 -16.46-16.46 16.36 16.36 0 0 0 -7.54 1.81v109.05l-87.45-104.94a16.44 16.44 0 0 0 -12.64-5.92h-3.45a16.46 16.46 0 0 0 -16.46 16.46v111.08a16.46 16.46 0 0 0 16.46 16.46z" fill="#24272a"/></svg>
+'''
+'''--- src/assets/logo-white.svg ---
+<svg viewBox="0 0 288 288" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><linearGradient id="a" gradientUnits="userSpaceOnUse" x1="76.81" x2="211.16" y1="211.17" y2="76.81"><stop offset=".21" stop-color="#fff"/><stop offset=".42" stop-color="#fff" stop-opacity="0"/><stop offset=".59" stop-color="#fff" stop-opacity="0"/><stop offset=".81" stop-color="#fff"/></linearGradient><path d="m88.46 216a16.45 16.45 0 0 0 12.46-5.71l112.56-130.57a16.42 16.42 0 0 0 -13.94-7.72 16.46 16.46 0 0 0 -12.41 5.65l-113.13 129.8a16.46 16.46 0 0 0 14.46 8.55z" fill="url(#a)"/><path d="m88.46 216a16.46 16.46 0 0 0 7.54-1.83v-109l87.45 104.94a16.44 16.44 0 0 0 12.64 5.89h3.45a16.46 16.46 0 0 0 16.46-16.46v-111.08a16.46 16.46 0 0 0 -16.46-16.46 16.36 16.36 0 0 0 -7.54 1.81v109.05l-87.45-104.94a16.44 16.44 0 0 0 -12.64-5.92h-3.45a16.46 16.46 0 0 0 -16.46 16.46v111.08a16.46 16.46 0 0 0 16.46 16.46z" fill="#fff"/></svg>
+'''
+'''--- src/components/AddElection.js ---
+import React, { useEffect, useState } from "react";
+import PropTypes from "prop-types";
+import { Button, Modal } from "react-bootstrap";
+import { Form, Input, Space, InputNumber } from "antd";
+import { MinusCircleOutlined} from "@ant-design/icons";
+
+export default function AddElection ({save}){
+
+  const [show, setShow] = useState(false);
+
+  const handleClose = () => setShow(false);
+  const handleShow = () => setShow(true);
+
+  const onSubmitElection = async ({position, description, duration, name1, name2, names }) => {
+    const candidates = [name1, name2];
+    for (const index in names) {
+      candidates.push(names[index].name);
+    }
+    save({candidates, position, description, end_time:duration})
+    handleClose();
+  };
+  
+
+  return (
+    <>
+     
+      <Button
+        onClick={handleShow}
+        variant="outline-light"
+        className="rounded-pill px-1"
+        size="sm"
+      >
+        Add election
+      </Button>
+      <Modal show={show} onHide={handleClose} centered>
+        <Modal.Header closeButton>
+          <Modal.Title>New Election</Modal.Title>
+        </Modal.Header>
+        <Form name="election" onFinish={onSubmitElection} >
+          <Modal.Body>
+              <Space style={{ display: "flex", marginBottom: 16 }} align="baseline">
+                <Form.Item label="Position" name="position" rules={[{ required: "true", message: "Missing Position" }]}>
+                <Input placeholder="positon" />
+              </Form.Item>
+              </Space>
+              <Space style={{ display: "flex", marginBottom: 16}} align="baseline">
+                <Form.Item label="Description" name="description" rules={[{ required: "true", message: "Missing Description" }]}>
+                  <Input placeholder="description" />
+                </Form.Item>
+              </Space>
+              <Space style={{ display: "flex", marginBottom: 16}} align="baseline">
+                  <Form.Item label="Duration: in hours" name="duration" rules={[{ required: "true", message: "Missing time duration" }]}>
+                  <InputNumber min={1} max={1000} />
+                </Form.Item>
+              </Space>
+              <Space style={{ display: "flex", marginBottom: 16}} align="baseline">
+                <Form.Item label="Candidates" name="name1" rules={[{ required: "true", message: "Missing candidate name" }]}>
+                  <Input placeholder="Enter candidate name" />
+                </Form.Item>
+              </Space>
+              <Space style={{ display: "flex", marginBottom: 16}} align="baseline">
+                <Form.Item  name="name2" rules={[{ required: "true", message: "Missing candidate name" }]}>
+                  <Input placeholder="Enter candidate name" />
+                </Form.Item>
+              </Space>
+              <Space style={{ display: "flex", marginBottom: 16 }} align="baseline">  
+                <Form.List name="names" >
+                {(fields, { add, remove }) => (
+                  <>
+                    {fields.map(({ key, name, ...restField }) => (
+                      <Space key={key} style={{ display: "flex", marginBottom: 16}} align="baseline">
+                        <Form.Item
+                          {...restField}
+                          name={[name, "name"]}
+                          rules={[{ required: "true", message: "Missing candidate name" }]}
+                        >
+                          <Input placeholder="Enter candidate name" />
+                        </Form.Item>
+                        <MinusCircleOutlined onClick={() => remove(name)} />
+                      </Space>
+                    ))}
+                    <Form.Item>
+                      <Button onClick={() => add()} >
+                        Add more Candidate
+                      </Button>
+                    </Form.Item>
+                  </>
+                )}
+                </Form.List>
+              </Space>
+               </Modal.Body>
+              <Modal.Footer>
+                <Button variant="outline-secondary" onClick={handleClose}>
+                  Close
+                </Button>
+                <Form.Item>
+                <Button type="primary" >
+                  Submit
+                </Button>
+              </Form.Item>
+              </Modal.Footer>
+            </Form>
+      </Modal>
+    </>
+  );
+};
+
+AddElection.propTypes = {
+  save: PropTypes.func.isRequired,
+};
+'''
+'''--- src/components/Cover.js ---
+import React from "react";
+import PropTypes from "prop-types";
+import { Button } from "react-bootstrap";
+import { Space } from "antd";
+import { login } from "../utils/near";
+import coverImg from "../assets/img/cover1.jpg";
+
+const Cover = () => {
+    return (
+      <div
+        className="d-flex justify-content-center flex-column text-center "
+        style={{ background: "#000", backgroundSize: 'cover', minHeight: "100vh", backgroundImage: `url(${coverImg})` }}
+        
+      >
+        <div className="mt-auto text-light mb-5">
+          <Space style={{ marginTop: 40 }}>
+          <div>
+            <h2  style={{ background: "#000", backgroundSize: 'cover'}}>Welcome to Election-is-near...</h2>
+            <br/> <br/>
+             <h3 style={{ background: "#000", backgroundSize: 'cover'}}>Home to credible elections</h3>
+             <p style={{ background: "#000", backgroundSize: 'cover'}}>Simply connect to your near wallet to create an election or simply vote for your candidate in an ongoing election.</p>
+          </div>
+          </Space>
+          <br/> <br/>
+          <p style={{ color: "magenta", backgroundColor: "black"}}>Ready to vote or start an election?</p>
+          <Button
+            onClick={ login}
+            variant="primary"
+            className="rounded-pill px-3 mt-3"
+          >
+            Connect Wallet
+          </Button>
+        </div>
+      </div>
+    );
+};
+
+Cover.propTypes = {
+  name: PropTypes.string,
+};
+
+Cover.defaultProps = {
+  name: "",
+};
+
+export default Cover;
+'''
+'''--- src/components/Election.js ---
+import React, { useEffect, useState } from "react";
+import PropTypes from "prop-types";
+import {Link} from "react-router-dom"
+import { Card, Col, Badge, Stack, Button, Row, Modal   } from "react-bootstrap";
+
+export default function Election({ election, del, start }){
+  const { id, position, description, votes, owner, isActive, endTime } =
+    election;
+
+  const [showDelete, setShowDelete] = useState(false);
+  const [showStart, setShowStart] = useState(false);
+
+  const handleClose = () => {
+      setShowStart(false);
+      setShowDelete(false);
+  };
+  const handleShow = (action) => {
+    if(action === "start") setShowStart(true);
+    if(action === "delete") setShowDelete(true);
+  };
+ 
+  const calculateTimeLeft = () => {
+        let diff = endTime - Date.now();
+
+        let timeLeft = {};
+
+        if (diff > 0) {
+            timeLeft = {
+            days: Math.floor(diff / (1000 * 60 * 60 * 24)),
+            hrs: Math.floor((diff / (1000 * 60 * 60)) % 24),
+            mins: Math.floor((diff / 1000 / 60) % 60),
+            secs: Math.floor((diff / 1000) % 60)
+            };
+        }
+
+        return timeLeft;
+    }
+
+  const [timeLeft, setTimeLeft] = useState(calculateTimeLeft())  
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setTimeLeft(calculateTimeLeft());
+    }, 1000);
+
+    return () => clearTimeout(timer);
+  });
+
+  const showModal = (text, show) => {
+    return (
+       <Modal show={show} onHide={handleClose}>
+        <Modal.Body>Please confirm you want {text} the election</Modal.Body>
+        <Modal.Footer>
+          <Button variant="secondary" onClick={handleClose}>
+            Cancel
+          </Button>
+          <Button variant="primary" onClick={() => {
+            text === "start" ? start(id) : del(id)
+            handleClose(text)
+          }}>
+            Confirm
+          </Button>
+        </Modal.Footer>
+      </Modal>
+    )
+  }
+
+  
+
+  return (
+    <div> 
+    <Col key={id}>
+      <Card className=" h-100" style={{opacity: 0.85, color: "magenta"}}>
+        <Card.Header>
+          <Stack direction="vertical">
+            <span className="font-monospace text-center">{owner}</span>
+            <Stack direction="horizontal">
+            <Badge bg="primary">
+              {votes} votes
+            </Badge>
+            <Badge bg="danger" className="ms-auto">
+              { !isActive ? "Not Started" : timeLeft.secs !== undefined ? `${timeLeft.days} D : ${timeLeft.hrs} H : ${timeLeft.mins} M : ${timeLeft.secs} S`: "Ended"}
+            </Badge>
+          </Stack>
+          </Stack>
+        </Card.Header>
+        <Card.Body className="d-flex  flex-column text-center" >
+          <Card.Title>{position}</Card.Title>
+          <Card.Text className="flex-grow-1 ">{description}</Card.Text>
+          <Row xs={1} sm={3} lg={3}>
+             <Col md="auto" ><Button variant="outline-primary" size="sm"><Link to={`election/${id}`} state={{id}}>View</Link></Button></Col>
+            <Col md="auto"> <Button variant="outline-danger" size="sm" onClick={() => handleShow("delete")}>Delete</Button></Col>
+            <Col md="auto"> <Button variant="outline-primary" size="sm" onClick={() => handleShow("start")} >Start</Button></Col> 
+          </Row>
+        </Card.Body>
+      </Card>
+    </Col>
+    {showModal("start", showStart)}
+    {showModal("delete", showDelete)}
+    </div>
+  );
+};
+
+Election.propTypes = {
+  election: PropTypes.instanceOf(Object).isRequired,
+};
+'''
+'''--- src/components/Elections.js ---
+import React, { useEffect, useState, useCallback } from "react";
+import { toast } from "react-toastify";
+import AddElection from "./AddElection";
+import Election from "./Election";
+import Loader from "./Loader";
+import { Row } from "react-bootstrap";
+import { NotificationSuccess, NotificationError } from "./Notifications";
+import { createElection, deleteElection, getElection, getElections, startElection } from "../utils/election";
+
+export default function Elections() {
+  const [elections, setElections] = useState([]);
+  const [loading, setLoading] = useState(false);
+
+ 
+
+  const getElectionsList = useCallback(async () => {
+    try {
+      setLoading(true);
+      setElections(await getElections());
+    } catch (error) {
+      console.log({ error });
+    } finally {
+      setLoading(false);
+    }
+  });
+
+  const addElection = async (data) => {
+  try {
+    setLoading(true);
+    await createElection(data).then((resp) => {
+      toast(<NotificationSuccess text="Election added successfully." />);
+      getElectionsList();
+    }).catch ((error) => {
+    let err =  "Failed to Create Election"
+        try {
+          err = error.kind.ExecutionError.split(",")[0].split("'")[1]
+        } finally {
+          toast(<NotificationError text={err} />);
+        };
+    });  
+  } finally {
+    setLoading(false);
+  }
+};
+
+const start = async (id) => {
+  try {
+    setLoading(true);
+   await startElection(id).then((resp) => {
+      toast(<NotificationSuccess text="Election started." />);
+      getElectionsList();
+    }).catch(error => {
+      let err =  "Failed to start Election"
+        try {
+          err = error.kind.ExecutionError.split(",")[0].split("'")[1]
+        }
+        finally {
+          toast(<NotificationError text={err} />);
+        };
+    });
+  } finally {
+    setLoading(false);
+  }
+};
+
+const del = async (id) => {
+  try {
+    setLoading(true);
+    await deleteElection(id).then((resp) => {
+      toast(<NotificationSuccess text="Election deleted successfully." />);
+      getElectionsList();
+    }).catch ((error) => {
+        let err =  "Failed to delete Election"
+        try {
+          err = error.kind.ExecutionError.split(",")[0].split("'")[1]
+        }
+        finally {toast(<NotificationError text={err} />);};
+    })  
+  } finally {
+    setLoading(false);
+  }
+};
+
+useEffect(() => {
+  getElectionsList();
+}, []);
+
+return (
+    <>
+      {!loading ? (
+        <>
+          <div className="d-flex justify-content-center align-items-center mb-4">
+            <AddElection  save={addElection}/>
+          </div>
+          <Row xs={1} sm={2} lg={3} className="g-3  mb-5 g-xl-4 g-xxl-5">
+            {elections.map((_election, _index) => (
+              <Election key={_index} 
+                election={{
+                  id: _election[0],
+                  position: _election[2],
+                  description: _election[3],
+                  endTime: _election[4],
+                  votes: _election[5],
+                  isActive: _election[6],
+                  owner: _election[7]
+                }}
+                del={del}
+                start={start}
+              />
+            ))}
+          </Row>
+        </>
+      ) : (
+        <Loader />
+      )}
+    </>
+  );
+};
+'''
+'''--- src/components/Loader.js ---
+import React from "react";
+import { Spinner } from "react-bootstrap";
+
+const Loader = () => (
+  <div className="d-flex justify-content-center">
+    <Spinner style={{color: "yellow"}} animation="border" role="status" className="opacity-25">
+      <span className="visually-hidden">Loading...</span>
+    </Spinner>
+  </div>
+);
+export default Loader;
+'''
+'''--- src/components/Notifications.js ---
+import React from "react";
+import { ToastContainer } from "react-toastify";
+import PropTypes from "prop-types";
+import "react-toastify/dist/ReactToastify.css";
+
+const Notification = () => (
+  <ToastContainer
+    position="bottom-center"
+    autoClose={5000}
+    hideProgressBar
+    newestOnTop
+    closeOnClick
+    rtl={false}
+    pauseOnFocusLoss
+    draggable={false}
+    pauseOnHover
+  />
+);
+
+const NotificationSuccess = ({ text }) => (
+  <div>
+    <i className="bi bi-check-circle-fill text-success mx-2" />
+    <span className="text-secondary mx-1">{text}</span>
+  </div>
+);
+
+const NotificationError = ({ text }) => (
+  <div>
+    <i className="bi bi-x-circle-fill text-danger mx-2" />
+    <span className="text-secondary mx-1">{text}</span>
+  </div>
+);
+
+const Props = {
+  text: PropTypes.string,
+};
+
+const DefaultProps = {
+  text: "",
+};
+
+NotificationSuccess.propTypes = Props;
+NotificationSuccess.defaultProps = DefaultProps;
+
+NotificationError.propTypes = Props;
+NotificationError.defaultProps = DefaultProps;
+
+export { Notification, NotificationSuccess, NotificationError };
+'''
+'''--- src/components/ViewElection.js ---
+import React, { useCallback, useEffect, useState } from "react"
+import {Table, Button} from "react-bootstrap"
+import { useLocation, useParams} from "react-router-dom"
+import { getElection, getVotes, vote } from "../utils/election";
+import { toast } from "react-toastify";
+import { NotificationSuccess, NotificationError } from "./Notifications";
+import Loader from "./Loader";
+
+export default function ViewElection(){
+
+  const [election, setElection] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [votes, setVotes] = useState([])
+  const [voted, setVoted] = useState(false)
+  
+
+  const { id } = useParams();
+  const electionId = parseInt(id)
+  
+
+  const getElectionItem = useCallback(async () => {
+    try {
+      setLoading(true);
+      setElection(await getElection(electionId));
+    } catch (error) {
+      console.log({ error });
+    } finally {
+      setLoading(false);
+    }
+  });
+
+  const getVote = useCallback(async () => {
+    try {
+      setLoading(true);
+      setVotes(await getVotes(electionId));
+    } catch (error) {
+      console.log({ error });
+    } finally {
+      setLoading(false);
+    }
+  });
+
+  const voteCandidate = async (candidate) => {
+    try {
+      setLoading(true)
+        await vote(
+          electionId,
+          candidate
+        ).then((resp) => getVote());
+        toast(<NotificationSuccess text="Voted successfully" />);
+      } catch (error) {
+          let err =  "Failed to Vote"
+          try {
+            err = error.kind.ExecutionError.split(",")[0].split("'")[1]
+            setVoted(true)
+          }
+          finally {toast(<NotificationError text={err} />);}
+      } finally {
+        setLoading(false);
+      }
+    };
+
+  useEffect(() => {
+    getElectionItem();
+  
+  }, []);
+
+  useEffect(() => {
+    getVote();
+  
+  }, []);
+
+    return (
+      !loading ? <Table striped bordered hover>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Candidate</th>
+            <th>Votes</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {election[1] != null ? election[1].map((candidate, index) => (
+                  <tr key={index}>
+                      <td>{index + 1}</td>
+                      <td>{candidate}</td>
+                      <td>{votes[candidate]}</td>
+                      <td>
+                        <Button
+                        disabled={voted}
+                        onClick={() => voteCandidate(candidate)}
+                        variant="outline-dark"
+                        className="rounded-pill px-3 mt-3">
+                        Vote
+                        </Button>
+                      </td>
+                  </tr> )) : null
+          }        
+        </tbody> 
+      </Table> : <Loader />
+    )
+}
+'''
+'''--- src/components/Wallet.js ---
+import React from "react";
+import { Dropdown, Stack, Spinner } from "react-bootstrap";
+
+const Wallet = ({ address, amount, symbol, logout }) => {
+  if (address) {
+    return (
+      <>
+        <Dropdown>
+          <Dropdown.Toggle
+            variant="light"
+            align="end"
+            id="dropdown-basic"
+            className="d-flex align-items-center border rounded-pill py-1"
+          >
+            {amount ? (
+              <>
+                {amount} <span className="ms-1"> {symbol}</span>
+              </>
+            ) : (
+              <Spinner animation="border" size="sm" className="opacity-25" />
+            )}
+          </Dropdown.Toggle>
+
+          <Dropdown.Menu className="shadow-lg border-0">
+            <Dropdown.Item
+              href={`https://explorer.testnet.near.org/accounts/${address}`}
+              target="_blank"
+            >
+              <Stack direction="horizontal" gap={2}>
+                <i className="bi bi-person-circle fs-4" />
+                <span className="font-monospace">{address}</span>
+              </Stack>
+            </Dropdown.Item>
+
+            <Dropdown.Divider />
+            <Dropdown.Item
+              as="button"
+              className="d-flex align-items-center"
+              onClick={() => {
+                logout();
+              }}
+            >
+              <i className="bi bi-box-arrow-right me-2 fs-4" />
+              Logout
+            </Dropdown.Item>
+          </Dropdown.Menu>
+        </Dropdown>
+      </>
+    );
+  }
+
+  return null;
+};
+
+export default Wallet;
+'''
+'''--- src/index.html ---
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="./assets/favicon.ico" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="apple-touch-icon" href="./assets/favicon.ico" />
+    <title>Welcome to Election-is-near</title>
+  </head>
+  <body>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="root"></div>
+    <!--
+      This HTML file is a template.
+      If you open it directly in the browser, you will see an empty page.
+
+      You can add webfonts, meta tags, or analytics to this file.
+      The build step will place the bundled scripts into the <body> tag.
+
+      To begin the development, run `npm start` or `yarn start`.
+      To create a production bundle, use `npm run build` or `yarn build`.
+    -->
+    <script type="module" src="./index.js"></script>
+  </body>
+</html>
+
+'''
+'''--- src/index.js ---
+import React from 'react'
+import ReactDOM from 'react-dom'
+// import { createRoot } from 'react-dom'
+import App from './App'
+import { initContract } from './utils/near'
+
+import "bootstrap";
+import "bootstrap-icons/font/bootstrap-icons.css";
+import "bootstrap/dist/css/bootstrap.min.css";
+import {BrowserRouter as Router, Route, Routes} from "react-router-dom"
+import ViewElection from "./components/ViewElection";
+import { Notification } from "./components/Notifications";
+
+window.nearInitPromise = initContract()
+  .then(() => {
+    ReactDOM.render(
+      <>
+        <Notification />
+        <Router>
+          <Routes>
+            <Route path="election/:id" element={<ViewElection />} /> 
+            <Route path="/" element={<App />}/>
+          </Routes>
+        </Router>
+      </>,
+      document.querySelector('#root')
+      )
+  })
+  .catch(console.error)
+
+'''
+'''--- src/jest.init.js ---
+import 'regenerator-runtime/runtime'
+
+'''
+'''--- src/utils/config.js ---
+const CONTRACT_NAME = process.env.CONTRACT_NAME || 'Voting'
+
+function environment(env) {
+  switch (env) {
+
+    case 'production':
+    case 'mainnet':
+      return {
+        networkId: 'mainnet',
+        nodeUrl: 'https://rpc.mainnet.near.org',
+        contractName: CONTRACT_NAME,
+        walletUrl: 'https://wallet.near.org',
+        helperUrl: 'https://helper.mainnet.near.org',
+        explorerUrl: 'https://explorer.mainnet.near.org',
+      }
+    case 'development':
+    case 'testnet':
+      return {
+        networkId: 'testnet',
+        nodeUrl: 'https://rpc.testnet.near.org',
+        contractName: CONTRACT_NAME,
+        walletUrl: 'https://wallet.testnet.near.org',
+        helperUrl: 'https://helper.testnet.near.org',
+        explorerUrl: 'https://explorer.testnet.near.org',
+      }
+    case 'betanet':
+      return {
+        networkId: 'betanet',
+        nodeUrl: 'https://rpc.betanet.near.org',
+        contractName: CONTRACT_NAME,
+        walletUrl: 'https://wallet.betanet.near.org',
+        helperUrl: 'https://helper.betanet.near.org',
+        explorerUrl: 'https://explorer.betanet.near.org',
+      }
+    case 'local':
+      return {
+        networkId: 'local',
+        nodeUrl: 'http://localhost:3030',
+        keyPath: `${process.env.HOME}/.near/validator_key.json`,
+        walletUrl: 'http://localhost:4000/wallet',
+        contractName: CONTRACT_NAME,
+      }
+    case 'test':
+    case 'ci':
+      return {
+        networkId: 'shared-test',
+        nodeUrl: 'https://rpc.ci-testnet.near.org',
+        contractName: CONTRACT_NAME,
+        masterAccount: 'test.near',
+      }
+    case 'ci-betanet':
+      return {
+        networkId: 'shared-test-staging',
+        nodeUrl: 'https://rpc.ci-betanet.near.org',
+        contractName: CONTRACT_NAME,
+        masterAccount: 'test.near',
+      }
+    default:
+      throw Error(`Unconfigured environment '${env}'. Can be configured in src/config.js.`)
+  }
+}
+
+export default environment;
+'''
+'''--- src/utils/election.js ---
+import { v4 as uuid4 } from "uuid";
+
+export function createElection(election) {
+  return window.contract.create_election( election );
+}
+
+export function getElections() {
+  const election =  window.contract.get_elections();
+  return election
+}
+
+export function getElection(id) {
+    return window.contract.get_election({id})
+}
+
+export async function vote( id, candidate, time ) {
+  await window.contract.vote({ id, candidate });
+}
+
+export function getVotes(id) {
+    return window.contract.get_votes({id});
+}
+
+export function deleteElection(id) {
+    return window.contract.delete_election({id});
+}
+
+export function startElection(id, time) {
+    return window.contract.start_election({id});
+}
+
+'''
+'''--- src/utils/near.js ---
+import environment from "./config";
+import { connect, Contract, keyStores, WalletConnection } from "near-api-js";
+import { formatNearAmount } from "near-api-js/lib/utils/format";
+
+const nearEnv = environment('development');
+
+export async function initContract() {
+  const near = await connect(
+    Object.assign(
+      { deps: { keyStore: new keyStores.BrowserLocalStorageKeyStore() } },
+      nearEnv
+    )
+  );
+  window.walletConnection = new WalletConnection(near);
+  window.accountId = window.walletConnection.getAccountId();
+  window.contract = new Contract(
+    window.walletConnection.account(),
+    nearEnv.contractName,
+    {
+      viewMethods: ["get_election", "get_elections","get_votes"],
+      changeMethods: ["create_election", "vote", "start_election", "delete_election"],
+    }
+  );
+}
+
+export async function accountBalance() {
+  return formatNearAmount(
+    (await window.walletConnection.account().getAccountBalance()).total,
+    2
+  );
+}
+
+export async function getAccountId() {
+  return window.walletConnection.getAccountId();
+}
+
+export function login() {
+  window.walletConnection.requestSignIn(nearEnv.contractName);
+}
+
+export function logout() {
+  window.walletConnection.signOut();
+  window.location.reload();
+}
+'''
+'''--- src/wallet/login/index.html ---
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.2.1/css/bootstrap.min.css" integrity="sha384-GJzZqFGwb1QTTN6wy59ffF1BuGJpLSa9DkKMp0DgiMDm4iYMj70gZWKYbI706tWS" crossorigin="anonymous">
+</head>
+<body style="background: #fff; margin-top: 3em">
+  <div>For local account login, Please run the following command in NEAR CLI, then enter account id here.
+  </div>
+  <div>
+      <code id="shell-command"></code>
+  </div>
+  <input type="text" id="accountId" name="accountId" placeholder="Account id"></input>
+  <button type="button" onClick="done()">done</button>
+  <script>
+    const currentUrl = new URL(window.location.href);
+    const message = `NODE_ENV=local near create_account {newAccountId} --masterAccount {masterAccountId} --publicKey ${currentUrl.searchParams.get('public_key')} --initialAmount 10000000000000000000`;
+    document.getElementById('shell-command').innerText = message;
+
+    function done() {
+      const successUrl = new URL(currentUrl.searchParams.get('success_url'));
+      successUrl.searchParams.set('account_id', document.getElementById('accountId').value);
+      successUrl.searchParams.set('public_key', currentUrl.searchParams.get('public_key'));
+      window.location.assign(successUrl.toString());
+    }
+  </script>
+</body>
+</html>
+'''

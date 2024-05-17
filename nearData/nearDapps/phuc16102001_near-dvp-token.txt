@@ -1,0 +1,1949 @@
+*GitHub Repository "phuc16102001/near-dvp-token"*
+
+'''--- README.md ---
+# DVP Application Frontend
+
+<div>
+  <img src="https://img.shields.io/badge/react-%2320232a.svg?style=for-the-badge&logo=react&logoColor=%2361DAFB"/>
+  <img src="https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white"/>
+  <img src="https://img.shields.io/badge/Node.js-43853D?style=for-the-badge&logo=node.js&logoColor=white"/>
+  <img src="https://img.shields.io/badge/Vercel-000000?style=for-the-badge&logo=vercel&logoColor=white"/>
+</div>
+
+## Introduction
+
+Blockchain technologies are very hard and require a high technical skill to use. Because of that reason, to become user-friendly, frontend UI is important. This is a repository of a website that provides usability on a token called DVP (Do Vuong Phuc) with different features:
+
+- **View information:** view tokens's metadata such as icon, symbol, name and balance of current user
+- **Faucet:** Withdraw tokens with a limit amount (test-purpose)
+- **Transfer:** Send tokens to the other users
+- **Staking:** Deposit token and receive reward after some interval of time
+
+## Gallery
+
+<p align="center">
+  <img width="640" height="300" src="res/ui.png">
+</p>
+<p align="center">
+    <b>Staking view</b>
+</p>
+
+## Code exploration
+The application builds with ReactJS framework with the structure as following:
+- `components`: The components which are used on pages
+- `pages`: The pages of application
+- `utils`: The utility services for interact with contracts
+
+## Smart contracts
+In the application, I have used several relative smart contracts:
+- [Fungible token](contract/fungible-token)
+- [Faucet contract](contract/faucet-contract)
+- [Staking contract](contract/staking-contract)
+
+## Contributions
+This source code is owned by [phuc16102001](https://github.com/phuc16102001)
+
+## License
+[MIT](LICENSE)
+
+'''
+'''--- contract/faucet-contract/Cargo.toml ---
+[package]
+name = "dvp-ft-faucet"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+# Opt into extra safety checks on arithmetic operations https://stackoverflow.com/a/64136471/249801
+overflow-checks = true
+
+[dependencies]
+near-sdk = "3.1.0"
+
+'''
+'''--- contract/faucet-contract/README.md ---
+# DVP Faucet contract
+'''
+'''--- contract/faucet-contract/build.sh ---
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo build --target wasm32-unknown-unknown --release
+mkdir -p out
+cp target/wasm32-unknown-unknown/release/*.wasm out/faucet-contract.wasm
+'''
+'''--- contract/faucet-contract/neardev/dev-account.env ---
+CONTRACT_NAME=faucet.phuc16102001.testnet
+'''
+'''--- contract/faucet-contract/src/lib.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::json_types::U128;
+use near_sdk::{
+    collections::LookupMap,
+    env, ext_contract, near_bindgen,
+    serde::{Deserialize, Serialize},
+    AccountId, Balance, Gas, PanicOnDefault, Promise, PromiseOrValue,
+};
+
+use types::StorageKey;
+mod types;
+
+const ONE_YOCTO_NEAR: Balance = 1;
+pub const FT_TRANSFER_GAS: Gas = 10_000_000_000_000;
+pub const FAUCET_CALLBACK_GAS: Gas = 10_000_000_000_000;
+
+// ====================================== Faucet info =================================
+
+// To cast to JSON
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct FaucetInfo {
+    pub current_shared_balance: U128,
+    pub available_balance: U128,
+    pub total_share_account: U128,
+    pub max_share_per_account: U128,
+    pub is_paused: bool,
+}
+
+impl FaucetInfo {
+    pub fn from(contract: &FaucetContract) -> Self {
+        FaucetInfo {
+            current_shared_balance: U128(contract.current_shared_balance),
+            available_balance: U128(contract.available_balance),
+            total_share_account: U128(contract.total_share_account),
+            max_share_per_account: U128(contract.max_share_per_account),
+            is_paused: contract.is_paused,
+        }
+    }
+}
+
+// ====================================== External interface ====================================
+
+// Token transfering method of NEP141
+#[ext_contract(ext_ft_contract)]
+pub trait FungibleTokenCore {
+    fn ft_transfer(&mut self, receiver_id: AccountId, amount: U128, memo: Option<String>);
+}
+
+// For callback after transfer token
+#[ext_contract(ext_self)]
+pub trait ExtFaucetContract {
+    fn ft_transfer_callback(&mut self, amount: U128, account_id: AccountId);
+}
+
+// For transfering balance share from owner
+pub trait FungibleTokenReceiver {
+    fn ft_on_transfer(
+        &mut self,
+        sender_id: AccountId,
+        amount: U128,
+        msg: String,
+    ) -> PromiseOrValue<U128>;
+}
+
+// ======================================== Faucet contract =====================================
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct FaucetContract {
+    pub owner_id: AccountId,             // Contract owner (for transfer tokens)
+    pub ft_contract_id: AccountId,       // FT contract account
+    pub current_shared_balance: Balance, // Shared tokens
+    pub available_balance: Balance,      // Current available to faucet
+    pub total_share_account: Balance,    // Number of sharing accounts
+    pub accounts: LookupMap<AccountId, Balance>, // Balance of account which was achieved (no storage deposit)
+    pub max_share_per_account: Balance,          // Max balance fauceting for each account
+    pub is_paused: bool,                         // Contract status
+}
+
+#[near_bindgen]
+impl FaucetContract {
+    #[init]
+    pub fn new(
+        owner_id: AccountId,
+        ft_contract_id: AccountId,
+        max_share_per_account: Balance,
+    ) -> Self {
+        FaucetContract {
+            owner_id,
+            ft_contract_id,
+            current_shared_balance: 0,
+            available_balance: 0,
+            total_share_account: 0,
+            accounts: LookupMap::new(StorageKey::AccountKey),
+            max_share_per_account,
+            is_paused: false,
+        }
+    }
+
+    pub fn get_info(&self) -> FaucetInfo {
+        FaucetInfo::from(&self)
+    }
+
+    pub fn shared_balance_of(&self, account_id: AccountId) -> Balance {
+        self.accounts.get(&account_id).unwrap_or_else(|| 0)
+    }
+
+    pub fn update_max_share(&mut self, max_share: Balance) {
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.owner_id,
+            "Only owner can update this field"
+        );
+        self.max_share_per_account = max_share;
+    }
+
+    #[payable]
+    pub fn faucet_token(&mut self, amount: U128) -> Promise {
+        assert!(
+            env::attached_deposit() > 1,
+            "Please deposit at least 1 yocto NEAR"
+        );
+        assert!(!self.is_paused, "Faucet is paused");
+        assert!(
+            self.available_balance >= amount.0,
+            "Not enough token to share"
+        );
+
+        let account_id = env::predecessor_account_id();
+        let account_balance: Balance = self.accounts.get(&account_id).unwrap_or_else(|| 0);
+        assert!(
+            account_balance + amount.0 <= self.max_share_per_account,
+            "Exceeded maximum amount"
+        );
+
+        ext_ft_contract::ft_transfer(
+            account_id.clone(),
+            amount,
+            Some("Faucet token from DVP".to_string()),
+            &self.ft_contract_id, // Calling contract (FT contract)
+            ONE_YOCTO_NEAR,       // Deposit amount
+            FT_TRANSFER_GAS,      // Gas amount
+        )
+        .then(ext_self::ft_transfer_callback(
+            amount,
+            account_id.clone(),
+            &env::current_account_id(), // Calling contract (Faucet contract)
+            0,                          // Deposit amount
+            FAUCET_CALLBACK_GAS,        // Gas amount
+        ))
+    }
+
+    // After transfering successfully
+    #[private]
+    pub fn ft_transfer_callback(&mut self, amount: U128, account_id: AccountId) {
+        let mut account_balance = self.accounts.get(&account_id).unwrap_or_else(|| 0);
+        if account_balance == 0 {
+            self.total_share_account += 1;
+        }
+        account_balance += amount.0;
+
+        self.accounts.insert(&account_id, &account_balance);
+        self.current_shared_balance += amount.0;
+        self.available_balance -= amount.0;
+    }
+}
+
+#[near_bindgen]
+impl FungibleTokenReceiver for FaucetContract {
+    fn ft_on_transfer(
+        &mut self,
+        sender_id: AccountId,
+        amount: U128,
+        msg: String,
+    ) -> PromiseOrValue<U128> {
+        assert_eq!(
+            sender_id, self.owner_id,
+            "Only owner can transfer to the faucet"
+        );
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.ft_contract_id,
+            "Only accept token from the correct FT"
+        );
+
+        self.available_balance += amount.0;
+        env::log(
+            format!(
+                "Receive {} tokens from {} with message \"{}\"",
+                &amount.0, &sender_id, &msg
+            )
+            .as_bytes(),
+        );
+
+        PromiseOrValue::Value(U128(0))
+    }
+}
+
+'''
+'''--- contract/faucet-contract/src/types.rs ---
+use near_sdk::BorshStorageKey;
+
+use crate::*;
+
+#[derive(BorshDeserialize, BorshSerialize, BorshStorageKey)]
+pub enum StorageKey {
+    AccountKey
+}
+'''
+'''--- contract/fungible-token/Cargo.toml ---
+[package]
+name = "dvp-ft"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+# Opt into extra safety checks on arithmetic operations https://stackoverflow.com/a/64136471/249801
+overflow-checks = true
+
+[dependencies]
+near-sdk = "4.0.0"
+near-contract-standards = "4.0.0"
+
+'''
+'''--- contract/fungible-token/README.md ---
+# DVP Fungible Token
+
+## What is Fungible Token (FT)
+
+Fungible tokens (shorten as FT) are digital assets which:
+- Interchangable
+- Divisible
+- Non-unique
+
+Usually, FT has metadata such as: name, symbol, icon, decimals, etc. However, many people may misunderstand that coins and tokens are same, but they aren't. Regarding coins, they have their own block-chain technology behind (e.g. Bitcoin, ETH, NEAR). On the other hand, tokens are created by using smart contract on those chain (e.g. Dai, wNEAR, USDT). You can check whether they are on the [Coin marketcap](https://coinmarketcap.com/).
+
+These FTs are frequently used for representing membership, trading, etc. Furthermore, tokens are built using the shared standard like ERC20, NEP141. Another explaination is that if you think block-chain is your country, coins will be your native currency, while tokens are business stocks.
+
+This repository is a smart contract for creating a token called DVP (Do Vuong Phuc). It based on the [NEP141](https://nomicon.io/Standards/Tokens/FungibleToken/Core) standard of NEAR Protocol
+
+## Build and deploy contract
+
+To build the source code, you just need to run the script `build.sh`:
+```bash
+./build.sh
+```
+
+After that, you can deploy the built file `out/dvp-ft.wasm` by yourself:
+```bash
+near dev-deploy out/dvp-ft.wasm
+```
+
+## Usage
+
+After deploying, the NEAR CLI will create a `neardev` folder which store the contract name:
+```bash
+source neardev/dev-account.env
+```
+
+Now, you can initialize the contract by specifying the `owner_id` and `total_supply`:
+```bash
+near call $CONTRACT_NAME new_default_meta '{"owner_id": "phuc16102001.testnet", "total_supply": "1000"}' --accountId phuc16102001.testnet
+```
+
+However, bare in mind that once you have initialized, you cannot undo again. 
+
+## Operation - Fungible token
+### Get total supply
+
+```bash
+near view $CONTRACT_NAME ft_total_supply
+```
+### Get metadata
+
+```bash
+near view $CONTRACT_NAME ft_metadata
+```
+
+### Get balance
+
+```bash
+near view $CONTRACT_NAME ft_balance_of '{"account_id": "phuc16102001.testnet"}'
+```
+
+### Transfer
+
+```bash
+near call $CONTRACT_NAME ft_transfer '{"receiver_id": "thanhhoang4869.testnet", "amount": "3", "memo": "Invest tokens"}' --accountId phuc16102001.testnet --depositYocto 1
+```
+
+### Transfer and callback
+
+```bash
+near call $CONTRACT_NAME ft_transfer_call '{"receiver_id": "faucet.phuc16102001.testnet", "amount": "100", "msg": "faucet-increase"}' --accountId phuc16102001.testnet --depositYocto 1
+```
+
+This method usually used to do the cross-contract call. For instance, the example above called for increasing faucet pool tokens. After the transfer occuring, the contract receiving contract's `ft_on_transfer` will be called. If the receiver did not implement that, the `ft_resolve_transfer` MUST be implemented in order to roll-back
+
+## Operation - Storage staking
+
+These operations are for implementing application. Because of allocating account require an amount of money, so the user must pay it to registry. This schema was based-on the [NEP145](https://nomicon.io/Standards/StorageManagement) standard.
+
+### Verify storage staking
+```bash
+near view $CONTRACT_NAME storage_balance_of '{"account_id": "phuc16102001.testnet"}'
+```
+
+### Registry
+```bash
+near call $CONTRACT_NAME storage_deposit '{"account_id":"thanhhoang4869.testnet", "registration_only": true}' --accountId thanhhoang4869.testnet --amount 1
+```
+
+In this method, you need to stake a small amount of NEAR in order to allocate storage. By default, I staked 1 NEAR and the method will automatically refund the unused coin since using `registration_only` parameter.
+
+## Data structure
+
+The DVP fungible token uses the NEP141 standard of NEAR Protocol whose structure likes:
+
+```rs
+pub struct FungibleToken {
+    pub accounts: LookupMap<AccountId, Balance>,
+    pub total_supply: Balance,
+    pub account_storage_usage: StorageUsage,
+}
+```
+
+And there are meta data related to the token:
+
+```rs
+pub struct FungibleTokenMetadata {
+    pub spec: String,
+    pub name: String,
+    pub symbol: String,
+    pub icon: Option<String>,
+    pub reference: Option<String>,
+    pub reference_hash: Option<Base64VecU8>,
+    pub decimals: u8,
+}
+```
+
+The icon field is a string which can be either Base64 image, or XML-SVG image.
+
+## Interface
+
+With all the fungible token, they have the same schema of basic function. In NEP141, NEAR team created an interface called:
+
+```rs
+pub trait FungibleTokenCore {
+    fn ft_transfer;
+    fn ft_transfer_call;
+    fn ft_total_supply;
+    fn ft_balance_of;
+}
+```
+
+Also, you can verify the meta data of the FT with its provider:
+
+```rs
+pub trait FungibleTokenMetadataProvider {
+    fn ft_metadata;
+}
+```
+
+Finally, because of using storage staking, indeed, it must implement the `Storage management` trait:
+
+```rs
+pub trait StorageManagement {
+    fn storage_deposit;
+    fn storage_withdraw;
+    fn storage_unregister;
+    fn storage_balance_bounds;
+    fn storage_balance_of;
+}
+```
+
+'''
+'''--- contract/fungible-token/build.sh ---
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo build --target wasm32-unknown-unknown --release
+mkdir -p out
+cp target/wasm32-unknown-unknown/release/*.wasm out/dvp-ft.wasm
+'''
+'''--- contract/fungible-token/neardev/dev-account.env ---
+CONTRACT_NAME=dev-1653638991572-46927321821761
+'''
+'''--- contract/fungible-token/src/lib.rs ---
+use near_contract_standards::fungible_token::metadata::{
+    FungibleTokenMetadata, FungibleTokenMetadataProvider, FT_METADATA_SPEC,
+};
+use near_contract_standards::fungible_token::FungibleToken;
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::LazyOption;
+use near_sdk::json_types::U128;
+use near_sdk::{env, log, near_bindgen, AccountId, Balance, PanicOnDefault, PromiseOrValue};
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Contract {
+    token: FungibleToken,
+    metadata: LazyOption<FungibleTokenMetadata>,
+}
+
+const DATA_ICON: &str = "data:image/png;base64,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";
+
+#[near_bindgen]
+impl Contract {
+    /// Initializes the contract with the given total supply owned by the given `owner_id` with
+    /// default metadata (for example purposes only).
+    #[init]
+    pub fn new_default_meta(owner_id: AccountId, total_supply: U128) -> Self {
+        Self::new(
+            owner_id,
+            total_supply,
+            FungibleTokenMetadata {
+                spec: FT_METADATA_SPEC.to_string(),
+                name: "DVP Token".to_string(),
+                symbol: "DVP".to_string(),
+                icon: Some(DATA_ICON.to_string()),
+                reference: None,
+                reference_hash: None,
+                decimals: 0,
+            },
+        )
+    }
+
+    /// Initializes the contract with the given total supply owned by the given `owner_id` with
+    /// the given fungible token metadata.
+    #[init]
+    pub fn new(
+        owner_id: AccountId,
+        total_supply: U128,
+        metadata: FungibleTokenMetadata,
+    ) -> Self {
+        assert!(!env::state_exists(), "Already initialized");
+        metadata.assert_valid();
+        let mut this = Self {
+            token: FungibleToken::new(b"a".to_vec()),
+            metadata: LazyOption::new(b"m".to_vec(), Some(&metadata)),
+        };
+        this.token.internal_register_account(&owner_id);
+        this.token.internal_deposit(&owner_id, total_supply.into());
+        near_contract_standards::fungible_token::events::FtMint {
+            owner_id: &owner_id,
+            amount: &total_supply,
+            memo: Some("Initial tokens supply is minted"),
+        }
+        .emit();
+        this
+    }
+
+    fn on_account_closed(&mut self, account_id: AccountId, balance: Balance) {
+        log!("Closed @{} with {}", account_id, balance);
+    }
+
+    fn on_tokens_burned(&mut self, account_id: AccountId, amount: Balance) {
+        log!("Account @{} burned {}", account_id, amount);
+    }
+}
+
+near_contract_standards::impl_fungible_token_core!(Contract, token, on_tokens_burned);
+near_contract_standards::impl_fungible_token_storage!(Contract, token, on_account_closed);
+
+#[near_bindgen]
+impl FungibleTokenMetadataProvider for Contract {
+    fn ft_metadata(&self) -> FungibleTokenMetadata {
+        self.metadata.get().unwrap()
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::MockedBlockchain;
+    use near_sdk::{testing_env, Balance};
+
+    use super::*;
+
+    const TOTAL_SUPPLY: Balance = 1_000_000_000_000_000;
+
+    fn get_context(predecessor_account_id: AccountId) -> VMContextBuilder {
+        let mut builder = VMContextBuilder::new();
+        builder
+            .current_account_id(accounts(0))
+            .signer_account_id(predecessor_account_id.clone())
+            .predecessor_account_id(predecessor_account_id);
+        builder
+    }
+
+    #[test]
+    fn test_new() {
+        let mut context = get_context(accounts(1));
+        testing_env!(context.build());
+        let contract = Contract::new_default_meta(accounts(1).into(), TOTAL_SUPPLY.into());
+        testing_env!(context.is_view(true).build());
+        assert_eq!(contract.ft_total_supply().0, TOTAL_SUPPLY);
+        assert_eq!(contract.ft_balance_of(accounts(1)).0, TOTAL_SUPPLY);
+    }
+
+    #[test]
+    #[should_panic(expected = "The contract is not initialized")]
+    fn test_default() {
+        let context = get_context(accounts(1));
+        testing_env!(context.build());
+        let _contract = Contract::default();
+    }
+
+    #[test]
+    fn test_transfer() {
+        let mut context = get_context(accounts(2));
+        testing_env!(context.build());
+        let mut contract = Contract::new_default_meta(accounts(2).into(), TOTAL_SUPPLY.into());
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .attached_deposit(contract.storage_balance_bounds().min.into())
+            .predecessor_account_id(accounts(1))
+            .build());
+        // Paying for account registration, aka storage deposit
+        contract.storage_deposit(None, None);
+
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .attached_deposit(1)
+            .predecessor_account_id(accounts(2))
+            .build());
+        let transfer_amount = TOTAL_SUPPLY / 3;
+        contract.ft_transfer(accounts(1), transfer_amount.into(), None);
+
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .account_balance(env::account_balance())
+            .is_view(true)
+            .attached_deposit(0)
+            .build());
+        assert_eq!(contract.ft_balance_of(accounts(2)).0, (TOTAL_SUPPLY - transfer_amount));
+        assert_eq!(contract.ft_balance_of(accounts(1)).0, transfer_amount);
+    }
+}
+'''
+'''--- contract/staking-contract/Cargo.toml ---
+[package]
+name = "staking-contract"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+# Opt into extra safety checks on arithmetic operations https://stackoverflow.com/a/64136471/249801
+overflow-checks = true
+
+[dependencies]
+near-sdk = "3.1.0"
+'''
+'''--- contract/staking-contract/build.sh ---
+set -e
+
+RUSTFLAG='-C link-arg=-s' cargo build --target wasm32-unknown-unknown --release
+mkdir -p out
+cp target/wasm32-unknown-unknown/release/*.wasm out/staking-contract.wasm
+'''
+'''--- contract/staking-contract/src/account.rs ---
+use crate::*;
+
+#[derive(BorshDeserialize, BorshSerialize)]
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(crate="near_sdk::serde")]
+pub enum Membership {
+    Basic,
+    Standard,
+    Companion
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Account {
+    pub stake_balance: Balance,                 
+    pub pre_reward: Balance,                    
+    pub last_block_balance_change: BlockHeight, 
+    pub unstake_balance: Balance,               
+    pub unstake_start_time: Timestamp,          
+    pub unstake_available_epoch: EpochHeight,   
+    pub membership: Membership,                 // Upgraded field
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(crate="near_sdk::serde")]
+pub struct AccountJson {
+    pub account_id: AccountId,
+    pub stake_balance: Balance,
+    pub unstake_balance: Balance,
+    pub reward: Balance,
+    pub can_withdraw: bool,
+    pub unstake_start_timestamp: Timestamp,
+    pub unstake_available_epoch: EpochHeight,
+    pub current_epoch: EpochHeight,
+    pub membership: Membership,                 // Upgraded field
+}
+
+// To cast from Account to Json
+impl AccountJson {
+    pub fn from(account_id: AccountId, new_reward: Balance, account: Account) -> Self {
+        AccountJson { 
+            account_id,
+            stake_balance: account.stake_balance,
+            unstake_balance: account.unstake_balance,
+            reward: account.pre_reward + new_reward,
+            can_withdraw: account.unstake_available_epoch <= env::epoch_height(),
+            unstake_start_timestamp: account.unstake_start_time,
+            unstake_available_epoch: account.unstake_available_epoch,
+            current_epoch: env::epoch_height(),
+            membership: account.membership,
+        }
+    }
+}
+'''
+'''--- contract/staking-contract/src/account_v1.rs ---
+use crate::*;
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct AccountV1 {
+    pub stake_balance: Balance,                 // Staked tokens
+    pub pre_reward: Balance,                    //
+    pub last_block_balance_change: BlockHeight, // Last block when balance changed
+    pub unstake_balance: Balance,               // Money that can unstake
+    pub unstake_start_time: Timestamp,          // Start time when user begin unstaking
+    pub unstake_available_epoch: EpochHeight,   // 1 Epoch ~ 12 hours
+}
+
+'''
+'''--- contract/staking-contract/src/config.rs ---
+use crate::*;
+
+// Need serde to init contract by json
+#[derive(BorshDeserialize,BorshSerialize, Serialize, Deserialize, Clone, Copy)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Config {
+    pub reward_num: u32,        // Incentive numerator
+    pub reward_denom: u64,      // Incentive denomerator
+    pub num_epoch_unlock: u64,  // Number of epoch need to wait to withdraw when unstake
+}
+
+// With APR 15% --> reward = 0.15*token (per year)
+// But we use the number of blocks, so APR 15%-18% is 
+impl Default for Config {
+    fn default() -> Self {
+        Self { reward_num: 715, reward_denom: 10u64.pow(9), num_epoch_unlock: 1 }
+    }
+}
+'''
+'''--- contract/staking-contract/src/core_impl.rs ---
+use crate::*;
+
+pub const FT_TRANSFER_GAS: Gas = 10_000_000_000_000;
+pub const HARVEST_CALLBACK_GAS: Gas = 10_000_000_000_000;
+pub const WITHDRAW_CALLBACK_GAS: Gas = 10_000_000_000_000;
+
+pub trait FungibleTokenReceiver {
+    // When receive tokens from user through FT contract
+    fn ft_on_transfer(&mut self, sender_id: AccountId, amount: U128, msg: String) -> PromiseOrValue<U128>;
+}
+
+#[ext_contract(ext_ft)]
+pub trait FungibleTokenCore {
+    // To transfer token when user harvest
+    fn ft_transfer(&mut self, receiver_id: AccountId, amount: U128, memo: Option<String>);
+}
+
+#[ext_contract(ext_self)]
+pub trait ExtStakingContract {
+    // For callback after harvest successfully
+    fn ft_harvest_callback(&mut self, account_id: AccountId, amount: U128);
+
+    // For withdraw callback after withdraw (mostly to handle fail case and rollback)
+    fn ft_withdraw_callback(&mut self, account_id: AccountId, old_account: Account);
+}
+
+#[near_bindgen]
+impl FungibleTokenReceiver for StakingContract {
+    fn ft_on_transfer(&mut self, sender_id: AccountId, amount: U128, msg: String) -> PromiseOrValue<U128> {
+        env::log(format!("User {} staking {} NEAR with message \"{}\"", sender_id, amount.0, msg).as_bytes());
+        self.internal_deposit_and_stake(sender_id, amount.0);
+
+        PromiseOrValue::Value(U128(0))
+    }
+}
+
+#[near_bindgen]
+impl StakingContract {
+
+    // Harvest the reward to the wallet
+    #[payable]
+    pub fn harvest(&mut self) -> Promise {
+        assert_one_yocto();
+        let account_id: AccountId = env::predecessor_account_id();
+        let upgradable_account = self.accounts.get(&account_id).unwrap();
+        let account = Account::from(upgradable_account);
+
+        let new_reward = self.internal_calculate_new_reward(Some(&account));
+        let current_reward = self.pre_reward + new_reward;
+        assert!(current_reward > 0, "Your reward is zero");
+
+        ext_ft::ft_transfer(
+            account_id.clone(), 
+            U128(current_reward), 
+            Some("Harvest reward from staking".to_string()), 
+            &self.ft_contract_id, 
+            1, 
+            FT_TRANSFER_GAS
+        ).then(ext_self::ft_harvest_callback(
+            account_id.clone(), 
+            U128(current_reward), 
+            &env::current_account_id(), 
+            0, 
+            HARVEST_CALLBACK_GAS
+        ))
+    }
+
+    #[private]
+    pub fn ft_harvest_callback(&mut self, account_id: AccountId, amount: U128) -> U128 {
+        assert_eq!(env::promise_results_count(), 1, "Too many result of promise");
+        match env::promise_result(0) {
+            PromiseResult::NotReady => unreachable!(),          // Will not be handle
+            PromiseResult::Successful(_value) => {
+                let upgradable_account = self.accounts.get(&account_id).unwrap();
+                let mut account = Account::from(upgradable_account);
+
+                account.pre_reward = 0;
+                account.last_block_balance_change = env::block_index();
+
+                self.accounts.insert(&account_id, &UpgradableAccount::from(account));
+                self.total_paid_reward += amount.0;
+
+                amount
+            },
+            PromiseResult::Failed => env::panic("Callback failed".as_bytes()),
+        }
+    }
+
+    // Unstake the staking token, and locked after an amount of epochs before can withdraw
+    #[payable]
+    pub fn unstake(&mut self, amount: U128) {
+        assert_one_yocto();
+        let account_id = env::predecessor_account_id();
+        self.internal_unstake(account_id, amount.0);
+    }
+
+    // Withdraw the token that unstaked after an amount of epochs
+    #[payable]
+    pub fn withdraw(&mut self) -> Promise {
+        assert_one_yocto();
+        let account_id = env::predecessor_account_id();
+        let old_account = self.internal_withdraw(account_id.clone());
+
+        ext_ft::ft_transfer(
+            account_id.clone(), 
+            U128(old_account.unstake_balance), 
+            Some("Unstaked token from staking contract".to_string()), 
+            &self.ft_contract_id, 
+            1, 
+            FT_TRANSFER_GAS
+        ).then(ext_self::ft_withdraw_callback(
+            account_id.clone(), 
+            old_account, 
+            &env::current_account_id(), 
+            0, 
+            WITHDRAW_CALLBACK_GAS
+        ))
+    }
+
+    #[private]
+    pub fn ft_withdraw_callback(&mut self, account_id: AccountId, old_account: Account) -> U128{
+        assert_eq!(env::promise_results_count(), 1, "Too many promise results");
+        match env::promise_result(0) {
+            PromiseResult::NotReady => unreachable!(),
+            PromiseResult::Successful(_value) => {
+                U128(old_account.unstake_balance)
+            },
+            PromiseResult::Failed => {
+                self.accounts.insert(&account_id, &UpgradableAccount::from(old_account));
+                U128(0)
+            }
+        }
+    }
+}
+'''
+'''--- contract/staking-contract/src/enumeration.rs ---
+use crate::*;
+
+#[near_bindgen]
+impl StakingContract {
+    pub fn get_account_info(&self, account_id: &AccountId) -> AccountJson {
+        let upgradable_account = self.accounts.get(account_id).unwrap();
+        let account = Account::from(upgradable_account);
+        let new_reward = self.internal_calculate_new_reward(Some(&account));
+        AccountJson::from(
+            account_id.clone(),
+            new_reward,
+            account
+        )
+    }
+
+    pub fn get_pool_info(&self) -> PoolJson {
+        PoolJson::from(&self)
+    }
+}
+'''
+'''--- contract/staking-contract/src/internal.rs ---
+use crate::*;
+
+// Using pub(crate) to only callable from inside the program instead of outside by command
+
+#[near_bindgen]
+impl StakingContract {
+    pub(crate) fn internal_unstake(&mut self, account_id: AccountId, amount: Balance) {
+        let upgradable_account = self.accounts.get(&account_id).unwrap();
+        let mut account = Account::from(upgradable_account);
+        assert!(amount <= account.stake_balance, "Cannot unstake more than the staking amount");
+
+        // Update account reward
+        let new_reward = self.internal_calculate_new_reward(Some(&account));
+        account.pre_reward += new_reward;
+        account.last_block_balance_change = env::block_index();
+    
+        // Update account unstake
+        account.stake_balance -= amount;
+        account.unstake_balance += amount;
+        account.unstake_start_time = env::block_timestamp();
+        account.unstake_available_epoch = env::epoch_height() + self.config.num_epoch_unlock;
+    
+        if account.stake_balance==0 {
+            self.num_staker -= 1;
+        }    
+        self.accounts.insert(&account_id, &UpgradableAccount::from(account));
+
+        let new_contract_reward = self.internal_calculate_new_reward(None);
+        self.pre_reward += new_contract_reward;
+        self.total_stake -= amount;
+        self.last_block_balance_change = env::block_index();
+    }
+
+    pub(crate) fn internal_withdraw(&mut self, account_id: AccountId) -> Account {
+        let upgradable_account = self.accounts.get(&account_id).unwrap();
+        let account = Account::from(upgradable_account);
+
+        assert!(account.unstake_balance > 0, "Unstaking balance is zero");
+        assert!(account.unstake_available_epoch <= env::epoch_height(), "You cannot unstake until reach the locked epoch");
+
+        let new_account = Account {
+            pre_reward: account.pre_reward,                    
+            last_block_balance_change: account.last_block_balance_change, 
+            membership: account.membership.clone(),                 
+            stake_balance: account.stake_balance,                 
+            unstake_balance: 0,               
+            unstake_start_time: 0,          
+            unstake_available_epoch: 0,   
+        };
+        self.accounts.insert(&account_id, &UpgradableAccount::from(new_account));
+
+        account
+    }
+
+    pub(crate) fn internal_deposit_and_stake(&mut self, sender_id: AccountId, amount: Balance) {
+        let upgradable_account = self.accounts.get(&sender_id);
+        assert!(upgradable_account.is_some(), "Account not found, please registry first");
+        assert_eq!(self.is_paused(), false, "Contract is paused");
+        assert_eq!(self.ft_contract_id, env::predecessor_account_id(), "Only accept the correct fungible token");
+
+        // Update account
+        let mut account = Account::from(upgradable_account.unwrap());
+        let is_new_staker = (account.stake_balance==0);
+        let new_reward = self.internal_calculate_new_reward(Some(&account));
+
+        account.pre_reward += new_reward;                           // Update pre_reward to become the new phase of staking
+        account.stake_balance += amount;                            // Staking the deposit amount
+        account.last_block_balance_change = env::block_index();     // Update current block
+        self.accounts.insert(&sender_id, &UpgradableAccount::from(account));
+
+        // Update pool
+        let new_global_reward = self.internal_calculate_new_reward(None);
+        self.pre_reward += new_global_reward;
+        self.total_stake += amount;
+        self.last_block_balance_change = env::block_index();
+        
+        if is_new_staker {
+            self.num_staker += 1;
+        }
+    }
+
+    pub(crate) fn internal_create_account(&mut self, account_id: AccountId) {
+        let account = Account {
+            stake_balance: 0,
+            pre_reward: 0,
+            last_block_balance_change: env::block_index(),
+            unstake_balance: 0,
+            unstake_start_time: 0,
+            unstake_available_epoch: 0,
+            membership: Membership::Basic,
+        };
+        self.accounts.insert(
+            &account_id, 
+            &UpgradableAccount::from(account)
+        );
+    }
+
+    // Calculate the reward for users from the previous changes
+    // Generally, we treat that users have deposited twice
+    // ==============================================
+    // | time  |     t1     |      t2     |   now   |
+    // | money |    10$     |      20$    |         |
+    // ==============================================
+    // t2 = last_block_balance_change
+    // now = block_height
+    // reward = (now-t2)*stake*rate
+    //
+    // If account=None, the return is for global
+    pub(crate) fn internal_calculate_new_reward(&self, account: Option<&Account>) -> Balance {
+        let last_block = if self.paused {
+            self.paused_block
+        }  else {
+            env::block_index()
+        };
+
+        let last_change = if account.is_some() {
+            account.unwrap().last_block_balance_change
+        } else {
+            self.last_block_balance_change
+        };
+
+        let stake = if account.is_some() {
+            account.unwrap().stake_balance
+        } else {
+            self.total_stake
+        };
+
+        let cnt_block = last_block - last_change;
+        let config = self.config;
+        let reward = ((config.reward_num as Balance) * (stake as Balance) * (cnt_block as Balance)) / (config.reward_denom as Balance);
+        reward
+    }
+}
+'''
+'''--- contract/staking-contract/src/lib.rs ---
+use near_sdk::*;
+use near_sdk::borsh::{self,BorshDeserialize,BorshSerialize};
+use near_sdk::collections::LookupMap;
+use near_sdk::json_types::{U128};
+use near_sdk::serde::{Deserialize, Serialize};
+// use ::constant::{ONE_YOCTO};
+
+use crate::config::*;
+use crate::account::*;
+use crate::types::*;
+use crate::utils::*;
+use crate::enumeration::*;
+use crate::pool::*;
+use crate::staking_contract_v1::*;
+use crate::account_v1::*;
+use crate::upgradable_account::*;
+use crate::core_impl::*;
+
+mod config;
+mod account;
+mod types;
+mod utils;
+mod internal;
+mod enumeration;
+mod pool;
+mod staking_contract_v1;
+mod account_v1;
+mod upgradable_account;
+mod core_impl;
+
+// Using `near_bindgen` marco, to notify the smart contract
+// BorshSerde to serde as byte code (for storing on-chain)
+// Serde to serde as json (for query and display on front-end)
+// PanicOnDefault to prevent the smart contract init by itself
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+#[near_bindgen]
+pub struct StakingContract {
+    pub owner_id: AccountId,                        
+    pub ft_contract_id: AccountId,                  
+    pub config: Config,                             
+    pub total_stake: Balance,                       
+    pub total_paid_reward: Balance,                 
+    pub num_staker: u128,                            
+    pub pre_reward: Balance,                        
+    pub last_block_balance_change: BlockHeight,     
+    pub accounts: LookupMap<AccountId, UpgradableAccount>,    
+    pub paused: bool,                               
+    pub paused_block: BlockHeight,                  
+    pub version: u128,                               // New field to update (V2)
+}
+
+#[near_bindgen]
+impl StakingContract {
+
+    // This macro define the function to init the contract
+    // If using PanicOnDefault but without init macro, the smart contract won't be able to initialize
+    // Also, you can use --initFunction to determine which function to be called
+    // And --initArgs flag is to pass arguments as JSON
+    #[init]
+    pub fn new_default_config(
+        owner_id: AccountId,
+        ft_contract_id: AccountId,
+    ) -> Self {
+        Self::new(owner_id,ft_contract_id,Config::default())
+    }
+
+    #[init]
+    pub fn new(
+        owner_id: AccountId,
+        ft_contract_id: AccountId,
+        config: Config
+    ) -> Self {
+        StakingContract { 
+            owner_id, 
+            ft_contract_id, 
+            config,
+            total_stake: 0, 
+            total_paid_reward: 0, 
+            num_staker: 0, 
+            pre_reward: 0, 
+            last_block_balance_change: env::block_index(), 
+            accounts: LookupMap::new(StorageKey::AccountKey),
+            paused: false,
+            paused_block: 0,
+            version: 2,
+        }
+    }
+
+    // Storing data on-chain require a small amount of NEAR (since using storage)
+    // Instead of using ourself money, we make the user to deposit them
+    // This is the `reserved_near` in wallet
+    #[payable]
+    pub fn storage_deposit(&mut self, account_id: Option<AccountId>) {
+        assert_at_least_one_yocto();
+        
+        let account = account_id.unwrap_or_else(|| env::predecessor_account_id());
+        let account_stake = self.accounts.get(&account);
+        if account_stake.is_some() {
+            // Refund all tokens
+            refund_deposit(0)
+        } else {
+            // Create new account
+            let storage_usage_before = env::storage_usage();
+            self.internal_create_account(account);
+            let storage_usage_after = env::storage_usage();
+
+            // Refund the rest tokens
+            refund_deposit(storage_usage_after - storage_usage_before);
+        }
+    }
+
+    pub fn exist_account(&self, account_id: AccountId) -> bool {
+        self.accounts.get(&account_id).is_some()
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    pub fn get_version(&self) -> U128 {
+        U128(self.version)
+    }
+
+    // This is to upgrade the staking contract from v1 to v2
+    // Use the private macro to avoid others people calling it (only the contract can call)
+    // To migrate, use the command `near dev-deploy path --initFunction migrate --initArgs '{}'`
+    //
+    // This function MUST BE REMOVED after migrating to be secured
+    #[private]
+    #[init(ignore_state)]
+    pub fn migrate() -> Self {
+        let old_contract: StakingContractV1 = env::state_read().expect("Cannot read old contract");
+        StakingContract { 
+            owner_id: old_contract.owner_id,
+            ft_contract_id: old_contract.ft_contract_id,
+            config: old_contract.config,
+            total_stake: old_contract.total_stake,
+            total_paid_reward: old_contract.total_paid_reward,
+            num_staker: old_contract.num_staker,
+            pre_reward: old_contract.pre_reward,
+            last_block_balance_change: old_contract.last_block_balance_change,
+            accounts: old_contract.accounts, 
+            paused: old_contract.paused,
+            paused_block: old_contract.paused_block,
+            version: 2
+        }
+    }
+}
+
+// =========================== Unit Test =============================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use near_sdk::{testing_env, MockedBlockchain};
+    use near_sdk::test_utils::{VMContextBuilder, accounts};
+
+    fn get_context(is_view: bool) -> VMContextBuilder {
+        let mut builder = VMContextBuilder::new();
+
+        builder.current_account_id(accounts(0))
+            .signer_account_id(accounts(0))
+            .predecessor_account_id(accounts(0))
+            .is_view(is_view);
+
+        builder
+    }
+
+    #[test]
+    fn test_init_contract() {
+        let context = get_context(false);
+        testing_env!(context.build());
+
+        let config: Config = Config {
+            reward_num: 500,
+            reward_denom: 100000,
+            num_epoch_unlock: 1,
+        };
+
+        let contract = StakingContract::new(
+            accounts(1).to_string(), 
+            "ft_contract".to_string(), 
+            config
+        );
+
+        assert_eq!(contract.owner_id, accounts(1).to_string());
+        assert_eq!(contract.ft_contract_id, "ft_contract".to_string());
+        assert_eq!(config.reward_num, contract.config.reward_num);
+        assert_eq!(contract.paused, false);
+    }   
+}
+'''
+'''--- contract/staking-contract/src/pool.rs ---
+use crate::*;
+
+#[derive(Deserialize, Serialize)]
+#[serde(crate="near_sdk::serde")]
+pub struct PoolJson {
+    pub total_stake_balance: U128,
+    pub total_reward: U128,
+    pub total_staker: U128,
+    pub is_paused: bool
+}
+
+impl PoolJson {
+    pub fn from(pool: &StakingContract) -> Self {
+        PoolJson {
+            total_stake_balance: U128(pool.total_stake),
+            total_reward: U128(pool.pre_reward + pool.internal_calculate_new_reward(None)),
+            total_staker: U128(pool.num_staker),
+            is_paused: pool.paused,
+        }
+    }
+}
+'''
+'''--- contract/staking-contract/src/staking_contract_v1.rs ---
+use crate::*;
+
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct StakingContractV1 {
+    pub owner_id: AccountId,                                    // ID of contract owner
+    pub ft_contract_id: AccountId,                              // ID of fungible token contract
+    pub config: Config,                                         // Config incentive rule
+    pub total_stake: Balance,                                   // Total stake balance
+    pub total_paid_reward: Balance,                             // Total reward paid for stakers
+    pub num_staker: u128,                                       // The number of stakers
+    pub pre_reward: Balance,                                    // Reward before adding the current reward
+    pub last_block_balance_change: BlockHeight,                 // Block height when balance updated
+    pub accounts: LookupMap<AccountId, UpgradableAccount>,      // Account informations respected to ID  
+    pub paused: bool,                                           // Staking will be paused when there is no more tokens
+    pub paused_block: BlockHeight,                              // Block height when contract paused  
+}
+'''
+'''--- contract/staking-contract/src/types.rs ---
+use crate::*;
+
+#[derive(BorshDeserialize, BorshSerialize, BorshStorageKey)]
+pub enum StorageKey {
+    AccountKey,
+}
+'''
+'''--- contract/staking-contract/src/upgradable_account.rs ---
+use crate::*;
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub enum UpgradableAccount {
+    Version1(AccountV1),
+    Current(Account)
+}
+
+impl From<Account> for UpgradableAccount {
+    fn from(account: Account) -> Self {
+        UpgradableAccount::Current(account)
+    }
+}
+
+impl From<UpgradableAccount> for Account {
+    fn from(upgradable_account: UpgradableAccount) -> Self {
+        match upgradable_account {
+            UpgradableAccount::Current(account) => account,
+            UpgradableAccount::Version1(account) => {
+                Account {
+                    stake_balance: account.stake_balance,
+                    pre_reward: account.stake_balance,
+                    last_block_balance_change: account.last_block_balance_change,
+                    unstake_balance: account.unstake_balance,
+                    unstake_start_time: account.unstake_start_time,
+                    unstake_available_epoch: account.unstake_available_epoch,
+                    membership: Membership::Basic
+                }
+            },
+        }
+    }
+}
+'''
+'''--- contract/staking-contract/src/utils.rs ---
+use crate::*;
+
+pub fn assert_at_least_one_yocto() {
+    assert!(env::attached_deposit() >= 1, "Require at least 1 yoctoNEAR");
+}
+
+pub fn refund_deposit(storage_used: StorageUsage) {
+    // NEAR cost to use `storage_used` bytes
+    let cost = env::storage_byte_cost() * Balance::from(storage_used);
+    let attached_deposit = env::attached_deposit();
+
+    assert!(
+        attached_deposit >= cost,
+        "Must attach at least {} yoctoNEAR to cover storage",
+        cost
+    );
+
+    let refund = attached_deposit - cost;
+    if refund>0 {
+        Promise::new(env::predecessor_account_id()).transfer(refund);
+    }
+}
+'''
+'''--- contract/staking-contract/tests/integrate_test.rs ---
+
+'''
+'''--- frontend/package.json ---
+{
+  "name": "dvp-near-ui",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": {
+    "@testing-library/jest-dom": "^5.16.4",
+    "@testing-library/react": "^13.3.0",
+    "@testing-library/user-event": "^13.5.0",
+    "antd": "^4.20.7",
+    "assert": "^2.0.0",
+    "buffer": "^6.0.3",
+    "env-cmd": "~10.1.0",
+    "near-api-js": "^0.44.2",
+    "react": "^18.1.0",
+    "react-dom": "^18.1.0",
+    "react-router": "^6.3.0",
+    "react-router-dom": "^6.3.0",
+    "react-scripts": "^5.0.1"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test",
+    "eject": "react-scripts eject"
+  },
+  "eslintConfig": {
+    "extends": [
+      "react-app",
+      "react-app/jest"
+    ]
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  },
+  "devDependencies": {
+    "autoprefixer": "^10.4.7",
+    "postcss": "^8.4.14",
+    "tailwindcss": "^3.0.24"
+  }
+}
+
+'''
+'''--- frontend/postcss.config.js ---
+module.exports = {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  },
+}
+
+'''
+'''--- frontend/public/index.html ---
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="%PUBLIC_URL%/DVP-icon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#000000" />
+    <meta
+      name="description"
+      content="Website using for NEAR development"
+    />
+    <link rel="apple-touch-icon" href="%PUBLIC_URL%/logo192.png" />
+    <!--
+      manifest.json provides metadata used when your web app is installed on a
+      user's mobile device or desktop. See https://developers.google.com/web/fundamentals/web-app-manifest/
+    -->
+    <link rel="manifest" href="%PUBLIC_URL%/manifest.json" />
+    <!--
+      Notice the use of %PUBLIC_URL% in the tags above.
+      It will be replaced with the URL of the `public` folder during the build.
+      Only files inside the `public` folder can be referenced from the HTML.
+
+      Unlike "/favicon.ico" or "favicon.ico", "%PUBLIC_URL%/favicon.ico" will
+      work correctly both with client-side routing and a non-root public URL.
+      Learn how to configure a non-root public URL by running `npm run build`.
+    -->
+    <title>DVP NEAR</title>
+  </head>
+  <body>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="root"></div>
+    <!--
+      This HTML file is a template.
+      If you open it directly in the browser, you will see an empty page.
+
+      You can add webfonts, meta tags, or analytics to this file.
+      The build step will place the bundled scripts into the <body> tag.
+
+      To begin the development, run `npm start` or `yarn start`.
+      To create a production bundle, use `npm run build` or `yarn build`.
+    -->
+  </body>
+</html>
+
+'''
+'''--- frontend/public/manifest.json ---
+{
+  "short_name": "React App",
+  "name": "Create React App Sample",
+  "icons": [
+    {
+      "src": "favicon.ico",
+      "sizes": "64x64 32x32 24x24 16x16",
+      "type": "image/x-icon"
+    },
+    {
+      "src": "logo192.png",
+      "type": "image/png",
+      "sizes": "192x192"
+    },
+    {
+      "src": "logo512.png",
+      "type": "image/png",
+      "sizes": "512x512"
+    }
+  ],
+  "start_url": ".",
+  "display": "standalone",
+  "theme_color": "#000000",
+  "background_color": "#ffffff"
+}
+
+'''
+'''--- frontend/public/robots.txt ---
+# https://www.robotstxt.org/robotstxt.html
+User-agent: *
+Disallow:
+
+'''
+'''--- frontend/src/App.css ---
+.App {
+  text-align: center;
+}
+
+.App-logo {
+  height: 40vmin;
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .App-logo {
+    animation: App-logo-spin infinite 20s linear;
+  }
+}
+
+.App-header {
+  background-color: #282c34;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  font-size: calc(10px + 2vmin);
+  color: white;
+}
+
+.App-link {
+  color: #61dafb;
+}
+
+@keyframes App-logo-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+'''
+'''--- frontend/src/components/TokenCard/style.css ---
+.site-card-border-less-wrapper {
+    padding: 10px;
+}
+'''
+'''--- frontend/src/index.css ---
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+'''
+'''--- frontend/src/index.js ---
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import './index.css';
+import App from './App';
+import {initContract} from './utils/near'
+
+window.nearInitPromise = initContract()
+  .then(() => {
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(
+      <React.StrictMode>
+        <App />
+      </React.StrictMode>
+    );    
+  })
+  .catch(console.error)
+
+'''
+'''--- frontend/src/utils/config.js ---
+const FAUCET_CONTRACT_NAME = 'faucet.phuc16102001.testnet'
+const FT_CONTRACT_NAME = 'ft.phuc16102001.testnet'
+const STAKING_CONTRACT_NAME = 'dev-1654255489604-90346948389505'
+
+function getConfig(env) {
+  switch (env) {
+    case 'production':
+      return {
+        networkId: 'testnet',
+        nodeUrl: 'https://rpc.testnet.near.org',
+        stakingContractName: STAKING_CONTRACT_NAME,
+        ftContractName: FT_CONTRACT_NAME,
+        faucetContractName: FAUCET_CONTRACT_NAME,
+        walletUrl: 'https://wallet.testnet.near.org',
+        helperUrl: 'https://helper.testnet.near.org',
+        explorerUrl: 'https://explorer.testnet.near.org',
+      }
+    case 'mainnet':
+      return {
+        networkId: 'mainnet',
+        nodeUrl: 'https://rpc.mainnet.near.org',
+        stakingContractName: STAKING_CONTRACT_NAME,
+        ftContractName: FT_CONTRACT_NAME,
+        faucetContractName: FAUCET_CONTRACT_NAME,
+        walletUrl: 'https://wallet.near.org',
+        helperUrl: 'https://helper.mainnet.near.org',
+        explorerUrl: 'https://explorer.mainnet.near.org',
+      }
+    case 'development':
+      return {
+        networkId: 'testnet',
+        nodeUrl: 'https://rpc.testnet.near.org',
+        stakingContractName: STAKING_CONTRACT_NAME,
+        ftContractName: FT_CONTRACT_NAME,
+        faucetContractName: FAUCET_CONTRACT_NAME,
+        walletUrl: 'https://wallet.testnet.near.org',
+        helperUrl: 'https://helper.testnet.near.org',
+        explorerUrl: 'https://explorer.testnet.near.org',
+      }
+    case 'testnet':
+      return {
+        networkId: 'testnet',
+        nodeUrl: 'https://rpc.testnet.near.org',
+        stakingContractName: STAKING_CONTRACT_NAME,
+        ftContractName: FT_CONTRACT_NAME,
+        faucetContractName: FAUCET_CONTRACT_NAME,
+        walletUrl: 'https://wallet.testnet.near.org',
+        helperUrl: 'https://helper.testnet.near.org',
+        explorerUrl: 'https://explorer.testnet.near.org',
+      }
+    case 'betanet':
+      return {
+        networkId: 'betanet',
+        nodeUrl: 'https://rpc.betanet.near.org',
+        stakingContractName: STAKING_CONTRACT_NAME,
+        ftContractName: FT_CONTRACT_NAME,
+        faucetContractName: FAUCET_CONTRACT_NAME,
+        walletUrl: 'https://wallet.betanet.near.org',
+        helperUrl: 'https://helper.betanet.near.org',
+        explorerUrl: 'https://explorer.betanet.near.org',
+      }
+    case 'local':
+      return {
+        networkId: 'local',
+        nodeUrl: 'http://localhost:3030',
+        keyPath: `${process.env.HOME}/.near/validator_key.json`,
+        stakingContractName: STAKING_CONTRACT_NAME,
+        walletUrl: 'http://localhost:4000/wallet',
+        faucetContractName: FAUCET_CONTRACT_NAME,
+        ftContractName: FT_CONTRACT_NAME,
+      }
+    default:
+      throw Error(`Unconfigured environment '${env}'. Can be configured in src/config.js.`)
+  }
+}
+
+module.exports = getConfig
+
+'''
+'''--- frontend/src/utils/faucet-api.js ---
+import { Contract } from 'near-api-js'
+import { TWO_YOCTO_NEAR, nearConfig, executeMultipleTransactions } from './near.js'
+
+export async function initFaucetContract() {
+  window.faucetContract = await new Contract(window.walletConnection.account(), nearConfig.faucetContractName, {
+    viewMethods: ['get_info', 'shared_balance_of'],
+    changeMethods: ['faucet_token'],
+  })
+}
+
+export async function faucetToken(faucetAmount) {
+    let transferTx = {
+        receiverId: nearConfig.faucetContractName,
+        functionCalls: [{
+            methodName: "faucet_token",
+            args: {
+                amount: String(faucetAmount),
+            },
+            gas: "60000000000000",
+            amount: TWO_YOCTO_NEAR
+        }]
+    }
+    let transactions = [transferTx]
+    await executeMultipleTransactions(transactions);
+}
+
+'''
+'''--- frontend/src/utils/ft-api.js ---
+import { nearConfig, ONE_YOCTO_NEAR, STAKING_STORAGE_AMOUNT, executeMultipleTransactions } from './near.js'
+import { Contract } from 'near-api-js'
+
+export async function initFtContract() {
+  window.ftContract = await new Contract(window.walletConnection.account(), nearConfig.ftContractName, {
+    viewMethods: ['ft_metadata', 'ft_balance_of', 'ft_total_supply', 'storage_balance_of'],
+    changeMethods: ['ft_transfer', 'storage_deposit'],
+  })
+}
+
+export async function transferToken(transferTo, transferAmount, memo) {
+    let transferTx = {
+        receiverId: nearConfig.ftContractName,
+        functionCalls: [{
+            methodName: "ft_transfer",
+            args: {
+                receiver_id: transferTo,
+                amount: String(transferAmount),
+                memo: memo
+            },
+            gas: "60000000000000",
+            amount: ONE_YOCTO_NEAR
+        }]
+    }
+    let transactions = [transferTx]
+
+    let registered = await window.ftContract.storage_balance_of({
+        account_id: transferTo
+    });
+
+    if (registered === null) {
+        let depositTx = {
+            receiverId: nearConfig.ftContractName,
+            functionCalls: [{
+                methodName: "storage_deposit",
+                args: {
+                    account_id: transferTo,
+                    registery_only: true
+                },
+                gas: "10000000000000",
+                amount: STAKING_STORAGE_AMOUNT
+            }]
+        }
+        transactions.unshift(depositTx);
+    }
+    await executeMultipleTransactions(transactions);
+}
+
+'''
+'''--- frontend/src/utils/my-wallet.js ---
+import { ConnectedWalletAccount, WalletConnection } from "near-api-js"
+import { createTransaction } from "near-api-js/lib/transaction";
+import { baseDecode } from 'borsh';
+import { PublicKey } from 'near-api-js/lib/utils';
+
+export default class MyWalletConnection extends WalletConnection {
+
+    _walletAccount;
+
+    account = () => {
+        if (!this._walletAccount) {
+            this._walletAccount = new MyWalletAccount(
+                this,
+                this._near.connection,
+                this._authData.accountId
+            );
+        }
+        return this._walletAccount;
+    }
+
+    createTransaction = ({receiverId, actions, nonceOffset = 1}) => {
+        return this._walletAccount.createTransaction({ receiverId, actions, nonceOffset });
+    }
+}
+
+class MyWalletAccount extends ConnectedWalletAccount {
+    async createTransaction({ receiverId, actions, nonceOffset }) {
+        const localKey = await this.connection.signer.getPublicKey(
+            this.accountId,
+            this.connection.networkId
+        );
+        let accessKey = await this.accessKeyForTransaction(
+            receiverId,
+            actions,
+            localKey
+        );
+        if (!accessKey) {
+            throw new Error(
+                `Cannot find matching key for transaction sent to ${receiverId}`
+            );
+        }
+
+        const block = await this.connection.provider.block({ finality: 'final' });
+        const blockHash = baseDecode(block.header.hash);
+
+        const publicKey = PublicKey.from(accessKey.public_key);
+        const nonce = accessKey.access_key.nonce + nonceOffset;
+
+        return createTransaction(
+            this.accountId,
+            publicKey,
+            receiverId,
+            nonce,
+            actions,
+            blockHash
+        );
+    }
+}
+'''
+'''--- frontend/src/utils/near.js ---
+import { keyStores, Near, utils } from 'near-api-js'
+import getConfig from './config'
+import { functionCall } from 'near-api-js/lib/transaction';
+import BN from 'bn.js';
+import MyWalletConnection from './my-wallet';
+import { initFtContract } from './ft-api';
+import { initFaucetContract } from './faucet-api';
+import { initStakingContract } from './staking-api';
+
+export const nearConfig = getConfig(process.env.NODE_ENV || 'development')
+export const ONE_YOCTO_NEAR = '0.000000000000000000000001';
+export const TWO_YOCTO_NEAR = '0.000000000000000000000002';
+export const STAKING_STORAGE_AMOUNT = '0.01';
+
+export async function initContract() {
+  const near = new Near({
+    keyStore: new keyStores.BrowserLocalStorageKeyStore(),
+    headers: {},
+    ...nearConfig,
+  });
+
+  window.Buffer = window.Buffer || require("buffer").Buffer;
+  window.walletConnection = new MyWalletConnection(near)
+  window.accountId = window.walletConnection.getAccountId()
+
+  await initFtContract();
+  await initFaucetContract();
+  await initStakingContract();
+}
+
+export function logout() {
+  window.walletConnection.signOut()
+  window.location.replace(window.location.origin + window.location.pathname)
+}
+
+export function login() {
+  window.walletConnection.requestSignIn()
+}
+
+export async function executeMultipleTransactions(transactions, callbackUrl) {
+  const nearTransactions = await Promise.all(
+    transactions.map((tx, i) => {
+      return window.walletConnection.createTransaction({
+        receiverId: tx.receiverId,
+        nonceOffset: i + 1,
+        actions: tx.functionCalls.map((fc) =>
+          functionCall(
+            fc.methodName,
+            fc.args,
+            new BN(fc.gas),
+            new BN(utils.format.parseNearAmount(fc.amount))
+          )
+        ),
+      })
+    }),
+  )
+  await window.walletConnection.requestSignTransactions(nearTransactions, callbackUrl);
+};
+
+'''
+'''--- frontend/src/utils/staking-api.js ---
+import { Contract } from 'near-api-js'
+import { ONE_YOCTO_NEAR, STAKING_STORAGE_AMOUNT, nearConfig, executeMultipleTransactions } from './near.js'
+
+export async function initStakingContract() {
+    window.stakingContract = await new Contract(window.walletConnection.account(), nearConfig.stakingContractName, {
+        viewMethods: ['get_pool_info', 'get_account_info', 'exist_account', 'is_paused', 'get_version'],
+        changeMethods: ['storage_deposit', 'harvest', 'unstake', 'withdraw'],
+    })
+}
+
+export async function stakeBalance(accountId, stakeAmount) {
+    let transferTx = {
+        receiverId: nearConfig.ftContractName,
+        functionCalls: [{
+            methodName: "ft_transfer_call",
+            args: {
+                receiver_id: nearConfig.stakingContractName,
+                amount: String(stakeAmount),
+                msg: "Staking token deposit"
+            },
+            gas: "60000000000000",
+            amount: ONE_YOCTO_NEAR
+        }]
+    }
+    let transactions = [transferTx]
+
+    let registered = await window.stakingContract.exist_account({
+        account_id: accountId
+    });
+
+    if (registered === false) {
+        let depositTx = {
+            receiverId: nearConfig.stakingContractName,
+            functionCalls: [{
+                methodName: "storage_deposit",
+                args: {
+                    account_id: accountId,
+                },
+                gas: "10000000000000",
+                amount: STAKING_STORAGE_AMOUNT
+            }]
+        }
+        transactions.unshift(depositTx);
+    }
+    await executeMultipleTransactions(transactions);
+}
+
+export async function unstakeBalance(unstakeAmount) {
+    let transferTx = {
+        receiverId: nearConfig.stakingContractName,
+        functionCalls: [{
+            methodName: "unstake",
+            args: {
+                amount: String(unstakeAmount),
+            },
+            gas: "60000000000000",
+            amount: ONE_YOCTO_NEAR
+        }]
+    }
+    let transactions = [transferTx]
+    await executeMultipleTransactions(transactions);
+}
+
+export async function withdraw() {
+    let transferTx = {
+        receiverId: nearConfig.stakingContractName,
+        functionCalls: [{
+            methodName: "withdraw",
+            args: {},
+            gas: "60000000000000",
+            amount: ONE_YOCTO_NEAR
+        }]
+    }
+    let transactions = [transferTx]
+    await executeMultipleTransactions(transactions);
+}
+
+export async function harvestReward() {
+    let transferTx = {
+        receiverId: nearConfig.stakingContractName,
+        functionCalls: [{
+            methodName: "harvest",
+            args: {},
+            gas: "60000000000000",
+            amount: ONE_YOCTO_NEAR
+        }]
+    }
+    let transactions = [transferTx]
+    await executeMultipleTransactions(transactions);
+}
+
+'''
+'''--- frontend/tailwind.config.js ---
+module.exports = {
+  content: [
+    "./src/**/*.{js,jsx,ts,tsx}",
+  ],
+  theme: {
+    extend: {},
+  },
+  plugins: [],
+}
+
+'''

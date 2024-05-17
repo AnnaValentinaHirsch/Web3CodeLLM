@@ -1,0 +1,1084 @@
+*GitHub Repository "near/near-abi-client-js"*
+
+'''--- .eslintrc.yml ---
+env:
+  es6: true
+  node: true
+extends:
+  - 'eslint:recommended'
+  - 'plugin:@typescript-eslint/eslint-recommended'
+parser: '@typescript-eslint/parser'
+parserOptions:
+  ecmaVersion: 2018
+  sourceType: module
+rules:
+  indent:
+    - error
+    - 4
+  linebreak-style:
+    - error
+    - unix
+  quotes:
+    - error
+    - single
+    - avoidEscape: true
+  semi:
+    - error
+    - always
+  no-console: off
+globals:
+  window: true
+  fetch: true
+  Headers: true
+  document: true
+
+'''
+'''--- .gitpod.yml ---
+tasks:
+  - init: yarn install && yarn run build
+    command: yarn run dev
+github:
+  prebuilds:
+    addCheck: true
+    addComment: true
+
+'''
+'''--- README.md ---
+# near-abi-client-js
+Library to generate JavaScript/TypeScript client code from NEAR ABI
+
+'''
+'''--- dangerfile.ts ---
+import { schedule, danger } from 'danger';
+import {
+    checkForRelease,
+    // checkForNewDependencies,
+    // checkForLockfileDiff,
+    checkForTypesInDeps
+} from 'danger-plugin-yarn';
+
+schedule(async () => {
+    const packageDiff = await danger.git.JSONDiffForFile("package.json")
+    checkForRelease(packageDiff)
+    // checkForNewDependencies(packageDiff)
+    // checkForLockfileDiff(packageDiff)
+    checkForTypesInDeps(packageDiff)
+  })
+'''
+'''--- jest.config.js ---
+module.exports = {
+    preset: 'ts-jest',
+    testEnvironment: 'node',
+    collectCoverage: true,
+    resolver: 'ts-jest-resolver'
+};
+
+'''
+'''--- lib/contract.d.ts ---
+/// <reference types="node" />
+import { Connection } from 'near-api-js';
+import { FinalExecutionOutcome } from 'near-api-js/lib/providers';
+import { AbiRoot, AbiParameters, AbiFunction } from 'near-abi';
+import { Wallet } from '@near-wallet-selector/core';
+import BN from 'bn.js';
+export interface FunctionCallOptions {
+    signer?: string;
+    /** max amount of gas that method call can use */
+    gas?: BN;
+    /** amount of NEAR (in yoctoNEAR) to send together with the call */
+    attachedDeposit?: BN;
+    /**
+     * Callback url to send the NEAR Wallet if using it to sign transactions.
+     * @see {@link RequestSignTransactionsOptions}
+     */
+    walletCallbackUrl?: string;
+}
+export declare class AbiValidationError extends Error {
+    constructor(error: string);
+}
+declare function serializeArgs(fn_name: string, args: any[], params_abi?: AbiParameters): Buffer;
+export declare class ContractMethodInvocation {
+    #private;
+    get contract(): Contract;
+    get arguments(): any[];
+    get method(): AbiFunction;
+    transact?(wallet: Wallet, opts?: FunctionCallOptions): Promise<void | FinalExecutionOutcome>;
+    view?(): Promise<any>;
+    /**
+     * @param contract NEAR Contract object
+     * @param fn ABI function object
+     * @param args Arguments to pass to the function
+     */
+    constructor(contract: Contract, fn: AbiFunction, args: any[]);
+}
+export declare class ContractMethods {
+    readonly [fn: string]: (...args: any[]) => ContractMethodInvocation;
+    /**
+     * @param contract NEAR Contract object
+     */
+    constructor(contract: Contract);
+}
+export declare class Contract {
+    #private;
+    get connection(): Connection;
+    get contractId(): string;
+    get abi(): AbiRoot;
+    readonly methods: ContractMethods;
+    /**
+     * @param connection Connection to NEAR network through RPC.
+     * @param contractId NEAR account id where the contract is deployed.
+     * @param abi ABI schema which will be used to generate methods to be called on this Contract
+     */
+    constructor(connection: Connection, contractId: string, abi: AbiRoot);
+}
+export declare const testingExports: {
+    serializeArgs: typeof serializeArgs;
+};
+export {};
+
+'''
+'''--- lib/contract.js ---
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.testingExports = exports.Contract = exports.ContractMethods = exports.ContractMethodInvocation = exports.AbiValidationError = void 0;
+const near_abi_1 = require("near-abi");
+async function transactInternal(account, contractId, methodName, args, opts) {
+    return await account.signAndSendTransaction({
+        signerId: opts?.signer,
+        receiverId: contractId,
+        callbackUrl: opts?.walletCallbackUrl,
+        actions: [
+            {
+                type: 'FunctionCall',
+                params: {
+                    methodName,
+                    args,
+                    gas: opts?.gas.toString(),
+                    deposit: opts?.attachedDeposit.toString(),
+                },
+            },
+        ],
+    });
+}
+async function viewInternal(connection, contractId, functionName, args) {
+    //* Not ideal that this logic is copied, but NAJ requires an Account to
+    //* perform a view call, which isn't necessary.
+    const serializedArgs = args.toString('base64');
+    const result = await connection.provider.query({
+        request_type: 'call_function',
+        account_id: contractId,
+        method_name: functionName,
+        args_base64: serializedArgs,
+        finality: 'optimistic',
+    });
+    if (result.logs && !process.env['NEAR_NO_LOGS']) {
+        for (const log of result.logs) {
+            console.log(`Log [${contractId}]: ${log}`);
+        }
+    }
+    return (result.result && result.result.length > 0 && Buffer.from(result.result));
+}
+class AbiValidationError extends Error {
+    constructor(error) {
+        super(`ABI validation error: ${error}`);
+    }
+}
+exports.AbiValidationError = AbiValidationError;
+function deserializeJSON(response) {
+    return JSON.parse(Buffer.from(response).toString());
+}
+function serializeJSON(input) {
+    return Buffer.from(JSON.stringify(input));
+}
+function serializeArgs(fn_name, args, params_abi) {
+    if (args.length > 0) {
+        if (!params_abi) {
+            throw new AbiValidationError(`${fn_name} accepts no arguments, got ${args}`);
+        }
+        let param_object;
+        if (args.length === params_abi.args.length) {
+            // Serializes the arguments as a JSON object by default.
+            // The reason for this is that contracts by default support object deserialization
+            // and only Rust contracts support the array JSON format ambiguously.
+            param_object = args.reduce((accumulator, value, idx) => {
+                const key = params_abi.args[idx].name;
+                return { ...accumulator, [key]: value };
+            }, {});
+        }
+        else if (args.length === 1 &&
+            typeof args[0] === 'object' &&
+            args[0] !== null) {
+            // Parameter for function call is an object, validate keys are correct
+            // and serialize.
+            param_object = args[0];
+            const keys = Object.keys(param_object);
+            if (keys.length !== params_abi.args.length) {
+                throw new AbiValidationError(`Invalid number of fields for ${fn_name}, expected ${params_abi.args.length} got ${keys.length}`);
+            }
+            //* This doesn't validate the order of keys. If we wanted serialization to be
+            //* canonical, we would check it here or sort after this method.
+            for (const k of params_abi.args) {
+                if (!param_object[k.name]) {
+                    throw new AbiValidationError(`Function ${fn_name} expected key ${k.name} in parameter object`);
+                }
+            }
+        }
+        else {
+            throw new AbiValidationError(`Invalid number of parameters for ${fn_name}, expected ${params_abi.args.length} got ${args.length}`);
+        }
+        // TODO serialize based on protocol in abi
+        return serializeJSON(param_object);
+    }
+    else {
+        if (params_abi) {
+            throw new AbiValidationError(`Passed no parameters for ${fn_name}, expected ${params_abi.args.length}`);
+        }
+        return Buffer.alloc(0);
+    }
+}
+class ContractMethodInvocation {
+    #contract;
+    get contract() {
+        return this.#contract;
+    }
+    #arguments;
+    get arguments() {
+        return this.#arguments;
+    }
+    #method;
+    get method() {
+        return this.#method;
+    }
+    /**
+     * @param contract NEAR Contract object
+     * @param fn ABI function object
+     * @param args Arguments to pass to the function
+     */
+    constructor(contract, fn, args) {
+        [this.#method, this.#arguments, this.#contract] = [fn, args, contract];
+        if (fn.kind == near_abi_1.AbiFunctionKind.View) {
+            this.view = async () => {
+                const returnBytes = await viewInternal(contract.connection, contract.contractId, fn.name, serializeArgs(fn.name, args, fn.params));
+                // TODO deserialize based on protocol from schema
+                return deserializeJSON(returnBytes);
+            };
+            Object.defineProperty(this.view, 'name', {
+                writable: false,
+                value: `ContractMethod[${fn.name}].view`,
+            });
+        }
+        else {
+            this.transact = async (account, opts) => {
+                // Using inner NAJ APIs for result for consistency, but this might
+                // not be ideal API.
+                return transactInternal(account, contract.contractId, fn.name, serializeArgs(fn.name, args, fn.params), opts);
+            };
+            Object.defineProperty(this.transact, 'name', {
+                writable: false,
+                value: `ContractMethod[${fn.name}].transact`,
+            });
+        }
+    }
+}
+exports.ContractMethodInvocation = ContractMethodInvocation;
+class ContractMethods {
+    /**
+     * @param contract NEAR Contract object
+     */
+    constructor(contract) {
+        if (!contract.abi)
+            throw new Error("Can't create ContractMethods without ABI");
+        // Create method on this contract object to be able to call methods.
+        for (const fn of contract.abi.body.functions) {
+            const handler = (...args) => {
+                return new ContractMethodInvocation(contract, fn, args);
+            };
+            Object.defineProperty(handler, 'name', {
+                writable: false,
+                value: `ContractMethod[${fn.name}]`,
+            });
+            Object.defineProperty(this, fn.name, {
+                writable: false,
+                enumerable: true,
+                value: handler,
+            });
+        }
+    }
+}
+exports.ContractMethods = ContractMethods;
+class Contract {
+    #connection;
+    get connection() {
+        return this.#connection;
+    }
+    #contractId;
+    get contractId() {
+        return this.#contractId;
+    }
+    #abi;
+    get abi() {
+        return this.#abi;
+    }
+    methods;
+    /**
+     * @param connection Connection to NEAR network through RPC.
+     * @param contractId NEAR account id where the contract is deployed.
+     * @param abi ABI schema which will be used to generate methods to be called on this Contract
+     */
+    constructor(connection, contractId, abi) {
+        this.#connection = connection;
+        this.#contractId = contractId;
+        this.#abi = abi;
+        Object.defineProperty(this, 'methods', {
+            writable: false,
+            enumerable: true,
+            value: new ContractMethods(this),
+        });
+    }
+}
+exports.Contract = Contract;
+exports.testingExports = {
+    serializeArgs,
+};
+
+'''
+'''--- lib/index.d.ts ---
+/** @ignore @module */
+export { Contract, ContractMethodInvocation, ContractMethods, FunctionCallOptions, AbiValidationError, } from './contract';
+export * from 'near-abi';
+
+'''
+'''--- lib/index.js ---
+"use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __exportStar = (this && this.__exportStar) || function(m, exports) {
+    for (var p in m) if (p !== "default" && !Object.prototype.hasOwnProperty.call(exports, p)) __createBinding(exports, m, p);
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.AbiValidationError = exports.ContractMethods = exports.ContractMethodInvocation = exports.Contract = void 0;
+/** @ignore @module */
+var contract_1 = require("./contract");
+Object.defineProperty(exports, "Contract", { enumerable: true, get: function () { return contract_1.Contract; } });
+Object.defineProperty(exports, "ContractMethodInvocation", { enumerable: true, get: function () { return contract_1.ContractMethodInvocation; } });
+Object.defineProperty(exports, "ContractMethods", { enumerable: true, get: function () { return contract_1.ContractMethods; } });
+Object.defineProperty(exports, "AbiValidationError", { enumerable: true, get: function () { return contract_1.AbiValidationError; } });
+__exportStar(require("near-abi"), exports);
+
+'''
+'''--- package.json ---
+{
+  "name": "near-abi-client",
+  "version": "0.1.0",
+  "description": "Typescript client to interact with contracts defined with an ABI",
+  "main": "lib/index.js",
+  "browser": "lib/browser-index.js",
+  "types": "lib/index.d.ts",
+  "author": "Pagoda",
+  "license": "(MIT AND Apache-2.0)",
+  "dependencies": {
+    "@near-wallet-selector/core": "^6.0.1",
+    "@types/json-schema": "^7.0.11",
+    "near-abi": "https://github.com/near/near-abi-js",
+    "near-api-js": "^0.44.2"
+  },
+  "devDependencies": {
+    "@types/bn.js": "^5.1.0",
+    "@types/http-errors": "^1.6.1",
+    "@types/jest": "^27.5.1",
+    "@typescript-eslint/eslint-plugin": "^5.30.1",
+    "@typescript-eslint/parser": "^5.30.1",
+    "browserify": "^16.2.3",
+    "bundlewatch": "^0.3.1",
+    "danger": "^10.6.6",
+    "danger-plugin-yarn": "^1.3.2",
+    "eslint": "^8.18.0",
+    "eslint-plugin-prettier": "4.2.1",
+    "husky": "^7.0.4",
+    "in-publish": "^2.0.0",
+    "jest": "^28.1.0",
+    "localstorage-memory": "^1.0.3",
+    "near-hello": "^0.5.1",
+    "prettier": "^2.7.1",
+    "rimraf": "^3.0.0",
+    "semver": "^7.1.1",
+    "ts-jest": "^28.0.3",
+    "ts-jest-resolver": "^2.0.0",
+    "ts-morph": "^11.0.3",
+    "typedoc": "^0.20.36",
+    "typedoc-neo-theme": "^1.1.1",
+    "typescript": "^4.3.0",
+    "uglifyify": "^5.0.1"
+  },
+  "scripts": {
+    "dist": "yarn browserify && yarn doc",
+    "browserify": "browserify browser-exports.js -i node-fetch -i http -i https -o dist/near-abi-client.js && browserify browser-exports.js -i node-fetch -g uglifyify -o dist/near-abi-client.min.js",
+    "prebrowserify": "yarn build",
+    "prepublish": "not-in-install && (yarn build && yarn browserify) || in-install",
+    "compile": "tsc -p ./tsconfig.json",
+    "dev": "yarn compile -w",
+    "doc": "typedoc src && touch docs/.nojekyll",
+    "build": "yarn compile",
+    "test": "jest test",
+    "lint": "eslint \"src/**/*.ts\"",
+    "fix": "eslint \"src/**/*.ts\" --fix",
+    "prefuzz": "yarn build",
+    "fuzz": "jsfuzz test/fuzz/borsh-roundtrip.js test/fuzz/corpus/",
+    "prepare": "husky install"
+  },
+  "bundlewatch": {
+    "files": [
+      {
+        "path": "dist/near-abi-client.min.js",
+        "maxSize": "105kB"
+      }
+    ]
+  },
+  "files": [
+    "lib",
+    "dist",
+    "browser-exports.js"
+  ]
+}
+
+'''
+'''--- src/.eslintrc.yml ---
+env:
+  es6: true
+  node: true
+extends:
+  - 'eslint:recommended'
+  - 'plugin:@typescript-eslint/eslint-recommended'
+  - 'plugin:@typescript-eslint/recommended'
+parser: '@typescript-eslint/parser'
+rules:
+  no-inner-declarations: off
+  '@typescript-eslint/no-explicit-any': off
+  '@typescript-eslint/camelcase': 0
+  '@typescript-eslint/explicit-function-return-type': 0
+  '@typescript-eslint/no-use-before-define': 2
+  prettier/prettier:
+    - warn
+    - singleQuote: true
+
+parserOptions:
+  ecmaVersion: 2018
+  sourceType: module
+
+plugins:
+  - '@typescript-eslint'
+  - prettier
+
+'''
+'''--- src/contract.ts ---
+import { Connection } from 'near-api-js';
+import { FinalExecutionOutcome } from 'near-api-js/lib/providers';
+import { CodeResult } from 'near-api-js/lib/providers/provider';
+import { AbiRoot, AbiParameters, AbiFunction, AbiFunctionKind } from 'near-abi';
+import { Wallet } from '@near-wallet-selector/core';
+import BN from 'bn.js';
+
+export interface FunctionCallOptions {
+    signer?: string;
+    /** max amount of gas that method call can use */
+    gas?: BN;
+    /** amount of NEAR (in yoctoNEAR) to send together with the call */
+    attachedDeposit?: BN;
+    /**
+     * Callback url to send the NEAR Wallet if using it to sign transactions.
+     * @see {@link RequestSignTransactionsOptions}
+     */
+    walletCallbackUrl?: string;
+}
+
+async function transactInternal(
+    account: Wallet,
+    contractId: string,
+    methodName: string,
+    args: Uint8Array,
+    opts?: FunctionCallOptions
+): Promise<void | FinalExecutionOutcome> {
+    return await account.signAndSendTransaction({
+        signerId: opts?.signer,
+        receiverId: contractId,
+        callbackUrl: opts?.walletCallbackUrl,
+        actions: [
+            {
+                type: 'FunctionCall',
+                params: {
+                    methodName,
+                    args,
+                    gas: opts?.gas.toString(),
+                    deposit: opts?.attachedDeposit.toString(),
+                },
+            },
+        ],
+    });
+}
+
+async function viewInternal(
+    connection: Connection,
+    contractId: string,
+    functionName: string,
+    args: Buffer
+): Promise<Buffer> {
+    //* Not ideal that this logic is copied, but NAJ requires an Account to
+    //* perform a view call, which isn't necessary.
+    const serializedArgs = args.toString('base64');
+
+    const result = await connection.provider.query<CodeResult>({
+        request_type: 'call_function',
+        account_id: contractId,
+        method_name: functionName,
+        args_base64: serializedArgs,
+        finality: 'optimistic',
+    });
+
+    if (result.logs && !process.env['NEAR_NO_LOGS']) {
+        for (const log of result.logs) {
+            console.log(`Log [${contractId}]: ${log}`);
+        }
+    }
+
+    return (
+        result.result && result.result.length > 0 && Buffer.from(result.result)
+    );
+}
+
+export class AbiValidationError extends Error {
+    constructor(error: string) {
+        super(`ABI validation error: ${error}`);
+    }
+}
+
+function deserializeJSON(response: Uint8Array): any {
+    return JSON.parse(Buffer.from(response).toString());
+}
+
+function serializeJSON(input: any): Buffer {
+    return Buffer.from(JSON.stringify(input));
+}
+
+function serializeArgs(
+    fn_name: string,
+    args: any[],
+    params_abi?: AbiParameters
+): Buffer {
+    if (args.length > 0) {
+        if (!params_abi) {
+            throw new AbiValidationError(
+                `${fn_name} accepts no arguments, got ${args}`
+            );
+        }
+
+        let param_object: object;
+        if (args.length === params_abi.args.length) {
+            // Serializes the arguments as a JSON object by default.
+            // The reason for this is that contracts by default support object deserialization
+            // and only Rust contracts support the array JSON format ambiguously.
+            param_object = args.reduce((accumulator, value, idx) => {
+                const key = params_abi.args[idx].name;
+                return { ...accumulator, [key]: value };
+            }, {});
+        } else if (
+            args.length === 1 &&
+            typeof args[0] === 'object' &&
+            args[0] !== null
+        ) {
+            // Parameter for function call is an object, validate keys are correct
+            // and serialize.
+            param_object = args[0];
+            const keys = Object.keys(param_object);
+            if (keys.length !== params_abi.args.length) {
+                throw new AbiValidationError(
+                    `Invalid number of fields for ${fn_name}, expected ${params_abi.args.length} got ${keys.length}`
+                );
+            }
+
+            //* This doesn't validate the order of keys. If we wanted serialization to be
+            //* canonical, we would check it here or sort after this method.
+            for (const k of params_abi.args) {
+                if (!param_object[k.name]) {
+                    throw new AbiValidationError(
+                        `Function ${fn_name} expected key ${k.name} in parameter object`
+                    );
+                }
+            }
+        } else {
+            throw new AbiValidationError(
+                `Invalid number of parameters for ${fn_name}, expected ${params_abi.args.length} got ${args.length}`
+            );
+        }
+
+        // TODO serialize based on protocol in abi
+        return serializeJSON(param_object);
+    } else {
+        if (params_abi) {
+            throw new AbiValidationError(
+                `Passed no parameters for ${fn_name}, expected ${params_abi.args.length}`
+            );
+        }
+        return Buffer.alloc(0);
+    }
+}
+
+export class ContractMethodInvocation {
+    #contract: Contract;
+    public get contract(): Contract {
+        return this.#contract;
+    }
+    #arguments: any[];
+    public get arguments(): any[] {
+        return this.#arguments;
+    }
+    #method: AbiFunction;
+    public get method(): AbiFunction {
+        return this.#method;
+    }
+
+    transact?(
+        wallet: Wallet,
+        opts?: FunctionCallOptions
+    ): Promise<void | FinalExecutionOutcome>;
+
+    view?(): Promise<any>;
+
+    /**
+     * @param contract NEAR Contract object
+     * @param fn ABI function object
+     * @param args Arguments to pass to the function
+     */
+    constructor(contract: Contract, fn: AbiFunction, args: any[]) {
+        [this.#method, this.#arguments, this.#contract] = [fn, args, contract];
+        if (fn.kind == AbiFunctionKind.View) {
+            this.view = async (): Promise<any> => {
+                const returnBytes = await viewInternal(
+                    contract.connection,
+                    contract.contractId,
+                    fn.name,
+                    serializeArgs(fn.name, args, fn.params)
+                );
+                // TODO deserialize based on protocol from schema
+                return deserializeJSON(returnBytes);
+            };
+            Object.defineProperty(this.view, 'name', {
+                writable: false,
+                value: `ContractMethod[${fn.name}].view`,
+            });
+        } else {
+            this.transact = async (
+                account,
+                opts
+            ): Promise<void | FinalExecutionOutcome> => {
+                // Using inner NAJ APIs for result for consistency, but this might
+                // not be ideal API.
+                return transactInternal(
+                    account,
+                    contract.contractId,
+                    fn.name,
+                    serializeArgs(fn.name, args, fn.params),
+                    opts
+                );
+            };
+            Object.defineProperty(this.transact, 'name', {
+                writable: false,
+                value: `ContractMethod[${fn.name}].transact`,
+            });
+        }
+    }
+}
+
+export class ContractMethods {
+    readonly [fn: string]: (...args: any[]) => ContractMethodInvocation;
+
+    /**
+     * @param contract NEAR Contract object
+     */
+    constructor(contract: Contract) {
+        if (!contract.abi)
+            throw new Error("Can't create ContractMethods without ABI");
+        // Create method on this contract object to be able to call methods.
+        for (const fn of contract.abi.body.functions) {
+            const handler = (...args): ContractMethodInvocation => {
+                return new ContractMethodInvocation(contract, fn, args);
+            };
+            Object.defineProperty(handler, 'name', {
+                writable: false,
+                value: `ContractMethod[${fn.name}]`,
+            });
+            Object.defineProperty(this, fn.name, {
+                writable: false,
+                enumerable: true,
+                value: handler,
+            });
+        }
+    }
+}
+
+export class Contract {
+    #connection: Connection;
+    public get connection(): Connection {
+        return this.#connection;
+    }
+
+    #contractId: string;
+    public get contractId(): string {
+        return this.#contractId;
+    }
+
+    #abi: AbiRoot;
+    public get abi(): AbiRoot {
+        return this.#abi;
+    }
+
+    readonly methods: ContractMethods;
+
+    /**
+     * @param connection Connection to NEAR network through RPC.
+     * @param contractId NEAR account id where the contract is deployed.
+     * @param abi ABI schema which will be used to generate methods to be called on this Contract
+     */
+    constructor(connection: Connection, contractId: string, abi: AbiRoot) {
+        this.#connection = connection;
+        this.#contractId = contractId;
+        this.#abi = abi;
+
+        Object.defineProperty(this, 'methods', {
+            writable: false,
+            enumerable: true,
+            value: new ContractMethods(this),
+        });
+    }
+}
+
+export const testingExports = {
+    serializeArgs,
+};
+
+'''
+'''--- src/index.ts ---
+/** @ignore @module */
+export {
+    Contract,
+    ContractMethodInvocation,
+    ContractMethods,
+    FunctionCallOptions,
+    AbiValidationError,
+} from './contract';
+export * from 'near-abi';
+
+'''
+'''--- test/abi.test.ts ---
+import { Contract } from "../src/index";
+import { testSchema } from "./testSchema";
+import { connect, keyStores } from "near-api-js";
+import { testingExports } from "../src/contract";
+
+test("ABI deserialization", async () => {
+    const keyStore = new keyStores.InMemoryKeyStore();
+    const config = {
+        networkId: "unittest",
+        nodeUrl: "https://rpc.ci-testnet.near.org",
+        masterAccount: "test.near",
+        headers: {},
+        deps: {
+            keyStore,
+        },
+    };
+    const near = await connect(config);
+
+    // const account = new Account(near.connection, 'test.testnet');
+    const contract = new Contract(
+        near.connection,
+        "test",
+        testSchema
+    );
+
+    const function_call = contract.methods.add([1, 2], [3, 4], 5);
+    expect(function_call.view).toBeDefined();
+    // function should be view only
+    expect(function_call.transact).toBeUndefined();
+
+    const serializeTest = (...input: any[]) => {
+        return testingExports
+            .serializeArgs("test", input, testSchema.body.functions[0].params)
+            .toString();
+    };
+    // Serialized data should be based on ABI schema
+    expect(serializeTest([1, 2], [3, 4], 5)).toStrictEqual(
+        `{"a":[1,2],"b":[3,4],"c":5}`
+    );
+
+    // Object should just be validated before serializing
+    expect(serializeTest({ c: 5, a: [1, 2], b: [3, 4] })).toStrictEqual(
+        `{"c":5,"a":[1,2],"b":[3,4]}`
+    );
+
+    // Invalid length of parameters
+    expect(() => serializeTest([1, 2], [3, 4])).toThrow(
+        "Invalid number of parameters for test, expected 3 got 2"
+    );
+
+    // Missing parameter on object
+    expect(() => serializeTest({ a: [1, 2], b: [3, 4] })).toThrow(
+        "Invalid number of fields for test, expected 3 got 2"
+    );
+
+    // Extra field on parameter
+    expect(() =>
+        serializeTest({ a: [1, 2], b: [3, 4], c: 5, d: "extra" })
+    ).toThrow("Invalid number of fields for test, expected 3 got 4");
+
+    // No parameters
+    expect(() => serializeTest()).toThrow(
+        "Passed no parameters for test, expected 3"
+    );
+
+    // ABI method with no params test
+    expect(
+        testingExports
+            .serializeArgs("no_params", [], testSchema.body.functions[2].params)
+            .toString()
+    ).toStrictEqual("");
+
+    expect(() =>
+        testingExports
+            .serializeArgs("no_params", ["something"], testSchema.body.functions[2].params)
+            .toString()
+    ).toThrow("no_params accepts no arguments, got something");
+
+    // it's a view contract, no change.
+    // let result = await contract.add([1, 2]).call(account);
+    // console.log(result);
+    // const result = await contract.add([1, 2]).view();
+    // console.log(result);
+});
+
+'''
+'''--- test/testSchema.ts ---
+import { AbiRoot } from "../src";
+
+// TODO for some reason the TS json module resolver fails to match exact patterns for types
+// TODO which in this case fails for "type" field.
+let rawSchema = `{
+  "schema_version": "0.3.0",
+  "metadata": {
+    "name": "adder",
+    "version": "0.1.0",
+    "authors": [
+      "Near Inc <hello@nearprotocol.com>"
+    ],
+    "build": {
+      "compiler": "rustc 1.64.0",
+      "builder": "cargo-near 0.3.0"
+    },
+    "wasm_hash": "J7WdfLnWv4ibDytmMGnrmpqwA7h2hmgwJum1o56ut4RD"
+  },
+  "body": {
+    "functions": [
+      {
+        "name": "add",
+        "doc": " Adds two pairs point-wise.",
+        "kind": "view",
+        "params": {
+          "serialization_type": "json",
+          "args": [
+            {
+              "name": "a",
+              "type_schema": {
+                "$ref": "#/definitions/Pair"
+              }
+            },
+            {
+              "name": "b",
+              "type_schema": {
+                "$ref": "#/definitions/Pair"
+              }
+            },
+            {
+              "name": "c",
+              "serialization_type": "json",
+              "type_schema": {
+                "type": "integer",
+                "format": "uint8",
+                "minimum": 0.0
+              }
+            }
+          ]
+        },
+        "result": {
+          "serialization_type": "json",
+          "type_schema": {
+            "$ref": "#/definitions/Pair"
+          }
+        }
+      },
+      {
+        "name": "add_borsh",
+        "kind": "view",
+        "params": {
+          "serialization_type": "borsh",
+          "args": [
+            {
+              "name": "a",
+              "type_schema": {
+                "declaration": "Pair",
+                "definitions": {
+                  "Pair": {
+                    "Struct": [
+                      "u32",
+                      "u32"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "name": "b",
+              "type_schema": {
+                "declaration": "Pair",
+                "definitions": {
+                  "Pair": {
+                    "Struct": [
+                      "u32",
+                      "u32"
+                    ]
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "result": {
+          "serialization_type": "borsh",
+          "type_schema": {
+            "declaration": "Pair",
+            "definitions": {
+              "Pair": {
+                "Struct": [
+                  "u32",
+                  "u32"
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "name": "add_callback",
+        "kind": "view",
+        "callbacks": [
+          {
+            "serialization_type": "json",
+            "type_schema": {
+              "$ref": "#/definitions/DoublePair"
+            }
+          },
+          {
+            "serialization_type": "json",
+            "type_schema": {
+              "$ref": "#/definitions/DoublePair"
+            }
+          }
+        ],
+        "callbacks_vec": {
+          "serialization_type": "json",
+          "type_schema": {
+            "$ref": "#/definitions/DoublePair"
+          }
+        },
+        "result": {
+          "serialization_type": "json",
+          "type_schema": {
+            "$ref": "#/definitions/DoublePair"
+          }
+        }
+      }
+    ],
+    "root_schema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "String",
+      "type": "string",
+      "definitions": {
+        "DoublePair": {
+          "type": "object",
+          "required": [
+            "first",
+            "second"
+          ],
+          "properties": {
+            "first": {
+              "$ref": "#/definitions/Pair"
+            },
+            "second": {
+              "$ref": "#/definitions/Pair"
+            }
+          }
+        },
+        "Pair": {
+          "type": "array",
+          "items": [
+            {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            }
+          ],
+          "maxItems": 2,
+          "minItems": 2
+        }
+      }
+    }
+  }
+}`;
+
+export const testSchema: AbiRoot = JSON.parse(rawSchema);
+
+'''
+'''--- tsconfig.json ---
+{
+    "compilerOptions": {
+        "esModuleInterop": true,
+        "lib": [
+            "es2015",
+            "esnext",
+            "dom"
+        ],
+        "module": "commonjs",
+        "target": "esnext",
+        "moduleResolution": "node",
+        "alwaysStrict": true,
+        "outDir": "./lib",
+        "declaration": true,
+        "preserveSymlinks": true,
+        "preserveWatchOutput": true,
+        "pretty": false,
+        "forceConsistentCasingInFileNames": true,
+        "noFallthroughCasesInSwitch": true,
+        "noImplicitAny": false,
+        "noImplicitReturns": true,
+        "noUnusedLocals": true,
+        "experimentalDecorators": true,
+        "resolveJsonModule": true,
+        "skipLibCheck": true
+    },
+    "files": [
+        "src/index.ts",
+    ],
+}
+
+'''

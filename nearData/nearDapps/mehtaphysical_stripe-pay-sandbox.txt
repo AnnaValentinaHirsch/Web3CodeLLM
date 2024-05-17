@@ -1,0 +1,1307 @@
+*GitHub Repository "mehtaphysical/stripe-pay-sandbox"*
+
+'''--- README.md ---
+# Setup the contract
+
+use the deploy script `./deploy.sh`
+
+It will do the following:
+
+* build the contract with `cargo build --all --target wasm32-unknown-unknown --release`
+* create the contract account `near create-account $CONTRACT_ID --masterAccount SOME_MASTER_ACCOUNT --initialBalance INITIAL_BALANCE`
+* then deploy the contract `near deploy $CONTRACT_ID target/wasm32-unknown-unknown/release/contract.wasm`
+* setup the contract so only transfers are allowed to the marketplace `near call $CONTRACT_ID new '{"marketplace_id":"MARKETPLACE_ID"}' --accountId $CONTRACT_ID`
+* pay for marketplace storage `near call $CONTRACT_ID storage_deposit "{\"account_id\":\"$MARKETPLACE_ID\",\"registration_only\": true}" --accountId $CONTRACT_ID --amount 0.00125`
+
+'''
+'''--- components/balance/Balance.js ---
+import { useEffect, useState } from "react";
+import { Near, keyStores } from "near-api-js";
+
+const near = new Near({
+  nodeUrl: process.env.NEXT_PUBLIC_NEAR_NODE_URL,
+  keyStore: new keyStores.InMemoryKeyStore(),
+});
+
+const parseBalance = (balance) =>
+  `${balance.slice(0, -2)}.${balance.slice(-2)}`;
+
+export default function Balance({ accountId }) {
+  const [balance, setBalance] = useState();
+  useEffect(() => {
+    console.log(accountId);
+    near
+      .account(accountId)
+      .then((account) => {
+        return account.viewFunction(
+          process.env.NEXT_PUBLIC_NEAR_CONTRACT_ID,
+          "ft_balance_of",
+          { account_id: accountId }
+        );
+      })
+      .then(parseBalance)
+      .then(setBalance);
+  }, []);
+
+  if (!balance) return null;
+
+  return <p>Current Balance: {balance}</p>;
+}
+
+'''
+'''--- components/checkout/Checkout.js ---
+import { useState } from "react";
+import { CardElement, useElements, useStripe } from "@stripe/react-stripe-js";
+import { useRouter } from "next/router";
+import styles from "./Checkout.module.css";
+import { KeyPair } from "near-api-js";
+
+const parseAmount = (amount) => {
+  const [whole, decimal = "00"] = amount.split(".");
+  return `${whole}${decimal.slice(0, 2)}`;
+};
+
+export default function Checkout({ accountId }) {
+  const stripe = useStripe();
+  const elements = useElements();
+
+  const router = useRouter();
+
+  const [amount, setAmount] = useState("");
+  const [email, setEmail] = useState();
+  const [phoneNumber, setPhoneNumber] = useState();
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState();
+
+  const handleSubmit = async (event) => {
+    event.preventDefault();
+    setLoading(true);
+
+    const card = elements.getElement(CardElement);
+
+    try {
+      const { paymentMethod, error } = await stripe.createPaymentMethod({
+        type: "card",
+        card,
+      });
+      if (error) throw error;
+
+      const res = await fetch("/api/pay", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          accountId,
+          paymentMethodId: paymentMethod.id,
+          amount: parseAmount(amount),
+          email,
+          phoneNumber,
+          publicKey: KeyPair.fromRandom("ed25519").getPublicKey().toString(),
+        }),
+      });
+
+      const json = await res.json();
+      if (res.status !== 200) throw json;
+
+      if (json.intent.next_action) {
+        window.open(json.intent.next_action.redirect_to_url.url);
+      } else {
+        router.reload();
+      }
+    } catch (err) {
+      setError(err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <form className={styles.Checkout} onSubmit={handleSubmit}>
+      {error && error.message}
+      <input
+        type="email"
+        placeholder="email"
+        onChange={({ target }) => setEmail(target.value)}
+      />
+      <input
+        type="text"
+        placeholder="phone number"
+        onChange={({ target }) => setPhoneNumber(target.value)}
+      />
+      <input
+        type="number"
+        step="0.01"
+        placeholder="Amount"
+        value={amount}
+        onChange={({ target }) => setAmount(target.value)}
+      />
+      <CardElement className={styles.Input} />
+      <button disabled={loading}>Purchase</button>
+    </form>
+  );
+}
+
+'''
+'''--- components/checkout/Checkout.module.css ---
+.Checkout input,
+.Input {
+  margin: 0.5rem 0;
+  width: 100%;
+  padding: 0.5rem;
+  border: none;
+}
+
+.Checkout button {
+  width: 100%;
+  margin-top: 1rem;
+  padding: 0.8rem;
+  border: none;
+
+  font-size: 1rem;
+
+  background-color: black;
+  color: white;
+}
+
+.Checkout button:disabled {
+  opacity: 0.7;
+}
+
+'''
+'''--- components/layout/Layout.js ---
+import Balance from "../balance/Balance";
+import styles from "./Layout.module.css";
+
+export default function Layout({ accountId, children }) {
+  return (
+    <section className={styles.Layout}>
+      <Balance accountId={accountId} />
+      {children}
+    </section>
+  );
+}
+
+'''
+'''--- components/layout/Layout.module.css ---
+.Layout {
+  margin: 1rem auto;
+  padding: 1rem;
+  max-width: 25rem;
+  border-radius: 1rem;
+
+  background-color: white;
+}
+
+'''
+'''--- components/loading/Loading.js ---
+import styles from "./Loading.module.css";
+
+export default function Loading() {
+  return (
+    <div className={styles["lds-loader"]}>
+      <div></div>
+      <div></div>
+      <div></div>
+    </div>
+  );
+}
+
+'''
+'''--- components/loading/Loading.module.css ---
+.lds-loader {
+  display: inline-block;
+  position: absolute;
+  top: calc(50% - 40px);
+  left: calc(50% - 40px);
+  width: 80px;
+  height: 80px;
+}
+
+.lds-loader div {
+  display: inline-block;
+  position: absolute;
+  left: 8px;
+  width: 16px;
+  background: #fff;
+  animation: lds-loader 1.2s cubic-bezier(0, 0.5, 0.5, 1) infinite;
+}
+
+.lds-loader div:nth-child(1) {
+  left: 8px;
+  animation-delay: -0.24s;
+}
+
+.lds-loader div:nth-child(2) {
+  left: 32px;
+  animation-delay: -0.12s;
+}
+
+.lds-loader div:nth-child(3) {
+  left: 56px;
+  animation-delay: 0;
+}
+
+@keyframes lds-loader {
+  0% {
+    top: 8px;
+    height: 64px;
+  }
+  50%,
+  100% {
+    top: 24px;
+    height: 32px;
+  }
+}
+
+'''
+'''--- contract/Cargo.toml ---
+[package]
+name = "contract"
+version = "0.1.0"
+authors = ["Ryan Mehta <ryan.mehta@gmail.com>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "3.1.0"
+near-contract-standards = "3.1.0"
+
+[profile.release]
+codegen-units = 1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+
+'''
+'''--- contract/src/lib.rs ---
+use near_contract_standards::fungible_token::core::FungibleTokenCore;
+use near_contract_standards::fungible_token::metadata::{
+    FungibleTokenMetadata, FungibleTokenMetadataProvider, FT_METADATA_SPEC,
+};
+use near_contract_standards::fungible_token::resolver::FungibleTokenResolver;
+use near_contract_standards::fungible_token::FungibleToken;
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::{LazyOption, UnorderedMap};
+use near_sdk::json_types::{ValidAccountId, U128};
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{
+    env, near_bindgen, AccountId, Balance, BorshStorageKey, PanicOnDefault, PromiseOrValue,
+};
+
+near_sdk::setup_alloc!();
+
+type StripeIntentId = String;
+
+#[derive(BorshDeserialize, BorshSerialize, Deserialize, Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct StripeIntent {
+    account_id: AccountId,
+    intent_id: StripeIntentId,
+    intent_balance: Balance,
+    refund_amount: Option<Balance>,
+}
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Contract {
+    owner_id: AccountId,
+    marketplace_id: AccountId,
+    token: FungibleToken,
+    intents: UnorderedMap<AccountId, Vec<StripeIntent>>,
+    metadata: LazyOption<FungibleTokenMetadata>,
+}
+
+#[derive(BorshSerialize, BorshStorageKey)]
+enum StorageKey {
+    FT,
+    Intents,
+    Metadata,
+}
+
+#[near_bindgen]
+impl Contract {
+    #[init]
+    pub fn new(marketplace_id: ValidAccountId) -> Self {
+        assert!(!env::state_exists(), "Already initialized");
+
+        let metadata = FungibleTokenMetadata {
+            spec: FT_METADATA_SPEC.to_string(),
+            name: "Hip Hop USD".to_string(),
+            symbol: "hhUSD".to_string(),
+            icon: None,
+            reference: None,
+            reference_hash: None,
+            decimals: 2,
+        };
+
+        Self {
+            owner_id: env::signer_account_id(),
+            marketplace_id: marketplace_id.to_string(),
+            token: FungibleToken::new(StorageKey::FT),
+            intents: UnorderedMap::new(StorageKey::Intents),
+            metadata: LazyOption::new(StorageKey::Metadata, Some(&metadata)),
+        }
+    }
+
+    pub fn change_marketplace_id(&mut self, marketplace_id: ValidAccountId) {
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.owner_id,
+            "Only owner can change the marketplace"
+        );
+
+        self.marketplace_id = marketplace_id.to_string();
+    }
+
+    pub fn mint(&mut self, account_id: ValidAccountId, intent_id: String, intent_balance: U128) {
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.owner_id,
+            "Only owner can mint"
+        );
+
+        let mut stripe_intents = self
+            .intents
+            .get(&account_id.to_string())
+            .unwrap_or(Vec::new());
+
+        assert!(
+            !stripe_intents
+                .iter()
+                .any(|intent| intent.intent_id == intent_id),
+            "Mint already occurred with that intent"
+        );
+
+        stripe_intents.push(StripeIntent {
+            account_id: account_id.to_string(),
+            intent_id,
+            intent_balance: intent_balance.into(),
+            refund_amount: None,
+        });
+
+        match self.token.accounts.get(&account_id.to_string()) {
+            None => {
+                self.token
+                    .internal_register_account(&account_id.to_string());
+            }
+            _ => {}
+        }
+
+        self.token
+            .internal_deposit(&account_id.to_string(), intent_balance.into());
+        self.intents
+            .insert(&account_id.to_string(), &stripe_intents);
+    }
+
+    pub fn capture_and_burn_for(&mut self, account_id: String) -> Vec<(String, U128)> {
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.owner_id,
+            "Only owner can execute burn"
+        );
+
+        let intents = self
+            .intents
+            .get(&account_id.to_string())
+            .unwrap_or(Vec::new());
+
+        let mut balance = self
+            .token
+            .internal_unwrap_balance_of(&account_id.to_string());
+        let execution_plan = intents
+            .iter()
+            .filter(|intent| intent.refund_amount.is_none())
+            .map(|intent| {
+                let to_burn = if balance > intent.intent_balance {
+                    intent.intent_balance
+                } else {
+                    balance
+                };
+
+                balance -= to_burn;
+
+                StripeIntent {
+                    account_id: intent.account_id.to_string(),
+                    intent_id: intent.intent_id.to_string(),
+                    intent_balance: intent.intent_balance,
+                    refund_amount: Some(to_burn),
+                }
+            })
+            .collect();
+
+        self.token
+            .accounts
+            .insert(&account_id.to_string(), &balance);
+        self.intents.insert(&account_id.into(), &execution_plan);
+
+        execution_plan
+            .iter()
+            .map(|intent| {
+                (
+                    intent.intent_id.to_string(),
+                    U128(intent.refund_amount.unwrap_or(0)),
+                )
+            })
+            .collect()
+    }
+
+    pub fn capture_and_burn_all(&mut self, limit: Option<u64>) -> Vec<(String, U128)> {
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.owner_id,
+            "Only owner can execute burn"
+        );
+
+        let limit = limit.unwrap_or(10);
+
+        let capturable_account_ids: Vec<String> = self
+            .intents
+            .iter()
+            .filter(|(_, intents)| intents.iter().any(|intent| intent.refund_amount.is_none()))
+            .map(|(account_id, _)| account_id)
+            .take(limit as usize)
+            .collect();
+
+        let mut intents_to_capture = Vec::new();
+        for account_id in capturable_account_ids {
+            intents_to_capture.extend(self.capture_and_burn_for(account_id));
+        }
+
+        intents_to_capture
+    }
+
+    #[payable]
+    pub fn ft_transfer(&mut self, receiver_id: ValidAccountId, amount: U128, memo: Option<String>) {
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.marketplace_id,
+            "Only transfers to the marketplace are allowed"
+        );
+        self.token.ft_transfer(receiver_id, amount, memo)
+    }
+
+    #[payable]
+    pub fn ft_transfer_call(
+        &mut self,
+        receiver_id: ValidAccountId,
+        amount: U128,
+        memo: Option<String>,
+        msg: String,
+    ) -> PromiseOrValue<U128> {
+        assert_eq!(
+            receiver_id.to_string(),
+            self.marketplace_id,
+            "Only transfers to the marketplace are allowed"
+        );
+        self.token.ft_transfer_call(receiver_id, amount, memo, msg)
+    }
+
+    pub fn ft_resolve_transfer(
+        &mut self,
+        sender_id: ValidAccountId,
+        receiver_id: ValidAccountId,
+        amount: U128,
+    ) -> U128 {
+        self.token
+            .ft_resolve_transfer(sender_id, receiver_id, amount)
+    }
+
+    pub fn ft_total_supply(&self) -> U128 {
+        self.token.ft_total_supply()
+    }
+
+    pub fn ft_balance_of(&self, account_id: ValidAccountId) -> U128 {
+        self.token.ft_balance_of(account_id)
+    }
+}
+
+near_contract_standards::impl_fungible_token_storage!(Contract, token);
+
+#[near_bindgen]
+impl FungibleTokenMetadataProvider for Contract {
+    fn ft_metadata(&self) -> FungibleTokenMetadata {
+        self.metadata.get().unwrap()
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use near_contract_standards::fungible_token::core::FungibleTokenCore;
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::testing_env;
+    use near_sdk::MockedBlockchain;
+
+    use super::*;
+
+    fn get_context(predecessor_account_id: ValidAccountId) -> VMContextBuilder {
+        let mut builder = VMContextBuilder::new();
+        builder
+            .current_account_id(accounts(0))
+            .signer_account_id(predecessor_account_id.clone())
+            .predecessor_account_id(predecessor_account_id);
+        builder
+    }
+
+    #[test]
+    fn test_new() {
+        let mut context = get_context(accounts(1));
+        testing_env!(context.build());
+        let contract = Contract::new(accounts(3));
+        testing_env!(context.is_view(true).build());
+        assert_eq!(contract.owner_id, accounts(1).to_string());
+    }
+
+    #[test]
+    #[should_panic(expected = "The contract is not initialized")]
+    fn test_default() {
+        let context = get_context(accounts(1));
+        testing_env!(context.build());
+        let _contract = Contract::default();
+    }
+
+    #[test]
+    fn test_mint() {
+        let context = get_context(accounts(1));
+        testing_env!(context.build());
+        let mut contract = Contract::new(accounts(3));
+
+        contract.mint(accounts(1), "intent-id".to_string(), 100.into());
+
+        assert_eq!(
+            contract
+                .intents
+                .get(&accounts(1).into())
+                .unwrap()
+                .first()
+                .unwrap()
+                .intent_balance,
+            100
+        );
+        assert_eq!(contract.token.ft_balance_of(accounts(1)).0, 100);
+
+        contract.mint(accounts(1), "intent-id-2".to_string(), 500.into());
+        assert_eq!(
+            contract
+                .intents
+                .get(&accounts(1).into())
+                .unwrap()
+                .get(1)
+                .unwrap()
+                .intent_balance,
+            500
+        );
+        assert_eq!(contract.token.ft_balance_of(accounts(1)).0, 600);
+    }
+
+    #[test]
+    fn test_ft_transfer() {
+        let mut context = get_context(accounts(1));
+        testing_env!(context.build());
+        let mut contract = Contract::new(accounts(1));
+
+        contract.mint(accounts(0), "intent-id".to_string(), 100.into());
+
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .attached_deposit(contract.storage_balance_bounds().min.into())
+            .predecessor_account_id(accounts(1))
+            .build());
+        contract.storage_deposit(None, None);
+
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .attached_deposit(1)
+            .predecessor_account_id(accounts(0))
+            .build());
+        contract.ft_transfer(accounts(1), 50.into(), None);
+
+        assert_eq!(contract.ft_balance_of(accounts(0)).0, 50);
+        assert_eq!(contract.ft_balance_of(accounts(1)).0, 50);
+    }
+
+    #[test]
+    fn test_capture_and_burn_all() {
+        let mut context = get_context(accounts(1));
+        testing_env!(context.build());
+        let mut contract = Contract::new(accounts(3));
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .attached_deposit(contract.storage_balance_bounds().min.into())
+            .predecessor_account_id(accounts(3))
+            .build());
+        contract.storage_deposit(None, None);
+
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .attached_deposit(0)
+            .predecessor_account_id(accounts(1))
+            .build());
+
+        contract.mint(accounts(0), "intent-id-0".to_string(), 10.into());
+
+        contract.mint(accounts(1), "intent-id-1".to_string(), 10.into());
+        contract.mint(accounts(1), "intent-id-2".to_string(), 20.into());
+        contract.mint(accounts(1), "intent-id-3".to_string(), 20.into());
+        contract.mint(accounts(1), "intent-id-4".to_string(), 20.into());
+
+        contract.mint(accounts(2), "intent-id-5".to_string(), 50.into());
+
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .attached_deposit(1)
+            .predecessor_account_id(accounts(1))
+            .build());
+
+        contract.ft_transfer(accounts(3), 45.into(), None);
+
+        assert_eq!(
+            contract.capture_and_burn_for(accounts(2).to_string()),
+            [("intent-id-5".to_string(), 50.into())]
+        );
+
+        assert_eq!(
+            contract.capture_and_burn_all(None),
+            [
+                ("intent-id-0".to_string(), 10.into()),
+                ("intent-id-1".to_string(), 10.into()),
+                ("intent-id-2".to_string(), 15.into()),
+                ("intent-id-3".to_string(), 0.into()),
+                ("intent-id-4".to_string(), 0.into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_capture_and_burn_all_paged() {
+        let mut context = get_context(accounts(1));
+        testing_env!(context.build());
+        let mut contract = Contract::new(accounts(3));
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .attached_deposit(contract.storage_balance_bounds().min.into())
+            .predecessor_account_id(accounts(3))
+            .build());
+        contract.storage_deposit(None, None);
+
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .attached_deposit(0)
+            .predecessor_account_id(accounts(1))
+            .build());
+
+        contract.mint(accounts(0), "intent-id-0".to_string(), 10.into());
+
+        contract.mint(accounts(1), "intent-id-1".to_string(), 10.into());
+        contract.mint(accounts(1), "intent-id-2".to_string(), 20.into());
+        contract.mint(accounts(1), "intent-id-3".to_string(), 20.into());
+        contract.mint(accounts(1), "intent-id-4".to_string(), 20.into());
+
+        contract.mint(accounts(2), "intent-id-5".to_string(), 50.into());
+
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .attached_deposit(1)
+            .predecessor_account_id(accounts(1))
+            .build());
+
+        contract.ft_transfer(accounts(3), 45.into(), None);
+
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .attached_deposit(1)
+            .predecessor_account_id(accounts(2))
+            .build());
+
+        contract.ft_transfer(accounts(3), 5.into(), None);
+
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .attached_deposit(0)
+            .predecessor_account_id(accounts(1))
+            .build());
+
+        assert_eq!(
+            contract.capture_and_burn_all(Some(1)),
+            [("intent-id-0".to_string(), 10.into()),]
+        );
+
+        assert_eq!(
+            contract.capture_and_burn_all(Some(1)),
+            [
+                ("intent-id-1".to_string(), 10.into()),
+                ("intent-id-2".to_string(), 15.into()),
+                ("intent-id-3".to_string(), 0.into()),
+                ("intent-id-4".to_string(), 0.into()),
+            ]
+        );
+
+        assert_eq!(
+            contract.capture_and_burn_all(Some(1)),
+            [("intent-id-5".to_string(), 45.into())]
+        );
+    }
+
+    #[test]
+    fn test_capture_and_burn_all_multi() {
+        let context = get_context(accounts(1));
+        testing_env!(context.build());
+        let mut contract = Contract::new(accounts(3));
+
+        contract.mint(accounts(1), "intent-id-0".to_string(), 10.into());
+
+        assert_eq!(
+            contract.capture_and_burn_all(Some(1)),
+            [("intent-id-0".to_string(), 10.into()),]
+        );
+
+        contract.mint(accounts(1), "intent-id-1".to_string(), 20.into());
+
+        assert_eq!(
+            contract.capture_and_burn_all(Some(1)),
+            [("intent-id-1".to_string(), 20.into()),]
+        );
+    }
+}
+
+'''
+'''--- deploy.sh ---
+#!/bin/bash
+
+echo "What is the contract account id?"
+read CONTRACT_ID
+
+echo "Should this account be created?"
+read CREATE_ACCOUNT
+
+if [[ $CREATE_ACCOUNT == "yes" ]]; then
+  echo "What is the master account?"
+  read MASTER_ACCOUNT
+
+  echo "Whate is the initial balance?"
+  read INITIAL_BALANCE
+fi
+
+echo "What is the marketplace contract id?"
+read MARKETPLACE_ID
+
+echo "CONTRACT_ID $CONTRACT_ID"
+
+if [[ $CREATE_ACCOUNT == "yes" ]]; then
+  echo "MASTER_ACCOUNT $MASTER_ACCOUNT"
+  echo "INITIAL_BALANCE $INITIAL_BALANCE"
+fi
+
+echo "MARKETPLACE_ID $MARKETPLACE_ID"
+
+echo "Is this correct?"
+read CORRECT
+
+if [[ $CORRECT != "yes" ]]; then
+  exit 1
+fi
+
+# Build contract
+cd contract
+env 'RUSTFLAGS=-C link-arg=-s' cargo build --target wasm32-unknown-unknown --release
+
+# Create contract if necessary
+if [[ $CREATE_ACCOUNT == "yes" ]]; then
+  npx -p near-cli near create-account $CONTRACT_ID --masterAccount $MASTER_ACCOUNT --initialBalance $INITIAL_BALANCE
+fi
+
+# deploy contract
+npx -p near-cli near deploy $CONTRACT_ID target/wasm32-unknown-unknown/release/contract.wasm
+
+# initialize contract
+npx -p near-cli near call $CONTRACT_ID new "{\"marketplace_id\":\"$MARKETPLACE_ID\"}" --accountId $CONTRACT_ID
+
+# pay for marketplace storage
+npx -p near-cli near call $CONTRACT_ID storage_deposit "{\"account_id\":\"$MARKETPLACE_ID\",\"registration_only\": true}" --accountId $CONTRACT_ID --amount 0.00125
+
+'''
+'''--- package.json ---
+{
+  "name": "stripe-pay-sandbox",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "@stripe/react-stripe-js": "^1.4.1",
+    "@stripe/stripe-js": "^1.15.0",
+    "cors": "^2.8.5",
+    "mongodb": "^3.6.9",
+    "near-api-js": "^0.41.0",
+    "next": "10.2.3",
+    "react": "17.0.2",
+    "react-dom": "17.0.2",
+    "stripe": "^8.154.0"
+  },
+  "devDependencies": {
+    "eslint": "^7.29.0",
+    "eslint-plugin-react": "^7.24.0"
+  }
+}
+
+'''
+'''--- pages/[accountId]/index.js ---
+import {
+  Elements,
+} from "@stripe/react-stripe-js";
+import { loadStripe } from "@stripe/stripe-js";
+import { useRouter } from "next/router";
+import Layout from "../../components/layout/Layout";
+import Checkout from "../../components/checkout/Checkout";
+
+const stripePromise = loadStripe(process.env.NEXT_PUBLIC_STRIPE_PUBLIC_KEY, {
+  stripeAccount: process.env.NEXT_PUBLIC_STRIPE_ACCOUNT_ID,
+});
+
+export default function Home() {
+  const router = useRouter();
+  const { accountId } = router.query;
+
+  if (!accountId) return <h1>No Account Id provided</h1>;
+
+  return (
+    <Layout accountId={accountId}>
+      <Elements stripe={stripePromise}>
+        <Checkout accountId={accountId} />
+      </Elements>
+    </Layout>
+  );
+}
+
+'''
+'''--- pages/[accountId]/success/[transactionHash].js ---
+import { useEffect } from "react";
+import { useRouter } from "next/router";
+import Loading from "../../../components/loading/Loading";
+
+export default function Success() {
+  const router = useRouter();
+  const { accountId, payment_intent, payment_intent_client_secret } =
+    router.query;
+
+  useEffect(() => {
+    if (!accountId) return;
+
+    fetch(`/api/${accountId}/complete`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        accountId,
+        paymentIntentId: payment_intent,
+        paymentIntentSecret: payment_intent_client_secret,
+      }),
+    }).finally(() => window.close());
+  }, [accountId]);
+
+  return <Loading />;
+}
+
+'''
+'''--- pages/_app.js ---
+import '../styles/globals.css'
+
+function MyApp({ Component, pageProps }) {
+  return <Component {...pageProps} />
+}
+
+export default MyApp
+
+'''
+'''--- pages/api/[accountId]/complete.js ---
+import { handleIntent } from "../../../services/near";
+import {
+  cancelIntent,
+  captureIntent,
+  getIntent,
+} from "../../../services/stripe";
+
+export default async (req, res) => {
+  const { accountId, paymentIntentId, paymentIntentSecret } = req.body;
+
+  let intent;
+  try {
+    intent = await getIntent(paymentIntentId);
+    if (intent.client_secret !== paymentIntentSecret) {
+      throw {
+        type: "STRIPE_CLIENT_SECRET_ERROR",
+        message: "Secrets do not match",
+      };
+    }
+
+    if (intent.description !== `Mint tokens for ${accountId}`) {
+      throw {
+        type: "STRIPE_CLIENT_SECRET_ERROR",
+        message: "PaymentIntent not for accountId",
+      };
+    }
+
+    let outcome;
+    if (intent.status === "requires_capture") {
+      outcome = await handleIntent({
+        accountId,
+        intentId: intent.id,
+        amount: intent.amount.toString(),
+      });
+      await captureIntent(intent);
+    } else {
+      await cancelIntent(intent);
+    }
+
+    res.send(outcome);
+  } catch (err) {
+    if (
+      intent &&
+      !(
+        err.kind &&
+        err.kind.ExecutionError.includes(
+          "Mint already occurred with that intent"
+        )
+      )
+    ) {
+      await cancelIntent(intent);
+    }
+    res.status(400).send(err);
+  }
+};
+
+'''
+'''--- pages/api/pay.js ---
+import cors from "cors";
+import { handleIntent } from "../../services/near";
+import { storeContact } from "../../services/contacts";
+import {
+  cancelIntent,
+  captureIntent,
+  createIntent,
+} from "../../services/stripe";
+
+const corsPromise = (req, res) => {
+  return new Promise((resolve, reject) => {
+    cors()(req, res, (err) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
+};
+
+export default async (req, res) => {
+  await corsPromise(req, res);
+  const { accountId, publicKey, paymentMethodId, amount, email, phoneNumber } =
+    req.body;
+
+  let intent;
+  try {
+    intent = await createIntent({ accountId, paymentMethodId, amount });
+
+    let outcome = null;
+    if (intent.status === "requires_capture" && !intent.next_action) {
+      outcome = await handleIntent({
+        accountId,
+        publicKey,
+        amount,
+        intentId: intent.id,
+      });
+      await captureIntent(intent);
+    }
+
+    await storeContact({
+      accountId,
+      email,
+      phoneNumber,
+    });
+
+    res.send({ intent, outcome });
+  } catch (err) {
+    console.log(err);
+    if (
+      intent &&
+      !(
+        err.kind &&
+        err.kind.ExecutionError.includes(
+          "Mint already occurred with that intent"
+        )
+      )
+    ) {
+      await cancelIntent(intent);
+    }
+    res.status(400).send(err);
+  }
+};
+
+'''
+'''--- public/vercel.svg ---
+<svg width="283" height="64" viewBox="0 0 283 64" fill="none" 
+    xmlns="http://www.w3.org/2000/svg">
+    <path d="M141.04 16c-11.04 0-19 7.2-19 18s8.96 18 20 18c6.67 0 12.55-2.64 16.19-7.09l-7.65-4.42c-2.02 2.21-5.09 3.5-8.54 3.5-4.79 0-8.86-2.5-10.37-6.5h28.02c.22-1.12.35-2.28.35-3.5 0-10.79-7.96-17.99-19-17.99zm-9.46 14.5c1.25-3.99 4.67-6.5 9.45-6.5 4.79 0 8.21 2.51 9.45 6.5h-18.9zM248.72 16c-11.04 0-19 7.2-19 18s8.96 18 20 18c6.67 0 12.55-2.64 16.19-7.09l-7.65-4.42c-2.02 2.21-5.09 3.5-8.54 3.5-4.79 0-8.86-2.5-10.37-6.5h28.02c.22-1.12.35-2.28.35-3.5 0-10.79-7.96-17.99-19-17.99zm-9.45 14.5c1.25-3.99 4.67-6.5 9.45-6.5 4.79 0 8.21 2.51 9.45 6.5h-18.9zM200.24 34c0 6 3.92 10 10 10 4.12 0 7.21-1.87 8.8-4.92l7.68 4.43c-3.18 5.3-9.14 8.49-16.48 8.49-11.05 0-19-7.2-19-18s7.96-18 19-18c7.34 0 13.29 3.19 16.48 8.49l-7.68 4.43c-1.59-3.05-4.68-4.92-8.8-4.92-6.07 0-10 4-10 10zm82.48-29v46h-9V5h9zM36.95 0L73.9 64H0L36.95 0zm92.38 5l-27.71 48L73.91 5H84.3l17.32 30 17.32-30h10.39zm58.91 12v9.69c-1-.29-2.06-.49-3.2-.49-5.81 0-10 4-10 10V51h-9V17h9v9.2c0-5.08 5.91-9.2 13.2-9.2z" fill="#000"/>
+</svg>
+'''
+'''--- services/contacts.js ---
+import { MongoClient } from "mongodb";
+
+const validateEmail = (email) => {
+  return email && email.length < 1024;
+};
+
+const validatePhoneNumber = (phoneNumber) => {
+  return phoneNumber && phoneNumber.length < 30;
+};
+
+export const storeContact = async ({ accountId, email, phoneNumber }) => {
+  try {
+    const updateObj = {};
+    if (validateEmail(email)) updateObj.email = email;
+    if (validatePhoneNumber(phoneNumber)) updateObj.phoneNumber = phoneNumber;
+
+    if (updateObj.email || updateObj.phoneNumber) {
+      const client = new MongoClient(process.env.MONGODB_URI, {
+        useNewUrlParser: true,
+        useUnifiedTopology: true,
+      });
+      await client.connect();
+      await client.db().collection("contacts").update(
+        {
+          accountId,
+        },
+        { $set: updateObj },
+        { upsert: true }
+      );
+    }
+  } catch (err) {
+    console.log(`Unable to store contact info: ${err.message}`);
+  }
+};
+
+'''
+'''--- services/near.js ---
+import { Near, KeyPair, utils } from "near-api-js";
+import BN from "bn.js";
+
+const MIN_CREDIT_AMOUNT = new BN("4701");
+const MIN_BALANCE = new BN(utils.format.parseNearAmount("0.02"));
+const FILL_AMOUNT = new BN(utils.format.parseNearAmount("0.1"));
+
+const CREATE_ACCOUNT_CONTRACT_ID = process.env.CREATE_ACCOUNT_CONTRACT_ID;
+const CONTRACT_ID = process.env.NEXT_PUBLIC_NEAR_CONTRACT_ID;
+
+const keyStore = {
+  getKey() {
+    return KeyPair.fromString(process.env.NEAR_PRIVATE_KEY);
+  },
+  setKey() {},
+};
+
+const near = new Near({
+  keyStore,
+  nodeUrl: process.env.NEXT_PUBLIC_NEAR_NODE_URL,
+});
+
+const needsAccountCreation = async ({ accountId, amount }) => {
+  if (new BN(amount).lt(MIN_CREDIT_AMOUNT)) {
+    throw new Error("Amount must be over $47");
+  }
+  try {
+    const account = await near.account(accountId);
+    await account.state();
+    return false;
+  } catch (error) {
+    const errorString = error.toString().toLowerCase();
+    const nonexistentAccountErrors = [
+      "does not exist while viewing",
+      `account id ${accountId.toLowerCase()} is invalid`,
+    ];
+
+    if (
+      nonexistentAccountErrors.some((errorStringPart) =>
+        errorString.includes(errorStringPart)
+      )
+    ) {
+      return true;
+    }
+    throw error;
+  }
+};
+
+const createAccount = async ({ accountId, publicKey }) => {
+  const account = await near.account(CONTRACT_ID);
+  return account.functionCall({
+    contractId: CREATE_ACCOUNT_CONTRACT_ID,
+    methodName: "create_account",
+    args: { new_account_id: accountId, new_public_key: publicKey },
+    gas: "200000000000000",
+    attachedDeposit: FILL_AMOUNT.toString(),
+  });
+};
+
+const needsRefill = async (accountId) => {
+  const account = await near.account(accountId);
+
+  const { available } = await account.getAccountBalance();
+
+  return new BN(available).lt(MIN_BALANCE);
+};
+
+const refill = async (accountId) => {
+  const account = await near.account(CONTRACT_ID);
+  return account.sendMoney(accountId, FILL_AMOUNT);
+};
+
+const checkAndCreateAccount = async ({ accountId, publicKey, amount }) => {
+  try {
+    if (publicKey && (await needsAccountCreation({ accountId, amount }))) {
+      await createAccount({ accountId, publicKey });
+    }
+  } catch (err) {
+    throw { type: "NEAR_ACCOUNT_CREATION_ERROR", message: err.message };
+  }
+};
+
+const checkAndRefill = async (accountId) => {
+  try {
+    if (await needsRefill(accountId)) {
+      await refill(accountId);
+    }
+  } catch (err) {
+    throw { type: "NEAR_ACCOUNT_REFILL_ERROR", message: err.message };
+  }
+};
+
+const mintTokens = async ({ accountId, intentId, amount }) => {
+  try {
+    const account = await near.account(CONTRACT_ID);
+
+    return account.functionCall({
+      contractId: CONTRACT_ID,
+      methodName: "mint",
+      args: {
+        account_id: accountId,
+        intent_id: intentId,
+        intent_balance: amount,
+      },
+    });
+  } catch (err) {
+    throw { type: "NEAR_MINT_ERROR", message: err.message };
+  }
+};
+
+export const handleIntent = async ({
+  accountId,
+  publicKey,
+  intentId,
+  amount,
+}) => {
+  await checkAndCreateAccount({ accountId, publicKey, amount });
+  await checkAndRefill(accountId);
+
+  return mintTokens({ accountId, intentId, amount });
+};
+
+'''
+'''--- services/stripe.js ---
+import Stripe from "stripe";
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
+  apiVersion: "2020-08-27",
+});
+
+export const createIntent = async ({ accountId, paymentMethodId, amount }) => {
+  try {
+    return await stripe.paymentIntents.create({
+      amount,
+      currency: "usd",
+      description: `Mint tokens for ${accountId}`,
+      payment_method_types: ["card"],
+      capture_method: "manual",
+      payment_method: paymentMethodId,
+      confirm: true,
+      return_url: `${process.env.HOST_NAME}/${accountId}/success/process`,
+    });
+  } catch (err) {
+    throw { type: "STRIPE_CHARGE_ERROR", message: err.message };
+  }
+};
+
+export const captureIntent = async (intent) => {
+  try {
+    await stripe.paymentIntents.capture(intent.id);
+  } catch (err) {
+    throw { type: "STRIPE_CAPTURE_ERROR", message: err.message };
+  }
+};
+
+export const cancelIntent = async (intent) => {
+  try {
+    await stripe.paymentIntents.cancel(intent.id);
+  } catch (err) {
+    throw { type: "STRIPE_CANCEL_ERROR", message: err.message };
+  }
+};
+
+export const getIntent = async (id) => {
+  try {
+    return await stripe.paymentIntents.retrieve(id);
+  } catch (err) {
+    throw { type: "STRIPE_GET_INTENT_ERROR", message: err.message };
+  }
+};
+
+'''
+'''--- styles/Home.module.css ---
+.Checkout input,
+.Input {
+  margin: 0.5rem 0;
+  width: 100%;
+  padding: 0.5rem;
+  border: none;
+}
+
+.Checkout button {
+  width: 100%;
+  margin-top: 1rem;
+  padding: 0.8rem;
+  border: none;
+
+  font-size: 1rem;
+
+  background-color: black;
+  color: white;
+}
+
+.Checkout button:disabled {
+  opacity: 0.7;
+}
+
+'''
+'''--- styles/globals.css ---
+html,
+body {
+  padding: 0;
+  margin: 0;
+  background-color: black;
+  font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Oxygen,
+    Ubuntu, Cantarell, Fira Sans, Droid Sans, Helvetica Neue, sans-serif;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+'''

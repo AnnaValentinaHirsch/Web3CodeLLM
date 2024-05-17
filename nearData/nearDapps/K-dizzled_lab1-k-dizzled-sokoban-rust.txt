@@ -1,0 +1,734 @@
+*GitHub Repository "K-dizzled/lab1-k-dizzled-sokoban-rust"*
+
+'''--- Cargo.toml ---
+[workspace]
+
+members = [
+    "sb_token",
+    "rust_near_sokoban",
+]
+
+'''
+'''--- build.sh ---
+#!/bin/bash
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/rust_near_sokoban.wasm ./res/
+
+'''
+'''--- neardev/dev-account.env ---
+CONTRACT_NAME=dev-1659116521129-91451008409183
+'''
+'''--- rust_near_sokoban/Cargo.toml ---
+[package]
+name = "rust_near_sokoban"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "4.0.0"
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "s"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+
+'''
+'''--- rust_near_sokoban/src/auxiliary.rs ---
+use crate::*;
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Copy, Clone, PartialEq)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Point {
+    pub x: usize,
+    pub y: usize,
+}
+
+impl Point {
+    pub fn get_point_in_direction(&self, direction: Direction) -> Option<Self> {
+        match direction {
+            Direction::Backward => {
+                if self.x != 0 {
+                    Some(Point {
+                            x: self.x - 1,
+                            ..*self
+                        })
+                } else { None }
+            },
+            Direction::Forward => Some(Point {
+                x: self.x + 1,
+                ..*self
+            }),
+            Direction::Up => {
+                if self.x != 0 {
+                    Some(Point {
+                        y: self.y - 1,
+                        ..*self
+                    })
+                } else { None }
+            }, 
+            Direction::Down => Some(Point {
+                y: self.y + 1,
+                ..*self
+            }),
+        }
+    }
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Copy, Clone)]
+#[serde(crate = "near_sdk::serde")]
+pub enum Direction {
+    Backward,
+    Forward,
+    Up,
+    Down,
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize, PartialEq)]
+#[serde(crate = "near_sdk::serde")]
+pub enum Outcome {
+    Success,
+    Failure,
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Copy, Clone)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Size {
+    pub width: usize,
+    pub height: usize
+}
+'''
+'''--- rust_near_sokoban/src/board.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::json_types::Base64VecU8;
+use near_sdk::{env, require};
+
+use crate::auxiliary::*;
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Board {
+    pub field: Base64VecU8,
+    pub is_valid: bool,
+    pub sokoban_position: Option<Point>, 
+    pub size: Size, 
+    pub field_len: usize,
+}
+
+impl Board {
+    pub fn new(size: Size) -> Self {
+        let mut field_len = size.width * size.height;
+        if field_len % 2 == 1 {
+            field_len += 1;
+        }
+
+        field_len /= 2;
+
+        Self {
+            field: Base64VecU8::from(vec![0u8; field_len]),
+            is_valid: false,
+            sokoban_position: None,
+            field_len,
+            size,
+        }
+    }
+
+    pub fn from(field: Base64VecU8, size: Size) -> Self {
+        let mut field_len = size.width * size.height;
+        if field_len % 2 == 1 {
+            field_len += 1;
+        }
+
+        field_len /= 2;
+
+        require!(field.0.len() == field_len, "Passed field_len and passed vector length don't match");
+        let board = Self {
+            field, 
+            is_valid: false,
+            sokoban_position: Option::None,
+            field_len,
+            size,
+        };
+
+        board.validate_board()
+    }
+
+    pub fn get_state_at_cell(&self, cord: Point) -> Option<u8> {
+        let x = cord.x;
+        let y = cord.y;
+
+        if x >= self.size.width || y >= self.size.height {
+            return Option::None 
+        }
+
+        let cell_index = y * self.size.width + x;
+        let in_vector_index = cell_index / 2;
+        let in_u8_index = cell_index % 2;
+
+        if in_u8_index == 1 {
+            Some(self.field.0[in_vector_index] & 0x0F)
+        } else {
+            Some(self.field.0[in_vector_index] >> 4)
+        }
+    }
+
+    pub fn set_state_at_cell(&mut self, cord: Point, state: u8) {
+        let x = cord.x;
+        let y = cord.y;
+
+        require!(state <= 6, "There is no such available state");
+        require!(x < self.size.width, "Attempt of setting a value beyond the field");
+        require!(y < self.size.height, "Attempt of setting a value beyond the field");
+
+        let cell_index = y * self.size.width + x;
+        let in_vector_index = cell_index / 2;
+        let in_u8_index = cell_index % 2;
+
+        let mut value: u8 = self.field.0[in_vector_index];
+
+        if in_u8_index == 1 {
+            value &= 0b11110000;
+            value |= state;
+        } else {
+            value = (state << 4) | (value & 15);
+        }
+
+        self.field.0[in_vector_index] = value;
+    }
+
+    pub fn validate_board(&self) -> Self {
+        let mut board : Board = self.clone();
+
+        let mut sokoban_counter = 0;
+        let mut box_counter = 0; 
+        let mut dest_counter = 0;
+
+        let mut sokoban_position: Point = Point { x: 0, y: 0 };
+
+        for x in 0..self.size.width {
+            for y in 0..self.size.height {
+                match board.get_state_at_cell(Point { x, y }).unwrap() {
+                    2 => box_counter += 1,
+                    4 => { 
+                        sokoban_counter += 1;
+                        sokoban_position.x = x;
+                        sokoban_position.y = y;
+                    }
+                    5 => {
+                        sokoban_counter += 1;
+                        dest_counter += 1;
+                        sokoban_position.x = x;
+                        sokoban_position.y = y;
+                    },
+                    6 => dest_counter +=1,
+                    _ => ()
+                };
+            }
+        }
+
+        let is_valid = sokoban_counter == 1 && box_counter == dest_counter;
+        board.is_valid = is_valid;
+
+        if is_valid {
+            board.sokoban_position = Option::Some(sokoban_position);
+        }
+
+        board
+    }
+
+    pub fn make_step(&self, direction: Direction) -> Self {
+        let mut board : Board = self.clone();
+        let cur_cell = board.sokoban_position.expect("Invalid board");
+
+        let next_cell = cur_cell.get_point_in_direction(direction);
+
+        if next_cell == None { return board; }
+        let next_cell = next_cell.unwrap();
+
+        let after_next_cell = next_cell.get_point_in_direction(direction);
+
+        if let Some(state_at_next_cell) = board.get_state_at_cell(next_cell) {
+            match state_at_next_cell {
+                1 => {
+                    board.set_state_at_cell(next_cell, 4);
+                    board.sokoban_position = Some(next_cell);
+                    board.set_state_at_cell(cur_cell, 1);
+                },
+                2 => {
+                    if after_next_cell == None { return board; } 
+                    let after_next_cell = after_next_cell.unwrap();
+
+                    let state = board.get_state_at_cell(after_next_cell);
+
+                    if let Some(state) = state {
+                        if state == 1 {
+                            board.set_state_at_cell(next_cell, 4);
+                            board.sokoban_position = Some(next_cell);
+                            board.set_state_at_cell(cur_cell, 1);
+                            board.set_state_at_cell(after_next_cell, 2)
+                        } else if state == 6 {
+                            board.set_state_at_cell(next_cell, 4);
+                            board.sokoban_position = Some(next_cell);
+                            board.set_state_at_cell(cur_cell, 1);
+                            board.set_state_at_cell(after_next_cell, 3)
+                        }
+                    } 
+                },
+                3 => {
+                    if after_next_cell == None { return board; } 
+                    let after_next_cell = after_next_cell.unwrap();
+
+                    let state = board.get_state_at_cell(after_next_cell);
+
+                    if let Some(state) = state {
+                        if state == 1 {
+                            board.set_state_at_cell(next_cell, 5);
+                            board.sokoban_position = Some(next_cell);
+                            board.set_state_at_cell(cur_cell, 1);
+                            board.set_state_at_cell(after_next_cell, 2)
+                        } else if state == 6 {
+                            board.set_state_at_cell(next_cell, 5);
+                            board.sokoban_position = Some(next_cell);
+                            board.set_state_at_cell(cur_cell, 1);
+                            board.set_state_at_cell(after_next_cell, 3)
+                        }
+                    }
+                }
+                6 => {
+                    board.set_state_at_cell(next_cell, 5);
+                    board.sokoban_position = Some(next_cell);
+                    board.set_state_at_cell(cur_cell, 1);
+                },
+                _ => ()
+            };
+        } 
+
+        board 
+    }
+
+    pub fn clone(&self) -> Self {
+        Self {
+            field: self.field.clone(),
+            ..*self
+        }
+    }
+
+    pub fn state_as_symbol(state: u8) -> char {
+        match state {
+            0 => '*',
+            1 => '.',
+            2 => 'c',
+            3 => 'C',
+            4 => 's',
+            5 => 'S',
+            6 => 'X',
+            _ => panic!("Invalid map")
+        }
+    }
+
+    pub fn get_board_as_strings(&self) -> Vec<String> {
+        let mut vector = Vec::new();
+
+        for i in 0..self.size.height {
+            let mut result = String::from("");
+            for j in 0..self.size.width {
+                let unwraped_cell = self.get_state_at_cell(Point { x: j, y: i }).unwrap();
+                let symbol = Self::state_as_symbol(unwraped_cell);
+                result.push(symbol);
+            }
+            vector.push(result);
+        }
+
+        vector
+    }
+
+    pub fn debug_logs(&self) {
+        self.get_board_as_strings()
+            .into_iter()
+            .for_each(|s| env::log_str(&s));
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn get_board_as_string(board: &Board) -> String {
+        board.get_board_as_strings().join("\n")
+    }
+
+    #[allow(dead_code)]
+    fn debug_board(board: &Board) {
+        print!("{}", get_board_as_string(&board));
+    }
+
+    #[test]
+    fn test_get_set_state_single() {
+        let mut board = Board::new(Size { width: 1, height: 1 });
+
+        board.set_state_at_cell(Point { x: 0, y: 0 }, 4);
+
+        let expected_board = String::from("s");
+        assert_eq!(expected_board, get_board_as_string(&board));
+    }
+
+    #[test]
+    fn test_get_set_state_one_crate() {
+        let mut board = Board::new(Size { width: 4, height: 2 });
+
+        board.set_state_at_cell(Point { x: 0, y: 0 }, 1);
+        board.set_state_at_cell(Point { x: 1, y: 0 }, 4);
+        board.set_state_at_cell(Point { x: 2, y: 0 }, 2);
+        board.set_state_at_cell(Point { x: 3, y: 0 }, 6);
+        board.set_state_at_cell(Point { x: 1, y: 1 }, 1);
+        board.set_state_at_cell(Point { x: 3, y: 1 }, 5);
+
+        let expected_board = String::from(".scX\n*.*S");
+        assert_eq!(expected_board, get_board_as_string(&board));
+    }
+
+    #[test]
+    fn test_get_set_state_all_available() {
+        let mut board = Board::new(Size { width: 7, height: 1 });
+
+        board.set_state_at_cell(Point { x: 0, y: 0 }, 0);
+        board.set_state_at_cell(Point { x: 1, y: 0 }, 1);
+        board.set_state_at_cell(Point { x: 2, y: 0 }, 2);
+        board.set_state_at_cell(Point { x: 3, y: 0 }, 3);
+        board.set_state_at_cell(Point { x: 4, y: 0 }, 4);
+        board.set_state_at_cell(Point { x: 5, y: 0 }, 5);
+        board.set_state_at_cell(Point { x: 6, y: 0 }, 6);
+
+        let expected_board = String::from("*.cCsSX");
+        assert_eq!(expected_board, get_board_as_string(&board));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_set_unavailable_state() {
+        let mut board = Board::new(Size { width: 1, height: 1 });
+
+        board.set_state_at_cell(Point { x: 0, y: 0 }, 7);
+    }
+
+    #[test]
+    fn test_get_state_at_unavailable_position() {
+        let board = Board::new(Size { width: 2, height: 2 });
+
+        assert_eq!(Option::None, board.get_state_at_cell(Point { x: 3, y: 0}));
+        assert_eq!(Option::None, board.get_state_at_cell(Point { x: 0, y: 3}));
+        assert_eq!(Option::None, board.get_state_at_cell(Point { x: 3, y: 3}));
+    }
+
+    #[test]
+    fn test_try_validate_invalid_board_two_sokobans() {
+        let mut board = Board::new(Size { width: 9, height: 1 });
+
+        board.set_state_at_cell(Point { x: 0, y: 0 }, 4);
+        board.set_state_at_cell(Point { x: 1, y: 0 }, 5);
+
+        board = board.validate_board();
+        assert_eq!(false, board.is_valid);
+    }
+
+    #[test]
+    fn test_try_validate_invalid_board_boxes_dests_not_eq() {
+        let mut board = Board::new(Size { width: 9, height: 1 });
+
+        board.set_state_at_cell(Point { x: 0, y: 0 }, 4);
+        board.set_state_at_cell(Point { x: 1, y: 0 }, 2);
+
+        board = board.validate_board();
+        assert_eq!(false, board.is_valid);
+    }
+
+    #[test]
+    fn test_try_validate_valid_board() {
+        let mut board = Board::new(Size { width: 9, height: 1 });
+
+        board.set_state_at_cell(Point { x: 0, y: 0 }, 4);
+        board.set_state_at_cell(Point { x: 1, y: 0 }, 2);
+        board.set_state_at_cell(Point { x: 2, y: 0 }, 6);
+
+        board = board.validate_board();
+        assert_eq!(true, board.is_valid);
+    }
+
+    #[test]
+    fn test_make_one_step_move_box_on_destination() {
+        let mut board = Board::new(Size { width: 4, height: 2 });
+
+        board.set_state_at_cell(Point { x: 0, y: 0 }, 1);
+        board.set_state_at_cell(Point { x: 1, y: 0 }, 4);
+        board.set_state_at_cell(Point { x: 2, y: 0 }, 2);
+        board.set_state_at_cell(Point { x: 3, y: 0 }, 6);
+        board.set_state_at_cell(Point { x: 1, y: 1 }, 1);
+
+        board = board.validate_board();
+        board = board.make_step(Direction::Forward);
+
+        let expected_board = String::from("..sC\n*.**");
+        assert_eq!(expected_board, get_board_as_string(&board));
+    }
+
+    #[test]
+    fn test_make_one_step_move_box_from_destionation() {
+        let mut board = Board::new(Size { width: 4, height: 2 });
+
+        board.set_state_at_cell(Point { x: 0, y: 0 }, 1);
+        board.set_state_at_cell(Point { x: 1, y: 0 }, 4);
+        board.set_state_at_cell(Point { x: 2, y: 0 }, 3);
+        board.set_state_at_cell(Point { x: 3, y: 0 }, 1);
+        board.set_state_at_cell(Point { x: 1, y: 1 }, 1);
+
+        board = board.validate_board();
+        board = board.make_step(Direction::Forward);
+
+        let expected_board = String::from("..Sc\n*.**");
+        assert_eq!(expected_board, get_board_as_string(&board));
+    }
+
+    #[test]
+    fn test_make_one_step_move_sokoban() {
+        let mut board = Board::new(Size { width: 2, height: 1 });
+
+        board.set_state_at_cell(Point { x: 0, y: 0 }, 4);
+        board.set_state_at_cell(Point { x: 1, y: 0 }, 1);
+
+        board = board.validate_board();
+        board = board.make_step(Direction::Forward);
+
+        let expected_board = String::from(".s");
+        assert_eq!(expected_board, get_board_as_string(&board));
+    }
+
+    #[test]
+    fn test_make_one_step_move_sokoban_on_destination() {
+        let mut board = Board::new(Size { width: 3, height: 1 });
+
+        board.set_state_at_cell(Point { x: 0, y: 0 }, 4);
+        board.set_state_at_cell(Point { x: 1, y: 0 }, 6);
+        board.set_state_at_cell(Point { x: 2, y: 0 }, 2);
+
+        board = board.validate_board();
+        board = board.make_step(Direction::Forward);
+
+        let expected_board = String::from(".Sc");
+        assert_eq!(expected_board, get_board_as_string(&board));
+    }
+
+    #[test]
+    fn test_make_one_step_move_sokoban_out_of_field_left() {
+        let mut board = Board::new(Size { width: 1, height: 1 });
+
+        board.set_state_at_cell(Point { x: 0, y: 0 }, 4);
+       
+        board = board.validate_board();
+        board.make_step(Direction::Backward);
+
+        let expected_board = String::from("s");
+        assert_eq!(expected_board, get_board_as_string(&board));
+    }
+
+    #[test]
+    fn test_make_one_step_move_sokoban_out_of_field_right() {
+        let mut board = Board::new(Size { width: 1, height: 1 });
+
+        board.set_state_at_cell(Point { x: 0, y: 0 }, 4);
+       
+        board = board.validate_board();
+        board = board.make_step(Direction::Forward);
+
+        let expected_board = String::from("s");
+        assert_eq!(expected_board, get_board_as_string(&board));
+    }
+
+    #[test]
+    fn test_run_simple_game() {
+        let mut board = Board::new(Size { width: 5, height: 4 });
+
+        board.set_state_at_cell(Point { x: 0, y: 0 }, 4);
+        board.set_state_at_cell(Point { x: 1, y: 0 }, 1);
+        board.set_state_at_cell(Point { x: 2, y: 0 }, 2);
+        board.set_state_at_cell(Point { x: 3, y: 0 }, 6);
+        board.set_state_at_cell(Point { x: 0, y: 1 }, 1);
+        board.set_state_at_cell(Point { x: 1, y: 1 }, 2);
+        board.set_state_at_cell(Point { x: 2, y: 1 }, 1);
+        board.set_state_at_cell(Point { x: 3, y: 1 }, 1);
+        board.set_state_at_cell(Point { x: 0, y: 2 }, 1);
+        board.set_state_at_cell(Point { x: 1, y: 2 }, 6);
+        board.set_state_at_cell(Point { x: 2, y: 2 }, 1);
+        board.set_state_at_cell(Point { x: 3, y: 2 }, 3);
+
+        let d = Direction::Forward;
+        let s: String = near_sdk::serde_json::to_string(&d).unwrap();
+        println!("{}", s);
+
+        let mut board = board.validate_board();
+
+        let actions = [
+            Direction::Forward, 
+            Direction::Forward,
+            Direction::Backward,
+            Direction::Down
+        ];
+
+        let game_states = [
+            String::from(".scX*\n.c..*\n.X.C*\n*****"), 
+            String::from("..sC*\n.c..*\n.X.C*\n*****"), 
+            String::from(".s.C*\n.c..*\n.X.C*\n*****"),
+            String::from("...C*\n.s..*\n.C.C*\n*****")
+        ];
+
+        for (index, action) in actions.iter().enumerate() {
+            board = board.make_step(*action);
+            assert_eq!(game_states[index], get_board_as_string(&board));
+        }   
+    }
+}
+
+'''
+'''--- rust_near_sokoban/src/lib.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{env, near_bindgen, BorshStorageKey, PanicOnDefault};
+use near_sdk::collections::Vector;
+use near_sdk::json_types::Base64VecU8;
+
+use crate::board::*;
+use crate::auxiliary::*;
+
+#[derive(BorshSerialize, BorshStorageKey)]
+pub enum StorageKey {
+    Boards,
+}
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Contract {
+    pub boards: Vector<Board>,
+}
+
+pub type BoardIndex = u64;
+
+#[near_bindgen]
+impl Contract {
+    #[init]
+    pub fn new() -> Self {
+        Self {
+            boards: Vector::new(StorageKey::Boards)
+        }
+    }
+
+    pub fn create_board(&mut self, field: Base64VecU8, field_size: Option<Size>) -> BoardIndex {
+        let size = field_size.unwrap_or(Size { width: 8, height: 8 });
+
+        let board = Board::from(field, size);
+        let index = self.boards.len();
+
+        self.boards.push(&board);
+        index
+    }
+
+    pub fn get_board(&self, index: BoardIndex) -> Option<Board> {
+        self.boards.get(index)
+    }
+
+    pub fn validate_board(&mut self, index: BoardIndex) {
+        let board = self.get_board(index).expect("No board");
+        let new_board = board.validate_board();
+        self.boards.replace(index, &new_board);
+    }
+
+    pub fn step(&mut self, index: BoardIndex, direction: Direction) -> Option<Board> {
+        let board = self.get_board(index).expect("No board");
+        if board.is_valid == true {
+            env::log_str("Old board");
+            board.debug_logs();
+            let new_board = board.make_step(direction);
+            self.boards.replace(index, &new_board);
+
+            env::log_str("New board");
+            new_board.debug_logs();
+
+            Some(new_board)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use near_sdk::test_utils::VMContextBuilder;
+    use near_sdk::{testing_env, VMContext};
+
+    fn get_context(is_view: bool) -> VMContext {
+        VMContextBuilder::new().is_view(is_view).build()
+    }
+
+    #[test]
+    fn test_new() {
+        let context = get_context(false);
+        testing_env!(context);
+        let mut _contract = Contract::new();
+    }
+
+    #[test]
+    fn test_board_create_get() {
+        let context = get_context(false);
+        testing_env!(context);
+        let mut contract = Contract::new();
+
+        let width: usize = 8;
+        let height: usize = 8;
+        let field_len: usize = (width / 2) * height;
+
+        let mut field = vec![0u8; field_len];
+        field[0] = 50;
+        let index = contract.create_board(field.clone().into(), None);
+        assert_eq!(index, 0);
+
+        testing_env!(get_context(true));
+        let board = contract.get_board(0).unwrap();
+        assert_eq!(field, board.field.0);    
+    }
+}
+
+pub mod board;
+pub mod auxiliary;
+'''
+'''--- sb_token/Cargo.toml ---
+[package]
+name = "sb_token"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+
+'''
+'''--- sb_token/src/lib.rs ---
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn it_works() {
+        let result = 2 + 2;
+        assert_eq!(result, 4);
+    }
+}
+
+'''

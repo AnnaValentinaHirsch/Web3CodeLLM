@@ -1,0 +1,1685 @@
+*GitHub Repository "ilblackdragon/balancer-near"*
+
+'''--- README.md ---
+# Outdated, see https://github.com/ilblackdragon/contracts
+
+'''
+'''--- balancer-pool/Cargo.toml ---
+[package]
+name = "balancer-pool"
+version = "0.1.0"
+authors = ["Illia Polosukhin <illia.polosukhin@gmail.com>"]
+edition = "2018"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+
+[dependencies]
+serde = { version = "*", features = ["derive"] }
+serde_json = "*"
+near-sdk = "0.11.0"
+borsh = "0.6.2"
+# near-sdk = "1.0.0"
+uint = { version = "0.8.3", default-features = false }
+wee_alloc = { version = "0.4.5", default-features = false, features = [] }
+near-lib = { path = "../near-lib-rs" }
+
+[dev-dependencies]
+near-test = { path = "../near-test-rs" }
+lazy_static = "1.4.0"
+
+'''
+'''--- balancer-pool/build.sh ---
+#!/bin/bash
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo +stable build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/balancer_pool.wasm ./res/
+
+'''
+'''--- balancer-pool/src/bconst.rs ---
+use near_sdk::Balance;
+
+pub type Weight = u128;
+
+pub const BONE: Balance = 1_000_000_000_000_000_000_000_000;
+
+pub const MIN_BOUND_TOKENS: usize = 2;
+pub const MAX_BOUND_TOKENS: usize = 8;
+
+pub const MIN_FEE: Balance = BONE / 1_000_000;
+pub const MAX_FEE: Balance = BONE / 10;
+pub const EXIT_FEE: Balance = 0;
+
+pub const MIN_WEIGHT: Weight = BONE;
+pub const MAX_WEIGHT: Weight = BONE * 50;
+pub const MAX_TOTAL_WEIGHT: Weight = BONE * 50;
+pub const MIN_BALANCE: Balance = BONE / 1_000_000_000_000;
+
+pub const INIT_POOL_SUPPLY: Balance = BONE * 100;
+pub const MIN_BPOW_BASE: Balance = 1;
+pub const MAX_BPOW_BASE: Balance = 2 * BONE - 1;
+pub const BPOW_PRECISION: Balance = BONE / 10_000_000_000;
+
+pub const MAX_IN_RATIO: Balance = BONE / 2;
+pub const MAX_OUT_RATIO: Balance = BONE / 3 + 1;
+
+pub const NO_DEPOSIT: Balance = 0;
+
+pub mod gas {
+    pub const BASE_GAS: u64 = 20_000_000_000_000;
+
+    pub const NEP21_TRANSFER: u64 = BASE_GAS;
+
+    pub const ON_PULL_CALLBACK: u64 = BASE_GAS;
+
+    pub const NEP21_TRANSFER_FROM: u64 = BASE_GAS;
+
+    pub const ON_PUSH_CALLBACK: u64 = BASE_GAS;
+}
+
+'''
+'''--- balancer-pool/src/bmath.rs ---
+use near_sdk::Balance;
+
+use crate::bconst::{Weight, BONE};
+
+/**********************************************************************************************
+// calcSpotPrice                                                                             //
+// sP = spotPrice                                                                            //
+// bI = tokenBalanceIn                ( bI / wI )         1                                  //
+// bO = tokenBalanceOut         sP =  -----------  *  ----------                             //
+// wI = tokenWeightIn                 ( bO / wO )     ( 1 - sF )                             //
+// wO = tokenWeightOut                                                                       //
+// sF = swapFee                                                                              //
+**********************************************************************************************/
+pub fn calc_spot_price(
+    balance_in: Balance,
+    weight_in: Weight,
+    balace_out: Balance,
+    weight_out: Weight,
+    swap_fee: Balance,
+) -> Balance {
+    let numer = balance_in / weight_in;
+    let denom = balace_out / weight_out;
+    let ratio = numer / denom;
+    let scale = BONE / (BONE - swap_fee);
+    ratio * scale
+}
+
+'''
+'''--- balancer-pool/src/lib.rs ---
+use borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::UnorderedMap;
+use near_sdk::json_types::U128;
+use near_sdk::{env, ext_contract, near_bindgen, AccountId, Balance, Promise};
+
+mod bconst;
+mod bmath;
+
+use bconst::*;
+use bmath::calc_spot_price;
+use near_lib::token::{ext_nep21, FungibleToken, Token};
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Record {
+    bound: bool,
+    index: u64,
+    denorm: Weight,
+    balance: Balance,
+}
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct BPool {
+    controller: AccountId,
+    factory: AccountId,
+    swap_fee: Balance,
+    finalized: bool,
+    public_swap: bool,
+    records: UnorderedMap<AccountId, Record>,
+    tokens: Vec<AccountId>,
+    total_weight: Weight,
+    token: Token,
+}
+
+impl Default for BPool {
+    fn default() -> Self {
+        panic!("BPool should be initialized before usage")
+    }
+}
+
+#[near_bindgen]
+impl BPool {
+    #[init]
+    pub fn new() -> Self {
+        Self {
+            controller: env::predecessor_account_id(),
+            factory: env::predecessor_account_id(),
+            swap_fee: MIN_FEE,
+            public_swap: false,
+            finalized: false,
+            records: UnorderedMap::new(b"r".to_vec()),
+            tokens: Vec::new(),
+            total_weight: 0,
+            token: Token::new(env::signer_account_id(), 0u128),
+        }
+    }
+
+    // Getters
+
+    pub fn isPublicSwap(&self) -> bool {
+        self.public_swap
+    }
+
+    pub fn isFinalized(&self) -> bool {
+        self.finalized
+    }
+
+    pub fn isBound(&self, token: AccountId) -> bool {
+        self.records
+            .get(&token)
+            .map(|record| record.bound)
+            .unwrap_or(false)
+    }
+
+    pub fn getNumTokens(&self) -> u64 {
+        self.tokens.len() as u64
+    }
+
+    pub fn getCurrentTokens(&self) -> Vec<AccountId> {
+        self.tokens.clone()
+    }
+
+    pub fn getFinalTokens(&self) -> Vec<AccountId> {
+        assert!(self.finalized, "ERR_NOT_FINALIZED");
+        self.tokens.clone()
+    }
+
+    pub fn getDenormalizedWeight(&self, token: AccountId) -> U128 {
+        assert!(self.isBound(token.clone()), "ERR_NOT_BOUND");
+        self.records.get(&token).unwrap().denorm.into()
+    }
+
+    pub fn getTotalDenormalizedWeight(&self) -> U128 {
+        self.total_weight.into()
+    }
+
+    pub fn getNormalizedWeight(&self, token: AccountId) -> U128 {
+        assert!(self.isBound(token.clone()), "ERR_NOT_BOUND");
+        let denorm = self.records.get(&token).unwrap().denorm;
+        // TODO: this division is special?
+        (denorm / self.total_weight).into()
+    }
+
+    pub fn getBalance(&self, token: AccountId) -> U128 {
+        assert!(self.isBound(token.clone()), "ERR_NOT_BOUND");
+        self.records.get(&token).unwrap().balance.into()
+    }
+
+    pub fn getSwapFee(&self) -> U128 {
+        self.swap_fee.into()
+    }
+
+    pub fn getController(&self) -> AccountId {
+        self.controller.clone()
+    }
+
+    // Setters.
+
+    pub fn setSwapFee(&mut self, swapFee: U128) {
+        let swap_fee = swapFee.into();
+        assert!(!self.finalized, "ERR_IS_FINALIZED");
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.controller,
+            "ERR_NOT_CONTROLLER"
+        );
+        assert!(swap_fee >= MIN_FEE, "ERR_MIN_FEE");
+        assert!(swap_fee <= MAX_FEE, "ERR_MIN_FEE");
+        self.swap_fee = swap_fee;
+    }
+
+    pub fn setController(&mut self, controller: AccountId) {
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.controller,
+            "ERR_NOT_CONTROLLER"
+        );
+        self.controller = controller;
+    }
+
+    pub fn setPublicSwap(&mut self, public: bool) {
+        assert!(!self.finalized, "ERR_IS_FINALIZED");
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.controller,
+            "ERR_NOT_CONTROLLER"
+        );
+        self.public_swap = public;
+    }
+
+    pub fn finalize(&mut self) {
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.controller,
+            "ERR_NOT_CONTROLLER"
+        );
+        assert!(!self.finalized, "ERR_IS_FINALIZED");
+        assert!(self.tokens.len() >= MIN_BOUND_TOKENS, "ERR_MIN_TOKENS");
+
+        self.finalized = true;
+        self.public_swap = true;
+
+        self.mint_pool_share(INIT_POOL_SUPPLY);
+        self.push_pool_share(env::predecessor_account_id(), INIT_POOL_SUPPLY);
+    }
+
+    pub fn bind(&mut self, token: AccountId, balance: U128, denorm: U128) {
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.controller,
+            "ERR_NOT_CONTROLLER"
+        );
+        assert!(!self.isBound(token.clone()), "ERR_IS_BOUND");
+        assert!(!self.finalized, "ERR_IS_FINALIZED");
+        assert!(self.tokens.len() < MAX_BOUND_TOKENS, "ERR_MAX_TOKENS");
+
+        self.records.insert(
+            &token,
+            &Record {
+                bound: true,
+                index: self.tokens.len() as u64,
+                denorm: 0,
+                balance: 0,
+            },
+        );
+        self.tokens.push(token.clone());
+        self.rebind(token, balance.into(), denorm.into());
+    }
+
+    pub fn rebind(&mut self, token: AccountId, balance: Balance, denorm: Weight) {
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.controller,
+            "ERR_NOT_CONTROLLER"
+        );
+        assert!(self.isBound(token.clone()), "ERR_NOT_BOUND");
+        assert!(!self.finalized, "ERR_IS_FINALIZED");
+
+        assert!(denorm >= MIN_WEIGHT, "ERR_MIN_WEIGHT");
+        assert!(denorm <= MAX_WEIGHT, "ERR_MAX_WEIGHT");
+        assert!(balance >= MIN_BALANCE, "ERR_MIN_BALANCE");
+
+        let mut record = self.records.get(&token).unwrap();
+        let old_weight = record.denorm;
+        record.denorm = denorm;
+        if denorm > old_weight {
+            self.total_weight = self.total_weight + (denorm - old_weight);
+        } else {
+            self.total_weight = self.total_weight - (old_weight - denorm);
+        }
+
+        let old_balance = record.balance;
+        record.balance = balance;
+        if balance > old_balance {
+            self.pull_underlying(
+                &token,
+                &env::predecessor_account_id(),
+                balance - old_balance,
+            );
+        } else {
+            let token_balance_withdrawn = old_balance - balance;
+            let token_exit_fee = token_balance_withdrawn * EXIT_FEE;
+            self.push_underlying(
+                token.clone(),
+                env::predecessor_account_id(),
+                token_balance_withdrawn - token_exit_fee,
+            );
+            self.push_underlying(token.clone(), self.factory.clone(), token_exit_fee);
+        }
+        // TODO: move this into the on_pull or else clause.
+        self.records.insert(&token, &record);
+    }
+
+    pub fn unbind(&mut self, token: AccountId) {}
+
+    /// Absorb any tokens that have been sent to this contract into the pool.
+    pub fn gulp(&mut self, token: AccountId) {
+        // TODO: call ext_nep21.balance(env::current_account_id(), token.clone()).then()
+    }
+
+    pub fn getSpotPrice(&self, tokenIn: AccountId, tokenOut: AccountId) -> Balance {
+        assert!(self.isBound(tokenIn.clone()), "ERR_NOT_BOUND");
+        assert!(self.isBound(tokenOut.clone()), "ERR_NOT_BOUND");
+        let in_record = self.records.get(&tokenIn).unwrap();
+        let out_record = self.records.get(&tokenOut).unwrap();
+        calc_spot_price(
+            in_record.balance,
+            in_record.denorm,
+            out_record.balance,
+            out_record.denorm,
+            self.swap_fee,
+        )
+    }
+
+    pub fn getSpotPriceSansFee(&self, tokenIn: AccountId, tokenOut: AccountId) -> Balance {
+        assert!(self.isBound(tokenIn.clone()), "ERR_NOT_BOUND");
+        assert!(self.isBound(tokenOut.clone()), "ERR_NOT_BOUND");
+        let in_record = self.records.get(&tokenIn).unwrap();
+        let out_record = self.records.get(&tokenOut).unwrap();
+        calc_spot_price(
+            in_record.balance,
+            in_record.denorm,
+            out_record.balance,
+            out_record.denorm,
+            0,
+        )
+    }
+
+    pub fn joinPool(&mut self, poolAmountOut: Balance, maxAmountsIn: Vec<Balance>) {
+        assert!(self.finalized, "ERR_NOT_FINALIZED");
+        let pool_total = self.token.get_total_supply();
+        let ratio = poolAmountOut / pool_total;
+        assert_ne!(ratio, 0, "ERR_MAX_APPROX");
+
+        for i in 0..self.tokens.len() {
+            let mut record = self.records.get(&self.tokens[i]).unwrap();
+            let token_amount_in = ratio * record.balance;
+            assert_ne!(token_amount_in, 0, "ERR_MATH_APPROX");
+            assert!(token_amount_in <= maxAmountsIn[i], "ERR_LIMIT_IN");
+            record.balance += token_amount_in;
+            self.pull_underlying(
+                &self.tokens[i].clone(),
+                &env::predecessor_account_id(),
+                token_amount_in,
+            );
+            // TODO: join all promises and only save records / mint shares on success.
+        }
+        self.mint_pool_share(poolAmountOut);
+        self.push_pool_share(env::predecessor_account_id(), poolAmountOut);
+    }
+
+    pub fn exitPool(&mut self, poolAmountIn: Balance, minAmountsOut: Vec<Balance>) {
+        assert!(self.finalized, "ERR_NOT_FINALIZED");
+
+        let pool_total = self.token.get_total_supply();
+        let exit_fee = poolAmountIn * EXIT_FEE;
+        let p_ai_after_exit_fee = poolAmountIn - exit_fee;
+        let ratio = p_ai_after_exit_fee / pool_total;
+        assert_ne!(ratio, 0, "ERR_MATH_APPROX");
+
+        self.pull_pool_share(env::predecessor_account_id(), poolAmountIn);
+        self.push_pool_share(self.factory.clone(), exit_fee);
+        self.burn_pool_share(p_ai_after_exit_fee);
+
+        for i in 0..self.tokens.len() {
+            let mut record = self.records.get(&self.tokens[i]).unwrap();
+            let token_amount_out = ratio * record.balance;
+            assert_ne!(token_amount_out, 0, "ERR_MATH_APPROX");
+            assert!(token_amount_out >= minAmountsOut[i], "ERR_LIMIT_OUT");
+            record.balance += token_amount_out;
+            self.push_underlying(
+                self.tokens[i].clone(),
+                env::predecessor_account_id(),
+                token_amount_out,
+            );
+        }
+    }
+
+    pub fn on_pull(&mut self) -> bool {
+        true
+    }
+
+    pub fn on_push(&mut self) -> bool {
+        true
+    }
+}
+
+#[near_bindgen]
+impl FungibleToken for BPool {
+    fn inc_allowance(&mut self, escrow_account_id: String, amount: U128) {
+        self.token.inc_allowance(escrow_account_id, amount.into());
+    }
+
+    fn dec_allowance(&mut self, escrow_account_id: String, amount: U128) {
+        self.token.dec_allowance(escrow_account_id, amount.into());
+    }
+
+    fn transfer_from(&mut self, owner_id: String, new_owner_id: String, amount: U128) {
+        self.token
+            .transfer_from(owner_id, new_owner_id, amount.into());
+    }
+
+    fn transfer(&mut self, new_owner_id: String, amount: U128) {
+        self.token.transfer(new_owner_id, amount.into());
+    }
+
+    fn get_total_supply(&self) -> U128 {
+        self.token.get_total_supply().into()
+    }
+
+    fn get_balance(&self, owner_id: String) -> U128 {
+        self.token.get_balance(owner_id).into()
+    }
+
+    fn get_allowance(&self, owner_id: String, escrow_account_id: String) -> U128 {
+        self.token.get_allowance(owner_id, escrow_account_id).into()
+    }
+}
+
+#[ext_contract(ext_self)]
+pub trait ExtSelf {
+    fn on_pull(&mut self) -> bool;
+
+    fn on_push(&mut self) -> bool;
+}
+
+impl BPool {
+    fn pull_underlying(&mut self, token: &AccountId, from: &AccountId, amount: Balance) -> Promise {
+        ext_nep21::transfer_from(
+            from.clone(),
+            env::current_account_id(),
+            amount.into(),
+            token,
+            NO_DEPOSIT,
+            gas::NEP21_TRANSFER_FROM,
+        )
+        .then(ext_self::on_pull(
+            &env::current_account_id(),
+            NO_DEPOSIT,
+            gas::ON_PULL_CALLBACK,
+        ))
+    }
+
+    fn push_underlying(&mut self, token: AccountId, to: AccountId, amount: Balance) -> Promise {
+        ext_nep21::transfer(
+            to.clone(),
+            amount.into(),
+            &token,
+            NO_DEPOSIT,
+            gas::NEP21_TRANSFER,
+        )
+        .then(ext_self::on_push(
+            &env::current_account_id(),
+            NO_DEPOSIT,
+            gas::ON_PUSH_CALLBACK,
+        ))
+    }
+
+    fn mint_pool_share(&mut self, amount: Balance) {
+        self.token.mint(env::current_account_id(), amount)
+    }
+
+    fn burn_pool_share(&mut self, amount: Balance) {
+        self.token.burn(env::current_account_id(), amount)
+    }
+
+    fn pull_pool_share(&mut self, from: AccountId, amount: Balance) {
+        self.token
+            .transfer_from(from, env::current_account_id(), amount)
+    }
+
+    fn push_pool_share(&mut self, to: AccountId, amount: Balance) {
+        self.token
+            .transfer_from(env::current_account_id(), to, amount)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use near_sdk::{testing_env, MockedBlockchain, VMContext};
+
+    fn pool_account() -> AccountId {
+        "pool".to_string()
+    }
+    fn factory_account() -> AccountId {
+        "factory".to_string()
+    }
+    fn token1_account() -> AccountId {
+        "token1".to_string()
+    }
+    fn token2_account() -> AccountId {
+        "token2".to_string()
+    }
+
+    pub fn get_context(
+        predecessor_account_id: AccountId,
+        account_balance: u128,
+        account_locked_balance: u128,
+        is_view: bool,
+    ) -> VMContext {
+        VMContext {
+            current_account_id: pool_account(),
+            signer_account_id: predecessor_account_id.clone(),
+            signer_account_pk: vec![0, 1, 2],
+            predecessor_account_id,
+            input: vec![],
+            block_index: 1,
+            block_timestamp: 0,
+            epoch_height: 1,
+            account_balance,
+            account_locked_balance,
+            storage_usage: 10u64.pow(6),
+            attached_deposit: 0,
+            prepaid_gas: 10u64.pow(15),
+            random_seed: vec![0, 1, 2],
+            is_view,
+            output_data_receivers: vec![],
+        }
+    }
+
+    fn to_yocto(amount: Balance) -> Balance {
+        amount * 10u128.pow(24)
+    }
+
+    #[test]
+    fn test_setup_pool() {
+        let context = get_context(factory_account(), to_yocto(10), 0, false);
+        testing_env!(context.clone());
+        let mut pool = BPool::new();
+        assert_eq!(pool.getController(), factory_account());
+        pool.bind(
+            token1_account(),
+            to_yocto(50_000).into(),
+            to_yocto(10).into(),
+        );
+        pool.bind(
+            token2_account(),
+            to_yocto(1_000_000).into(),
+            to_yocto(10).into(),
+        );
+        pool.finalize();
+        assert_eq!(pool.getSpotPrice(token1_account(), token2_account()), 1);
+    }
+}
+
+'''
+'''--- balancer-pool/test.sh ---
+#!/bin/bash
+
+./build.sh
+cargo test
+'''
+'''--- balancer-pool/tests/general.rs ---
+use near_sdk::AccountId;
+use near_sdk::json_types::U128;
+use near_test::test_user::{init_test_runtime, TestRuntime, to_yocto};
+use near_test::token::TokenContract;
+use serde_json::json;
+
+const WETH: &str = "weth";
+const MKR: &str = "mkr";
+const DAI: &str = "dai";
+const XXX: &str = "xxx";
+const POOL: &str = "pool";
+
+lazy_static::lazy_static! {
+    static ref TOKEN_WASM_BYTES: &'static [u8] = include_bytes!("../../test-token/res/test_token.wasm").as_ref();
+    static ref POOL_WASM_BYTES: &'static [u8] = include_bytes!("../res/balancer_pool.wasm").as_ref();
+}
+
+pub struct BPool {
+    contract_id: AccountId,
+}
+
+impl BPool {
+    pub fn new(runtime: &mut TestRuntime, signer_id: &AccountId, contract_id: AccountId) -> Self {
+        let _ = runtime
+            .deploy(signer_id.clone(), contract_id.clone(), &POOL_WASM_BYTES, json!({}))
+            .unwrap();
+        Self { contract_id }
+    }
+
+    pub fn getController(&self, runtime: &mut TestRuntime) -> AccountId {
+        runtime.view(self.contract_id.clone(), "getController", json!({}))
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    pub fn getNumTokens(&self, runtime: &mut TestRuntime) -> u64 {
+        runtime.view(self.contract_id.clone(), "getNumTokens", json!({}))
+            .as_u64()
+            .unwrap()
+    }
+
+    pub fn bind(&self, runtime: &mut TestRuntime, signer_id: &AccountId, token: AccountId, balance: &str, denorm: &str) {
+        let _ = runtime.call(signer_id.clone(), self.contract_id.clone(), "bind", json!({"token": token, "balance": U128::from(to_yocto(balance)), "denorm": U128::from(to_yocto(denorm))}), 0).unwrap();
+    }
+}
+
+fn setup_multi_token_pool() -> (
+    TestRuntime,
+    BPool,
+    TokenContract,
+    TokenContract,
+    TokenContract,
+    TokenContract,
+) {
+    let mut runtime = init_test_runtime();
+    let root = "root".to_string();
+    let user1 = "user1".to_string();
+    let user2 = "user2".to_string();
+
+    let pool = BPool::new(&mut runtime, &root, POOL.to_string());
+
+    let weth = TokenContract::new(&mut runtime, &root, &TOKEN_WASM_BYTES, WETH.to_string(), &root, "50");
+    let mkr = TokenContract::new(&mut runtime, &root, &TOKEN_WASM_BYTES, MKR.to_string(), &root, "20");
+    let dai = TokenContract::new(
+        &mut runtime,
+        &root,
+        &TOKEN_WASM_BYTES,
+        DAI.to_string(),
+        &root,
+        "10000",
+    );
+    let xxx = TokenContract::new(&mut runtime, &root, &TOKEN_WASM_BYTES, XXX.to_string(), &root, "10");
+
+    // User1 balances.
+    weth.mint(&mut runtime, &root, &user1, "25");
+    mkr.mint(&mut runtime, &root, &user1, "4");
+    dai.mint(&mut runtime, &root, &user1, "40000");
+    xxx.mint(&mut runtime, &root, &user1, "10");
+
+    // User2 balances.
+    weth.mint(&mut runtime, &root, &user2, "12.2222");
+    mkr.mint(&mut runtime, &root, &user2, "1.015333");
+    dai.mint(&mut runtime, &root, &user2, "0");
+    xxx.mint(&mut runtime, &root, &user2, "51");
+
+    (runtime, pool, weth, mkr, dai, xxx)
+}
+
+#[test]
+fn multi_token_pool() {
+    let (mut user, pool, weth, mkr, dai, xxx) = setup_multi_token_pool();
+    let root = "root".to_string();
+    assert_eq!(pool.getController(&mut user), root);
+    assert_eq!(pool.getNumTokens(&mut user), 0);
+}
+
+#[test]
+fn deposit_failure() {
+    let (mut user, pool, weth, mkr, dai, xxx) = setup_multi_token_pool();
+    let root = "root".to_string();
+    pool.bind(&mut user, &root, weth.contract_id, "100", "1");
+}
+
+'''
+'''--- balancer-pool/tests/utils.rs ---
+use near_crypto::{InMemorySigner, KeyType, Signer};
+use near_primitives::{
+    account::{AccessKey, Account},
+    errors::{RuntimeError, TxExecutionError},
+    hash::CryptoHash,
+    transaction::{ExecutionOutcome, ExecutionStatus, Transaction},
+    types::{AccountId, Balance},
+};
+use near_runtime_standalone::{init_runtime_and_signer, RuntimeStandalone};
+use near_sdk::json_types::U128;
+use serde::de::DeserializeOwned;
+use serde_json::json;
+use std::convert::TryFrom;
+
+const DEFAULT_GAS: u64 = 300_000_000_000_000;
+const STORAGE_AMOUNT: u128 = 50_000_000_000_000_000_000_000_000;
+
+lazy_static::lazy_static! {
+    static ref TOKEN_WASM_BYTES: &'static [u8] = include_bytes!("../../test-token/res/test_token.wasm").as_ref();
+    static ref POOL_WASM_BYTES: &'static [u8] = include_bytes!("../res/balancer_pool.wasm").as_ref();
+}
+
+type TxResult = Result<ExecutionOutcome, ExecutionOutcome>;
+
+fn outcome_into_result(outcome: ExecutionOutcome) -> TxResult {
+    match outcome.status {
+        ExecutionStatus::SuccessValue(_) => Ok(outcome),
+        ExecutionStatus::Failure(_) => Err(outcome),
+        ExecutionStatus::SuccessReceiptId(_) => panic!("Unresolved ExecutionOutcome run runtime.resolve(tx) to resolve the final outcome of tx"),
+        ExecutionStatus::Unknown => unreachable!()
+    }
+}
+
+fn to_yocto(value: &str) -> u128 {
+    let vals: Vec<_> = value.split(".").collect();
+    let part1 = vals[0].parse::<u128>().unwrap() * 10u128.pow(24);
+    if vals.len() > 1 {
+        let power = vals[1].len() as u32;
+        let part2 = vals[1].parse::<u128>().unwrap() * 10u128.pow(24 - power);
+        part1 + part2
+    } else {
+        part1
+    }
+}
+
+pub struct ExternalUser {
+    runtime: RuntimeStandalone,
+    pub account_id: AccountId,
+    signer: InMemorySigner,
+}
+
+impl ExternalUser {
+    pub fn new(runtime: RuntimeStandalone, account_id: AccountId, signer: InMemorySigner) -> Self {
+        Self {
+            runtime,
+            account_id,
+            signer,
+        }
+    }
+
+    fn transaction(&self, receiver_id: AccountId) -> Transaction {
+        let nonce = self
+            .runtime
+            .view_access_key(&self.account_id, &self.signer.public_key())
+            .unwrap()
+            .nonce
+            + 1;
+        Transaction::new(
+            self.account_id.clone(),
+            self.signer.public_key(),
+            receiver_id,
+            nonce,
+            CryptoHash::default(),
+        )
+    }
+
+    fn submit_transaction(&mut self, transaction: Transaction) -> TxResult {
+        let res = self
+            .runtime
+            .resolve_tx(transaction.sign(&self.signer))
+            .unwrap();
+        self.runtime.process_all().unwrap();
+        outcome_into_result(res)
+    }
+
+    pub fn deploy(
+        &mut self,
+        contract_id: AccountId,
+        wasm_bytes: &[u8],
+        args: serde_json::Value,
+    ) -> TxResult {
+        self.submit_transaction(
+            self.transaction(contract_id)
+                .create_account()
+                .transfer(STORAGE_AMOUNT)
+                .deploy_contract(wasm_bytes.to_vec())
+                .function_call(
+                    "new".to_string(),
+                    args.to_string().as_bytes().to_vec(),
+                    DEFAULT_GAS,
+                    0,
+                ),
+        )
+    }
+
+    pub fn call(
+        &mut self,
+        contract_id: AccountId,
+        method: &str,
+        args: serde_json::Value,
+        deposit: u128,
+    ) -> TxResult {
+        println!("{:?}", args.to_string());
+        self.submit_transaction(self.transaction(contract_id).function_call(
+            method.to_string(),
+            args.to_string().as_bytes().to_vec(),
+            DEFAULT_GAS,
+            deposit,
+        ))
+    }
+
+    pub fn view(
+        &mut self,
+        contract_id: AccountId,
+        method: &str,
+        args: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::from_slice(
+            &self
+                .runtime
+                .view_method_call(
+                    &contract_id,
+                    &method.to_string(),
+                    args.to_string().as_bytes(),
+                )
+                .unwrap()
+                .0,
+        )
+        .unwrap()
+    }
+}
+
+pub fn init_user() -> ExternalUser {
+    let (mut runtime, signer) = init_runtime_and_signer(&"root".into());
+    ExternalUser::new(runtime, "root".into(), signer)
+}
+
+'''
+'''--- near-lib-rs/Cargo.toml ---
+[package]
+name = "near-lib"
+version = "0.1.0"
+authors = ["Illia Polosukhin <illia.polosukhin@gmail.com>"]
+edition = "2018"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+
+[dependencies]
+near-sdk = "0.11.0"
+borsh = "0.6.2"
+serde = { version = "*", features = ["derive"] }
+serde_json = "*"
+
+'''
+'''--- near-lib-rs/src/lib.rs ---
+pub mod token;
+
+'''
+'''--- near-lib-rs/src/token.rs ---
+use near_sdk::{AccountId, Balance, env, ext_contract, Promise, StorageUsage};
+use borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::UnorderedMap;
+use near_sdk::json_types::U128;
+
+/// Price per 1 byte of storage from mainnet genesis config.
+const STORAGE_PRICE_PER_BYTE: Balance = 100000000000000000000;
+
+/// Contains balance and allowances information for one account.
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Account {
+    /// Current account balance.
+    pub balance: Balance,
+    /// Escrow Account ID hash to the allowance amount.
+    /// Allowance is the amount of tokens the Escrow Account ID can spent on behalf of the account
+    /// owner.
+    pub allowances: UnorderedMap<Vec<u8>, Balance>,
+}
+
+impl Account {
+    /// Initializes a new Account with 0 balance and no allowances for a given `account_hash`.
+    pub fn new(account_hash: Vec<u8>) -> Self {
+        Self {
+            balance: 0,
+            allowances: UnorderedMap::new(account_hash),
+        }
+    }
+
+    /// Sets allowance for account `escrow_account_id` to `allowance`.
+    pub fn set_allowance(&mut self, escrow_account_id: &AccountId, allowance: Balance) {
+        let escrow_hash = env::sha256(escrow_account_id.as_bytes());
+        if allowance > 0 {
+            self.allowances.insert(&escrow_hash, &allowance);
+        } else {
+            self.allowances.remove(&escrow_hash);
+        }
+    }
+
+    /// Returns the allowance of account `escrow_account_id`.
+    pub fn get_allowance(&self, escrow_account_id: &AccountId) -> Balance {
+        let escrow_hash = env::sha256(escrow_account_id.as_bytes());
+        self.allowances.get(&escrow_hash).unwrap_or(0)
+    }
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Token {
+    /// sha256(AccountID) -> Account details.
+    pub accounts: UnorderedMap<Vec<u8>, Account>,
+
+    /// Total supply of the all token.
+    pub total_supply: Balance,
+}
+
+impl Token {
+    pub fn new(owner_id: AccountId, total_supply: Balance) -> Self {
+        let mut ft = Self {
+            accounts: UnorderedMap::new(b"a".to_vec()),
+            total_supply,
+        };
+        let mut account = ft.get_account(&owner_id);
+        account.balance = total_supply;
+        ft.set_account(&owner_id, &account);
+        ft
+    }
+
+    pub fn inc_allowance(&mut self, escrow_account_id: AccountId, amount: Balance) {
+        let initial_storage = env::storage_usage();
+        assert!(
+            env::is_valid_account_id(escrow_account_id.as_bytes()),
+            "Escrow account ID is invalid"
+        );
+        let owner_id = env::predecessor_account_id();
+        if escrow_account_id == owner_id {
+            env::panic(b"Can not increment allowance for yourself");
+        }
+        let mut account = self.get_account(&owner_id);
+        let current_allowance = account.get_allowance(&escrow_account_id);
+        account.set_allowance(&escrow_account_id, current_allowance.saturating_add(amount));
+        self.set_account(&owner_id, &account);
+        self.refund_storage(initial_storage);
+    }
+
+    pub fn dec_allowance(&mut self, escrow_account_id: AccountId, amount: Balance) {
+        let initial_storage = env::storage_usage();
+        assert!(
+            env::is_valid_account_id(escrow_account_id.as_bytes()),
+            "Escrow account ID is invalid"
+        );
+        let owner_id = env::predecessor_account_id();
+        if escrow_account_id == owner_id {
+            env::panic(b"Can not decrement allowance for yourself");
+        }
+        let mut account = self.get_account(&owner_id);
+        let current_allowance = account.get_allowance(&escrow_account_id);
+        account.set_allowance(&escrow_account_id, current_allowance.saturating_sub(amount));
+        self.set_account(&owner_id, &account);
+        self.refund_storage(initial_storage);
+    }
+
+    pub fn transfer_from(&mut self, owner_id: AccountId, new_owner_id: AccountId, amount: Balance) {
+        let initial_storage = env::storage_usage();
+        assert!(
+            env::is_valid_account_id(new_owner_id.as_bytes()),
+            "New owner's account ID is invalid"
+        );
+        if amount == 0 {
+            env::panic(b"Can't transfer 0 tokens");
+        }
+        assert_ne!(
+            owner_id, new_owner_id,
+            "The new owner should be different from the current owner"
+        );
+        // Retrieving the account from the state.
+        let mut account = self.get_account(&owner_id);
+
+        // Checking and updating unlocked balance
+        if account.balance < amount {
+            env::panic(b"Not enough balance");
+        }
+        account.balance -= amount;
+
+        // If transferring by escrow, need to check and update allowance.
+        let escrow_account_id = env::predecessor_account_id();
+        if escrow_account_id != owner_id {
+            let allowance = account.get_allowance(&escrow_account_id);
+            if allowance < amount {
+                env::panic(b"Not enough allowance");
+            }
+            account.set_allowance(&escrow_account_id, allowance - amount);
+        }
+
+        // Saving the account back to the state.
+        self.set_account(&owner_id, &account);
+
+        // Deposit amount to the new owner and save the new account to the state.
+        let mut new_account = self.get_account(&new_owner_id);
+        new_account.balance += amount;
+        self.set_account(&new_owner_id, &new_account);
+        self.refund_storage(initial_storage);
+    }
+
+    pub fn transfer(&mut self, new_owner_id: AccountId, amount: Balance) {
+        // NOTE: New owner's Account ID checked in transfer_from.
+        // Storage fees are also refunded in transfer_from.
+        self.transfer_from(env::predecessor_account_id(), new_owner_id, amount);
+    }
+
+    pub fn mint(&mut self, account_id: AccountId, amount: Balance) {
+        let mut account = self.get_account(&account_id);
+        account.balance += amount;
+        self.total_supply += amount;
+        self.set_account(&account_id, &account);
+    }
+
+    pub fn burn(&mut self, account_id: AccountId, amount: Balance) {
+        let mut account = self.get_account(&account_id);
+        assert!(account.balance >= amount, "ERR_INSUFFICIENT_BAL");
+        account.balance -= amount;
+        self.total_supply -= amount;
+        self.set_account(&account_id, &account);
+    }
+
+    #[inline]
+    pub fn get_total_supply(&self) -> Balance {
+        self.total_supply
+    }
+
+    pub fn get_balance(&self, account_id: AccountId) -> Balance {
+        self.get_account(&account_id).balance
+    }
+
+    pub fn get_allowance(&self, owner_id: AccountId, escrow_account_id: AccountId) -> Balance {
+        assert!(
+            env::is_valid_account_id(escrow_account_id.as_bytes()),
+            "Escrow account ID is invalid"
+        );
+        self.get_account(&owner_id)
+            .get_allowance(&escrow_account_id)
+    }
+
+    /// Helper method to get the account details for `owner_id`.
+    pub fn get_account(&self, owner_id: &AccountId) -> Account {
+        assert!(
+            env::is_valid_account_id(owner_id.as_bytes()),
+            "Owner's account ID is invalid"
+        );
+        let account_hash = env::sha256(owner_id.as_bytes());
+        self.accounts
+            .get(&account_hash)
+            .unwrap_or_else(|| Account::new(account_hash))
+    }
+
+    /// Helper method to set the account details for `owner_id` to the state.
+    pub fn set_account(&mut self, owner_id: &AccountId, account: &Account) {
+        let account_hash = env::sha256(owner_id.as_bytes());
+        if account.balance > 0 || !account.allowances.is_empty() {
+            self.accounts.insert(&account_hash, &account);
+        } else {
+            self.accounts.remove(&account_hash);
+        }
+    }
+
+    pub fn refund_storage(&self, initial_storage: StorageUsage) {
+        let current_storage = env::storage_usage();
+        let attached_deposit = env::attached_deposit();
+        let refund_amount = if current_storage > initial_storage {
+            let required_deposit =
+                Balance::from(current_storage - initial_storage) * STORAGE_PRICE_PER_BYTE;
+            assert!(
+                required_deposit <= attached_deposit,
+                "The required attached deposit is {}, but the given attached deposit is is {}",
+                required_deposit,
+                attached_deposit,
+            );
+            attached_deposit - required_deposit
+        } else {
+            attached_deposit
+                + Balance::from(initial_storage - current_storage) * STORAGE_PRICE_PER_BYTE
+        };
+        if refund_amount > 0 {
+            env::log(format!("Refunding {} tokens for storage", refund_amount).as_bytes());
+            Promise::new(env::predecessor_account_id()).transfer(refund_amount);
+        }
+    }
+}
+
+/// Trait with FungibleToken interface that implements NEP-21 standard.
+pub trait FungibleToken {
+    /// Increments the `allowance` for `escrow_account_id` by `amount` on the account of the caller of this contract
+    /// (`predecessor_id`) who is the balance owner.
+    /// Requirements:
+    /// * Caller of the method has to attach deposit enough to cover storage difference at the
+    ///   fixed storage price defined in the contract.
+    fn inc_allowance(&mut self, escrow_account_id: AccountId, amount: U128);
+
+    /// Decrements the `allowance` for `escrow_account_id` by `amount` on the account of the caller of this contract
+    /// (`predecessor_id`) who is the balance owner.
+    /// Requirements:
+    /// * Caller of the method has to attach deposit enough to cover storage difference at the
+    ///   fixed storage price defined in the contract.
+    fn dec_allowance(&mut self, escrow_account_id: AccountId, amount: U128);
+
+    /// Transfers the `amount` of tokens from `owner_id` to the `new_owner_id`.
+    /// Requirements:
+    /// * `amount` should be a positive integer.
+    /// * `owner_id` should have balance on the account greater or equal than the transfer `amount`.
+    /// * If this function is called by an escrow account (`owner_id != predecessor_account_id`),
+    ///   then the allowance of the caller of the function (`predecessor_account_id`) on
+    ///   the account of `owner_id` should be greater or equal than the transfer `amount`.
+    /// * Caller of the method has to attach deposit enough to cover storage difference at the
+    ///   fixed storage price defined in the contract.
+    fn transfer_from(&mut self, owner_id: AccountId, new_owner_id: AccountId, amount: U128);
+
+    /// Transfer `amount` of tokens from the caller of the contract (`predecessor_id`) to
+    /// `new_owner_id`.
+    /// Act the same was as `transfer_from` with `owner_id` equal to the caller of the contract
+    /// (`predecessor_id`).
+    /// Requirements:
+    /// * Caller of the method has to attach deposit enough to cover storage difference at the
+    ///   fixed storage price defined in the contract.
+    fn transfer(&mut self, new_owner_id: AccountId, amount: U128);
+
+    /// Returns total supply of tokens.
+    fn get_total_supply(&self) -> U128;
+
+    /// Returns balance of the `owner_id` account.
+    fn get_balance(&self, owner_id: AccountId) -> U128;
+
+    /// Returns current allowance of `escrow_account_id` for the account of `owner_id`.
+    ///
+    /// NOTE: Other contracts should not rely on this information, because by the moment a contract
+    /// receives this information, the allowance may already be changed by the owner.
+    /// So this method should only be used on the front-end to see the current allowance.
+    fn get_allowance(&self, owner_id: AccountId, escrow_account_id: AccountId) -> U128;
+}
+
+#[ext_contract(ext_nep21)]
+pub trait ExtNEP21 {
+    fn transfer(&mut self, new_owner_id: AccountId, amount: U128);
+
+    fn transfer_from(&mut self, owner_id: AccountId, new_owner_id: AccountId, amount: U128);
+
+    fn get_balance(&self, owner_id: AccountId) -> U128;
+}
+
+'''
+'''--- near-test-rs/Cargo.toml ---
+[package]
+name = "near-test"
+version = "0.1.0"
+authors = ["Illia Polosukhin <illia.polosukhin@gmail.com>"]
+edition = "2018"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+
+[dependencies]
+serde_json = "*"
+serde = { version = "*", features = ["derive"] }
+near-sdk = "0.11.0"
+borsh = "0.6.2"
+# near-sdk = "1.0.0"
+quickcheck = "0.9"
+quickcheck_macros = "0.9"
+log = "0.4"
+env_logger = { version = "0.7.1", default-features = false }
+near-crypto = { git = "https://github.com/nearprotocol/nearcore.git" }
+near-primitives = { git = "https://github.com/nearprotocol/nearcore.git" }
+near-runtime-standalone = { git = "https://github.com/nearprotocol/nearcore.git" }
+
+'''
+'''--- near-test-rs/src/context.rs ---
+use near_sdk::{AccountId, Balance, BlockHeight, MockedBlockchain, PromiseResult, PublicKey, VMContext};
+
+/// Simple VMContext builder that allows to quickly create custom context in tests.
+pub struct VMContextBuilder {
+    context: VMContext,
+}
+
+impl VMContextBuilder {
+    pub fn new() -> Self {
+        Self {
+            context: VMContext {
+                current_account_id: "".to_string(),
+                signer_account_id: "".to_string(),
+                signer_account_pk: vec![0u8; 32],
+                predecessor_account_id: "".to_string(),
+                input: vec![],
+                block_index: 0,
+                block_timestamp: 0,
+                epoch_height: 0,
+                account_balance: 10u128.pow(26),
+                account_locked_balance: 0,
+                storage_usage: 1024 * 300,
+                attached_deposit: 0,
+                prepaid_gas: 10u64.pow(18),
+                random_seed: vec![0u8; 32],
+                is_view: false,
+                output_data_receivers: vec![],
+            },
+        }
+    }
+
+    pub fn current_account_id(mut self, account_id: AccountId) -> Self {
+        self.context.current_account_id = account_id;
+        self
+    }
+
+    pub fn signer_account_id(mut self, account_id: AccountId) -> Self {
+        self.context.signer_account_id = account_id;
+        self
+    }
+
+    pub fn signer_account_pk(mut self, pk: PublicKey) -> Self {
+        self.context.signer_account_pk = pk;
+        self
+    }
+
+    pub fn predecessor_account_id(mut self, account_id: AccountId) -> Self {
+        self.context.predecessor_account_id = account_id;
+        self
+    }
+
+    pub fn block_index(mut self, block_index: BlockHeight) -> Self {
+        self.context.block_index = block_index;
+        self
+    }
+
+    pub fn attached_deposit(mut self, amount: Balance) -> Self {
+        self.context.attached_deposit = amount;
+        self
+    }
+
+    pub fn account_balance(mut self, amount: Balance) -> Self {
+        self.context.account_balance = amount;
+        self
+    }
+
+    pub fn account_locked_balance(mut self, amount: Balance) -> Self {
+        self.context.account_locked_balance = amount;
+        self
+    }
+
+    pub fn finish(self) -> VMContext {
+        self.context
+    }
+}
+
+pub fn testing_env_with_promise_results(context: VMContext, promise_result: PromiseResult) {
+    let storage = near_sdk::env::take_blockchain_interface()
+        .unwrap()
+        .as_mut_mocked_blockchain()
+        .unwrap()
+        .take_storage();
+
+    near_sdk::env::set_blockchain_interface(Box::new(MockedBlockchain::new(
+        context,
+        Default::default(),
+        Default::default(),
+        vec![promise_result],
+        storage,
+        Default::default(),
+    )));
+}
+
+'''
+'''--- near-test-rs/src/lib.rs ---
+
+pub mod test_user;
+pub mod token;
+pub mod context;
+pub mod units;
+
+'''
+'''--- near-test-rs/src/test_user.rs ---
+use near_crypto::{InMemorySigner, Signer};
+use near_primitives::{
+    account::AccessKey,
+    hash::CryptoHash,
+    transaction::{ExecutionOutcome, ExecutionStatus, Transaction},
+    types::Balance,
+};
+use near_runtime_standalone::{init_runtime_and_signer, RuntimeStandalone};
+use near_sdk::AccountId;
+
+pub use crate::units::to_yocto;
+
+const DEFAULT_GAS: u64 = 300_000_000_000_000;
+const STORAGE_AMOUNT: u128 = 50_000_000_000_000_000_000_000_000;
+
+pub type TxResult = Result<ExecutionOutcome, ExecutionOutcome>;
+
+fn outcome_into_result(outcome: ExecutionOutcome) -> TxResult {
+    match outcome.status {
+        ExecutionStatus::SuccessValue(_) => Ok(outcome),
+        ExecutionStatus::Failure(_) => Err(outcome),
+        ExecutionStatus::SuccessReceiptId(_) => panic!("Unresolved ExecutionOutcome run runtime.resolve(tx) to resolve the final outcome of tx"),
+        ExecutionStatus::Unknown => unreachable!()
+    }
+}
+
+pub struct TestRuntime {
+    runtime: RuntimeStandalone,
+    signer: InMemorySigner,
+}
+
+impl TestRuntime {
+    pub fn new(
+        runtime: RuntimeStandalone,
+        signer: InMemorySigner,
+    ) -> Self {
+        Self {
+            runtime,
+            signer,
+        }
+    }
+
+    pub fn transaction(&self, signer_id: AccountId, receiver_id: AccountId) -> Transaction {
+        let nonce = self
+            .runtime
+            .view_access_key(&signer_id, &self.signer.public_key())
+            .unwrap()
+            .nonce
+            + 1;
+        Transaction::new(
+            signer_id.clone(),
+            self.signer.public_key(),
+            receiver_id,
+            nonce,
+            CryptoHash::default(),
+        )
+    }
+
+    pub fn submit_transaction(&mut self, transaction: Transaction) -> TxResult {
+        let res = self
+            .runtime
+            .resolve_tx(transaction.sign(&self.signer))
+            .unwrap();
+        self.runtime.process_all().unwrap();
+        outcome_into_result(res)
+    }
+
+    pub fn deploy(
+        &mut self,
+        signer_id: AccountId,
+        contract_id: AccountId,
+        wasm_bytes: &[u8],
+        args: serde_json::Value,
+    ) -> TxResult {
+        self.submit_transaction(
+            self.transaction(signer_id, contract_id)
+                .create_account()
+                .transfer(STORAGE_AMOUNT)
+                .deploy_contract(wasm_bytes.to_vec())
+                .function_call(
+                    "new".to_string(),
+                    args.to_string().as_bytes().to_vec(),
+                    DEFAULT_GAS,
+                    0,
+                ),
+        )
+    }
+
+    pub fn call(
+        &mut self,
+        signer_id: AccountId,
+        contract_id: AccountId,
+        method: &str,
+        args: serde_json::Value,
+        deposit: u128,
+    ) -> TxResult {
+        self.call_args(signer_id, contract_id, method, args.to_string().as_bytes().to_vec(), deposit)
+   }
+
+    pub fn call_args(&mut self, signer_id: AccountId, contract_id: AccountId, method: &str, args: Vec<u8>, deposit: u128) -> TxResult {
+       self.submit_transaction(self.transaction(signer_id, contract_id).function_call(
+            method.to_string(),
+            args,
+            DEFAULT_GAS,
+            deposit,
+       ))
+    }
+
+    pub fn view(
+        &mut self,
+        contract_id: AccountId,
+        method: &str,
+        args: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::from_slice(
+            &self
+                .runtime
+                .view_method_call(
+                    &contract_id,
+                    &method.to_string(),
+                    args.to_string().as_bytes(),
+                )
+                .unwrap()
+                .0,
+        )
+        .unwrap()
+    }
+
+    pub fn create_user(&mut self, signer_id: AccountId, account_id: AccountId, amount: Balance) {
+        self.submit_transaction(
+            self.transaction(signer_id, account_id)
+                .create_account()
+                .add_key(self.signer.public_key(), AccessKey::full_access())
+                .transfer(amount),
+        )
+        .unwrap();
+    }
+}
+
+pub fn init_test_runtime() -> TestRuntime {
+    let (runtime, signer) = init_runtime_and_signer(&"root".into());
+    TestRuntime::new(runtime, signer)
+}
+
+'''
+'''--- near-test-rs/src/token.rs ---
+use near_sdk::{AccountId, Balance};
+use near_sdk::json_types::U128;
+use serde_json::json;
+
+use crate::test_user::{TestRuntime, TxResult};
+use crate::units::to_yocto;
+
+const STORAGE_PRICE_PER_BYTE: Balance = 100000000000000000000;
+
+/// Interface for fungible token contract to test in standalone mode.
+pub struct TokenContract {
+    pub contract_id: AccountId,
+}
+
+impl TokenContract {
+    pub fn new(
+        runtime: &mut TestRuntime,
+        signer_id: &AccountId,
+        wasm_bytes: &[u8],
+        contract_id: AccountId,
+        owner_id: &AccountId,
+        total_supply: &str,
+    ) -> Self {
+        let _ = runtime.deploy(signer_id.clone(), contract_id.clone(), wasm_bytes, json!({"owner_id": owner_id.clone(), "total_supply": U128::from(to_yocto(total_supply))})).unwrap();
+        Self { contract_id }
+    }
+
+    pub fn mint(&self, runtime: &mut TestRuntime, signer_id: &AccountId, account_id: &AccountId, amount: &str) -> TxResult {
+        runtime
+            .call(
+                signer_id.clone(),
+                self.contract_id.clone(),
+                "mint",
+                json!({"account_id": account_id, "amount": U128::from(to_yocto(amount))}),
+                0,
+            )
+    }
+
+    pub fn transfer(&self, runtime: &mut TestRuntime, signer_id: &AccountId, new_owner_id: &AccountId, amount: U128) -> TxResult {
+        runtime.call(signer_id.clone(), self.contract_id.clone(), "transfer", json!({"new_owner_id": new_owner_id, "amount": amount}), 0)
+    }
+
+    pub fn transfer_from(&self, runtime: &mut TestRuntime, signer_id: &AccountId, owner_id: &AccountId, new_owner_id: &AccountId, amount: U128) -> TxResult {
+        runtime.call(signer_id.clone(), self.contract_id.clone(), "transfer_from", json!({"owner_id": owner_id, "new_owner_id": new_owner_id, "amount": amount}), 0)
+    }
+
+    pub fn inc_allowance(&self, runtime: &mut TestRuntime, signer_id: &AccountId, escrow_account_id: AccountId, amount: U128) -> TxResult {
+        runtime.call(signer_id.clone(), self.contract_id.clone(), "inc_allowance", json!({"escrow_account_id": escrow_account_id, "amount": amount}), 1024 * STORAGE_PRICE_PER_BYTE)
+    }
+
+    pub fn dec_allowance(&self, runtime: &mut TestRuntime, signer_id: &AccountId, escrow_account_id: AccountId, amount: U128) -> TxResult {
+        runtime.call(signer_id.clone(), self.contract_id.clone(), "dec_allowance", json!({"escrow_account_id": escrow_account_id, "amount": amount}), 0)
+    }
+
+    pub fn get_total_supply(&self, runtime: &mut TestRuntime) -> String {
+        runtime.view(self.contract_id.clone(), "get_total_supply", json!({})).as_str().unwrap().to_string()
+    }
+
+    pub fn get_balance(&self, runtime: &mut TestRuntime, owner_id: String) -> String {
+        runtime.view(self.contract_id.clone(), "get_balance", json!({"owner_id": owner_id})).as_str().unwrap().to_string()
+    }
+
+    pub fn get_allowance(&self, runtime: &mut TestRuntime, owner_id: String, escrow_account_id: AccountId) -> String {
+        runtime.view(self.contract_id.clone(), "get_balance", json!({"owner_id": owner_id, "escrow_account_id": escrow_account_id})).as_str().unwrap().to_string()
+    }
+}
+
+'''
+'''--- near-test-rs/src/units.rs ---
+
+pub fn to_nanos(num_days: u64) -> u64 {
+    num_days * 86400_000_000_000
+}
+
+pub fn to_ts(num_days: u64) -> u64 {
+    // 2018-08-01 UTC in nanoseconds
+    1533081600_000_000_000 + to_nanos(num_days)
+}
+
+pub fn to_yocto(value: &str) -> u128 {
+    let vals: Vec<_> = value.split(".").collect();
+    let part1 = vals[0].parse::<u128>().unwrap() * 10u128.pow(24);
+    if vals.len() > 1 {
+        let power = vals[1].len() as u32;
+        let part2 = vals[1].parse::<u128>().unwrap() * 10u128.pow(24 - power);
+        part1 + part2
+    } else {
+        part1
+    }
+}
+
+'''
+'''--- test-token/Cargo.toml ---
+[package]
+name = "test-token"
+version = "0.1.0"
+authors = ["Illia Polosukhin <illia.polosukhin@gmail.com>"]
+edition = "2018"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+
+[dependencies]
+near-sdk = "1.0.0"
+near-lib = { path = "../near-lib-rs" }
+
+[dev-dependencies]
+lazy_static = "1.4.0"
+quickcheck = "0.9"
+quickcheck_macros = "0.9"
+log = "0.4"
+env_logger = { version = "0.7.1", default-features = false }
+near-crypto = { git = "https://github.com/nearprotocol/nearcore.git" }
+near-primitives = { git = "https://github.com/nearprotocol/nearcore.git" }
+near-runtime-standalone = { git = "https://github.com/nearprotocol/nearcore.git" }
+
+'''
+'''--- test-token/build.sh ---
+#!/bin/bash
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo +stable build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/test_token.wasm ./res/
+
+'''
+'''--- test-token/src/lib.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::json_types::U128;
+use near_sdk::{env, near_bindgen, AccountId};
+
+use near_lib::token::{FungibleToken, Token};
+
+#[global_allocator]
+static ALLOC: near_sdk::wee_alloc::WeeAlloc<'_> = near_sdk::wee_alloc::WeeAlloc::INIT;
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct TToken {
+    token: Token,
+}
+
+impl Default for TToken {
+    fn default() -> Self {
+        panic!("Test token should be initialized before usage")
+    }
+}
+
+#[near_bindgen]
+impl TToken {
+    /// Initializes the contract with the given total supply owned by the given `owner_id`.
+    #[init]
+    pub fn new(owner_id: AccountId, total_supply: U128) -> Self {
+        let total_supply = total_supply.into();
+        assert!(!env::state_exists(), "Already initialized");
+        Self {
+            token: Token::new(owner_id, total_supply),
+        }
+    }
+
+    pub fn mint(&mut self, account_id: AccountId, amount: U128) {
+        self.token.mint(account_id, amount.into());
+    }
+}
+
+#[near_bindgen]
+impl FungibleToken for TToken {
+    #[payable]
+    fn inc_allowance(&mut self, escrow_account_id: String, amount: U128) {
+        self.token.inc_allowance(escrow_account_id, amount.into());
+    }
+
+    #[payable]
+    fn dec_allowance(&mut self, escrow_account_id: String, amount: U128) {
+        self.token.dec_allowance(escrow_account_id, amount.into());
+    }
+
+    #[payable]
+    fn transfer_from(&mut self, owner_id: String, new_owner_id: String, amount: U128) {
+        self.token
+            .transfer_from(owner_id, new_owner_id, amount.into());
+    }
+
+    #[payable]
+    fn transfer(&mut self, new_owner_id: String, amount: U128) {
+        self.token.transfer(new_owner_id, amount.into());
+    }
+
+    fn get_total_supply(&self) -> U128 {
+        self.token.get_total_supply().into()
+    }
+
+    fn get_balance(&self, owner_id: String) -> U128 {
+        self.token.get_balance(owner_id).into()
+    }
+
+    fn get_allowance(&self, owner_id: String, escrow_account_id: String) -> U128 {
+        self.token.get_allowance(owner_id, escrow_account_id).into()
+    }
+}
+
+'''

@@ -1,0 +1,1797 @@
+*GitHub Repository "near-multicall/nearcon22"*
+
+'''--- Cargo.toml ---
+[workspace]
+members = [
+  "core",
+  "methods",
+  "web/server",
+]
+
+exclude = [
+  "host",
+  "contract",
+  "web/client",
+]
+
+'''
+'''--- README.md ---
+# nearcon22
+Submission for the NEARCON2022 Hackerthon
+
+'''
+'''--- build.sh ---
+#!/bin/bash
+
+cargo build --release
+cargo build --release --manifest-path contract/Cargo.toml
+# compile the contract
+cd ./contract
+cargo build --release
+cd ..
+
+cd ./web/client/merkle
+wasm-pack build --target web --release
+
+'''
+'''--- contract/.cargo/config.toml ---
+[build]
+target = "wasm32-unknown-unknown"
+
+'''
+'''--- contract/Cargo.toml ---
+[package]
+name = "drop-contract"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "3.1"
+near-contract-standards = "3.1.0"
+drop-core = { path="../core" }
+drop-methods = { path = "../methods" }
+base64ct = { version = "1.0.1", features = ["alloc"] }
+base64 = "0.13"
+merkle_light = { version = "0.4.0" }
+bincode = "1.3"
+risc0-zkvm-core = "0.10"
+risc0-zkvm-serde = "0.10"
+risc0-zkvm-verify = { version = "0.10", default-features = false, features = ["verify"] }
+serde = "1.0"
+
+[profile.release]
+codegen-units = 1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+'''
+'''--- contract/src/lib.rs ---
+use std::collections::HashSet;
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::collections::{UnorderedMap};
+use near_sdk::{near_bindgen, AccountId, BorshStorageKey, PanicOnDefault, env, ext_contract, PromiseResult, Promise};
+use near_sdk::json_types::{U128};
+use drop_core::{LeafInfo, ZkProofCommit, MerkleDropProof, Sha256Hasher, sha256_to_base64_string};
+use drop_methods::{PROVEDROP_ID};
+use risc0_zkvm_verify::zkvm::{MethodID, Receipt};
+use base64ct::{ Base64, Encoding };
+use merkle_light::proof::Proof;
+use near_contract_standards::fungible_token::core_impl::ext_fungible_token;
+
+pub const GAS_FOR_WITHDRAW: u64 = 20_000_000_000;
+pub const GAS_FOR_CLAIM: u64 = 40_000_000_000;
+pub const GAS_FOR_CLAIM_CALLBACK: u64 = 10_000_000_000;
+
+#[derive(BorshStorageKey, BorshSerialize)]
+pub(crate) enum StorageKey {
+    Airdrops,
+    AllBalances,
+    Balances {account_id: AccountId}
+}
+
+#[ext_contract(ext_self)]
+pub trait DropContract {
+    fn claim_callback(
+        &mut self,
+        airdrop_id: u64,
+        user: AccountId,
+        amount: U128,
+    );
+}
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Contract {
+    airdrops: UnorderedMap<u64, Airdrop>,
+    balances: UnorderedMap<AccountId, UnorderedMap<AccountId, U128>>
+}
+
+#[near_bindgen]
+impl Contract {
+
+    #[init]
+    pub fn new() -> Self {
+        Self {
+            airdrops: UnorderedMap::new(StorageKey::Airdrops),
+            balances: UnorderedMap::new(StorageKey::AllBalances)
+        }
+    }
+
+    pub fn get_number_airdrops(&self) -> u64 {
+        return self.airdrops.len();
+    }
+
+    pub fn get_airdrop_info(&self, airdrop_id: u64) -> Airdrop {
+        return self.airdrops.get(&airdrop_id).expect("no airdrop found for given ID!").into();
+    }
+
+    pub fn get_balance(&self, account_id: AccountId) -> Vec<(AccountId, U128)> {
+        return self.balances.get(&account_id).expect("user has no funds!").to_vec();
+    }
+
+    pub fn create_new_airdrop(
+        &mut self, 
+        token_id: AccountId, 
+        ipfs_cid: String, 
+        expiry_date: u64,
+        description: String,
+        receipt_str: String
+    ) -> u64 {
+        // validate creator has token deposits
+        let creator = env::predecessor_account_id();
+        let mut token_table = self.balances.get(&creator).expect("creator does not have funds!");
+        let balance = token_table.get(&token_id).expect("creator did not deposit correct token!");
+
+        // parse receipt for ZK commit + proof
+        let method_id = MethodID::try_from(PROVEDROP_ID).unwrap();
+        let journal = verify_receipt(&receipt_str, &method_id);
+        let commit = risc0_zkvm_serde::from_slice::<ZkProofCommit>(&journal).unwrap();
+        let amount: U128 = U128(commit.token_sum.into());
+        let root_hash: String = sha256_to_base64_string(&commit.root_hash);
+        assert!(balance.0 > amount.0, "creator does not have enough funds!");
+        
+        // reduce creators balance and give it to the airdrop
+        let new_balance = U128(balance.0 - amount.0);
+        token_table.insert(&token_id, &new_balance);
+        self.balances.insert(&creator, &token_table);
+
+        let new_airdrop = Airdrop {
+            description,
+            creator,
+            token_id,
+            ipfs_cid,
+            root_hash,
+            expiry_date,
+            claimed_users: HashSet::new(),
+            amount
+        };
+        let key = self.airdrops.len();
+        self.airdrops.insert(&key, &new_airdrop);
+        return key;
+    }
+
+    #[allow(unreachable_code)]
+    pub fn ft_on_transfer(
+        &mut self,
+        sender_id: AccountId,
+        amount: U128,
+        msg: String,
+    ) -> U128 {
+        let token_in = env::predecessor_account_id();
+
+        let mut token_table: UnorderedMap<AccountId, U128> = UnorderedMap::new(StorageKey::Balances {account_id: sender_id.clone()});
+        if self.balances.get(&sender_id).is_some() {
+            token_table = self.balances.get(&sender_id).unwrap();
+
+            if token_table.get(&token_in).is_some() {
+                // update token amount
+                let old_token_amt: U128 = token_table.get(&token_in).unwrap();
+                let new_token_amt = U128(old_token_amt.0 + amount.0);
+                token_table.insert(&token_in, &new_token_amt);
+            } else {
+                // add token to token table
+                token_table.insert(&token_in, &amount);
+            }
+
+        } else {
+            // add user and token
+            token_table.insert(&token_in, &amount);
+        }
+
+        self.balances.insert(&sender_id, &token_table);
+        0.into()
+    }
+
+    pub fn claim(&self, airdrop_id: u64, amt: String, memo: String, proof: MerkleDropProof) -> Promise {
+
+        // ensure airdrop with id exists
+        assert!(self.airdrops.get(&airdrop_id).is_some(), "no airdrop with this id!"); 
+    
+        // ensure account + amount + memo hashed is in a leaf
+        let user = env::predecessor_account_id();
+        let hash = LeafInfo { addr: user.clone(), amt: amt.clone(), memo: memo.clone() }.to_hash();
+        assert!(Base64::encode_string(&hash).to_owned() == proof.lemma[0], "proof incompatible with claim!");
+    
+        // ensure merkle root is our merkle root
+        let mut airdrop: Airdrop = self.airdrops.get(&airdrop_id).expect("no airdrop with found!").into();
+        assert!(&airdrop.root_hash == proof.lemma.last().unwrap(), "merkel root does not match the airdrops root hash!");
+    
+        // ensure merkle proof is valid
+        let merkle_light_proof = Proof::new(
+            proof.lemma
+                .iter()
+                .map(|l| Base64::decode_vec(l).unwrap().as_slice().try_into().unwrap())
+                .collect(), 
+            proof.path
+        );
+        assert!(merkle_light_proof.validate::<Sha256Hasher>(), "invalid merkle proof!");
+
+        // ensure user has not yet claimed the airdrop
+        assert!(!airdrop.claimed_users.contains(&user), "user already claimed airdrop!");
+
+        // set user to claimed
+        airdrop.claimed_users.insert(user.clone());
+
+        // transfer token amount
+        return ext_fungible_token::ft_transfer(
+            user.to_owned(),
+            U128(amt.parse::<u128>().unwrap()),
+            Some(memo.to_owned()),
+            &airdrop.token_id,
+            1,
+            GAS_FOR_CLAIM,
+        )
+        // on error revoke claimed
+        // on success decrease airdrop amount
+        .then(ext_self::claim_callback(
+            airdrop_id,
+            user.clone(),
+            U128(amt.parse::<u128>().unwrap()),
+            &env::current_account_id(),
+            0,
+            GAS_FOR_CLAIM_CALLBACK,
+        ));
+
+    }
+
+    #[private]
+    pub fn claim_callback(
+        &mut self,
+        airdrop_id: u64,
+        user: AccountId,
+        amount: U128,
+    ) -> U128 {
+        assert_eq!(
+            env::promise_results_count(),
+            1,
+            "{}",
+            "expected 1 promise result from claim!"
+        );
+        match env::promise_result(0) {
+            PromiseResult::NotReady => unreachable!(),
+            PromiseResult::Successful(_) => {
+                let mut airdrop = self.airdrops.get(&airdrop_id).unwrap();
+                airdrop.amount = U128(airdrop.amount.0 - amount.0);
+                self.airdrops.insert(&airdrop_id, &airdrop);
+                amount
+            },
+            PromiseResult::Failed => {
+                let mut airdrop: Airdrop = self.airdrops.get(&airdrop_id).expect("no airdrop with found!").into();
+                airdrop.claimed_users.remove(&user);
+                0.into()
+            }
+        }
+    }
+}
+
+// TODO move claimed users into own struct
+#[derive(Serialize, Deserialize, BorshDeserialize, BorshSerialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Airdrop {
+    description: String,
+    creator: AccountId,
+    token_id: AccountId,
+    ipfs_cid: String,
+    root_hash: String,
+    expiry_date: u64,
+    claimed_users: HashSet<AccountId>,
+    amount: U128
+}
+
+pub fn verify_receipt(str: &String, method_id: &MethodID) -> Vec<u32> {
+    let as_bytes = base64::decode(str).unwrap();
+    let receipt = bincode::deserialize::<Receipt>(&as_bytes).unwrap();
+    receipt.verify(&method_id).expect("verification failed");
+    receipt.get_journal_u32()
+}
+
+'''
+'''--- core/Cargo.toml ---
+[package]
+name = "drop-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+base64ct = { version = "1.0.1", features = ["alloc"] }
+sha2 = { version = "0.10.5" }
+merkle_light = { version = "0.4.0" }
+merkle_light_derive = { version = "0.4.0" }
+
+'''
+'''--- core/src/lib.rs ---
+use sha2::Digest;
+use merkle_light::merkle::{MerkleTree};
+use merkle_light_derive::Hashable;
+use serde::{Serialize, Deserialize};
+use std::hash::Hasher;
+use sha2::Sha256;
+// use risc0_zkvm_guest::{env, sha};
+use merkle_light::hash::Algorithm;
+use merkle_light::proof::Proof;
+use base64ct::{ Base64, Encoding };
+
+// Sha256 Hash type alias
+pub type Sha256Hash = [u8; 32];
+// TODO: ZK-Sha256 Hash type alias
+// pub type Sha256Hash = [u8; 32];
+
+// Sha256 implementations of Algorithm abstraction that we use in our integration tests
+pub struct Sha256Hasher(Sha256);
+// TODO: ZK-Sha256 implementations of Algorithm abstraction that we use in our integration tests
+// pub struct ZKSha256Hasher(sha);
+
+// Type for our merkle-drop tree
+pub type MerkleDropTree = MerkleTree<Sha256Hash, Sha256Hasher>;
+
+#[derive(Serialize, Deserialize)]
+pub struct MerkleDropProof {
+    // Sha256Hash encoded as base64 string
+    pub lemma: Vec<String>,
+    // how to combine hashes in each proof step (left vs. right hash)
+    pub path: Vec<bool>
+}
+
+impl Sha256Hasher {
+    pub fn new() -> Sha256Hasher {
+        Sha256Hasher(Sha256::new())
+    }
+}
+
+impl Default for Sha256Hasher {
+    fn default() -> Sha256Hasher {
+        Sha256Hasher::new()
+    }
+}
+
+impl Hasher for Sha256Hasher {
+    #[inline]
+    fn write(&mut self, msg: &[u8]) {
+        self.0.update(msg)
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        unimplemented!()
+    }
+}
+
+impl Algorithm<Sha256Hash> for Sha256Hasher {
+    #[inline]
+    fn hash(&mut self) -> Sha256Hash {
+        self.0.clone().finalize().as_slice().try_into().unwrap()
+    }
+
+    #[inline]
+    fn reset(&mut self) {
+        self.0.reset();
+    }
+}
+
+// generate merkle proof for every specified element
+pub fn gen_proofs (tree: &MerkleDropTree, from_index: u32, limit: u32) -> Vec<MerkleDropProof> {
+    let result = (from_index..limit).map(|i| {
+        let proof: Proof<Sha256Hash> = tree.gen_proof(i.try_into().unwrap());
+        return MerkleDropProof {
+            lemma: proof.lemma()
+                .into_iter()
+                .map(|hash| sha256_to_base64_string(hash))
+                .collect(),
+            path: proof.path().to_vec()
+        }
+    }).collect();
+
+    return result;
+}
+
+pub fn sha256_to_base64_string (raw_hash: &Sha256Hash) -> String {
+    // encode hash in base64 string
+    return Base64::encode_string(raw_hash).to_owned();
+}
+
+#[derive(Serialize, Deserialize, Hashable, Debug)]
+// addr: address | amt: amount | memo: notes, like reason for airdrop
+pub struct LeafInfo {
+    pub addr: String,
+    pub amt: String,
+    pub memo: String
+}
+
+impl LeafInfo {
+
+    pub fn to_hash(&self) -> Sha256Hash {
+        let mut data = Vec::<LeafInfo>::new();
+        data.push(LeafInfo { 
+            addr: self.addr.to_owned(), 
+            amt: self.amt.to_owned(), 
+            memo: self.memo.to_owned() 
+        });
+        let leaf: Leaves = Leaves { data };
+        let tree = leaf.gen_tree();
+        tree.root()
+    }
+
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Leaves {
+    pub data: Vec<LeafInfo>
+}
+
+impl Leaves {
+
+    pub fn gen_tree(&self) -> MerkleDropTree {
+        return MerkleTree::from_data(&self.data);
+    }
+
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ZkProofCommit {
+    pub root_hash: Sha256Hash,
+    pub token_sum: u32
+}
+
+'''
+'''--- host/Cargo.toml ---
+[package]
+name = "drop-host"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+base64 = "0.13"
+bincode = "1.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+drop-core = { path = "../core" }
+drop-methods = { path = "../methods" }
+risc0-zkvm-host = "0.10"
+risc0-zkvm-serde = "0.10"
+
+'''
+'''--- host/src/main.rs ---
+/// Hard-coded host (runs ZK prover) for debugging
+/// as it's more straightforward than a server environment
+
+use serde::{Deserialize, Serialize};
+
+use drop_core::{sha256_to_base64_string, Leaves, LeafInfo, ZkProofCommit};
+use drop_methods::{PROVEDROP_ID, PROVEDROP_PATH};
+use risc0_zkvm_host::Prover;
+
+#[derive(Deserialize, Serialize)]
+pub struct Receipt {
+    journal: Vec<u8>,
+    seal: Vec<u32>,
+}
+
+fn main() {
+    let first_leaf = LeafInfo {
+        addr: "a".to_owned(),
+        amt: "10".to_owned(),
+        memo: "".to_owned()
+    };
+    let second_leaf = LeafInfo {
+        addr: "b".to_owned(),
+        amt: "20".to_owned(),
+        memo: "".to_owned()
+    };
+    let test_leaves = Leaves { data: vec![first_leaf, second_leaf] };
+    let mut prover = Prover::new(&std::fs::read(PROVEDROP_PATH).unwrap(), PROVEDROP_ID).unwrap();
+    let vec = risc0_zkvm_serde::to_vec(&test_leaves).unwrap();
+    prover.add_input(vec.as_slice());
+    println!("running prover...");
+    let receipt = prover.run().unwrap();
+    println!("prover run success!");
+    let receipt = Receipt {
+        journal: receipt.get_journal().unwrap().to_vec(),
+        seal: receipt.get_seal().unwrap().to_vec(),
+    };
+    println!("zk receipt success!");
+    let output_vec = prover.get_output_vec().unwrap();
+    let result = risc0_zkvm_serde::from_slice::<ZkProofCommit>(output_vec.as_slice()).unwrap();
+
+    print!("token sum: {}", &result.token_sum.to_string());
+    print!("root hash: {}", sha256_to_base64_string(&result.root_hash));
+}
+
+'''
+'''--- methods/Cargo.toml ---
+[package]
+name = "drop-methods"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.risc0]
+methods = ["guest"]
+
+[profile.release]
+lto = true
+opt-level = "z"
+
+[build-dependencies]
+risc0-build = "0.10"
+
+'''
+'''--- methods/build.rs ---
+// Copyright 2022 Risc0, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+fn main() {
+    risc0_build::embed_methods();
+}
+
+'''
+'''--- methods/guest/Cargo.toml ---
+[workspace]
+
+[package]
+name = "drop-methods-guest"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+drop-core = { path = "../../core" }
+risc0-zkvm-guest = "0.10"
+
+[profile.release]
+lto = true
+opt-level = "z"
+
+[build-dependencies]
+risc0-build = "0.10"
+'''
+'''--- methods/guest/build.rs ---
+// Copyright 2022 Risc0, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+fn main() {
+    risc0_build::link();
+}
+'''
+'''--- methods/guest/src/bin/provedrop.rs ---
+// Copyright 2022 Risc0, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#![no_main]
+#![no_std]
+#[macro_use]
+extern crate alloc;
+use alloc::{vec, string};
+use vec::Vec;
+use string::String;
+
+// Recommendation by pem: Actually implement String 
+//struct String {
+//    len: u16
+//    string: 
+//}
+
+use risc0_zkvm_guest::env;
+
+use drop_core::{Leaves, ZkProofCommit, MerkleDropTree};
+
+risc0_zkvm_guest::entry!(main);
+
+pub fn main() {
+    let balances: Leaves = env::read();
+    // sum of all token allocations
+    let drop_sum: u32 = balances.data
+        .iter()
+        .map(|claim| claim.amt.parse::<u32>().unwrap())
+        .sum::<u32>();
+    // convert claims into a merkle tree
+    let tree: MerkleDropTree = balances.gen_tree();
+    // commit results
+    env::commit(&ZkProofCommit {
+        root_hash: tree.root(),
+        token_sum: drop_sum
+    });
+}
+
+'''
+'''--- methods/src/lib.rs ---
+// Copyright 2022 Risc0, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+include!(concat!(env!("OUT_DIR"), "/methods.rs"));
+
+'''
+'''--- neardev/dev-account.env ---
+CONTRACT_NAME=dev-1663134336150-17003481999856
+'''
+'''--- web/client/README.md ---
+# Getting Started with Create React App
+
+This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
+
+## Available Scripts
+
+In the project directory, you can run:
+
+### `yarn start`
+
+Runs the app in the development mode.\
+Open [http://localhost:3000](http://localhost:3000) to view it in the browser.
+
+The page will reload if you make edits.\
+You will also see any lint errors in the console.
+
+### `yarn test`
+
+Launches the test runner in the interactive watch mode.\
+See the section about [running tests](https://facebook.github.io/create-react-app/docs/running-tests) for more information.
+
+### `yarn build`
+
+Builds the app for production to the `build` folder.\
+It correctly bundles React in production mode and optimizes the build for the best performance.
+
+The build is minified and the filenames include the hashes.\
+Your app is ready to be deployed!
+
+See the section about [deployment](https://facebook.github.io/create-react-app/docs/deployment) for more information.
+
+### `yarn eject`
+
+**Note: this is a one-way operation. Once you `eject`, you can’t go back!**
+
+If you aren’t satisfied with the build tool and configuration choices, you can `eject` at any time. This command will remove the single build dependency from your project.
+
+Instead, it will copy all the configuration files and the transitive dependencies (webpack, Babel, ESLint, etc) right into your project so you have full control over them. All of the commands except `eject` will still work, but they will point to the copied scripts so you can tweak them. At this point you’re on your own.
+
+You don’t have to ever use `eject`. The curated feature set is suitable for small and middle deployments, and you shouldn’t feel obligated to use this feature. However we understand that this tool wouldn’t be useful if you couldn’t customize it when you are ready for it.
+
+## Learn More
+
+You can learn more in the [Create React App documentation](https://facebook.github.io/create-react-app/docs/getting-started).
+
+To learn React, check out the [React documentation](https://reactjs.org/).
+
+'''
+'''--- web/client/merkle/Cargo.toml ---
+[package]
+name = "drop-merkle"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+console_error_panic_hook = { version = "0.1.7" }
+serde = { version = "1.0", features = ["derive"] }
+wasm-bindgen = { version = "0.2", features = ["serde-serialize"] }
+drop-core = { path="../../../core" }
+
+'''
+'''--- web/client/merkle/pkg/drop_merkle.d.ts ---
+/* tslint:disable */
+/* eslint-disable */
+/**
+* @param {any} balances_js
+* @returns {any}
+*/
+export function parse_balance_map(balances_js: any): any;
+
+export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
+
+export interface InitOutput {
+  readonly memory: WebAssembly.Memory;
+  readonly parse_balance_map: (a: number) => number;
+  readonly __wbindgen_malloc: (a: number) => number;
+  readonly __wbindgen_realloc: (a: number, b: number, c: number) => number;
+  readonly __wbindgen_free: (a: number, b: number) => void;
+}
+
+export type SyncInitInput = BufferSource | WebAssembly.Module;
+/**
+* Instantiates the given `module`, which can either be bytes or
+* a precompiled `WebAssembly.Module`.
+*
+* @param {SyncInitInput} module
+*
+* @returns {InitOutput}
+*/
+export function initSync(module: SyncInitInput): InitOutput;
+
+/**
+* If `module_or_path` is {RequestInfo} or {URL}, makes a request and
+* for everything else, calls `WebAssembly.instantiate` directly.
+*
+* @param {InitInput | Promise<InitInput>} module_or_path
+*
+* @returns {Promise<InitOutput>}
+*/
+export default function init (module_or_path?: InitInput | Promise<InitInput>): Promise<InitOutput>;
+
+'''
+'''--- web/client/merkle/pkg/drop_merkle.js ---
+
+let wasm;
+
+const heap = new Array(32).fill(undefined);
+
+heap.push(undefined, null, true, false);
+
+function getObject(idx) { return heap[idx]; }
+
+let WASM_VECTOR_LEN = 0;
+
+let cachedUint8Memory0 = new Uint8Array();
+
+function getUint8Memory0() {
+    if (cachedUint8Memory0.byteLength === 0) {
+        cachedUint8Memory0 = new Uint8Array(wasm.memory.buffer);
+    }
+    return cachedUint8Memory0;
+}
+
+const cachedTextEncoder = new TextEncoder('utf-8');
+
+const encodeString = (typeof cachedTextEncoder.encodeInto === 'function'
+    ? function (arg, view) {
+    return cachedTextEncoder.encodeInto(arg, view);
+}
+    : function (arg, view) {
+    const buf = cachedTextEncoder.encode(arg);
+    view.set(buf);
+    return {
+        read: arg.length,
+        written: buf.length
+    };
+});
+
+function passStringToWasm0(arg, malloc, realloc) {
+
+    if (realloc === undefined) {
+        const buf = cachedTextEncoder.encode(arg);
+        const ptr = malloc(buf.length);
+        getUint8Memory0().subarray(ptr, ptr + buf.length).set(buf);
+        WASM_VECTOR_LEN = buf.length;
+        return ptr;
+    }
+
+    let len = arg.length;
+    let ptr = malloc(len);
+
+    const mem = getUint8Memory0();
+
+    let offset = 0;
+
+    for (; offset < len; offset++) {
+        const code = arg.charCodeAt(offset);
+        if (code > 0x7F) break;
+        mem[ptr + offset] = code;
+    }
+
+    if (offset !== len) {
+        if (offset !== 0) {
+            arg = arg.slice(offset);
+        }
+        ptr = realloc(ptr, len, len = offset + arg.length * 3);
+        const view = getUint8Memory0().subarray(ptr + offset, ptr + len);
+        const ret = encodeString(arg, view);
+
+        offset += ret.written;
+    }
+
+    WASM_VECTOR_LEN = offset;
+    return ptr;
+}
+
+let cachedInt32Memory0 = new Int32Array();
+
+function getInt32Memory0() {
+    if (cachedInt32Memory0.byteLength === 0) {
+        cachedInt32Memory0 = new Int32Array(wasm.memory.buffer);
+    }
+    return cachedInt32Memory0;
+}
+
+const cachedTextDecoder = new TextDecoder('utf-8', { ignoreBOM: true, fatal: true });
+
+cachedTextDecoder.decode();
+
+function getStringFromWasm0(ptr, len) {
+    return cachedTextDecoder.decode(getUint8Memory0().subarray(ptr, ptr + len));
+}
+
+let heap_next = heap.length;
+
+function addHeapObject(obj) {
+    if (heap_next === heap.length) heap.push(heap.length + 1);
+    const idx = heap_next;
+    heap_next = heap[idx];
+
+    heap[idx] = obj;
+    return idx;
+}
+
+function dropObject(idx) {
+    if (idx < 36) return;
+    heap[idx] = heap_next;
+    heap_next = idx;
+}
+
+function takeObject(idx) {
+    const ret = getObject(idx);
+    dropObject(idx);
+    return ret;
+}
+
+let stack_pointer = 32;
+
+function addBorrowedObject(obj) {
+    if (stack_pointer == 1) throw new Error('out of js stack');
+    heap[--stack_pointer] = obj;
+    return stack_pointer;
+}
+/**
+* @param {any} balances_js
+* @returns {any}
+*/
+export function parse_balance_map(balances_js) {
+    try {
+        const ret = wasm.parse_balance_map(addBorrowedObject(balances_js));
+        return takeObject(ret);
+    } finally {
+        heap[stack_pointer++] = undefined;
+    }
+}
+
+async function load(module, imports) {
+    if (typeof Response === 'function' && module instanceof Response) {
+        if (typeof WebAssembly.instantiateStreaming === 'function') {
+            try {
+                return await WebAssembly.instantiateStreaming(module, imports);
+
+            } catch (e) {
+                if (module.headers.get('Content-Type') != 'application/wasm') {
+                    console.warn("`WebAssembly.instantiateStreaming` failed because your server does not serve wasm with `application/wasm` MIME type. Falling back to `WebAssembly.instantiate` which is slower. Original error:\n", e);
+
+                } else {
+                    throw e;
+                }
+            }
+        }
+
+        const bytes = await module.arrayBuffer();
+        return await WebAssembly.instantiate(bytes, imports);
+
+    } else {
+        const instance = await WebAssembly.instantiate(module, imports);
+
+        if (instance instanceof WebAssembly.Instance) {
+            return { instance, module };
+
+        } else {
+            return instance;
+        }
+    }
+}
+
+function getImports() {
+    const imports = {};
+    imports.wbg = {};
+    imports.wbg.__wbindgen_json_serialize = function(arg0, arg1) {
+        const obj = getObject(arg1);
+        const ret = JSON.stringify(obj === undefined ? null : obj);
+        const ptr0 = passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        getInt32Memory0()[arg0 / 4 + 1] = len0;
+        getInt32Memory0()[arg0 / 4 + 0] = ptr0;
+    };
+    imports.wbg.__wbindgen_json_parse = function(arg0, arg1) {
+        const ret = JSON.parse(getStringFromWasm0(arg0, arg1));
+        return addHeapObject(ret);
+    };
+    imports.wbg.__wbg_new_abda76e883ba8a5f = function() {
+        const ret = new Error();
+        return addHeapObject(ret);
+    };
+    imports.wbg.__wbg_stack_658279fe44541cf6 = function(arg0, arg1) {
+        const ret = getObject(arg1).stack;
+        const ptr0 = passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        getInt32Memory0()[arg0 / 4 + 1] = len0;
+        getInt32Memory0()[arg0 / 4 + 0] = ptr0;
+    };
+    imports.wbg.__wbg_error_f851667af71bcfc6 = function(arg0, arg1) {
+        try {
+            console.error(getStringFromWasm0(arg0, arg1));
+        } finally {
+            wasm.__wbindgen_free(arg0, arg1);
+        }
+    };
+    imports.wbg.__wbindgen_object_drop_ref = function(arg0) {
+        takeObject(arg0);
+    };
+
+    return imports;
+}
+
+function initMemory(imports, maybe_memory) {
+
+}
+
+function finalizeInit(instance, module) {
+    wasm = instance.exports;
+    init.__wbindgen_wasm_module = module;
+    cachedInt32Memory0 = new Int32Array();
+    cachedUint8Memory0 = new Uint8Array();
+
+    return wasm;
+}
+
+function initSync(module) {
+    const imports = getImports();
+
+    initMemory(imports);
+
+    if (!(module instanceof WebAssembly.Module)) {
+        module = new WebAssembly.Module(module);
+    }
+
+    const instance = new WebAssembly.Instance(module, imports);
+
+    return finalizeInit(instance, module);
+}
+
+async function init(input) {
+    if (typeof input === 'undefined') {
+        input = new URL('drop_merkle_bg.wasm', import.meta.url);
+    }
+    const imports = getImports();
+
+    if (typeof input === 'string' || (typeof Request === 'function' && input instanceof Request) || (typeof URL === 'function' && input instanceof URL)) {
+        input = fetch(input);
+    }
+
+    initMemory(imports);
+
+    const { instance, module } = await load(await input, imports);
+
+    return finalizeInit(instance, module);
+}
+
+export { initSync }
+export default init;
+
+'''
+'''--- web/client/merkle/pkg/drop_merkle_bg.wasm.d.ts ---
+/* tslint:disable */
+/* eslint-disable */
+export const memory: WebAssembly.Memory;
+export function parse_balance_map(a: number): number;
+export function __wbindgen_malloc(a: number): number;
+export function __wbindgen_realloc(a: number, b: number, c: number): number;
+export function __wbindgen_free(a: number, b: number): void;
+
+'''
+'''--- web/client/merkle/pkg/package.json ---
+{
+  "name": "drop-merkle",
+  "version": "0.1.0",
+  "files": [
+    "drop_merkle_bg.wasm",
+    "drop_merkle.js",
+    "drop_merkle.d.ts"
+  ],
+  "module": "drop_merkle.js",
+  "types": "drop_merkle.d.ts",
+  "sideEffects": false
+}
+'''
+'''--- web/client/merkle/src/lib.rs ---
+extern crate console_error_panic_hook;
+
+use drop_core::{
+    Leaves,
+    LeafInfo,
+    gen_proofs, 
+    sha256_to_base64_string, 
+    MerkleDropTree, 
+    MerkleDropProof 
+};
+
+use std::collections::HashMap;
+use wasm_bindgen::prelude::*;
+use serde::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize)]
+struct Claim {
+    amount: String,
+    memo: String,
+    proof: MerkleDropProof
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct MerkleDropInfo {
+    merkle_root: String,
+    token_total: String,
+    claims: HashMap<String, Claim>
+}
+
+#[wasm_bindgen]
+// Generates Merkle Tree from 
+// returns Merkle info, like root hash and total airdrop amount
+pub fn parse_balance_map (balances_js: &JsValue) -> JsValue {
+    console_error_panic_hook::set_once();
+    println!("hi");
+    // de-serialize balances array from JS readable value
+    let balances: Leaves = Leaves { data: balances_js.into_serde().unwrap() };
+
+    // sum of all token allocations
+    let drop_sum: String = balances.data
+        .iter()
+        .map(|claim| claim.amt.parse::<u128>().unwrap())
+        .sum::<u128>()
+        .to_string();
+
+    // convert claims into a merkle tree
+    let tree: MerkleDropTree = balances.gen_tree();
+    // get merkle root in base64 encoding
+    let base64_root: String = sha256_to_base64_string( &tree.root() );
+    // generate and save a proof for each address
+    let proofs = gen_proofs(&tree, 0, balances.data.len() as u32);
+    let all_claims: HashMap<String, Claim> = proofs
+        .into_iter()
+        .enumerate()
+        .map(|(i, curr_proof)| {
+            let LeafInfo { addr, amt, memo } = &balances.data[i];
+            return (
+                addr.clone(),
+                Claim { amount: amt.clone(), memo: memo.to_owned(), proof: curr_proof }
+            );
+        })
+        .collect();
+    
+    // merkle drop information
+    let merkle_drop_info = MerkleDropInfo {
+        merkle_root: base64_root,
+        token_total: drop_sum,
+        claims: all_claims
+    };
+    // serialize return object to be JS readable
+    return JsValue::from_serde(&merkle_drop_info).unwrap()
+}
+'''
+'''--- web/client/package.json ---
+{
+  "name": "drop-ui",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": {
+    "@emotion/react": "^11.10.4",
+    "@emotion/styled": "^11.10.4",
+    "@mui/material": "^5.10.4",
+    "@mui/styled-engine-sc": "^5.10.3",
+    "@near-wallet-selector/core": "^7.0.2",
+    "@near-wallet-selector/math-wallet": "^7.0.2",
+    "@near-wallet-selector/modal-ui": "^7.0.2",
+    "@near-wallet-selector/my-near-wallet": "^7.0.2",
+    "@near-wallet-selector/near-wallet": "^7.0.2",
+    "@near-wallet-selector/sender": "^7.0.2",
+    "@testing-library/jest-dom": "^5.14.1",
+    "@testing-library/react": "^13.0.0",
+    "@testing-library/user-event": "^13.2.1",
+    "@types/jest": "^27.0.1",
+    "@types/node": "^16.7.13",
+    "@types/react": "^18.0.0",
+    "@types/react-dom": "^18.0.0",
+    "buffer": "^6.0.3",
+    "drop-merkle": "./merkle/pkg",
+    "js-base64": "^3.7.2",
+    "near-api-js": "^1.0.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.3.0",
+    "react-scripts": "5.0.1",
+    "styled-components": "^5.3.5",
+    "typescript": "^4.4.2",
+    "web-vitals": "^2.1.0",
+    "web3.storage": "^4.4.0"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "build:merkle": "wasm-pack build ./merkle --target nodejs --release",
+    "test": "react-scripts test",
+    "eject": "react-scripts eject"
+  },
+  "eslintConfig": {
+    "extends": [
+      "react-app",
+      "react-app/jest"
+    ]
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  }
+}
+
+'''
+'''--- web/client/public/index.html ---
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="%PUBLIC_URL%/favicon.ico" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#000000" />
+    <meta
+      name="description"
+      content="Web site created using create-react-app"
+    />
+    <link rel="apple-touch-icon" href="%PUBLIC_URL%/logo192.png" />
+    <!--
+      manifest.json provides metadata used when your web app is installed on a
+      user's mobile device or desktop. See https://developers.google.com/web/fundamentals/web-app-manifest/
+    -->
+    <link rel="manifest" href="%PUBLIC_URL%/manifest.json" />
+    <!--
+      Notice the use of %PUBLIC_URL% in the tags above.
+      It will be replaced with the URL of the `public` folder during the build.
+      Only files inside the `public` folder can be referenced from the HTML.
+
+      Unlike "/favicon.ico" or "favicon.ico", "%PUBLIC_URL%/favicon.ico" will
+      work correctly both with client-side routing and a non-root public URL.
+      Learn how to configure a non-root public URL by running `npm run build`.
+    -->
+    <title>React App</title>
+  </head>
+  <body>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="root"></div>
+    <!--
+      This HTML file is a template.
+      If you open it directly in the browser, you will see an empty page.
+
+      You can add webfonts, meta tags, or analytics to this file.
+      The build step will place the bundled scripts into the <body> tag.
+
+      To begin the development, run `npm start` or `yarn start`.
+      To create a production bundle, use `npm run build` or `yarn build`.
+    -->
+  </body>
+</html>
+
+'''
+'''--- web/client/public/manifest.json ---
+{
+  "short_name": "React App",
+  "name": "Create React App Sample",
+  "icons": [
+    {
+      "src": "favicon.ico",
+      "sizes": "64x64 32x32 24x24 16x16",
+      "type": "image/x-icon"
+    },
+    {
+      "src": "logo192.png",
+      "type": "image/png",
+      "sizes": "192x192"
+    },
+    {
+      "src": "logo512.png",
+      "type": "image/png",
+      "sizes": "512x512"
+    }
+  ],
+  "start_url": ".",
+  "display": "standalone",
+  "theme_color": "#000000",
+  "background_color": "#ffffff"
+}
+
+'''
+'''--- web/client/public/robots.txt ---
+# https://www.robotstxt.org/robotstxt.html
+User-agent: *
+Disallow:
+
+'''
+'''--- web/client/src/constants/addresses.ts ---
+export const AIRDROP_CONTRACT_ADDRESS = "dev-1663134336150-17003481999856";
+'''
+'''--- web/client/src/constants/routes.ts ---
+export const routes = {
+  app: "/app",
+  create: "/create",
+  claim: "/claim",
+  deposit: "/deposit",
+  airdropClaim: "/claim/:id",
+};
+
+'''
+'''--- web/client/src/constants/urls.ts ---
+export const API_URL = 'https://7c46-109-49-179-93.eu.ngrok.io/prove';
+'''
+'''--- web/client/src/contracts/airdrop.ts ---
+// // chluff goes here
+// import { view } from "../../src/utils/wallet";
+
+// const FACTORY_ADDRESS_SELECTOR: Record<string, string> = {
+//     mainnet: "TODO",
+//     testnet: "dev-1663082207724-65204983285265",
+// };
+
+// class NoCapDrop {
+//     static CONTRACT_ADDRESS: string = FACTORY_ADDRESS_SELECTOR[window.NEAR_ENV];
+
+//     static async getNumberAirdrops(): Promise<number> {
+//         return view(
+//             NoCapDrop.CONTRACT_ADDRESS,
+//             "get_number_airdrops",
+//             {}
+//         );
+//     }
+
+//     static async getAirdropInfo(airdropId: number): Promise<AirdropInfo> {
+//         return view(
+//             NoCapDrop.CONTRACT_ADDRESS,
+//             "get_airdrop_info",
+//             { airdrop_id: airdropId }
+//         ); 
+//     }
+
+//     static async getBalance(AccountId: string): Promise<[]> 
+
+// }
+
+// type AirdropInfo = {
+//     description: string,
+//     creator: string,
+//     token_id: string,
+//     ipfs_cid: string,
+//     root_hash: string,
+//     expiry_date: number,
+//     claimed_users: HashSet<AccountId>,
+//     amount: string // u128 encoded as string
+// }
+
+// export { NoCapDrop };
+export {};
+
+'''
+'''--- web/client/src/logo.svg ---
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 841.9 595.3"><g fill="#61DAFB"><path d="M666.3 296.5c0-32.5-40.7-63.3-103.1-82.4 14.4-63.6 8-114.2-20.2-130.4-6.5-3.8-14.1-5.6-22.4-5.6v22.3c4.6 0 8.3.9 11.4 2.6 13.6 7.8 19.5 37.5 14.9 75.7-1.1 9.4-2.9 19.3-5.1 29.4-19.6-4.8-41-8.5-63.5-10.9-13.5-18.5-27.5-35.3-41.6-50 32.6-30.3 63.2-46.9 84-46.9V78c-27.5 0-63.5 19.6-99.9 53.6-36.4-33.8-72.4-53.2-99.9-53.2v22.3c20.7 0 51.4 16.5 84 46.6-14 14.7-28 31.4-41.3 49.9-22.6 2.4-44 6.1-63.6 11-2.3-10-4-19.7-5.2-29-4.7-38.2 1.1-67.9 14.6-75.8 3-1.8 6.9-2.6 11.5-2.6V78.5c-8.4 0-16 1.8-22.6 5.6-28.1 16.2-34.4 66.7-19.9 130.1-62.2 19.2-102.7 49.9-102.7 82.3 0 32.5 40.7 63.3 103.1 82.4-14.4 63.6-8 114.2 20.2 130.4 6.5 3.8 14.1 5.6 22.5 5.6 27.5 0 63.5-19.6 99.9-53.6 36.4 33.8 72.4 53.2 99.9 53.2 8.4 0 16-1.8 22.6-5.6 28.1-16.2 34.4-66.7 19.9-130.1 62-19.1 102.5-49.9 102.5-82.3zm-130.2-66.7c-3.7 12.9-8.3 26.2-13.5 39.5-4.1-8-8.4-16-13.1-24-4.6-8-9.5-15.8-14.4-23.4 14.2 2.1 27.9 4.7 41 7.9zm-45.8 106.5c-7.8 13.5-15.8 26.3-24.1 38.2-14.9 1.3-30 2-45.2 2-15.1 0-30.2-.7-45-1.9-8.3-11.9-16.4-24.6-24.2-38-7.6-13.1-14.5-26.4-20.8-39.8 6.2-13.4 13.2-26.8 20.7-39.9 7.8-13.5 15.8-26.3 24.1-38.2 14.9-1.3 30-2 45.2-2 15.1 0 30.2.7 45 1.9 8.3 11.9 16.4 24.6 24.2 38 7.6 13.1 14.5 26.4 20.8 39.8-6.3 13.4-13.2 26.8-20.7 39.9zm32.3-13c5.4 13.4 10 26.8 13.8 39.8-13.1 3.2-26.9 5.9-41.2 8 4.9-7.7 9.8-15.6 14.4-23.7 4.6-8 8.9-16.1 13-24.1zM421.2 430c-9.3-9.6-18.6-20.3-27.8-32 9 .4 18.2.7 27.5.7 9.4 0 18.7-.2 27.8-.7-9 11.7-18.3 22.4-27.5 32zm-74.4-58.9c-14.2-2.1-27.9-4.7-41-7.9 3.7-12.9 8.3-26.2 13.5-39.5 4.1 8 8.4 16 13.1 24 4.7 8 9.5 15.8 14.4 23.4zM420.7 163c9.3 9.6 18.6 20.3 27.8 32-9-.4-18.2-.7-27.5-.7-9.4 0-18.7.2-27.8.7 9-11.7 18.3-22.4 27.5-32zm-74 58.9c-4.9 7.7-9.8 15.6-14.4 23.7-4.6 8-8.9 16-13 24-5.4-13.4-10-26.8-13.8-39.8 13.1-3.1 26.9-5.8 41.2-7.9zm-90.5 125.2c-35.4-15.1-58.3-34.9-58.3-50.6 0-15.7 22.9-35.6 58.3-50.6 8.6-3.7 18-7 27.7-10.1 5.7 19.6 13.2 40 22.5 60.9-9.2 20.8-16.6 41.1-22.2 60.6-9.9-3.1-19.3-6.5-28-10.2zM310 490c-13.6-7.8-19.5-37.5-14.9-75.7 1.1-9.4 2.9-19.3 5.1-29.4 19.6 4.8 41 8.5 63.5 10.9 13.5 18.5 27.5 35.3 41.6 50-32.6 30.3-63.2 46.9-84 46.9-4.5-.1-8.3-1-11.3-2.7zm237.2-76.2c4.7 38.2-1.1 67.9-14.6 75.8-3 1.8-6.9 2.6-11.5 2.6-20.7 0-51.4-16.5-84-46.6 14-14.7 28-31.4 41.3-49.9 22.6-2.4 44-6.1 63.6-11 2.3 10.1 4.1 19.8 5.2 29.1zm38.5-66.7c-8.6 3.7-18 7-27.7 10.1-5.7-19.6-13.2-40-22.5-60.9 9.2-20.8 16.6-41.1 22.2-60.6 9.9 3.1 19.3 6.5 28.1 10.2 35.4 15.1 58.3 34.9 58.3 50.6-.1 15.7-23 35.6-58.4 50.6zM320.8 78.4z"/><circle cx="420.9" cy="296.5" r="45.7"/><path d="M520.5 78.1z"/></g></svg>
+'''
+'''--- web/client/src/main.css ---
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;600&family=Nabla&display=swap');
+
+html, body, #root {
+    height: 100%;
+}
+'''
+'''--- web/client/src/near-config.ts ---
+import { NetworkId } from "@near-wallet-selector/core";
+
+function getConfig(env: NetworkId | string) {
+  switch (env) {
+    case "production":
+    case "mainnet":
+      return {
+        networkId: "mainnet",
+        MULTICALL_FACTORY_ADDRESS: "v1.multicall.near",
+        WNEAR_ADDRESS: "wrap.near",
+        EXAMPLE_ADDRESS: "example.near",
+        REF_EXCHANGE_ADDRESS: "v2.ref-finance.near",
+        CRONCAT_MANAGER_ADDRESS: "manager_v1.croncat.near",
+        nodeUrl: "https://rpc.mainnet.near.org",
+        walletUrl: "https://wallet.near.org",
+        helperUrl: "https://helper.mainnet.near.org",
+        explorerUrl: "https://explorer.mainnet.near.org",
+      };
+    case "development":
+    case "testnet":
+      return {
+        networkId: "testnet",
+        MULTICALL_FACTORY_ADDRESS: "v1_03.multicall.testnet",
+        WNEAR_ADDRESS: "wrap.testnet",
+        EXAMPLE_ADDRESS: "example.testnet",
+        REF_EXCHANGE_ADDRESS: "ref-finance-101.testnet",
+        CRONCAT_MANAGER_ADDRESS: "manager_v1.croncat.testnet",
+        nodeUrl: "https://rpc.testnet.near.org",
+        walletUrl: "https://wallet.testnet.near.org",
+        helperUrl: "https://helper.testnet.near.org",
+        explorerUrl: "https://explorer.testnet.near.org",
+      };
+    case "betanet":
+      return {
+        networkId: "betanet",
+        nodeUrl: "https://rpc.betanet.near.org",
+        walletUrl: "https://wallet.betanet.near.org",
+        helperUrl: "https://helper.betanet.near.org",
+        explorerUrl: "https://explorer.betanet.near.org",
+      };
+    case "local":
+      return {
+        networkId: "local",
+        nodeUrl: "http://localhost:3030",
+        keyPath: `${process.env.HOME}/.near/validator_key.json`,
+        walletUrl: "http://localhost:4000/wallet",
+      };
+    case "test":
+    case "ci":
+      return {
+        networkId: "shared-test",
+        nodeUrl: "https://rpc.ci-testnet.near.org",
+        masterAccount: "test.near",
+      };
+    case "ci-betanet":
+      return {
+        networkId: "shared-test-staging",
+        nodeUrl: "https://rpc.ci-betanet.near.org",
+        masterAccount: "test.near",
+      };
+    default:
+      throw Error(
+        `Unconfigured environment '${env}'. Can be configured in src/config.js.`
+      );
+  }
+}
+
+export { getConfig };
+
+'''
+'''--- web/client/src/react-app-env.d.ts ---
+/// <reference types="react-scripts" />
+
+'''
+'''--- web/client/src/reportWebVitals.ts ---
+import { ReportHandler } from 'web-vitals';
+
+const reportWebVitals = (onPerfEntry?: ReportHandler) => {
+  if (onPerfEntry && onPerfEntry instanceof Function) {
+    import('web-vitals').then(({ getCLS, getFID, getFCP, getLCP, getTTFB }) => {
+      getCLS(onPerfEntry);
+      getFID(onPerfEntry);
+      getFCP(onPerfEntry);
+      getLCP(onPerfEntry);
+      getTTFB(onPerfEntry);
+    });
+  }
+};
+
+export default reportWebVitals;
+
+'''
+'''--- web/client/src/setupTests.ts ---
+// jest-dom adds custom jest matchers for asserting on DOM nodes.
+// allows you to do things like:
+// expect(element).toHaveTextContent(/react/i)
+// learn more: https://github.com/testing-library/jest-dom
+import '@testing-library/jest-dom';
+
+'''
+'''--- web/client/src/utils/wallet.ts ---
+// TODO: de-deprecate near-wallet on wallet selector. Use patch
+import { providers } from "near-api-js";
+import type { NetworkId } from "@near-wallet-selector/core";
+import { getConfig } from "../near-config";
+import { Base64 } from "js-base64";
+
+declare global {
+    interface Window {
+        NEAR_ENV: NetworkId;
+        nearConfig: any;
+    }
+}
+
+window.NEAR_ENV = <NetworkId>process.env.NEAR_ENV ?? "testnet";
+window.nearConfig = getConfig(window.NEAR_ENV);
+// create RPC Provider object.
+const rpcProvider = new providers.JsonRpcProvider({
+    url: window.nearConfig.nodeUrl,
+});
+
+async function silentTx(
+  signer: string,
+  addr: string,
+  func: string,
+  args: object | Uint8Array,
+  gas: string,
+  depo: string = "0"
+): Promise<any> {
+  // is user logged in?
+  if (!window.selector.isSignedIn()) {
+    console.error("Wallet not connected");
+    // create & return empty promise
+    return Promise.resolve();
+  }
+
+  // get wallet from wallet selector
+  const wallet = await window.selector.wallet();
+  return wallet.signAndSendTransaction({
+    signerId: signer,
+    actions: [
+      {
+        type: "FunctionCall",
+        params: {
+          methodName: func,
+          args: args,
+          gas: gas,
+          deposit: "0",
+        },
+      },
+    ],
+  });
+}
+
+async function tx(
+    addr: string,
+    func: string,
+    args: object | Uint8Array,
+    gas: string,
+    depo: string = "0"
+): Promise<any> {
+    // is user logged in?
+    if (!window.selector.isSignedIn()) {
+        console.error("Wallet not connected");
+        // create & return empty promise
+        return Promise.resolve();
+    }
+
+    // get wallet from wallet selector
+    const wallet = await window.selector.wallet();
+    return wallet.signAndSendTransaction({
+        receiverId: addr,
+        actions: [
+            {
+                type: "FunctionCall",
+                params: {
+                    methodName: func,
+                    args: args,
+                    gas: gas,
+                    deposit: depo,
+                },
+            },
+        ],
+    });
+}
+
+/**
+ * make view calls using RPC, no need for user to sign in.
+ *
+ * @param addr
+ * @param func
+ * @param args
+ * @returns
+ */
+async function view(addr: string, func: string, args: object): Promise<any> {
+    const encodedArgs: string = Base64.encode(JSON.stringify(args));
+    // returns response object
+    const response: any = await rpcProvider.query({
+        request_type: "call_function",
+        finality: "final",
+        account_id: addr,
+        method_name: func,
+        args_base64: encodedArgs,
+    });
+    // RPC returns JSON-serialized, needs parsing.
+    // Fix "Maximum call stack size exceeded" for large response data. See: https://stackoverflow.com/a/49124600
+    const strResult = (<Array<number>>response.result).reduce((data, byte) => data + String.fromCharCode(byte), "");
+    return JSON.parse(strResult);
+}
+
+export { tx, view, silentTx, rpcProvider };
+
+'''
+'''--- web/client/src/utils/window.ts ---
+import * as nearAPI from "near-api-js";
+import type { NetworkId } from "@near-wallet-selector/core";
+import { Component } from "react";
+
+type CardInfo = {
+  call: object;
+  showArgs: boolean;
+  options: object;
+  errors: object;
+};
+
+type CardCopy = {
+  from: string;
+  to: string;
+  payload?: CardInfo;
+};
+
+declare global {
+  interface Window {
+    parse_balance_map: any;
+    debug: any;
+    // Page components
+    DAO: Component;
+
+    MENU: Component;
+    EDITOR: Component;
+    EXPORT: Component;
+
+    SIDEBAR: Component;
+
+    // List of all mounted tasks
+
+    // Indicates what page is opened
+    PAGE: "app" | "dao";
+
+    // Temporary storage for moving and cloning cards
+    TEMP: CardInfo | null;
+    COPY: CardCopy | null;
+
+    // Wallet definitions
+    WALLET_COMPONENT: Promise<nearAPI.WalletConnection> | Component;
+    NEAR_ENV: NetworkId;
+    nearConfig: any;
+  }
+}
+
+'''
+'''--- web/client/tsconfig.json ---
+{
+  "compilerOptions": {
+    "target": "es5",
+    "lib": [
+      "dom",
+      "dom.iterable",
+      "esnext"
+    ],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "strict": true,
+    "forceConsistentCasingInFileNames": true,
+    "noFallthroughCasesInSwitch": true,
+    "module": "esnext",
+    "moduleResolution": "node",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx"
+  },
+  "include": [
+    "src"
+  ]
+}
+
+'''
+'''--- web/client/webpack.config.js ---
+const webpack = require('webpack');
+
+module.exports = {
+    webpack: {
+        configure: (webpackConfig) => {
+            const wasmExtensionRegExp = /\.wasm$/;
+            webpackConfig.resolve.extensions.push('.wasm');
+            webpackConfig.experiments = {
+                asyncWebAssembly: false,
+                lazyCompilation: true,
+                syncWebAssembly: true,
+                topLevelAwait: true,
+            };
+            webpackConfig.resolve.fallback = {
+                buffer: require.resolve('buffer/')
+            }
+            webpackConfig.module.rules.forEach((rule) => {
+                (rule.oneOf || []).forEach((oneOf) => {
+                    if (oneOf.type === "asset/resource") {
+                        oneOf.exclude.push(wasmExtensionRegExp);
+                    }
+                });
+            });
+            webpackConfig.plugins.push(new webpack.ProvidePlugin({
+                Buffer: ['buffer', 'Buffer'],
+            }));
+
+            return webpackConfig;
+        }
+    }
+}
+'''
+'''--- web/server/Cargo.toml ---
+[package]
+name = "drop-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.5"
+base64 = "0.13"
+bincode = "1.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.17", features = ["full"] }
+tower-http = { version = "0.2", features = ["trace", "cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+drop-core = { path = "../../core" }
+drop-methods = { path = "../../methods" }
+risc0-zkvm-host = "0.10"
+risc0-zkvm-serde = "0.10"
+
+'''
+'''--- web/server/src/main.rs ---
+// Copyright 2022 Risc0, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::net::{Ipv4Addr, SocketAddr};
+
+use axum::http::Method;
+use axum::{http::StatusCode, response::IntoResponse, routing::post, Json, Router};
+use serde::{Deserialize, Serialize};
+use tower_http::trace::TraceLayer;
+use tower_http::cors::{CorsLayer, Any};
+use tracing_subscriber::prelude::*;
+
+use drop_core::{Leaves};
+use drop_methods::{PROVEDROP_ID, PROVEDROP_PATH};
+use risc0_zkvm_host::Prover;
+
+#[derive(Deserialize, Serialize)]
+pub struct Receipt {
+    journal: Vec<u8>,
+    seal: Vec<u32>,
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::registry()
+        // Filter spans based on the RUST_LOG env var.
+        .with(tracing_subscriber::EnvFilter::new(
+            "info,server,tower_http=debug",
+        ))
+        // Send a copy of all spans to stdout as JSON.
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_level(true)
+                .compact(),
+        )
+        // Install this registry as the global tracing registry.
+        .try_init()
+        .unwrap();
+
+    let cors = CorsLayer::new()
+        .allow_methods(vec![Method::POST])
+        .allow_origin(Any)
+        .allow_headers(Any);
+
+    let app = Router::new()
+        .route("/prove", post(prove_drop))
+        .layer(TraceLayer::new_for_http())
+        .layer(cors);
+
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 3001));
+    tracing::info!("listening on {}", addr);
+    let server = axum::Server::bind(&addr).serve(app.into_make_service());
+
+    server.await.unwrap();
+}
+
+fn do_drop_proof(name: &str, input: Leaves) -> Result<String, risc0_zkvm_host::Exception> {
+    let elf_contents = std::fs::read(name).unwrap();
+    let mut prover = Prover::new(&elf_contents, PROVEDROP_ID)?;
+    let vec = risc0_zkvm_serde::to_vec(&input).unwrap();
+    prover.add_input(vec.as_slice())?;
+    println!("running prover...");
+    let receipt = prover.run()?;
+    println!("prover run success!");
+    let receipt = Receipt {
+        journal: receipt.get_journal().unwrap().to_vec(),
+        seal: receipt.get_seal().unwrap().to_vec(),
+    };
+    println!("zk receipt success!");
+    Ok(base64::encode(bincode::serialize(&receipt).unwrap()))
+}
+
+async fn prove_drop(Json(payload): Json<Leaves>) -> impl IntoResponse {
+    let out = match do_drop_proof(PROVEDROP_PATH, payload) {
+        Ok(receipt) => receipt,
+        Err(_e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                String::from("bad proof load"),
+            )
+        }
+    };
+    (StatusCode::OK, out)
+}
+
+'''

@@ -1,0 +1,530 @@
+*GitHub Repository "luciotato/token-o-matic"*
+
+'''--- .vscode/settings.json ---
+{
+    "cSpell.words": [
+        "CHDR",
+        "Chedder"
+    ]
+}
+'''
+'''--- .vscode/tasks.json ---
+{
+    // See https://go.microsoft.com/fwlink/?LinkId=733558
+    // for the documentation about the tasks.json format
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "build WASM",
+            "type": "shell",
+            "command": "bash build.sh",
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        }
+    ]
+}
+'''
+'''--- Cargo.toml ---
+[workspace]
+members = [
+    "./nep-141-model",
+]
+
+# https://github.com/near/core-contracts/blob/master/staking-pool/Cargo.toml
+# https://doc.rust-lang.org/cargo/reference/profiles.html
+
+# compilation profile for a release target
+[profile.release]
+codegen-units = 1
+# s = optimize for binary size ("z" would additionally turn off loop vectorization)
+opt-level = "s"
+# link time optimization
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+
+'''
+'''--- README.md ---
+# The Cheddar Project Token-o-Matic
+NEAR NEP-141 Token start ecosystem deploy all automatic
+
+'''
+'''--- build.sh ---
+#!/bin/bash
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo build --all --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/nep_141_model.wasm res/
+
+'''
+'''--- deploy-testnet.sh ---
+set -e
+NETWORK=testnet
+OWNER=chedder.$NETWORK
+MASTER_ACC=$OWNER
+CONTRACT_ACC=token.$MASTER_ACC
+
+export NODE_ENV=$NETWORK
+
+## delete acc
+echo "Delete $CONTRACT_ACC? are you sure? Ctrl-C to cancel"
+read input
+near delete $CONTRACT_ACC $MASTER_ACC
+near create-account $CONTRACT_ACC --masterAccount $MASTER_ACC
+near deploy $CONTRACT_ACC ./res/nep_141_model.wasm new "{\"owner_id\":\"$OWNER\",\"owner_supply\":\"1000000000000000000000000000000000\"}" --accountId $MASTER_ACC
+## set params
+
+## redeploy code only
+#near deploy $CONTRACT_ACC ./res/nep_141_model.wasm 
+
+#save last deployment  (to be able to recover state/tokens)
+#cp ./res/nep_141_model.wasm ./res/nep_141_model.`date +%F.%T`.wasm
+#date +%F.%T
+
+'''
+'''--- nep-141-model/Cargo.toml ---
+[package]
+name = "nep-141-model"
+version = "0.1.0"
+authors = []
+edition = "2018"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde = { version = "*", features = ["derive"] }
+serde_json = "*"
+near-sdk = { git = "https://github.com/near/near-sdk-rs" } 
+near-contract-standards = { git = "https://github.com/near/near-sdk-rs" }
+uint = { version = "0.9.0", default-features = false }
+
+[dev-dependencies]
+near-primitives = { git = "https://github.com/nearprotocol/nearcore.git" }
+# near-sdk-sim = { git = "https://github.com/near/near-sdk-rs.git", rev="9d99077" }
+
+'''
+'''--- nep-141-model/README.md ---
+# Token-o-Matic NEP-141 Token Model
+
+## Technicalities
+
+The NEP-141 Token Model implements a pure `NEP-141` standard. It's a fungible token.
+
+'''
+'''--- nep-141-model/src/internal.rs ---
+use near_sdk::collections::LookupMap;
+
+use near_sdk::json_types::{ValidAccountId, U128};
+use near_sdk::{ AccountId, Balance, PromiseResult, StorageUsage};
+
+use crate::*;
+
+pub fn measure_account_storage(a: &mut LookupMap<AccountId, Balance>) -> StorageUsage {
+    let initial_storage_usage = env::storage_usage();
+    let tmp_account_id = "a".repeat(64);
+    a.insert(&tmp_account_id, &0u128);
+    let usage = env::storage_usage() - initial_storage_usage;
+    a.remove(&tmp_account_id);
+    return usage;
+}
+
+impl Contract {
+
+    pub fn assert_owner_calling(&self){
+        assert!(env::predecessor_account_id()==self.owner_id,"can only be called by the owner");
+    }
+
+    pub fn internal_unwrap_balance_of(&self, account_id: &AccountId) -> Balance {
+        match self.accounts.get(&account_id) {
+            Some(balance) => balance,
+            None => 0,
+        }
+    }
+
+    pub fn internal_deposit(&mut self, account_id: &AccountId, amount: Balance) {
+        let balance = self.internal_unwrap_balance_of(account_id);
+        let new_balance = balance.checked_add(amount).expect("Total supply overflow");
+        self.internal_update_account(&account_id, new_balance);
+        self.total_supply = self.total_supply.checked_add(amount).expect("Total supply overflow");
+    }
+
+    pub fn internal_withdraw(&mut self, account_id: &AccountId, amount: Balance) {
+        let balance = self.internal_unwrap_balance_of(account_id);
+        let new_balance = balance.checked_sub(amount).expect("The account doesn't have enough balance");
+        self.internal_update_account(&account_id, new_balance);
+        self.total_supply = self.total_supply.checked_sub(amount).expect("Total supply underflow");
+    }
+
+    pub fn internal_transfer(
+        &mut self,
+        sender_id: &AccountId,
+        receiver_id: &AccountId,
+        amount: Balance,
+        memo: Option<String>,
+    ) {
+        assert_ne!(
+            sender_id, receiver_id,
+            "Sender and receiver should be different"
+        );
+        assert!(amount > 0, "The amount should be a positive number");
+        self.internal_withdraw(sender_id, amount);
+        self.internal_deposit(receiver_id, amount);
+        log!("Transfer {} from {} to {}", amount, sender_id, receiver_id);
+        if let Some(memo) = memo {
+            log!("Memo: {}", memo);
+        }
+    }
+
+    /// Inner method to save the given account for a given account ID.
+    /// If the account balance is 0, the account is deleted instead to release storage.
+    pub fn internal_update_account(&mut self, account_id: &AccountId, balance: u128) {
+        if balance==0 {
+            self.accounts.remove(account_id);
+        } else {
+            self.accounts.insert(account_id, &balance); //insert_or_update
+        }
+    }
+
+    // TODO rename
+    pub fn int_ft_resolve_transfer(
+        &mut self,
+        sender_id: &AccountId,
+        receiver_id: ValidAccountId,
+        amount: U128,
+    ) -> (u128, u128) {
+        let sender_id: AccountId = sender_id.into();
+        let receiver_id: AccountId = receiver_id.into();
+        let amount: Balance = amount.into();
+
+        // Get the unused amount from the `ft_on_transfer` call result.
+        let unused_amount = match env::promise_result(0) {
+            PromiseResult::NotReady => unreachable!(),
+            PromiseResult::Successful(value) => {
+                if let Ok(unused_amount) = near_sdk::serde_json::from_slice::<U128>(&value) {
+                    std::cmp::min(amount, unused_amount.0)
+                } else {
+                    amount
+                }
+            }
+            PromiseResult::Failed => amount,
+        };
+
+        if unused_amount > 0 {
+            let receiver_balance = self.accounts.get(&receiver_id).unwrap_or(0);
+            if receiver_balance > 0 {
+                let refund_amount = std::cmp::min(receiver_balance, unused_amount);
+                self.accounts
+                    .insert(&receiver_id, &(receiver_balance - refund_amount));
+
+                if let Some(sender_balance) = self.accounts.get(&sender_id) {
+                    self.accounts
+                        .insert(&sender_id, &(sender_balance + refund_amount));
+                    log!(
+                        "Refund {} from {} to {}",
+                        refund_amount,
+                        receiver_id,
+                        sender_id
+                    );
+                    return (amount - refund_amount, 0);
+                } else {
+                    // Sender's account was deleted, so we need to burn tokens.
+                    self.total_supply -= refund_amount;
+                    log!("The account of the sender was deleted");
+                    return (amount, refund_amount);
+                }
+            }
+        }
+        (amount, 0)
+    }
+
+}
+'''
+'''--- nep-141-model/src/lib.rs ---
+use near_sdk::collections::LookupMap;
+
+use near_contract_standards::fungible_token::{
+    core::FungibleTokenCore,
+    metadata::{FungibleTokenMetadata, FungibleTokenMetadataProvider, FT_METADATA_SPEC},
+    resolver::FungibleTokenResolver,
+};
+
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::LazyOption;
+use near_sdk::json_types::{ValidAccountId, U128};
+use near_sdk::{
+    assert_one_yocto, env, ext_contract, log, near_bindgen, AccountId, Balance, Gas,
+    PanicOnDefault, PromiseOrValue, StorageUsage,
+};
+
+const TGAS: Gas = 1_000_000_000_000;
+const GAS_FOR_RESOLVE_TRANSFER: Gas = 5*TGAS;
+const GAS_FOR_FT_TRANSFER_CALL: Gas = 25*TGAS + GAS_FOR_RESOLVE_TRANSFER;
+const NO_DEPOSIT: Balance = 0;
+
+type U128String = U128;
+
+near_sdk::setup_alloc!();
+
+mod internal;
+use internal::*;
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Contract {
+    metadata: LazyOption<FungibleTokenMetadata>,
+
+    pub accounts: LookupMap<AccountId, Balance>,
+
+    pub owner_id: AccountId,
+    pub total_supply: Balance,
+    
+    /// The storage size in bytes for one account.
+    pub account_storage_usage: StorageUsage,
+}
+
+#[near_bindgen]
+impl Contract {
+    /// Initializes the contract with the given total supply owned by the given `owner_id`.
+
+    #[init]
+    pub fn new(owner_id: ValidAccountId, owner_supply: U128) -> Self {
+        let m = FungibleTokenMetadata {
+            spec: FT_METADATA_SPEC.to_string(),
+            name: "Chedder".to_string(),
+            symbol: "CHDR".to_string(),
+            icon: Some(String::from(r###"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 56 56"><style>.a{fill:#F4C647;}.b{fill:#EEAF4B;}</style><path d="M45 19.5v5.5l4.8 0.6 0-11.4c-0.1-3.2-11.2-6.7-24.9-6.7 -13.7 0-24.8 3.6-24.9 6.7L0 32.5c0 3.2 10.7 7.1 24.5 7.1 0.2 0 0.3 0 0.5 0V21.5l-4.7-7.2L45 19.5z" class="a"/><path d="M25 31.5v-10l-4.7-7.2L45 19.5v5.5l-14-1.5v10C31 33.5 25 31.5 25 31.5z" fill="#F9E295"/><path d="M24.9 7.5C11.1 7.5 0 11.1 0 14.3s10.7 7.2 24.5 7.2c0.2 0 0.3 0 0.5 0l-4.7-7.2 25 5.2c2.8-0.9 4.4-4 4.4-5.2C49.8 11.1 38.6 7.5 24.9 7.5z" class="b"/><path d="M36 29v19.6c8.3 0 15.6-1 20-2.5V26.5L31 23.2 36 29z" class="a"/><path d="M31 23.2l5 5.8c8.2 0 15.6-1 19.9-2.5L31 23.2z" class="b"/><polygon points="36 29 36 48.5 31 42.5 31 23.2 " fill="#FCDF76"/></svg>"###)),
+            reference: None, // TODO
+            reference_hash: None,
+            decimals: 24,
+        };
+        m.assert_valid();
+        let mut this = Self {
+            owner_id: owner_id.clone().into(),
+            metadata: LazyOption::new(b"m".to_vec(), Some(&m)),
+            accounts: LookupMap::new(b"a".to_vec()),
+            total_supply: 0,
+            account_storage_usage: 0,
+        };
+        this.account_storage_usage = measure_account_storage(&mut this.accounts);
+        this.internal_deposit(owner_id.as_ref(), owner_supply.into());
+        this
+    }
+
+    //owner can mint more
+    pub fn mint(&mut self, amount:U128String){
+        &self.assert_owner_calling();
+        self.total_supply = self.total_supply.checked_add(amount.0).unwrap();
+        self.internal_deposit(&self.owner_id.clone(), amount.0);
+    }
+
+    /// Returns account ID of the staking pool owner.
+    pub fn get_owner_id(&self) -> AccountId {
+        return self.owner_id.clone();
+    }
+
+    /// Returns account ID of the staking pool owner.
+    #[payable]
+    pub fn set_metadata_icon(&mut self, svg_string: String)  {
+        assert_one_yocto();
+        self.assert_owner_calling();
+        let mut m = self.metadata.get().unwrap();
+        m.icon = Some(svg_string);
+        self.metadata.set(&m);
+    }
+
+    /// Returns account ID of the staking pool owner.
+    #[payable]
+    pub fn set_metadata_reference(&mut self, reference: String, reference_hash:String)  {
+        assert_one_yocto();
+        self.assert_owner_calling();
+        let mut m = self.metadata.get().unwrap();
+        m.reference = Some(reference);
+        m.reference_hash = Some(reference_hash.as_bytes().to_vec().into());
+        m.assert_valid();
+        self.metadata.set(&m);
+    }
+
+}
+
+#[near_bindgen]
+impl FungibleTokenCore for Contract {
+    #[payable]
+    fn ft_transfer(&mut self, receiver_id: ValidAccountId, amount: U128, memo: Option<String>) {
+        assert_one_yocto();
+        let sender_id = env::predecessor_account_id();
+        let amount: Balance = amount.into();
+        self.internal_transfer(&sender_id, receiver_id.as_ref(), amount, memo);
+    }
+
+    #[payable]
+    fn ft_transfer_call(
+        &mut self,
+        receiver_id: ValidAccountId,
+        amount: U128,
+        memo: Option<String>,
+        msg: String,
+    ) -> PromiseOrValue<U128> {
+        assert_one_yocto();
+        let sender_id = env::predecessor_account_id();
+        let amount: Balance = amount.into();
+        self.internal_transfer(&sender_id, receiver_id.as_ref(), amount, memo);
+        // Initiating receiver's call and the callback
+        // ext_fungible_token_receiver::ft_on_transfer(
+        ext_ft_receiver::ft_on_transfer(
+            sender_id.clone(),
+            amount.into(),
+            msg,
+            receiver_id.as_ref(),
+            NO_DEPOSIT,
+            env::prepaid_gas() - GAS_FOR_FT_TRANSFER_CALL,
+        )
+        .then(ext_self::ft_resolve_transfer(
+            sender_id,
+            receiver_id.into(),
+            amount.into(),
+            &env::current_account_id(),
+            NO_DEPOSIT,
+            GAS_FOR_RESOLVE_TRANSFER,
+        ))
+        .into()
+    }
+
+    fn ft_total_supply(&self) -> U128 {
+        self.total_supply.into()
+    }
+
+    fn ft_balance_of(&self, account_id: ValidAccountId) -> U128 {
+        self.accounts.get(account_id.as_ref()).unwrap_or(0).into()
+    }
+}
+
+#[near_bindgen]
+impl FungibleTokenResolver for Contract {
+    /// Returns the amount of burned tokens in a corner case when the sender
+    /// has deleted (unregistered) their account while the `ft_transfer_call` was still in flight.
+    /// Returns (Used token amount, Burned token amount)
+    #[private]
+    fn ft_resolve_transfer(
+        &mut self,
+        sender_id: ValidAccountId,
+        receiver_id: ValidAccountId,
+        amount: U128,
+    ) -> U128 {
+        let sender_id: AccountId = sender_id.into();
+        let (used_amount, burned_amount) =
+            self.int_ft_resolve_transfer(&sender_id, receiver_id, amount);
+        if burned_amount > 0 {
+            log!("{} tokens burned", burned_amount);
+        }
+        return used_amount.into();
+    }
+}
+
+#[near_bindgen]
+impl FungibleTokenMetadataProvider for Contract {
+    fn ft_metadata(&self) -> FungibleTokenMetadata {
+        self.metadata.get().unwrap()
+    }
+}
+
+#[ext_contract(ext_ft_receiver)]
+pub trait FungibleTokenReceiver {
+    fn ft_on_transfer(
+        &mut self,
+        sender_id: AccountId,
+        amount: U128,
+        msg: String,
+    ) -> PromiseOrValue<U128>;
+}
+
+#[ext_contract(ext_self)]
+trait FungibleTokenResolver {
+    fn ft_resolve_transfer(
+        &mut self,
+        sender_id: AccountId,
+        receiver_id: AccountId,
+        amount: U128,
+    ) -> U128;
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::MockedBlockchain;
+    use near_sdk::{testing_env, Balance};
+
+    use super::*;
+
+    const OWNER_SUPPLY: Balance = 1_000_000_000_000_000;
+
+    fn get_context(predecessor_account_id: ValidAccountId) -> VMContextBuilder {
+        let mut builder = VMContextBuilder::new();
+        builder
+            .current_account_id(accounts(0))
+            .signer_account_id(predecessor_account_id.clone())
+            .predecessor_account_id(predecessor_account_id);
+        builder
+    }
+
+    #[test]
+    fn test_new() {
+        let mut context = get_context(accounts(1));
+        testing_env!(context.build());
+        let contract = Contract::new(accounts(1).into(), OWNER_SUPPLY.into());
+        testing_env!(context.is_view(true).build());
+        assert_eq!(contract.ft_total_supply().0, OWNER_SUPPLY);
+        assert_eq!(contract.ft_balance_of(accounts(1)).0, OWNER_SUPPLY);
+    }
+
+    #[test]
+    #[should_panic(expected = "The contract is not initialized")]
+    fn test_default() {
+        let context = get_context(accounts(1));
+        testing_env!(context.build());
+        let _contract = Contract::default();
+    }
+
+    #[test]
+    fn test_transfer() {
+        let mut context = get_context(accounts(2));
+        testing_env!(context.build());
+        let mut contract = Contract::new(accounts(2).into(), OWNER_SUPPLY.into());
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .attached_deposit(contract.storage_balance_bounds().min.into())
+            .predecessor_account_id(accounts(1))
+            .build());
+        // Paying for account registration, aka storage deposit
+        contract.storage_deposit(None, None);
+
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .attached_deposit(1)
+            .predecessor_account_id(accounts(2))
+            .build());
+        let transfer_amount = OWNER_SUPPLY / 3;
+        contract.ft_transfer(accounts(1), transfer_amount.into(), None);
+
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .account_balance(env::account_balance())
+            .is_view(true)
+            .attached_deposit(0)
+            .build());
+        assert_eq!(
+            contract.ft_balance_of(accounts(2)).0,
+            (OWNER_SUPPLY - transfer_amount)
+        );
+        assert_eq!(contract.ft_balance_of(accounts(1)).0, transfer_amount);
+    }
+}
+
+'''

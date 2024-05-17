@@ -1,0 +1,261 @@
+*GitHub Repository "Mergifyio/gha-add-linear-author-as-reviewer"*
+
+'''--- .github/dependabot.yml ---
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: daily
+      time: "08:00"
+      timezone: Europe/Paris
+    open-pull-requests-limit: 10
+
+'''
+'''--- .mergify.yml ---
+extends: .github
+shared:
+  DefaultQueueOptions: &DefaultQueueOptions
+    commit_message_template: |
+      {{ title }} (#{{ number }})
+
+      {{ body }}
+    allow_inplace_checks: true
+    merge_method: squash
+    speculative_checks: 5
+queue_rules:
+  - name: default
+    <<: *DefaultQueueOptions
+    queue_conditions:
+      - "#approved-reviews-by>=1"
+      - "#changes-requested-reviews-by=0"
+      - "#review-threads-unresolved=0"
+      - "#review-requested=0"
+    merge_conditions: []
+
+  - name: lowprio
+    <<: *DefaultQueueOptions
+    queue_conditions:
+      - "#commits=1"
+      - author=dependabot[bot]
+    merge_method: merge
+    merge_conditions: []
+    speculative_checks: 1
+    batch_size: 7
+    batch_max_wait_time: 5min
+    commit_message_template: null
+    queue_branch_merge_method: fast-forward
+    disallow_checks_interruption_from_queues:
+      - default
+
+pull_request_rules:
+  - name: automatic merge
+    conditions:
+      - base=main
+      - label!=manual merge
+      - "check-success=Rule: Conventional Commit (post_check)"
+    actions:
+      queue:
+
+  - name: request review
+    conditions:
+      - -author=dependabot[bot]
+      - -author=mergify-ci-bot
+      - -merged
+      - -closed
+      - "#approved-reviews-by=0"
+      - "#changes-requested-reviews-by=0"
+      - "review-requested!=@devs"
+    actions:
+      request_reviews:
+        teams:
+          - devs
+
+  - name: Conventional Commit
+    conditions:
+      - base=main
+    actions:
+      post_check:
+        success_conditions:
+          - "title ~= ^(fix|feat|docs|style|refactor|perf|test|build|ci|chore|revert)(?:\\(.+\\))?:"
+        title: |
+          {% if check_succeed %}
+          Title follows Conventional Commit
+          {% else %}
+          Title does not follow Conventional Commit
+          {% endif %}
+        summary: |
+          {% if not check_succeed %}
+          The pull request title must follow
+          [Conventional Commit](https://www.conventionalcommits.org/en/v1.0.0/).
+          {% endif %}
+
+'''
+'''--- README.md ---
+# add-linear-author-as-reviewer
+
+This project is a GitHub action that requests a review from the Linear issue author.
+
+Usage example:
+
+```
+name: Linear automation
+
+on:
+  pull_request:
+    branches: [ "main" ]
+    types: [ "opened", "synchronize", "reopened", "edited" ]
+
+permissions: write-all
+
+jobs:
+  add-linear-author-as-reviewer:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add reviewers
+        uses: Mergifyio/add-linear-author-as-reviewer@main
+        with:
+           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+           LINEAR_ISSUE_REGEX: "MRGFY-\d+"
+           EMAIL_MAPPING: ${{ vars.EMAIL_MAPPING }}
+```
+
+The email mapping GitHub Action variables format is:
+
+```
+user1@example.com github-user-login-1
+user2@example.com github-user-login-2
+```
+
+'''
+'''--- SECURITY.md ---
+# Reporting Security Issues
+
+The Mergify team and community take security bugs seriously. We appreciate your efforts to responsibly disclose your findings, and will make every effort to acknowledge your contributions.
+
+Report a security issue about:
+
+* this GitHub Action, please use the GitHub Security Advisory ["Report a Vulnerability"](https://github.com/Mergifyio/gha-add-linear-author-as-reviewer/security/advisories/new) tab.
+* a Mergify product, please use our Security Program https://hackerone.com/mergify.
+
+The Mergify team will send a response indicating the next steps in handling your report. After the initial reply to your report, the security team will keep you informed of the progress towards a fix and full announcement, and may ask for additional information or guidance.
+
+'''
+'''--- action.yml ---
+name: 'add-linear-author-as-reviewer'
+description: 'Add Linear author as reviewer'
+author: 'Mergify'
+branding:
+  icon: 'at-sign'
+  color: 'blue'
+inputs:
+  LINEAR_API_KEY:
+    required: true
+    description: 'Linear Api Key'
+  GITHUB_TOKEN:
+    required: true
+    description: 'GitHub Token'
+  EMAIL_MAPPING:
+    required: true
+    description: 'Linear Email to GitHub login mapping (one by line and separated by a space)'
+  LINEAR_ISSUE_REGEX:
+    required: false
+    description: 'Linear issue regex to find the issue ID'
+    default: 'MRGFY-\d+'
+runs:
+  using: 'composite'
+  steps:
+    - id: extract
+      shell: bash
+      run: |
+        python3 -m venv venv
+        venv/bin/pip install -r ${{ github.action_path }}/requirements.txt
+        venv/bin/python ${{ github.action_path }}/linear-extract-reviewers.py >> $GITHUB_OUTPUT
+      env:
+        INPUT_LINEAR_API_KEY: ${{ inputs.LINEAR_API_KEY }}
+        INPUT_LINEAR_ISSUE_REGEX: ${{ inputs.LINEAR_ISSUE_REGEX }}
+        INPUT_EMAIL_MAPPING: ${{ inputs.EMAIL_MAPPING }}
+        INPUT_PULL_REQUEST_BODY: ${{ github.event.pull_request.body  }}
+    - shell: bash
+      if: "${{ steps.extract.outputs.creators }}"
+      run: |
+        set -x
+        for creator in ${{steps.extract.outputs.creators}}; do  
+          gh pr view ${{github.event.pull_request.html_url}} --json latestReviews |jq -e '.latestReviews[] | select(.author.login == "'${creator}'" and .state != "DISMISSED" and .state != "COMMENTED")' \
+          && \
+            echo "Review of ${creator} has already been requested" \
+          || \
+            curl -X POST \
+                -H "Content-type: application/json" \
+                -H "Accept: application/json" \
+                -H "Authorization: token $GITHUB_TOKEN" \
+                -d '{"reviewers": ["'${creator}'"]}' \
+                ${{github.event.pull_request.url}}/requested_reviewers
+            # This doesn't work because of https://github.com/cli/cli/issues/4844
+            # gh pr edit ${{github.event.pull_request.html_url}} --add-reviewer $creator
+        done
+      env:
+        GITHUB_TOKEN: ${{inputs.GITHUB_TOKEN}}
+
+'''
+'''--- linear-extract-reviewers.py ---
+import os
+import re
+import sys
+
+import httpx
+
+def main() -> None:
+    linear_api_key = os.environ["INPUT_LINEAR_API_KEY"]
+    linear_issue_regex = os.environ["INPUT_LINEAR_ISSUE_REGEX"]
+    pull_request_body = os.environ["INPUT_PULL_REQUEST_BODY"]
+    raw_mapping = os.environ["INPUT_EMAIL_MAPPING"]
+
+    email_mapping = {}
+    for line in raw_mapping.split("\n"):
+        if line:
+            email, _, login = line.strip().partition(" ")
+            email_mapping[email] = login.strip()
+
+    linear_ids = re.findall(linear_issue_regex, pull_request_body)
+    if not linear_ids:
+        print("No linear ticket found", file=sys.stderr)
+        return
+
+    issue_queries = ""
+    for linear_id in linear_ids:
+        issue_queries += f'{linear_id.replace("-", "_")}: issue(id: "{linear_id}") {{ creator {{ email }} }} '
+
+    query = {"query": f"query {{ {issue_queries} }}"}
+    print(query, file=sys.stderr)
+
+    with httpx.Client(
+        base_url="https://api.linear.app",
+        headers={"Content-Type": "application/json", "Authorization": linear_api_key},
+        timeout=httpx.Timeout(timeout=15.0)
+    ) as linear:
+        responses = linear.post("/graphql", json=query).json()
+        if "error" in responses:
+            print(responses, file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            creators = ",".join(
+                email_mapping[response["creator"]["email"]]
+                for response in responses["data"].values()
+                if response.get("creator") and response["creator"].get("email")
+            )
+            if creators:
+                print(f"CREATORS={creators}")
+        except Exception:
+            print(responses, file=sys.stderr)
+            raise
+
+main()
+
+'''
+'''--- requirements.txt ---
+httpx==0.27.0
+
+'''

@@ -1,0 +1,2132 @@
+*GitHub Repository "near/near-cli"*
+
+'''--- bin/near-cli.js ---
+const yargs = require('yargs');
+const chalk = require('chalk');
+
+yargs // eslint-disable-line
+    .strict()
+    .scriptName('near')
+    .middleware(require('../utils/check-version'))
+    .middleware(require('../middleware/key-store'))
+    .middleware(require('../middleware/retro-ledger'))
+    .middleware(require('../middleware/print-options'))
+    .command(require('../commands/credentials/add'))
+    .command(require('../commands/keys/add'))
+    .command(require('../commands/contract/call'))
+    .command(require('../commands/account/create'))
+    .command(require('../commands/account/delete'))
+    .command(require('../commands/keys/delete'))
+    .command(require('../commands/contract/deploy'))
+    .command(require('../commands/credentials/generate'))
+    .command(require('../commands/keys/list'))
+    .command(require('../commands/account/login'))
+    .command(require('../commands/transactions/send'))
+    .command(require('../commands/account/state'))
+    .command(require('../commands/contract/storage'))
+    .command(require('../commands/transactions/status'))
+    .command(require('../commands/validators/stake'))
+    .command(require('../commands/validators/validators'))
+    .command(require('../commands/contract/view'))
+    .command(require('../commands/deprecated'))
+    .option('verbose', { alias: ['v'], desc: 'Prints out verbose output', type: 'boolean', default: false })
+    .showHelpOnFail(true)
+    .recommendCommands()
+    .demandCommand(1, chalk`Pass {bold --help} to see all available commands and options.`)
+    .usage(chalk`Usage: {bold $0 <command> [options]}`)
+    .wrap(null)
+    .argv;
+'''
+'''--- commands/account/create.js ---
+
+const connect = require('../../utils/connect');
+const { KeyPair, utils, DEFAULT_FUNCTION_CALL_GAS } = require('near-api-js');
+const inspectResponse = require('../../utils/inspect-response');
+const { assertCredentials, storeCredentials } = require('../../utils/credentials');
+const { DEFAULT_NETWORK } = require('../../config');
+const chalk = require('chalk');
+const { getPublicKeyForPath } = require('../../utils/ledger');
+const { parseSeedPhrase } = require('near-seed-phrase');
+
+module.exports = {
+    command: 'create-account <new-account-id>',
+    aliases: ['create'],
+    desc: 'Create a new account',
+    builder: (yargs) => yargs
+        .describe('new-account-id', 'Account to be created (e.g. bob.testnet, bob.near, sub.bob.testnet, sub.bob.near)')
+        .option('useFaucet', {
+            desc: 'Pre-fund the account through a faucet service (testnet only)',
+            type: 'boolean',
+            default: false
+        })
+        .option('useAccount', {
+            desc: 'Account that will request and fund creating the new account',
+            alias: ['accountId', 'masterAccount'],
+            type: 'string',
+            required: false
+        })
+        .option('initialBalance', {
+            desc: 'Number of tokens to transfer to the new account',
+            type: 'string',
+            default: '1'
+        })
+        .option('publicKey', {
+            desc: 'Public key to initialize the account with',
+            type: 'string',
+            required: false
+        })
+        .option('seedPhrase', {
+            desc: 'seedPhrase from which to derive the account\'s publicKey',
+            type: 'string',
+            required: false
+        })
+        .option('signWithLedger', {
+            alias: ['useLedgerKey'],
+            desc: 'Use Ledger for signing',
+            type: 'boolean',
+            default: false
+        })
+        .option('ledgerPath', {
+            desc: 'Path to the Ledger key',
+            type: 'string',
+            default: "44'/397'/0'/0'/1'"
+        })
+        .option('useLedgerPK', {
+            alias: ['newLedgerKey'],
+            desc: 'Initialize the account using the public key from the Ledger',
+            type: 'boolean',
+            default: false
+        })
+        .option('PkLedgerPath', {
+            desc: 'Path to the Ledger key that will be added to the account',
+            type: 'string',
+            default: "44'/397'/0'/0'/1'"
+        })
+        .option('networkId', {
+            desc: 'Which network to use. Supports: mainnet, testnet, custom',
+            type: 'string',
+            default: DEFAULT_NETWORK
+        }),
+    handler: create
+};
+
+const network2TLA = { testnet: 'testnet', mainnet: 'near' };
+
+async function assertAccountDoesNotExist(accountId, near) {
+    // Check to see if account already exists
+    try {
+        // This is expected to error because the account shouldn't exist
+        const account = await near.account(accountId);
+        await account.state();
+        throw new Error(`Sorry, account '${accountId}' already exists.`);
+    } catch (e) {
+        const opt1 = e.message.includes('does not exist');
+        const opt2 = e.message.includes('doesn\'t exist');
+        if (!opt1 && !opt2) throw e;
+    }
+}
+
+async function create(options) {
+    const near = await connect(options);
+
+    if (!options.useFaucet && !options.useAccount) {
+        throw new Error(chalk`Please specify if you want the account to be fund by a faucet (--useFaucet) or through an existing --accountId)`);
+    }
+
+    if (options.useLedgerPK && options.publicKey) {
+        throw new Error('Please specify only one of --publicKeyFromLedger or --publicKey');
+    }
+
+    if (options.useFaucet) {
+        if (options.networkId === 'mainnet') throw new Error('Pre-funding accounts is not possible on mainnet');
+    } else {
+        if (!options.useAccount) throw new Error('Please specify an account to sign the transaction (--useAccount)');
+        await assertCredentials(options.useAccount, options.networkId, options.keyStore, options.useLedgerKey);
+    }
+
+    // assert account being created does not exist
+    const newAccountId = options.newAccountId;
+    await assertAccountDoesNotExist(newAccountId, near);
+
+    let keyPair;
+    let publicKey = options.useLedgerPK ? await getPublicKeyForPath(options.PkLedgerPath) : options.publicKey;
+
+    if (options.seedPhrase) {
+        const parsed = parseSeedPhrase(options.seedPhrase);
+        keyPair = KeyPair.fromString(parsed.secretKey);
+        publicKey = keyPair.getPublicKey();
+    }
+
+    if (!publicKey) {
+        // If no public key is specified, create a random one
+        keyPair = KeyPair.fromRandom('ed25519');
+        publicKey = keyPair.getPublicKey();
+    }
+
+    let promise;
+
+    if (options.useFaucet) {
+        // Use faucet service from NEAR
+        promise = near.createAccount(newAccountId, publicKey);
+    } else {
+        // Use an existing account
+        const account = await near.account(options.useAccount);
+        try { await account.state(); } catch (e) {
+            throw new Error(`Account ${options.useAccount} does not exist in ${options.networkId}. Are you using the right network?`);
+        }
+
+        const initialBalance = utils.format.parseNearAmount(options.initialBalance);
+
+        const split = newAccountId.split('.');
+        const isSubAccount = newAccountId.endsWith(options.useAccount);
+
+        if (split.length === 2 && !isSubAccount) {
+            // Assuming the TLA has the `create_account` method
+            console.log(chalk`Calling {bold ${split[1]}.create_account()} to create ${newAccountId} using ${options.useAccount}`);
+            promise = account.functionCall(
+                { contractId: split[1], methodName: 'create_account', args: { new_account_id: newAccountId, new_public_key: publicKey.toString() }, gas: DEFAULT_FUNCTION_CALL_GAS, attachedDeposit: initialBalance }
+            );
+        } else {
+            // creating sub-account or creating TLA
+            console.log(chalk`Creating account ${newAccountId} using ${options.useAccount}`);
+            promise = account.createAccount(newAccountId, publicKey, initialBalance);
+        }
+    }
+
+    try {
+        // Handle response
+        const response = await promise;
+
+        if (keyPair) {
+            storeCredentials(newAccountId, options.networkId, options.keyStore, keyPair, true);
+        } else {
+            console.log('Public key was provided, so we are not storing credentials (since we don\'t have the private key)');
+            console.log('If you have the private key, you can import it using `near add-credentials`');
+        }
+
+        // The faucet does not throw on error, so we force it here
+        if (options.useFaucet) { await response.state(); }
+
+        inspectResponse.prettyPrintResponse(response, options);
+    } catch (error) {
+        // Handle errors
+        switch (error.type) {
+        case 'CreateAccountNotAllowed':
+            console.error(chalk`\n{red.bold Error:} ${options.useFaucet ? 'the faucet service' : options.useAccount} cannot create ${newAccountId} (networkId: ${options.networkId}).`);
+            options.useAccount && console.error(chalk`${options.useAccount} can only create sub-accounts of itself, or .${network2TLA[options.networkId]} accounts.\n`);
+            options.useFaucet && console.error(chalk`Try using an account to fund it (--useAccount).`);
+            process.exit(1);
+            break;
+        case 'NotEnoughBalance':
+            console.error(chalk`\n{red.bold Error:} ${options.useFaucet ? 'The faucet service' : options.useAccount} does not have enough balance.`);
+            console.error(`Transaction hash: ${error.context.transactionHash}\n`);
+            console.error(`Signer: ${error.kind.signer_id}`);
+            console.error(`Balance: ${utils.format.formatNearAmount(error.kind.balance)}`);
+            console.error(`Action Cost: ${utils.format.formatNearAmount(error.kind.cost)}\n`);
+            process.exit(1);
+            break;
+        case 'CreateAccountOnlyByRegistrar':
+            console.error(chalk`\nYou cannot create Top Level Accounts.`);
+            process.exit(1);
+            break;
+        case 'AccountDoesNotExist':
+            if (!options.useFaucet) throw error;
+            console.error(chalk`\nThe faucet reported {bold.white no errors}, but we {bold.red cannot} find ${options.newAccountId}. Check if it exists with "near state ${options.newAccountId} --networkId ${options.networkId}".\n`);
+            process.exit(1);
+            break;
+        default:
+            throw error;
+        }
+    }
+}
+
+'''
+'''--- commands/account/delete.js ---
+const chalk = require('chalk');
+const connect = require('../../utils/connect');
+const inspectResponse = require('../../utils/inspect-response');
+const { assertCredentials } = require('../../utils/credentials');
+const { askYesNoQuestion } = require('../../utils/readline');
+const { DEFAULT_NETWORK } = require('../../config');
+
+module.exports = {
+    command: 'delete-account <account-id> <beneficiary-id>',
+    aliases: ['delete'],
+    desc: 'Delete account, sending remaining NEAR to a beneficiary',
+    builder: (yargs) => yargs
+        .option('signWithLedger', {
+            alias: ['useLedgerKey'],
+            desc: 'Use Ledger for signing',
+            type: 'boolean',
+            default: false
+        })
+        .option('ledgerPath', {
+            desc: 'HD key path',
+            type: 'string',
+            default: "44'/397'/0'/0'/1'"
+        })
+        .option('networkId', {
+            desc: 'Which network to use. Supports: mainnet, testnet, custom',
+            type: 'string',
+            default: DEFAULT_NETWORK
+        })
+        .option('force', {
+            desc: 'Forcefully delete account even if it is unsafe to do so',
+            type: 'boolean',
+            default: false,
+        }),
+    handler: deleteAccount
+};
+
+const confirmDelete = function (accountId, beneficiaryId) {
+    return askYesNoQuestion(
+        chalk`This will {bold.red delete ${accountId}}, transferring {bold.white the remaining NEAR tokens} to the {bold.green beneficiary ${beneficiaryId}}. This action will {bold.red NOT transfer} {bold.white FTs, NFTs} or other assets the account holds, make sure you to {bold.white manually transfer} them before deleting or they will be {bold.red lost}. Do you want to proceed? {bold.green (y/n)} `,
+        false);
+};
+
+async function deleteAccount(options) {
+    await assertCredentials(options.accountId, options.networkId, options.keyStore, options.useLedgerKey);
+    const near = await connect(options);
+    const beneficiaryAccount = await near.account(options.beneficiaryId);
+
+    try {
+        await beneficiaryAccount.state();
+    } catch (e) {
+        // beneficiary account does not exist if there is no state
+        if (e.type === 'AccountDoesNotExist') {
+            console.error(`Beneficiary account ${options.beneficiaryId} does not exist. Please create it before proceeding.`);
+            return;
+        } else {
+            throw e;
+        }
+    }
+
+    if (!options.force && !(await confirmDelete(options.accountId, options.beneficiaryId))) {
+        return console.log(chalk`{bold.white Deletion of account {bold.blue  ${options.accountId}} was {bold.red cancelled}}`);
+    }
+
+    const account = await near.account(options.accountId);
+    console.log(`Deleting account ${options.accountId}, beneficiary: ${options.beneficiaryId}`);
+
+    try {
+        const result = await account.deleteAccount(options.beneficiaryId);
+        console.log(`Account ${options.accountId} for network "${options.networkId}" was deleted.`);
+        inspectResponse.prettyPrintResponse(result, options);
+    } catch (error) {
+        switch (error.type) {
+        case 'KeyNotFound':
+            console.log(chalk`\n{bold.white ${options.accountId}} was not found in the network ${options.networkId}\n`);
+            process.exit(1);
+            break;
+        case 'SignerDoesNotExist':
+            // On re-sending a transaction, the signer might have been deleted already
+            console.log('RPC returned an error, please check if the account is deleted and try again');
+            process.exit(0);
+            break;
+        default:
+            throw error;
+        }
+    }
+}
+'''
+'''--- commands/account/login.js ---
+const chalk = require('chalk');
+const capture = require('../../utils/capture-login-success');
+const { KeyPair } = require('near-api-js');
+const open = require('open');    // open URL in default browser
+const readline = require('readline');
+const URL = require('url').URL;
+const verify = require('../../utils/verify-account');
+const { getConfig, DEFAULT_NETWORK } = require('../../config');
+
+module.exports = {
+    command: 'login',
+    desc: 'Login through a web wallet (default: MyNearWallet)',
+    builder: (yargs) => yargs
+        .option('networkId', {
+            desc: 'Which network to use. Supports: mainnet, testnet, custom',
+            type: 'string',
+            default: DEFAULT_NETWORK
+        }),
+    handler: login
+};
+
+// open a given URL in browser in a safe way.
+const openUrl = async function (url) {
+    try {
+        await open(url.toString());
+    } catch (error) {
+        console.error(`Failed to open the URL [ ${url.toString()} ]`, error);
+    }
+};
+
+async function login(options) {
+    const config = getConfig(options.networkId);
+    const newUrl = new URL(config.walletUrl + '/login/');
+    const referrer = 'NEAR CLI';
+    newUrl.searchParams.set('referrer', referrer);
+    const keyPair = await KeyPair.fromRandom('ed25519');
+    newUrl.searchParams.set('public_key', keyPair.getPublicKey());
+
+    console.log(chalk`\n{bold.yellow Please authorize NEAR CLI} on at least one of your accounts.`);
+
+    // attempt to capture accountId automatically via browser callback
+    let tempUrl;
+    const isWin = process.platform === 'win32';
+
+    // find a callback URL on the local machine
+    try {
+        if (!isWin) { // capture callback is currently not working on windows. This is a workaround to not use it
+            tempUrl = await capture.callback(5000);
+        }
+    } catch (error) {
+        // console.error("Failed to find suitable port.", error.message)
+        // TODO: Is it? Try triggering error
+        // silent error is better here
+    }
+
+    // if we found a suitable URL, attempt to use it
+    if (tempUrl) {
+        if (process.env.GITPOD_WORKSPACE_URL) {
+            const workspaceUrl = new URL(process.env.GITPOD_WORKSPACE_URL);
+            newUrl.searchParams.set('success_url', `https://${tempUrl.port}-${workspaceUrl.hostname}`);
+            // Browser not opened, as will open automatically for opened port
+        } else {
+            newUrl.searchParams.set('success_url', `http://${tempUrl.hostname}:${tempUrl.port}`);
+            openUrl(newUrl);
+        }
+    } else if (isWin) {
+        // redirect automatically on windows, but do not use the browser callback
+        openUrl(newUrl);
+    }
+
+    console.log(chalk`\n{dim If your browser doesn't automatically open, please visit this URL\n${newUrl.toString()}}`);
+
+    const getAccountFromWebpage = async () => {
+        // capture account_id as provided by NEAR Wallet
+        const [accountId] = await capture.payload(['account_id'], tempUrl, newUrl);
+        return accountId;
+    };
+
+    const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout
+    });
+    const redirectAutomaticallyHint = tempUrl ? ' (if not redirected automatically)' : '';
+    const getAccountFromConsole = async () => {
+        return await new Promise((resolve) => {
+            rl.question(
+                chalk`Please authorize at least one account at the URL above.\n\n` +
+                chalk`Which account did you authorize for use with NEAR CLI?\n` +
+                chalk`{bold Enter it here${redirectAutomaticallyHint}:}\n`, async (accountId) => {
+                    resolve(accountId);
+                });
+        });
+    };
+
+    let accountId;
+    if (!tempUrl) {
+        accountId = await getAccountFromConsole();
+    } else {
+        accountId = await new Promise((resolve, reject) => {
+            let resolved = false;
+            const resolveOnce = (result) => { if (!resolved) resolve(result); resolved = true; };
+            getAccountFromWebpage()
+                .then(resolveOnce); // NOTE: error ignored on purpose
+            getAccountFromConsole()
+                .then(resolveOnce)
+                .catch(reject);
+        });
+    }
+    rl.close();
+    capture.cancel();
+    // verify the accountId if we captured it or ...
+    try {
+        await verify(accountId, keyPair, options);
+    } catch (error) {
+        console.error('Failed to verify accountId.', error.message);
+    }
+}
+'''
+'''--- commands/account/state.js ---
+const { DEFAULT_NETWORK } = require('../../config');
+const connect = require('../../utils/connect');
+const inspectResponse = require('../../utils/inspect-response');
+const { utils } = require('near-api-js');
+
+module.exports = {
+    command: 'state <accountId>',
+    desc: 'View account\'s state (balance, storage_usage, code_hash, etc...)',
+    builder: (yargs) => yargs
+        .option('networkId', {
+            desc: 'Which network to use. Supports: mainnet, testnet, custom',
+            type: 'string',
+            default: DEFAULT_NETWORK
+        }),
+    handler: viewAccount
+};
+
+async function viewAccount(options) {
+    let near = await connect(options);
+    let account = await near.account(options.accountId);
+    let state = await account.state();
+    if (state && state.amount) {
+        state['formattedAmount'] = utils.format.formatNearAmount(state.amount);
+    }
+    console.log(`Account ${options.accountId}`);
+    console.log(inspectResponse.formatResponse(state));
+}
+'''
+'''--- commands/contract/call.js ---
+const { DEFAULT_FUNCTION_CALL_GAS, providers, utils } = require('near-api-js');
+const connect = require('../../utils/connect');
+const inspectResponse = require('../../utils/inspect-response');
+const { assertCredentials } = require('../../utils/credentials');
+const { DEFAULT_NETWORK } = require('../../config');
+const { InMemoryKeyStore } = require('near-api-js/lib/key_stores');
+const chalk = require('chalk');
+
+module.exports = {
+    command: 'call <contractName> <methodName> [args]',
+    desc: 'Call method in smart contract',
+    builder: (yargs) => yargs
+        .option('useAccount', {
+            required: true,
+            alias: ['accountId'],
+            desc: 'Account that will execute the actions',
+            type: 'string'
+        })
+        .option('signWithLedger', {
+            alias: ['useLedgerKey'],
+            desc: 'Use Ledger for signing',
+            type: 'boolean',
+            default: false
+        })
+        .option('ledgerPath', {
+            desc: 'HD key path',
+            type: 'string',
+            default: "44'/397'/0'/0'/1'"
+        })
+        .option('networkId', {
+            desc: 'Which network to use. Supports: mainnet, testnet, custom',
+            type: 'string',
+            default: DEFAULT_NETWORK
+        })
+        .option('gas', {
+            desc: 'Max amount of gas this call can use (in gas units)',
+            type: 'string',
+            default: DEFAULT_FUNCTION_CALL_GAS.toNumber(),
+        })
+        .option('deposit', {
+            desc: 'Number of tokens to attach (in NEAR) to a function call',
+            type: 'string',
+            default: '0',
+            alias: 'amount'
+        })
+        .option('depositYocto', {
+            desc: 'Number of tokens to attach (in yocto NEAR) to a function call',
+            type: 'string',
+            default: null,
+        })
+        .option('base64', {
+            desc: 'Treat arguments as base64-encoded BLOB.',
+            type: 'boolean',
+            default: false
+        })
+        .option('privateKey', {
+            desc: 'AccessKey to use in the call',
+            type: 'string',
+            default: null
+        }),
+    handler: scheduleFunctionCall
+};
+
+async function scheduleFunctionCall(options) {
+    if (options.privateKey) {
+        const keyPair = utils.KeyPair.fromString(options.privateKey);
+        console.log(`Using provided private key with public counterpart: ${keyPair.getPublicKey()}`);
+        options.keyStore = new InMemoryKeyStore();
+        options.keyStore.setKey(options.networkId, options.accountId, keyPair);
+    }
+
+    await assertCredentials(options.accountId, options.networkId, options.keyStore, options.useLedgerKey);
+
+    const deposit = options.depositYocto != null ? options.depositYocto : utils.format.parseNearAmount(options.deposit);
+    console.log(`Scheduling a call: ${options.contractName}.${options.methodName}(${options.args || ''})` +
+        (deposit && deposit != '0' ? ` with attached ${utils.format.formatNearAmount(deposit)} NEAR` : ''));
+
+    const near = await connect(options);
+    const account = await near.account(options.accountId);
+
+    const parsedArgs = options.base64 ? Buffer.from(options.args, 'base64') : JSON.parse(options.args || '{}');
+
+    try {
+        const functionCallResponse = await account.functionCall({
+            contractId: options.contractName,
+            methodName: options.methodName,
+            args: parsedArgs,
+            gas: options.gas,
+            attachedDeposit: deposit,
+        });
+        const result = providers.getTransactionLastResult(functionCallResponse);
+        inspectResponse.prettyPrintResponse(functionCallResponse, options);
+        console.log(inspectResponse.formatResponse(result));
+    } catch (error) {
+        switch (error.kind) {
+        case '{"ExecutionError":"Exceeded the prepaid gas."}': {
+            console.log(chalk(`\nTransaction ${error.transaction_outcome.id} had ${options.gas} of attached gas but used ${error.transaction_outcome.outcome.gas_burnt} of gas`));
+            console.log('View this transaction in explorer:', chalk.blue(`https://explorer.${options.networkId}.near.org/transactions/${error.transaction_outcome.id}`));
+            process.exit(1);
+            break;
+        }
+        default: {
+            throw error;
+        }
+        }
+    }
+}
+
+'''
+'''--- commands/contract/deploy.js ---
+const fs = require('fs');
+const chalk = require('chalk');
+const { utils, transactions, DEFAULT_FUNCTION_CALL_GAS } = require('near-api-js');
+
+const connect = require('../../utils/connect');
+const { assertCredentials } = require('../../utils/credentials');
+const { askYesNoQuestion } = require('../../utils/readline');
+const inspectResponse = require('../../utils/inspect-response');
+const { DEFAULT_NETWORK } = require('../../config');
+
+module.exports = {
+    command: 'deploy <account-id> <wasm-file>',
+    desc: 'Deploy a contract to an existing account (optionally initializing it)',
+    builder: (yargs) => yargs
+        .option('wasmFile', {
+            desc: 'Path to wasm file to deploy',
+            type: 'string',
+            required: true,
+        })
+        .option('initFunction', {
+            desc: 'Initialization method',
+            type: 'string',
+        })
+        .option('initArgs', {
+            desc: 'Initialization arguments',
+        })
+        .option('initGas', {
+            desc: 'Gas for initialization call (default: 30TGAS)',
+            type: 'number',
+            default: DEFAULT_FUNCTION_CALL_GAS
+        })
+        .option('initDeposit', {
+            desc: 'Deposit in Ⓝ to send for initialization call (default: 0)',
+            type: 'string',
+            default: '0'
+        })
+        .option('networkId', {
+            desc: 'Which network to use. Supports: mainnet, testnet, custom',
+            type: 'string',
+            default: DEFAULT_NETWORK
+        })
+        .option('force', {
+            desc: 'Forcefully deploy the contract',
+            type: 'boolean',
+            default: false,
+        }),
+    handler: deploy
+};
+
+const askOverrideContract = async function (prevCodeHash) {
+    if (prevCodeHash !== '11111111111111111111111111111111') {
+        return await askYesNoQuestion(
+            chalk`{bold.white This account already has a deployed contract [ {bold.blue ${prevCodeHash}} ]. Do you want to proceed? {bold.green (y/n) }}`,
+            false
+        );
+    }
+    return true;
+};
+
+async function deploy(options) {
+    await assertCredentials(options.accountId, options.networkId, options.keyStore, options.useLedgerKey);
+
+    const near = await connect(options);
+    const account = await near.account(options.accountId);
+    let prevState = await account.state();
+    let prevCodeHash = prevState.code_hash;
+
+    if(!options.force && !(await askOverrideContract(prevCodeHash))) return;
+
+    console.log(`Deploying contract ${options.wasmFile} in ${options.accountId}`);
+
+    // Deploy with init function and args
+    const txs = [transactions.deployContract(fs.readFileSync(options.wasmFile))];
+
+    if (options.initArgs && !options.initFunction) {
+        console.error('Must add initialization function.');
+        process.exit(1);
+    }
+
+    if (options.initFunction) {
+        if (!options.initArgs) {
+            console.error('Must add initialization arguments.\nExample: near deploy near.testnet ./out/contract.wasm --initFunction "new" --initArgs \'{"key": "value"}\'');
+            process.exit(1);
+        }
+        txs.push(transactions.functionCall(
+            options.initFunction,
+            Buffer.from(options.initArgs),
+            options.initGas,
+            utils.format.parseNearAmount(options.initDeposit)),
+        );
+    }
+
+    const result = await account.signAndSendTransaction({
+        receiverId: options.accountId,
+        actions: txs
+    });
+    console.log(`Done deploying ${options.initFunction ? 'and initializing' : 'to'} ${options.accountId}`);
+    inspectResponse.prettyPrintResponse(result, options);
+}
+'''
+'''--- commands/contract/storage.js ---
+const { DEFAULT_NETWORK } = require('../../config');
+const connect = require('../../utils/connect');
+const { formatResponse } = require('../../utils/inspect-response');
+
+module.exports = {
+    command: 'storage <account-id> [prefix]',
+    aliases: ['view-state'],
+    desc: 'View contract\'s storage (stored key-value pairs)',
+    builder: (yargs) => yargs
+        .option('networkId', {
+            desc: 'Which network to use. Supports: mainnet, testnet, custom',
+            type: 'string',
+            default: DEFAULT_NETWORK
+        })
+        .option('prefix', {
+            desc: 'Return keys only with given prefix.',
+            type: 'string',
+            default: ''
+        })
+        .option('blockId', {
+            desc: 'The block number OR the block hash (base58-encoded).',
+            type: 'string',
+            coerce: (blockId) => {
+                if (blockId && !isNaN(blockId)) {
+                    return Number(blockId);
+                }
+                return blockId;
+            }
+        })
+        .option('finality', {
+            desc: '`optimistic` uses the latest block recorded on the node that responded to your query,\n' +
+                '`final` is for a block that has been validated on at least 66% of the nodes in the network',
+            type: 'string',
+            choices: ['optimistic', 'final'],
+        })
+        .option('utf8', {
+            desc: 'Decode keys and values as UTF-8 strings',
+            type: 'boolean',
+            default: false
+        })
+        .conflicts('blockId', 'finality')
+        .check((argv) => {
+            if (!argv.finality && !argv.blockId) {
+                throw new Error('Must provide either --finality or --blockId');
+            }
+            return true;
+        }),
+    handler: viewState
+};
+
+async function viewState(options) {
+    const { accountId, prefix, finality, blockId, utf8 } = options;
+    const near = await connect(options);
+    const account = await near.account(accountId);
+
+    // near-api-js takes block_id instead of blockId
+    let state = await account.viewState(prefix, { block_id: blockId, finality });
+    if (utf8) {
+        state = state.map(({ key, value }) => ({ key: key.toString('utf-8'), value: value.toString('utf-8') }));
+    } else {
+        state = state.map(({ key, value }) => ({ key: key.toString('base64'), value: value.toString('base64') }));
+    }
+    console.log(formatResponse(state, options));
+}
+
+'''
+'''--- commands/contract/view.js ---
+const chalk = require('chalk');
+const connect = require('../../utils/connect');
+const { DEFAULT_NETWORK } = require('../../config');
+const inspectResponse = require('../../utils/inspect-response');
+
+module.exports = {
+    command: 'view <contractName> <methodName> [args]',
+    desc: 'Call a read-only method in a contract',
+    builder: (yargs) => yargs
+        .option('args', {
+            desc: 'Arguments to the view call, in JSON format (e.g. \'{"param_a": "value"}\')',
+            type: 'string',
+            default: null
+        })
+        .option('networkId', {
+            desc: 'Which network to use. Supports: mainnet, testnet, custom',
+            type: 'string',
+            default: DEFAULT_NETWORK
+        }),
+    handler: callViewFunction
+};
+
+async function callViewFunction(options) {
+    const near = await connect(options);
+    const account = await near.account(options.accountId || options.masterAccount || options.contractName);
+
+    try {
+        console.log(`View call: ${options.contractName}.${options.methodName}(${options.args || ''})`);
+        const response = await account.viewFunction({
+            contractId: options.contractName,
+            methodName: options.methodName,
+            args: JSON.parse(options.args || '{}')
+        });
+        console.log(inspectResponse.formatResponse(response, options));
+    } catch (error) {
+        switch(error.type){
+        case 'AccountDoesNotExist':
+            console.error(chalk`\nAccount {bold.white ${options.contractName}} was {bold.red not found} in {bold.white ${options.networkId}}.`);
+            console.error(chalk`Check if the contract's account is correct, and if you choose the right {bold.white --networkId}.\n`);
+            process.exit(1);
+            break;
+        case 'UntypedError':
+            console.error(chalk`\n{bold.red Error:} ${error.toString()}\n`);
+            process.exit(1);
+            break;
+        default:
+            throw error;
+        }
+    }
+}
+'''
+'''--- commands/credentials/add.js ---
+const { DEFAULT_NETWORK } = require('../../config');
+const { parseSeedPhrase } = require('near-seed-phrase');
+const { storeCredentials } = require('../../utils/credentials');
+const { KeyPair } = require('near-api-js');
+
+module.exports = {
+    command: 'add-credentials <account-id>',
+    desc: 'Store credentials locally to use them later to deploy, call, etc.',
+    builder: (yargs) => yargs
+        .option('secretKey', {
+            desc: 'Secret key for the account',
+            type: 'string',
+            required: false,
+        })
+        .option('seedPhrase', {
+            desc: 'Seed phrase from which to derive the access-key',
+            type: 'string',
+            required: false,
+        })
+        .option('networkId', {
+            desc: 'Which network to use. Supports: mainnet, testnet, custom',
+            type: 'string',
+            default: DEFAULT_NETWORK
+        })
+        .option('force', {
+            desc: 'Force storing the key even if the account already has one',
+            type: 'boolean',
+            default: false
+        })
+        .conflicts('secretKey', 'seedPhrase'),
+    handler: importAccount
+};
+
+async function importAccount(options) {
+    if (!options.secretKey && !options.seedPhrase) return console.log('Provide a secret key or a seed phrase.');
+
+    let secretKey;
+
+    if (options.secretKey) {
+        console.log(`Importing account ${options.accountId} with secret key.`);
+        secretKey = options.secretKey;
+    }
+
+    if (options.seedPhrase) {
+        console.log(`Importing account ${options.accountId} with seed phrase.`);
+        secretKey = parseSeedPhrase(options.seedPhrase).secretKey;
+    }
+
+    const keyPair = KeyPair.fromString(secretKey);
+
+    // store it
+    storeCredentials(options.accountId, options.networkId, options.keyStore, keyPair, options.force);
+}
+
+'''
+'''--- commands/credentials/generate.js ---
+const { decode } = require('bs58');
+const { generateSeedPhrase, parseSeedPhrase } = require('near-seed-phrase');
+const { DEFAULT_NETWORK } = require('../../config');
+const { storeCredentials } = require('../../utils/credentials');
+const { KeyPair } = require('near-api-js');
+
+module.exports = {
+    command: 'generate-key [account-id]',
+    desc: 'Create and display a key-pair (optionally, save it as credentials for an account)',
+    builder: (yargs) => yargs
+        .option('fromSeedPhrase', {
+            alias: 'seedPhrase',
+            desc: 'Generate key-pair from a seed phrase (e.g. "word-1 word-2 ... word-11 word-12")',
+            type: 'string',
+            required: false,
+        })
+        .option('saveImplicit', {
+            desc: 'Save the key as credentials for the implicit account',
+            type: 'boolean',
+            default: false
+        })
+        .option('queryLedgerPK', {
+            alias: ['useLedgerKey'],
+            desc: 'Save the key as credentials for the implicit account',
+            type: 'boolean',
+            default: false
+        })
+        .option('ledgerPath', {
+            desc: 'Path to the Ledger key',
+            type: 'string',
+            default: "44'/397'/0'/0'/1'"
+        })
+        .option('networkId', {
+            desc: 'Which network to use. Supports: mainnet, testnet, custom',
+            type: 'string',
+            default: DEFAULT_NETWORK
+        })
+        .option('force', {
+            desc: 'Force storing the key even if the account already has one',
+            type: 'boolean',
+            default: false
+        }),
+    handler: generateKey
+};
+
+function pKtoAccountId(publicKey) {
+    return Buffer.from(decode(publicKey.replace('ed25519:', ''))).toString('hex');
+}
+
+async function generateKey(options) {
+    let secret;
+
+    if (options.queryLedgerPK) {
+        const { getPublicKeyForPath } = require('../../utils/ledger');
+        const publicKey = await getPublicKeyForPath(options.ledgerPath);
+        console.log(`Public key: ${publicKey}`);
+        console.log(`Implicit account: ${pKtoAccountId(publicKey.toString())}`);
+        return;
+    }
+
+    if (options.fromSeedPhrase) {
+        const { publicKey, secretKey } = parseSeedPhrase(options.fromSeedPhrase);
+        console.log(`Seed phrase: ${options.fromSeedPhrase}`);
+        console.log(`Key pair: ${JSON.stringify({ publicKey, secretKey })}`);
+        console.log(`Implicit account: ${pKtoAccountId(publicKey)}`);
+        secret = secretKey;
+    } else {
+        const { seedPhrase, publicKey, secretKey } = generateSeedPhrase();
+        console.log(`Seed phrase: ${seedPhrase}`);
+        console.log(`Key pair: ${JSON.stringify({ publicKey, secretKey })}`);
+        console.log(`Implicit account: ${pKtoAccountId(publicKey)}`);
+        secret = secretKey;
+    }
+
+    const keyPair = KeyPair.fromString(secret);
+    if (options.accountId) {
+        storeCredentials(options.accountId, options.networkId, options.keyStore, keyPair, options.force);
+    }
+
+    if (options.saveImplicit) {
+        const implicit = pKtoAccountId(keyPair.getPublicKey().toString());
+        storeCredentials(implicit, options.networkId, options.keyStore, keyPair, options.force);
+    }
+}
+'''
+'''--- commands/deprecated.js ---
+const chalk = require('chalk');
+
+module.exports = [
+    {
+        command: ['clean', 'repl', 'evm-call', 'evm-view', 'set-api-key', 'js'],
+        desc: false,
+        handler: deprecated
+    },
+    {
+        command: 'dev-deploy [...]',
+        desc: false,
+        handler: deprecatedDevDeploy
+    },
+    {
+        command: 'proposals',
+        desc: false,
+        handler: deprecatedProposals
+    }
+
+];
+
+async function deprecated() {
+    console.log(chalk`\nThis command has been {bold.red deprecated}. Consider using {bold.blue near-cli-rs} instead\n`);
+}
+
+async function deprecatedDevDeploy() {
+    console.log(chalk`\nThis command has been {bold.red deprecated}`);
+    console.log(chalk`Please use: {bold.white near create-account <accId> --useFaucet} to create a pre-funded account, and then {bold.white near deploy} to deploy the contract\n`);
+}
+
+async function deprecatedProposals() {
+    console.log(chalk`\nThis command has been {bold.red deprecated}`);
+    console.log(chalk`Please use: {bold.white near validators proposals`);
+}
+'''
+'''--- commands/keys/add.js ---
+const { utils } = require('near-api-js');
+const connect = require('../../utils/connect');
+const { DEFAULT_NETWORK } = require('../../config');
+const inspectResponse = require('../../utils/inspect-response');
+const { assertCredentials } = require('../../utils/credentials');
+
+module.exports = {
+    command: 'add-key <account-id> <public-key>',
+    desc: 'Add an access key to a given account',
+    builder: (yargs) => yargs
+        .option('contractId', {
+            desc: 'Limit access key to given contract (if not provided - will create full access key)',
+            type: 'string',
+            required: false,
+        })
+        .option('methodNames', {
+            desc: 'Method names to limit access key to (example: --method-names meth1 meth2)',
+            type: 'array',
+            required: false,
+            default: []
+        })
+        .option('allowance', {
+            desc: 'Allowance in $NEAR for the key (default 0)',
+            type: 'string',
+            required: false,
+            default: '0'
+        })
+        .option('signWithLedger', {
+            alias: ['useLedgerKey'],
+            desc: 'Use Ledger for signing',
+            type: 'boolean',
+            default: false
+        })
+        .option('ledgerPath', {
+            desc: 'HD key path',
+            type: 'string',
+            default: "44'/397'/0'/0'/1'"
+        })
+        .option('networkId', {
+            desc: 'Which network to use. Supports: mainnet, testnet, custom',
+            type: 'string',
+            default: DEFAULT_NETWORK
+        }),
+    handler: addAccessKey
+};
+
+async function addAccessKey(options) {
+    await assertCredentials(options.accountId, options.networkId, options.keyStore, options.useLedgerKey);
+
+    console.log(`Adding ${options.contractId ? 'function call access' : 'full access'} key ${options.publicKey} to ${options.accountId}.`);
+    if (options.contractId) console.log(`Limited to: ${options.allowance} $NEAR and methods: [${options.methodNames.join(' ')}].`);
+
+    const near = await connect(options);
+    const account = await near.account(options.accountId);
+    const allowance = utils.format.parseNearAmount(options.allowance);
+
+    try {
+        const response = await account.addKey(options.publicKey, options.contractId, options.methodNames, allowance);
+        console.log('\nKey added to account, but not stored locally.');
+        inspectResponse.prettyPrintResponse(response, options);
+    } catch (error) {
+        if (error.type !== 'AddKeyAlreadyExists') throw error;
+        console.log(`\nAccess key ${options.publicKey} already exists in account ${options.accountId}.`);
+    }
+}
+
+'''
+'''--- commands/keys/delete.js ---
+const chalk = require('chalk');
+const connect = require('../../utils/connect');
+const inspectResponse = require('../../utils/inspect-response');
+const { assertCredentials } = require('../../utils/credentials');
+const { askYesNoQuestion } = require('../../utils/readline');
+const { DEFAULT_NETWORK } = require('../../config');
+
+module.exports = {
+    command: 'delete-key <account-id> <access-key>',
+    desc: 'Delete access key',
+    builder: (yargs) => yargs
+        .option('signWithLedger', {
+            alias: ['useLedgerKey'],
+            desc: 'Use Ledger for signing',
+            type: 'boolean',
+            default: false
+        })
+        .option('ledgerPath', {
+            desc: 'HD key path',
+            type: 'string',
+            default: "44'/397'/0'/0'/1'"
+        })
+        .option('networkId', {
+            desc: 'Which network to use. Supports: mainnet, testnet, custom',
+            type: 'string',
+            default: DEFAULT_NETWORK
+        })
+        .option('force', {
+            desc: 'Forcefully delete key even if it is unsafe to do so',
+            type: 'boolean',
+            default: false,
+        }),
+    handler: deleteAccessKey
+};
+
+async function deleteAccessKey(options) {
+    await assertCredentials(options.accountId, options.networkId, options.keyStore, options.useLedgerKey);
+    const near = await connect(options);
+    const account = await near.account(options.accountId);
+    const approval = await isAllApprovalsGranted(account, options.accessKey);
+
+    if (!options.force && !approval) {
+        console.log(chalk`Deletion of {bold.white ${options.accessKey}} key on {bold.white ${options.accountId}} was {bold.red canceled}}`);
+    }
+
+    // forced or approved
+    console.log(chalk`Deleting key {bold.white ${options.accessKey}} on {bold.white ${options.accountId}.}`);
+
+    try {
+        const result = await account.deleteKey(options.accessKey);
+        inspectResponse.prettyPrintResponse(result, options);
+    } catch (error) {
+        if (error.type !== 'DeleteKeyDoesNotExist') throw error;
+        console.log(chalk`\nKey {bold.white ${options.accessKey}} does {bold.red not exist} on account {bold.white ${options.accountId}}.`);
+    }
+}
+
+function confirmDelete(accessKey) {
+    return askYesNoQuestion(
+        chalk`{bold.white Key {bold.blue ${accessKey}} is a Full Access key. Make sure it's not your recovery method. Do you want to proceed? {bold.green (y/n) }}`,
+        false);
+}
+
+function confirmLock(accountId, accessKey) {
+    return askYesNoQuestion(
+        chalk`{bold.white Key {bold.blue ${accessKey}} is the last Full Access key on your account. In case of deleting you will not be able to restore access to the account {bold.blue ${accountId}}. Do you want to proceed? {bold.green (y/n) }}`,
+        false);
+}
+
+async function isAllApprovalsGranted(account, accessKey) {
+    let accessKeys = await account.getAccessKeys();
+    let fullAccessKeys = accessKeys.filter(accessKey => accessKey.access_key.permission === 'FullAccess');
+
+    if (fullAccessKeys.find(key => key.public_key === accessKey)) {
+        // asks for approval if user is deleting Full Access Key
+        if (!await confirmDelete(accessKey)) { return false; }
+
+        // ask additional questions if it's the last Full Access Key
+        if (fullAccessKeys.length === 1 && !await confirmLock(account.accountId, accessKey)) { return false; }
+    }
+    return true;
+}
+
+'''
+'''--- commands/keys/list.js ---
+const { DEFAULT_NETWORK } = require('../../config');
+const connect = require('../../utils/connect');
+const inspectResponse = require('../../utils/inspect-response');
+
+module.exports = {
+    command: 'list-keys <accountId>',
+    aliases: ['keys'],
+    desc: 'Query public keys of an account',
+    builder: (yargs) => yargs
+        .option('networkId', {
+            desc: 'Which network to use. Supports: mainnet, testnet, custom',
+            type: 'string',
+            default: DEFAULT_NETWORK
+        }),
+    handler: viewAccessKeys
+};
+
+async function viewAccessKeys(options) {
+    let near = await connect(options);
+    let account = await near.account(options.accountId);
+    let accessKeys = await account.getAccessKeys();
+    console.log(`Keys for account ${options.accountId}`);
+    console.log(inspectResponse.formatResponse(accessKeys));
+}
+
+'''
+'''--- commands/transactions/send.js ---
+const chalk = require('chalk');
+const connect = require('../../utils/connect');
+const inspectResponse = require('../../utils/inspect-response');
+const { assertCredentials } = require('../../utils/credentials');
+const { utils } = require('near-api-js');
+const { DEFAULT_NETWORK } = require('../../config');
+
+module.exports = {
+    command: 'send-near <sender> <receiver> <amount>',
+    aliases: ['send'],
+    desc: 'Send tokens to given receiver',
+    builder: (yargs) => yargs
+        .option('amount', {
+            desc: 'Amount of NEAR tokens to send',
+            type: 'string',
+        })
+        .option('signWithLedger', {
+            alias: ['useLedgerKey'],
+            desc: 'Use Ledger for signing',
+            type: 'boolean',
+            default: false
+        })
+        .option('ledgerPath', {
+            desc: 'HD key path',
+            type: 'string',
+            default: "44'/397'/0'/0'/1'"
+        })
+        .option('networkId', {
+            desc: 'Which network to use. Supports: mainnet, testnet, custom',
+            type: 'string',
+            default: DEFAULT_NETWORK
+        }),
+    handler: sendMoney
+};
+
+async function sendMoney(options) {
+    await assertCredentials(options.sender, options.networkId, options.keyStore, options.useLedgerKey);
+
+    const near = await connect(options);
+    const account = await near.account(options.sender);
+
+    try {
+        console.log(`Sending ${options.amount} NEAR to ${options.receiver} from ${options.sender}`);
+        const result = await account.sendMoney(options.receiver, utils.format.parseNearAmount(options.amount));
+        inspectResponse.prettyPrintResponse(result, options);
+    } catch (error) {
+        switch (error.type) {
+        case 'AccountDoesNotExist':
+            console.log(chalk`\nAccount {bold.white ${options.receiver}} does {bold.red not exist} on {bold.white ${options.networkId}}.\n`);
+            process.exit(1);
+            break;
+        case 'NotEnoughBalance':
+            console.log(chalk`\nAccount {bold.white ${options.sender}} does {bold.red not have enough balance} to send {bold.white ${options.amount} NEAR} to {bold.white ${options.receiver}}.\n`);
+            process.exit(1);
+            break;
+        default:
+            throw error;
+        }
+    }
+}
+'''
+'''--- commands/transactions/status.js ---
+const { DEFAULT_NETWORK } = require('../../config');
+const connect = require('../../utils/connect');
+const inspectResponse = require('../../utils/inspect-response');
+const bs58 = require('bs58');
+
+module.exports = {
+    command: 'tx-status <hash> <accountId>',
+    desc: 'Lookup transaction status by hash',
+    builder: (yargs) => yargs
+        .option('hash', {
+            desc: 'base58-encoded hash',
+            type: 'string',
+            required: true
+        })
+        .option('accountId', {
+            desc: 'Account that signed the tx (used to determine which shard to query)',
+            type: 'string',
+        })
+        .option('networkId', {
+            desc: 'Which network to use. Supports: mainnet, testnet, custom',
+            type: 'string',
+            default: DEFAULT_NETWORK
+        }),
+    handler: txStatus
+};
+
+async function txStatus(options) {
+    const near = await connect(options);
+
+    const hashParts = options.hash.split(':');
+    let hash, accountId;
+    if (hashParts.length == 2) {
+        [accountId, hash] = hashParts;
+    } else if (hashParts.length == 1) {
+        [hash] = hashParts;
+    } else {
+        throw new Error('Unexpected transaction hash format');
+    }
+
+    accountId = accountId || options.accountId || options.masterAccount;
+
+    if (!accountId) {
+        throw new Error('Please specify account id, either as part of transaction hash or using --accountId flag.');
+    }
+
+    const status = await near.connection.provider.txStatus(bs58.decode(hash), accountId);
+    console.log(`Transaction ${null}:${hash}`);
+    console.log(inspectResponse.formatResponse(status));
+}
+'''
+'''--- commands/validators/stake.js ---
+const qs = require('querystring');
+const { utils } = require('near-api-js');
+
+const connect = require('../../utils/connect');
+const inspectResponse = require('../../utils/inspect-response');
+const { assertCredentials } = require('../../utils/credentials');
+const { DEFAULT_NETWORK } = require('../../config');
+
+module.exports = {
+    command: 'validator-stake accountId stakingKey amount',
+    aliases: ['stake'],
+    desc: 'Create a staking transaction (for **validators** only)',
+    builder: (yargs) => yargs
+        .option('accountId', {
+            desc: 'Account that wants to become a network validator',
+            type: 'string',
+            required: true,
+        })
+        .option('stakingKey', {
+            desc: 'Public key to stake with (base58 encoded)',
+            type: 'string',
+            required: true,
+        })
+        .option('amount', {
+            desc: 'Amount to stake',
+            type: 'string',
+            required: true,
+        })
+        .option('signWithLedger', {
+            alias: ['useLedgerKey'],
+            desc: 'Use Ledger for signing',
+            type: 'boolean',
+            default: false
+        })
+        .option('ledgerPath', {
+            desc: 'HD key path',
+            type: 'string',
+            default: "44'/397'/0'/0'/1'"
+        })
+        .option('networkId', {
+            desc: 'Which network to use. Supports: mainnet, testnet, custom',
+            type: 'string',
+            default: DEFAULT_NETWORK
+        }),
+    handler: stake
+};
+
+async function stake(options) {
+    await assertCredentials(options.accountId, options.networkId, options.keyStore, options.useLedgerKey);
+    console.log(`Staking ${options.amount} (${utils.format.parseNearAmount(options.amount)}N) on ${options.accountId} with public key = ${qs.unescape(options.stakingKey)}.`);
+    const near = await connect(options);
+    const account = await near.account(options.accountId);
+    const result = await account.stake(qs.unescape(options.stakingKey), utils.format.parseNearAmount(options.amount));
+    inspectResponse.prettyPrintResponse(result, options);
+}
+'''
+'''--- commands/validators/validators.js ---
+const { DEFAULT_NETWORK } = require('../../config');
+const connect = require('../../utils/connect');
+const validatorsInfo = require('../../utils/validators-info');
+
+module.exports = {
+    command: 'validators <query>',
+    desc: 'Info on validators',
+    handler: validators,
+    builder: (yargs) => yargs
+        .option('query',
+            {
+                desc: 'current | next | <block number> | <block hash> to lookup validators at a specific epoch, or "proposals" to see the current proposals',
+                type: 'string',
+                default: 'current'
+            }
+        )
+        .option('networkId', {
+            desc: 'Which network to use. Supports: mainnet, testnet, custom',
+            type: 'string',
+            default: DEFAULT_NETWORK
+        }),
+};
+
+async function validators(options) {
+    const near = await connect(options);
+
+    switch (options.query) {
+    case 'proposals':
+        await validatorsInfo.showProposalsTable(near);
+        break;
+    case 'current':
+        await validatorsInfo.showValidatorsTable(near, null);
+        break;
+    case 'next':
+        await validatorsInfo.showNextValidatorsTable(near);
+        break;
+    default:
+        await validatorsInfo.showValidatorsTable(near, options.query);
+        break;
+    }
+}
+'''
+'''--- config.js ---
+const DEFAULT_NETWORK = process.env.NEAR_NETWORK || process.env.NEAR_ENV || 'testnet';
+
+if (process.env.NEAR_NETWORK && process.env.NEAR_ENV){
+    console.log(`Warning: NEAR_NETWORK and NEAR_ENV are both set! We will use NEAR_NETWORK (${process.env.NEAR_NETWORK})\n`);
+}
+
+function getConfig(env) {
+    let config;
+    switch (env) {
+    case 'production':
+    case 'mainnet':
+        config = {
+            networkId: 'mainnet',
+            nodeUrl: process.env.NEAR_MAINNET_RPC || 'https://rpc.mainnet.near.org',
+            walletUrl: process.env.NEAR_MAINNET_WALLET || 'https://app.mynearwallet.com',
+            helperUrl: 'https://helper.mainnet.near.org',
+            helperAccount: 'near',
+        };
+        break;
+    case 'development':
+    case 'testnet':
+        config = {
+            networkId: 'testnet',
+            nodeUrl: process.env.NEAR_TESTNET_RPC || 'https://rpc.testnet.near.org',
+            walletUrl: process.env.NEAR_TESTNET_WALLET || 'https://testnet.mynearwallet.com',
+            helperUrl: 'https://helper.testnet.near.org',
+            helperAccount: 'testnet',
+        };
+        break;
+    case 'custom':
+        config = {
+            networkId: 'custom',
+            nodeUrl: process.env.NEAR_CUSTOM_RPC,
+            walletUrl: process.env.NEAR_CUSTOM_WALLET,
+            helperUrl: process.env.NEAR_CUSTOM_HELPER,
+            helperAccount: process.env.NEAR_CUSTOM_TLA,
+        };
+        break;
+    default:
+        throw Error(`Unconfigured environment '${env}'. Can be configured in src/config.js.`);
+    }
+    config['initialBalance'] = '1' + '0'.repeat(24);
+    return config;
+}
+
+module.exports = { getConfig, DEFAULT_NETWORK };
+
+'''
+'''--- dangerfile.js ---
+const { danger, warn } = require('danger');
+const { includes } = require('lodash');
+
+const hasPackageChanges = includes(danger.git.modified_files, 'package.json');
+const hasLockfileChanges = includes(danger.git.modified_files, 'yarn.lock');
+if (hasPackageChanges && !hasLockfileChanges) {
+    warn('There are package.json changes with no corresponding lockfile changes');
+}
+
+'''
+'''--- middleware/key-store.js ---
+const { keyStores } = require('near-api-js');
+const homedir = require('os').homedir();
+const path = require('path');
+const UnencryptedFileSystemKeyStore = keyStores.UnencryptedFileSystemKeyStore;
+
+const CREDENTIALS_DIR = '.near-credentials';
+
+module.exports = async function createKeyStore() {
+    // TODO: use system keystores.
+    const credentialsPath = path.join(homedir, CREDENTIALS_DIR);
+    return { keyStore: new UnencryptedFileSystemKeyStore(credentialsPath) };
+};
+'''
+'''--- middleware/print-options.js ---
+
+module.exports = async function printOptions(options) {
+    if (options.verbose) {
+        const filteredOptions = Object.keys(options)
+            .filter(key => !key.match(/[-_$]/))
+            .reduce((obj, key) => ({ ...obj, [key]: options[key] }), {});
+        console.log('Using options:', filteredOptions);
+    }
+};
+'''
+'''--- middleware/retro-ledger.js ---
+// In v3.5.0 the argument `useLedgerKey` was a string, in v4.0.0 this was change to a boolean
+// Sadly, yargs assumes that --useLedgerKey='anything' is FALSE
+// Here we detect if an argument is `useLedgerKey=` and guide the user to the correct format
+
+module.exports = async function ledgerOptions() {
+    let path = '';
+
+    process.argv.forEach(arg => {
+        path = arg.includes('--useLedgerKey=') ? arg.split('=')[1] : path;
+    });
+
+    if (path != '') { 
+        console.log(`\nPlease use --useLedgerKey --ledgerPath="${path}" instead of --useLedgerKey="${path}"\n`);
+        process.exit(0);
+    }
+};
+'''
+'''--- test/unit/inspect-response.test.js ---
+const inspectResponse = require('../../utils/inspect-response');
+
+describe('getTxnId', () => {
+    test('with expected data format', async () => {
+        const data =  {
+            transaction: {
+                hash: 'BF1iyVWTkagisho3JKKUXiPQu2sMuuLsEbvQBDYHHoKE'
+            }
+        };
+        expect(inspectResponse.getTxnId(data)).toEqual('BF1iyVWTkagisho3JKKUXiPQu2sMuuLsEbvQBDYHHoKE');
+    });
+
+    test('with null response', async () => {
+        expect(inspectResponse.getTxnId(null)).toEqual(null);
+    });
+
+    test('with null transaction inside response', async () => {
+        expect(inspectResponse.getTxnId({})).toEqual(null);
+    });
+});
+
+'''
+'''--- utils/capture-login-success.js ---
+const http = require('http');
+const url = require('url');
+const stoppable = require('stoppable'); // graceful, effective server shutdown
+const tcpPortUsed = require('tcp-port-used'); // avoid port collisions
+
+let server;
+
+/**
+    extract arbitrary collection of fields from temporary HTTP server
+    server processes a single request and then shuts down gracefully
+
+    @param fields array of fields to extract from req.url.query
+    @param port the port the server should use
+    @param hostname the hostname the server should use
+ */
+const payload = (fields, { port, hostname }, redirectUrl) => new Promise((resolve, reject) => {
+    server = stoppable(http.createServer(handler)).listen(port, hostname);
+
+    /**
+        request handler for single-use node server
+     */
+    function handler(req, res){
+        try {
+            let parsedUrl = url.parse(req.url, true);
+            let results = fields.map((field) => parsedUrl.query[field]);
+
+            if (Object.keys(parsedUrl.query).length > 0) {
+                res.statusCode = 200;
+                res.setHeader('Content-Type', 'text/html');
+                // TODO: Make code more specialized (vs handling generic fields) and only output this if login succeeded end to end
+                res.end(renderWebPage('You are logged in. Please close this window.'), () => {
+                    server.stop();
+                    resolve(results);
+                });
+            } else {
+                res.writeHead(302, { Location: redirectUrl });
+                res.end();
+            }
+        } catch (e) {
+            console.error('Unexpected error: ', e);
+            res.statusCode = 400;
+            res.end('It\'s a scam!');
+            server.stop();
+            reject(new Error('Failed to capture accountId'));
+        }
+    }
+});
+
+/**
+    attempt to find the first suitable (open) port
+    @param port the starting port on the computer to scan for availability
+    @param hostname the hostname of the machine on which to scan for open ports
+    @param range the number of ports to try scanning before giving up
+ */
+const callback = async (port = 3000, hostname = '127.0.0.1', range = 10) => {
+    if (process.env.GITPOD_WORKSPACE_URL) {
+        // NOTE: Port search interferes with GitPod port management
+        return { port, hostname };
+    }
+
+    const start = port;
+    const end = start + range;
+    let inUse = true;
+
+    for (;port <= end; port++) {
+        try {
+            inUse = await tcpPortUsed.check(port, hostname);
+            if (!inUse) {
+                break; // unused port found
+            }
+        } catch (e) {
+            console.error('Error while scanning for available ports.', e.message);
+        }
+    }
+
+    if(inUse) {
+        throw new Error(`All ports in use: [ ${start} - ${end} ]`);
+    }
+
+    return { port, hostname };
+};
+
+const cancel = () => {
+    if (server) server.stop();
+};
+
+module.exports = { payload, callback, cancel };
+
+/**
+    helper to render a proper success page
+ */
+function renderWebPage(message){
+    const title = 'NEAR Account Authorization Success';
+
+    // logo and font from https://near.org/brand/
+    return `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="X-UA-Compatible" content="ie=edge">
+  <title>${title}</title>
+  <link rel='stylesheet' href='https://use.typekit.net/pqx2pko.css?ver=5.3' type='text/css' media='all' />
+  <style>
+    body {
+      font-family: benton-sans,sans-serif;
+    }
+
+    #container {
+        display: flex;              /* establish flex container */
+        flex-direction: column;     /* stack flex items vertically */
+        justify-content: center;    /* center items vertically, in this case */
+        align-items: center;        /* center items horizontally, in this case */
+        height: 80vh;
+    }
+
+    .box {
+        width: 400px;
+        text-align: center;
+    }
+  </style>
+</head>
+<body>
+<div id="container">
+    <div class="box">
+        <svg
+            id="Layer_1"
+            data-name="Layer 1"
+            xmlns="http://www.w3.org/2000/svg"
+            xmlns:xlink="http://www.w3.org/1999/xlink"
+            viewBox="0 0 414 162"
+        >
+            <defs>
+                <style>
+                    .cls-1 {
+                        fill: url(#New_Gradient_Swatch_1);
+                    }
+                    .cls-2 {
+                        fill: #24272a;
+                    }
+                </style>
+                <linearGradient
+                    id="New_Gradient_Swatch_1"
+                    x1="39.01"
+                    y1="122.98"
+                    x2="122.98"
+                    y2="39.01"
+                    gradientUnits="userSpaceOnUse"
+                >
+                    <stop offset="0.21" stop-color="#24272a" />
+                    <stop offset="0.42" stop-color="#24272a" stop-opacity="0" />
+                    <stop offset="0.59" stop-color="#24272a" stop-opacity="0" />
+                    <stop offset="0.81" stop-color="#24272a" />
+                </linearGradient>
+            </defs>
+            <title>near_logo</title>
+            <path
+                class="cls-2"
+                d="M108.24,40.57,89.42,68.5a2,2,0,0,0,3,2.63l18.52-16a.74.74,0,0,1,1.24.56v50.29a.75.75,0,0,1-1.32.48l-56-67A9.59,9.59,0,0,0,47.54,36H45.59A9.59,9.59,0,0,0,36,45.59v70.82A9.59,9.59,0,0,0,45.59,126h0a9.59,9.59,0,0,0,8.17-4.57L72.58,93.5a2,2,0,0,0-3-2.63l-18.52,16a.74.74,0,0,1-1.24-.56V56.07a.75.75,0,0,1,1.32-.48l56,67a9.59,9.59,0,0,0,7.33,3.4h2a9.59,9.59,0,0,0,9.59-9.59V45.59A9.59,9.59,0,0,0,116.41,36h0A9.59,9.59,0,0,0,108.24,40.57Z"
+               
+            />
+            <path
+                class="cls-2"
+                d="M207.21,54.75v52.5a.76.76,0,0,1-.75.75H201a7.49,7.49,0,0,1-6.3-3.43l-24.78-38.3.85,19.13v21.85a.76.76,0,0,1-.75.75h-7.22a.76.76,0,0,1-.75-.75V54.75a.76.76,0,0,1,.75-.75h5.43a7.52,7.52,0,0,1,6.3,3.42l24.78,38.24-.77-19.06V54.75a.75.75,0,0,1,.75-.75h7.22A.76.76,0,0,1,207.21,54.75Z"
+            />
+            <path
+                class="cls-2"
+                d="M281,108h-7.64a.75.75,0,0,1-.7-1L292.9,54.72A1.14,1.14,0,0,1,294,54h9.57a1.14,1.14,0,0,1,1.05.72L324.8,107a.75.75,0,0,1-.7,1h-7.64a.76.76,0,0,1-.71-.48l-16.31-43a.75.75,0,0,0-1.41,0l-16.31,43A.76.76,0,0,1,281,108Z"
+            />
+            <path
+                class="cls-2"
+                d="M377.84,106.79,362.66,87.4c8.57-1.62,13.58-7.4,13.58-16.27,0-10.19-6.63-17.13-18.36-17.13H336.71a1.12,1.12,0,0,0-1.12,1.12h0a7.2,7.2,0,0,0,7.2,7.2H357c7.09,0,10.49,3.63,10.49,8.87s-3.32,9-10.49,9H336.71a1.13,1.13,0,0,0-1.12,1.13v26a.75.75,0,0,0,.75.75h7.22a.76.76,0,0,0,.75-.75V87.87h8.33l13.17,17.19a7.51,7.51,0,0,0,6,2.94h5.48A.75.75,0,0,0,377.84,106.79Z"
+            />
+            <path
+                class="cls-2"
+                d="M258.17,54h-33.5a1,1,0,0,0-1,1h0A7.33,7.33,0,0,0,231,62.33h27.17a.74.74,0,0,0,.75-.75V54.75A.75.75,0,0,0,258.17,54Zm0,45.67h-25a.76.76,0,0,1-.75-.75V85.38a.75.75,0,0,1,.75-.75h23.11a.75.75,0,0,0,.75-.75V77a.75.75,0,0,0-.75-.75H224.79a1.13,1.13,0,0,0-1.12,1.13v29.46a1.12,1.12,0,0,0,1.12,1.12h33.38a.75.75,0,0,0,.75-.75v-6.83A.74.74,0,0,0,258.17,99.67Z"
+            />
+        </svg>
+        <p>${message}</p>
+    </div>
+</div>
+</body>
+</html>
+    `;
+}
+
+'''
+'''--- utils/check-version.js ---
+/**
+    this utility inspired by:
+    https://github.com/gatsbyjs/gatsby/tree/master/packages/gatsby-cli
+    https://github.com/npm/cli
+ */
+const updateNotifier = require('update-notifier');
+const chalk = require('chalk');  // colorize output
+const isCI = require('is-ci');   // avoid output if running in CI server
+
+// updateCheckInterval is measured in seconds
+const UPDATE_CHECK_INTERVAL_SECONDS = 1;
+
+/**
+    check the current version of NEAR CLI against latest as published on npm
+ */
+module.exports = async function checkVersion() {
+    const pkg = require('../package.json');
+
+    const notifier = updateNotifier({ pkg, updateCheckInterval: UPDATE_CHECK_INTERVAL_SECONDS });
+
+    if (
+        notifier.update &&
+        notifier.update.latest !== pkg.version &&
+        !isCI
+    ) {
+        const { type: diff, current, latest } = notifier.update;
+        const update = normalizePhrasingOf(diff);
+        const updateCommand = '{updateCommand}';
+        const message = chalk`NEAR CLI has a ${update} available {dim ${current}} → {green ${latest}}
+Run {cyan ${updateCommand}} to avoid unexpected behavior`;
+
+        const boxenOpts = {
+            padding: 1,
+            margin: 1,
+            align: 'left',
+            borderColor: 'yellow',
+            borderStyle: 'round'
+        };
+
+        notifier.notify({ message, boxenOpts, isGlobal: true });
+    }
+};
+
+/**
+    semver-diff always returns undefined or 1 word
+    but this doesn't read well in English ouput
+
+    see: https://www.npmjs.com/package/semver-diff
+ */
+function normalizePhrasingOf(text) {
+    let update = 'new version'; // new version available
+
+    switch (text) {
+    case 'major': // major update available
+    case 'minor': // minor update available
+        update = `${text} update`;
+        break;
+    case 'patch':
+        update = text; // patch available
+        break;
+    case 'build':
+        update = `new ${text}`; // new build available
+        break;
+    default: // [ prepatch | premajor | preminor | prerelease ] available
+        update = text;
+    }
+
+    return update;
+}
+
+'''
+'''--- utils/connect.js ---
+const { connect: nearConnect } = require('near-api-js');
+const { getConfig } = require('../config');
+const { getPublicKeyForPath, signForPath } = require('./ledger');
+const chalk = require('chalk');
+
+module.exports = async function connect({ keyStore, ...options }) {
+    // If using Ledger, override the signer so that it uses the Ledger device
+    if (options.signWithLedger) { 
+        console.log(chalk`\nUsing Ledger with path {blue ${options.ledgerPath}}, change path with {blue --ledgerPath}\n`);
+        options.signer = {
+            getPublicKey: () => getPublicKeyForPath(options.ledgerPath),
+            signMessage: (m) => signForPath(m, options.ledgerPath)
+        };
+    }      
+
+    // TODO: Avoid need to wrap in deps
+    const config = getConfig(options.networkId);
+    return await nearConnect({ ...options, ...config, deps: { keyStore } });
+};
+
+'''
+'''--- utils/credentials.js ---
+const chalk = require('chalk');
+
+async function assertCredentials(accountId, networkId, keyStore, usingLedger) {
+    if (usingLedger) return;
+
+    const key = await keyStore.getKey(networkId, accountId);
+    if (key) return;
+
+    console.error(chalk`You are trying to use the account {bold.white ${accountId}}, but do not have the credentials locally (network: {bold.white ${networkId}})`);
+    process.exit(1);
+}
+
+async function storeCredentials(accountId, networkId, keyStore, keyPair, force) {
+    const key = await keyStore.getKey(networkId, accountId);
+
+    if (key && !force) {
+        console.log(chalk`The account {bold.white ${accountId}} already has local credentials (network: {bold.white ${networkId}})`);
+        return;
+    }
+
+    console.log(chalk`Storing credentials for account: {bold.white ${accountId}} (network: {bold.white ${networkId}})`);
+    console.log(`Saving key to '~/.near-credentials/${networkId}/${accountId}.json'`);
+    await keyStore.setKey(networkId, accountId, keyPair);
+}
+
+module.exports = { assertCredentials, storeCredentials };
+'''
+'''--- utils/inspect-response.js ---
+const util = require('util');
+
+const prettyPrintResponse = (response, options) => {
+    if (options.verbose) {
+        console.log(formatResponse(response));
+    }
+    const txnId = getTxnId(response);
+    if (txnId) {
+        const prefix = options.networkId === 'mainnet' ? 'www' : 'testnet';
+        console.log(`Transaction Id ${txnId}`);
+        console.log(`Open the explorer for more info: https://${prefix}.nearblocks.io/txns/${txnId}`);
+    }
+};
+
+const formatResponse = (response) => {
+    return util.inspect(response, {
+        // showHidden: true,
+        depth: null,
+        colors: Boolean(process.stdout.isTTY && process.stdout.hasColors()),
+        maxArrayLength: null
+    });
+};
+
+const getTxnId = (response) => {
+    // Currently supported response format: 
+    //{
+    //   ...
+    //   transaction: {
+    //     ...
+    //     hash: 'BF1iyVWTkagisho3JKKUXiPQu2sMuuLsEbvQBDYHHoKE'
+    //   },
+    if (!response || !response.transaction) {
+        return null;
+    }
+    return response.transaction.hash;
+};
+
+module.exports = {
+    prettyPrintResponse,
+    formatResponse,
+    getTxnId,
+};
+'''
+'''--- utils/ledger.js ---
+/*
+For future maintainers: The way this middleware works is by returning a signer object
+that is later **INJECTED** into the `near` object during the `connect` call.
+
+This way, each time an `account` object is created, the signer inside points the `account`
+object points to the Ledger.
+*/
+const { exit } = require('process');
+const { createClient } = require('near-ledger-js');
+const { utils: { PublicKey, key_pair: { KeyType } } } = require('near-api-js');
+const { default: TransportNodeHid } = require('@ledgerhq/hw-transport-node-hid');
+
+let client;
+let transport;
+let cachedPublicKeys = {};
+
+async function getPublicKeyForPath(hdKeyPath) {
+    // cache keys to avoid confirming on Ledger multiple times
+    if (cachedPublicKeys[hdKeyPath]) return cachedPublicKeys[hdKeyPath];
+
+    console.log('Trying to connect with Ledger...');
+
+    transport = await TransportNodeHid.create();
+    client = await createClient(transport);
+
+    console.log('Getting public key from Ledger...');
+
+    try {
+        const rawPublicKey = await client.getPublicKey(hdKeyPath);
+        const publicKey = new PublicKey({ keyType: KeyType.ED25519, data: rawPublicKey });
+        cachedPublicKeys[hdKeyPath] = publicKey;
+        console.log('Using public key:', publicKey.toString());
+        return publicKey;
+    } catch (e) { handleLedgerError(e); }
+}
+
+async function signForPath(message, hdKeyPath) {
+    const publicKey = await getPublicKeyForPath(hdKeyPath);
+
+    console.log('Waiting for confirmation on Ledger...');
+
+    try {
+        const signature = await client.sign(message, hdKeyPath);
+        return { signature, publicKey };
+    } catch (e) { handleLedgerError(e); }
+}
+
+function handleLedgerError(e) {
+    switch (e.statusText) {
+    case 'CONDITIONS_OF_USE_NOT_SATISFIED':
+        console.log('Rejected from Ledger');
+        exit(1);
+        break;
+    case 'UNKNOWN_ERROR':
+        console.log(`Ledger returned an unknown error (${e.statusCode}). Check your Ledger and try again`);
+        exit(1);
+        break;
+    default:
+        throw e;
+    }
+}
+
+module.exports = { getPublicKeyForPath, signForPath };
+'''
+'''--- utils/readline.js ---
+const readline = require('readline');
+
+const askYesNoQuestion = async (question, defaultResponse = false) => {
+    const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout,
+    });
+    try {
+        for (let attempts = 0; attempts < 10; attempts++) {
+            const answer = await new Promise((resolve) => {
+                rl.question(
+                    question,
+                    async (response) => {
+                        if (response.toLowerCase() == 'y') {
+                            resolve(true);
+                        } else if (
+                            response.toLowerCase() == 'n'
+                        ) {
+                            resolve(false);
+                        }
+                        resolve(undefined);
+                    }
+                );
+            });
+            if (answer !== undefined) {
+                return answer;
+            }
+        }
+
+        // Use default response when no valid response is obtained
+        return defaultResponse;
+    } finally {
+        rl.close();
+    }
+};
+
+module.exports = { askYesNoQuestion };
+'''
+'''--- utils/validators-info.js ---
+const { validators, utils } = require('near-api-js');
+const BN = require('bn.js');
+const AsciiTable = require('ascii-table');
+
+async function validatorsInfo(near, blockNumberOrHash) {
+    // converts block number to integer
+    if (blockNumberOrHash && !isNaN(Number(blockNumberOrHash))) {
+        blockNumberOrHash = Number(blockNumberOrHash);
+    }
+    const genesisConfig = await near.connection.provider.sendJsonRpc('EXPERIMENTAL_genesis_config', {});
+    const protocolConfig = await near.connection.provider.sendJsonRpc('EXPERIMENTAL_protocol_config', { 'finality': 'final' });
+    const result = await near.connection.provider.sendJsonRpc('validators', [blockNumberOrHash]);
+    result.genesisConfig = genesisConfig;
+    result.protocolConfig = protocolConfig;
+    result.numSeats = genesisConfig.num_block_producer_seats + genesisConfig.avg_hidden_validator_seats_per_shard.reduce((a, b) => a + b);
+    return result;
+}
+
+async function showValidatorsTable(near, blockNumberOrHash) {
+    const result = await validatorsInfo(near, blockNumberOrHash);
+    const seatPrice = validators.findSeatPrice(
+        result.current_validators,
+        result.numSeats,
+        result.genesisConfig.minimum_stake_ratio,
+        result.protocolConfig.protocol_version);
+    result.current_validators = result.current_validators.sort((a, b) => -new BN(a.stake).cmp(new BN(b.stake)));
+    var validatorsTable = new AsciiTable();
+    validatorsTable.setHeading('Validator Id', 'Stake', '# Seats', '% Online', 'Blocks produced', 'Blocks expected', 'Chunks produced', 'Chunks expected');
+    console.log(`Validators (total: ${result.current_validators.length}, seat price: ${utils.format.formatNearAmount(seatPrice, 0)}):`);
+    result.current_validators.forEach((validator) => {
+        validatorsTable.addRow(
+            validator.account_id,
+            utils.format.formatNearAmount(validator.stake, 0),
+            getNumberOfSeats(result.protocolConfig.protocol_version, validator.stake, seatPrice),
+            `${Math.floor((validator.num_produced_blocks + validator.num_produced_chunks) / (validator.num_expected_blocks + validator.num_expected_chunks) * 10000) / 100}%`,
+            validator.num_produced_blocks,
+            validator.num_expected_blocks,
+            validator.num_produced_chunks,
+            validator.num_expected_chunks);
+    });
+    console.log(validatorsTable.toString());
+}
+
+async function showNextValidatorsTable(near) {
+    const result = await validatorsInfo(near, null);
+    const nextSeatPrice = validators.findSeatPrice(
+        result.next_validators,
+        result.numSeats,
+        result.genesisConfig.minimum_stake_ratio,
+        result.protocolConfig.protocol_version);
+    result.next_validators = result.next_validators.sort((a, b) => -new BN(a.stake).cmp(new BN(b.stake)));
+    const diff = validators.diffEpochValidators(result.current_validators, result.next_validators);
+    console.log(`\nNext validators (total: ${result.next_validators.length}, seat price: ${utils.format.formatNearAmount(nextSeatPrice, 0)}):`);
+    let nextValidatorsTable = new AsciiTable();
+    nextValidatorsTable.setHeading('Status', 'Validator', 'Stake', '# Seats');
+    diff.newValidators.forEach((validator) => nextValidatorsTable.addRow(
+        'New',
+        validator.account_id,
+        utils.format.formatNearAmount(validator.stake, 0),
+        getNumberOfSeats(result.protocolConfig.protocol_version, validator.stake, nextSeatPrice)));
+    diff.changedValidators.forEach((changeValidator) => nextValidatorsTable.addRow(
+        'Rewarded',
+        changeValidator.next.account_id,
+        `${utils.format.formatNearAmount(changeValidator.current.stake, 0)} -> ${utils.format.formatNearAmount(changeValidator.next.stake, 0)}`,
+        getNumberOfSeats(result.protocolConfig.protocol_version, changeValidator.next.stake, nextSeatPrice)));
+    diff.removedValidators.forEach((validator) => nextValidatorsTable.addRow('Kicked out', validator.account_id, '-', '-'));
+    console.log(nextValidatorsTable.toString());
+}
+
+function combineValidatorsAndProposals(validators, proposalsMap) {
+    // TODO: filter out all kicked out validators.
+    let result = validators.filter((validator) => !proposalsMap.has(validator.account_id));
+    return result.concat([...proposalsMap.values()]);
+}
+
+async function showProposalsTable(near) {
+    const result = await validatorsInfo(near, null);
+    let currentValidators = new Map();
+    result.current_validators.forEach((v) => currentValidators.set(v.account_id, v));
+    let proposals = new Map();
+    result.current_proposals.forEach((p) => proposals.set(p.account_id, p));
+    const combinedProposals = combineValidatorsAndProposals(result.current_validators, proposals);
+    const expectedSeatPrice = validators.findSeatPrice(
+        combinedProposals,
+        result.numSeats,
+        result.genesisConfig.minimum_stake_ratio,
+        result.protocolConfig.protocol_version);
+    const combinedPassingProposals = combinedProposals.filter((p) => new BN(p.stake).gte(expectedSeatPrice));
+    console.log(`Proposals for the epoch after next (new: ${proposals.size}, passing: ${combinedPassingProposals.length}, expected seat price = ${utils.format.formatNearAmount(expectedSeatPrice, 0)})`);
+    const proposalsTable = new AsciiTable();
+    proposalsTable.setHeading('Status', 'Validator', 'Stake => New Stake', '# Seats');
+    combinedProposals.sort((a, b) => -new BN(a.stake).cmp(new BN(b.stake))).forEach((proposal) => {
+        let kind = '';
+        if (new BN(proposal.stake).gte(expectedSeatPrice)) {
+            kind = proposals.has(proposal.account_id) ? 'Proposal(Accepted)' : 'Rollover';
+        } else {
+            kind = proposals.has(proposal.account_id) ? 'Proposal(Declined)' : 'Kicked out';
+        }
+        let stake_fmt = utils.format.formatNearAmount(proposal.stake, 0);
+        if (currentValidators.has(proposal.account_id) && proposals.has(proposal.account_id)) {
+            stake_fmt = `${utils.format.formatNearAmount(currentValidators.get(proposal.account_id).stake, 0)} => ${stake_fmt}`;
+        }
+        proposalsTable.addRow(
+            kind,
+            proposal.account_id,
+            stake_fmt,
+            getNumberOfSeats(result.protocolConfig.protocol_version, proposal.stake, expectedSeatPrice)
+        );
+    });
+    console.log(proposalsTable.toString());
+    console.log('Expected seat price is calculated based on observed so far proposals and validators.');
+    console.log('It can change from new proposals or some validators going offline.');
+    console.log('Note: this currently doesn\'t account for offline kickouts and rewards for current epoch');
+}
+
+// starting from protocol version 49 each validator has 1 seat
+function getNumberOfSeats(protocolVersion, stake, seatPrice) {
+    return protocolVersion < 49 ? new BN(stake).div(seatPrice) : new BN(1);
+}
+
+module.exports = { showValidatorsTable, showNextValidatorsTable, showProposalsTable };
+'''
+'''--- utils/verify-account.js ---
+// npm imports
+const chalk = require('chalk');
+
+// local imports
+const connect = require('./connect');
+
+module.exports = async (accountId, keyPair, options) => {
+    try {
+        // check that the key got added
+        const near = await connect(options);
+        let account = await near.account(accountId);
+        let keys = await account.getAccessKeys();
+        let publicKey = keyPair.getPublicKey().toString();
+        const short = key => `${key.substring(0, 14)}...`; // keep the public key readable
+
+        let keyFound = keys.some(
+            key => key.public_key == keyPair.getPublicKey().toString()
+        );
+        if (keyFound) {
+            const keyStore = near.config.deps.keyStore;
+            await keyStore.setKey(options.networkId, accountId, keyPair);
+            console.log(chalk`Logged in as [ {bold ${accountId}} ] with public key [ {bold ${short(publicKey)}} ] successfully\n`
+            );
+            return true;
+        } else {
+            console.log(chalk`The account you provided {bold.red [ {bold.white ${accountId}} ] has not authorized the expected key [ {bold.white ${short(publicKey)}} ]}  Please try again.\n`
+            );
+            return false;
+        }
+    } catch (e) {
+        if (/Account ID/.test(e.message)) {
+            console.log(chalk`\n{bold.red You need to provide a valid account ID to login}. Please try logging in again.\n`);
+            return false;
+        } else if (/does not exist/.test(e.message)) {
+            console.log(chalk`\nThe account you provided {bold.red [ {bold.white ${accountId}} ] does not exist on the [ {bold.white ${options.networkId}} ] network} (using ${options.nodeUrl})\n`);
+            return false;
+        } else {
+            throw e;
+        }
+    }
+};
+
+'''

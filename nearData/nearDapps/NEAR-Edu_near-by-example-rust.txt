@@ -1,0 +1,1434 @@
+*GitHub Repository "NEAR-Edu/near-by-example-rust"*
+
+'''--- README.md ---
+This is a [Next.js](https://nextjs.org/) project bootstrapped with [`create-next-app`](https://github.com/vercel/next.js/tree/canary/packages/create-next-app).
+
+## Getting Started
+
+First, run the development server:
+
+```bash
+npm run dev
+# or
+yarn dev
+```
+
+Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+
+You can start editing the page by modifying `pages/index.js`. The page auto-updates as you edit the file.
+
+[API routes](https://nextjs.org/docs/api-routes/introduction) can be accessed on [http://localhost:3000/api/hello](http://localhost:3000/api/hello). This endpoint can be edited in `pages/api/hello.js`.
+
+The `pages/api` directory is mapped to `/api/*`. Files in this directory are treated as [API routes](https://nextjs.org/docs/api-routes/introduction) instead of React pages.
+
+## Learn More
+
+To learn more about Next.js, take a look at the following resources:
+
+- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
+- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+
+You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js/) - your feedback and contributions are welcome!
+
+## Deploy on Vercel
+
+The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+
+Check out our [Next.js deployment documentation](https://nextjs.org/docs/deployment) for more details.
+
+'''
+'''--- contract/Cargo.toml ---
+[package]
+name = "near-by-example-contract"
+version = "0.1.0"
+authors = ["Ryan Mehta <ryan@near.org>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "3.1.0"
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+# Opt into extra safety checks on arithmetic operations https://stackoverflow.com/a/64136471/249801
+overflow-checks = true
+
+'''
+'''--- contract/neardev/dev-account.env ---
+CONTRACT_NAME=dev-1625320722391-5649157
+'''
+'''--- contract/src/lib.rs ---
+use std::collections::HashMap;
+
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::{LookupMap, Vector};
+use near_sdk::json_types::ValidAccountId;
+use near_sdk::{env, near_bindgen, AccountId, BorshStorageKey, PanicOnDefault};
+
+near_sdk::setup_alloc!();
+
+#[derive(BorshSerialize, BorshStorageKey)]
+enum StorageKey {
+    EXERCISES,
+    ACCOUNTS,
+}
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Contract {
+    pub owner_id: AccountId,
+    pub exercises: Vector<String>,
+    pub accounts: LookupMap<String, HashMap<String, bool>>,
+}
+
+#[near_bindgen]
+impl Contract {
+    #[init]
+    pub fn new(initial_exercises: Vec<String>) -> Self {
+        let mut exercises = Vector::new(StorageKey::EXERCISES);
+        exercises.extend(initial_exercises);
+        Self {
+            exercises,
+            owner_id: env::signer_account_id(),
+            accounts: LookupMap::new(StorageKey::ACCOUNTS),
+        }
+    }
+
+    pub fn add_exercise(&mut self, exercise_index: u64, exercise_title: String) {
+        assert_eq!(
+            env::signer_account_id(),
+            self.owner_id,
+            "Only owner can add exercises"
+        );
+        assert!(
+            exercise_index <= self.exercises.len(),
+            "Exercise Index out of range"
+        );
+        let mut next = exercise_title;
+        for index in exercise_index..self.exercises.len() {
+            next = self.exercises.replace(index, &next);
+        }
+
+        self.exercises.push(&next);
+    }
+
+    pub fn remove_exercise(&mut self, exercise_index: u64) {
+        assert_eq!(
+            env::signer_account_id(),
+            self.owner_id,
+            "Only owner can remove exercises"
+        );
+        assert!(
+            exercise_index < self.exercises.len(),
+            "Exercise Index out of range"
+        );
+
+        let mut next = self.exercises.pop().unwrap();
+        for index in (exercise_index..self.exercises.len()).rev() {
+            next = self.exercises.replace(index, &next);
+        }
+    }
+
+    pub fn get_status(&self, account_id: ValidAccountId) -> Vec<(String, bool)> {
+        let status = self
+            .accounts
+            .get(&account_id.to_string())
+            .unwrap_or(HashMap::new());
+
+        self.exercises
+            .iter()
+            .map(|exercise| {
+                (
+                    exercise.clone(),
+                    status.get(&exercise).unwrap_or(&false).clone(),
+                )
+            })
+            .collect()
+    }
+
+    pub fn set_status(&mut self, account_id: ValidAccountId, exercise_index: u64, success: bool) {
+        let title = self.exercises.get(exercise_index).unwrap();
+        let mut status = self.internal_get_status(account_id.clone().into());
+        status.insert(title, success);
+        self.accounts.insert(&account_id.to_string(), &status);
+    }
+
+    #[private]
+    fn internal_get_status(&self, account_id: AccountId) -> HashMap<String, bool> {
+        self.accounts
+            .get(&account_id.to_string())
+            .unwrap_or(
+                self.exercises
+                    .iter()
+                    .fold(HashMap::new(), |mut acc, exercise| {
+                        acc.insert(exercise, false);
+                        acc
+                    }),
+            )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use near_sdk::test_utils::accounts;
+    use near_sdk::MockedBlockchain;
+    use near_sdk::{testing_env, VMContext};
+
+    fn get_context(input: Vec<u8>, is_view: bool) -> VMContext {
+        VMContext {
+            current_account_id: "alice.testnet".to_string(),
+            signer_account_id: "robert.testnet".to_string(),
+            signer_account_pk: vec![0, 1, 2],
+            predecessor_account_id: "jane.testnet".to_string(),
+            input,
+            block_index: 0,
+            block_timestamp: 0,
+            account_balance: 0,
+            account_locked_balance: 0,
+            storage_usage: 0,
+            attached_deposit: 0,
+            prepaid_gas: 10u64.pow(18),
+            random_seed: vec![0, 1, 2],
+            is_view,
+            output_data_receivers: vec![],
+            epoch_height: 19,
+        }
+    }
+
+    #[test]
+    fn test_add_exercise() {
+        let context = get_context(vec![], false);
+        testing_env!(context);
+
+        let mut contract = Contract::new(Vec::new());
+
+        contract.add_exercise(0, "Exercise 1".to_string());
+
+        let exercises = contract.exercises.to_vec();
+        assert_eq!(exercises[0], "Exercise 1".to_string());
+
+        contract.add_exercise(0, "Exercise 0".to_string());
+
+        let exercises = contract.exercises.to_vec();
+        assert_eq!(exercises[0], "Exercise 0".to_string());
+        assert_eq!(exercises[1], "Exercise 1".to_string());
+
+        contract.add_exercise(2, "Exercise 2".to_string());
+
+        let exercises = contract.exercises.to_vec();
+        assert_eq!(exercises[0], "Exercise 0".to_string());
+        assert_eq!(exercises[1], "Exercise 1".to_string());
+        assert_eq!(exercises[2], "Exercise 2".to_string());
+
+        contract.add_exercise(2, "Exercise 1.5".to_string());
+
+        let exercises = contract.exercises.to_vec();
+        assert_eq!(exercises[0], "Exercise 0".to_string());
+        assert_eq!(exercises[1], "Exercise 1".to_string());
+        assert_eq!(exercises[2], "Exercise 1.5".to_string());
+        assert_eq!(exercises[3], "Exercise 2".to_string());
+    }
+
+    #[test]
+    fn test_remove_exercise() {
+        let context = get_context(vec![], false);
+        testing_env!(context);
+
+        let mut contract = Contract::new(vec![
+            "Exercise 0".to_string(),
+            "Exercise 1".to_string(),
+            "Exercise 2".to_string(),
+            "Exercise 3".to_string(),
+        ]);
+
+        contract.remove_exercise(2);
+
+        let exercises = contract.exercises.to_vec();
+        assert_eq!(
+            exercises,
+            vec![
+                "Exercise 0".to_string(),
+                "Exercise 1".to_string(),
+                "Exercise 3".to_string(),
+            ]
+        );
+
+        contract.remove_exercise(0);
+
+        let exercises = contract.exercises.to_vec();
+        assert_eq!(
+            exercises,
+            vec!["Exercise 1".to_string(), "Exercise 3".to_string(),]
+        );
+
+        contract.remove_exercise(1);
+
+        let exercises = contract.exercises.to_vec();
+        assert_eq!(exercises, vec!["Exercise 1".to_string(),]);
+
+        contract.remove_exercise(0);
+
+        let exercises = contract.exercises.to_vec();
+        assert_eq!(exercises, vec![] as Vec<String>);
+    }
+
+    #[test]
+    fn test_status() {
+        let context = get_context(vec![], false);
+        testing_env!(context);
+
+        let mut contract = Contract::new(vec![
+            "Exercise 0".to_string(),
+            "Exercise 1".to_string(),
+            "Exercise 2".to_string(),
+            "Exercise 3".to_string(),
+        ]);
+
+        assert_eq!(
+            contract.get_status(accounts(0)),
+            vec![
+                ("Exercise 0".to_string(), false),
+                ("Exercise 1".to_string(), false),
+                ("Exercise 2".to_string(), false),
+                ("Exercise 3".to_string(), false)
+            ]
+        );
+
+        contract.set_status(accounts(0), 2, true);
+        assert_eq!(
+            contract.get_status(accounts(0)),
+            vec![
+                ("Exercise 0".to_string(), false),
+                ("Exercise 1".to_string(), false),
+                ("Exercise 2".to_string(), true),
+                ("Exercise 3".to_string(), false)
+            ]
+        );
+
+        contract.set_status(accounts(0), 0, true);
+        assert_eq!(
+            contract.get_status(accounts(0)),
+            vec![
+                ("Exercise 0".to_string(), true),
+                ("Exercise 1".to_string(), false),
+                ("Exercise 2".to_string(), true),
+                ("Exercise 3".to_string(), false)
+            ]
+        );
+
+        contract.set_status(accounts(0), 1, true);
+        assert_eq!(
+            contract.get_status(accounts(0)),
+            vec![
+                ("Exercise 0".to_string(), true),
+                ("Exercise 1".to_string(), true),
+                ("Exercise 2".to_string(), true),
+                ("Exercise 3".to_string(), false)
+            ]
+        );
+
+        contract.set_status(accounts(0), 2, false);
+        assert_eq!(
+            contract.get_status(accounts(0)),
+            vec![
+                ("Exercise 0".to_string(), true),
+                ("Exercise 1".to_string(), true),
+                ("Exercise 2".to_string(), false),
+                ("Exercise 3".to_string(), false)
+            ]
+        );
+    }
+}
+
+'''
+'''--- exercises/0/README.md ---
+# Counter Contract
+
+Implement a Smart Contract that can `increment`, `decrement`, and `reset` a `val`.
+
+## get_num
+
+The `get_num` smart contract method should return the current counter `val`. The counter struct is accessible via `self`.
+
+## increment
+
+The `increment` smart contract method should increment `val` by `1`. It is a mutable method (because it changes `val`). In Rust we need to explicitly state that `increment` can mutate the data held in the `Counter` struct by mutably borrowing `self` with `&mut self` as the first parameter in the method signature.
+
+## decrement
+
+The `decrement` smart contract method should decrement `val` by `1`. Like `increment`, it is a mutable method.
+
+## reset
+
+The `reset` smart contract method should reset `val` to `0`. Like `increment` and `decrement`, it is a mutable method.
+
+## Resources
+
+- [Rust Book - Data Types](https://ferrous-systems.github.io/teaching-material/basic-types.html#)
+- [Rust Book - Structs](https://doc.rust-lang.org/book/ch05-01-defining-structs.html)
+- [Rust Book - Method Syntax](https://doc.rust-lang.org/book/ch05-03-method-syntax.html)
+- [Ferrous Systems - Basic Type](https://ferrous-systems.github.io/teaching-material/basic-types.html)
+- [Ferrous Systems - Compound Types](https://ferrous-systems.github.io/teaching-material/compound-types.html#/)
+
+'''
+'''--- exercises/0/lib.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::near_bindgen;
+
+near_sdk::setup_alloc!();
+
+#[near_bindgen]
+#[derive(Default, BorshDeserialize, BorshSerialize)]
+pub struct Counter {
+    val: i8,
+}
+
+#[near_bindgen]
+impl Counter {
+    pub fn get_num(&self) -> i8 {
+
+    }
+
+    pub fn increment(&mut self) {
+
+    }
+
+    pub fn decrement(&mut self) {
+
+    }
+
+    pub fn reset(&mut self) {
+        
+    }
+}
+
+'''
+'''--- exercises/0/test.rs ---
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use near_sdk::MockedBlockchain;
+    use near_sdk::{testing_env, VMContext};
+
+    fn get_context(input: Vec<u8>, is_view: bool) -> VMContext {
+        VMContext {
+            current_account_id: "alice.testnet".to_string(),
+            signer_account_id: "robert.testnet".to_string(),
+            signer_account_pk: vec![0, 1, 2],
+            predecessor_account_id: "jane.testnet".to_string(),
+            input,
+            block_index: 0,
+            block_timestamp: 0,
+            account_balance: 0,
+            account_locked_balance: 0,
+            storage_usage: 0,
+            attached_deposit: 0,
+            prepaid_gas: 10u64.pow(18),
+            random_seed: vec![0, 1, 2],
+            is_view,
+            output_data_receivers: vec![],
+            epoch_height: 19,
+        }
+    }
+
+    #[test]
+    fn test_get_num() {
+        let context = get_context(vec![], false);
+        testing_env!(context);
+
+        let contract = Counter { val: 15 };
+
+        assert_eq!(15, contract.get_num());
+    }
+
+    #[test]
+    fn test_increment() {
+        let context = get_context(vec![], false);
+        testing_env!(context);
+
+        let mut contract = Counter { val: 0 };
+        contract.increment();
+
+        assert_eq!(1, contract.get_num());
+    }
+
+    #[test]
+    fn test_decrement() {
+        let context = get_context(vec![], false);
+        testing_env!(context);
+
+        let mut contract = Counter { val: 0 };
+        contract.decrement();
+
+        assert_eq!(-1, contract.get_num());
+    }
+
+    #[test]
+    fn test_increment_and_reset() {
+        let context = get_context(vec![], false);
+        testing_env!(context);
+
+        let mut contract = Counter { val: 42 };
+        contract.reset();
+
+        assert_eq!(0, contract.get_num());
+    }
+}
+
+'''
+'''--- exercises/1/README.md ---
+# Saturating Counter Contract
+
+In the last exercise we implemented a simple `Counter` smart contract. In this exercise we'll improve that contract by adding some overflow safety.
+
+Since the `Counter` uses an `i8` the minimum `self.val` is `-128` and the maximum is `127`. If we try to `decrement` or `increment` outside the minimum or maximum an overflow will occur. This can be prevented by using the `saturating_*` methods.
+
+## Improve increment
+
+Update the `increment` method so that it saturates at the `i8::MAX` value.
+
+## Improve decrement
+
+Update the `decrement` method so that it saturates at the `i8::MIN` value.
+
+## Resources
+
+- [saturating_add](https://doc.rust-lang.org/std/primitive.i8.html#method.saturating_add)
+- [saturating_sub](https://doc.rust-lang.org/std/primitive.i8.html#method.saturating_sub)
+
+'''
+'''--- exercises/1/lib.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::near_bindgen;
+
+near_sdk::setup_alloc!();
+
+#[near_bindgen]
+#[derive(Default, BorshDeserialize, BorshSerialize)]
+pub struct Counter {
+    val: i8,
+}
+
+#[near_bindgen]
+impl Counter {
+    pub fn get_num(&self) -> i8 {
+        self.val
+    }
+
+    pub fn increment(&mut self) {
+        self.val += 1;
+    }
+
+    pub fn decrement(&mut self) {
+        self.val -= 1;
+    }
+
+    pub fn reset(&mut self) {
+        self.val = 0;
+    }
+}
+
+'''
+'''--- exercises/1/test.rs ---
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use near_sdk::MockedBlockchain;
+    use near_sdk::{testing_env, VMContext};
+
+    fn get_context(input: Vec<u8>, is_view: bool) -> VMContext {
+        VMContext {
+            current_account_id: "alice.testnet".to_string(),
+            signer_account_id: "robert.testnet".to_string(),
+            signer_account_pk: vec![0, 1, 2],
+            predecessor_account_id: "jane.testnet".to_string(),
+            input,
+            block_index: 0,
+            block_timestamp: 0,
+            account_balance: 0,
+            account_locked_balance: 0,
+            storage_usage: 0,
+            attached_deposit: 0,
+            prepaid_gas: 10u64.pow(18),
+            random_seed: vec![0, 1, 2],
+            is_view,
+            output_data_receivers: vec![],
+            epoch_height: 19,
+        }
+    }
+
+    #[test]
+    fn test_get_num() {
+        let context = get_context(vec![], false);
+        testing_env!(context);
+
+        let contract = Counter { val: 15 };
+
+        assert_eq!(15, contract.get_num());
+    }
+
+    #[test]
+    fn test_increment() {
+        let context = get_context(vec![], false);
+        testing_env!(context);
+
+        let mut contract = Counter { val: 0 };
+        contract.increment();
+
+        assert_eq!(1, contract.get_num());
+    }
+
+    #[test]
+    fn test_decrement() {
+        let context = get_context(vec![], false);
+        testing_env!(context);
+
+        let mut contract = Counter { val: 0 };
+        contract.decrement();
+
+        assert_eq!(-1, contract.get_num());
+    }
+
+    #[test]
+    fn test_saturating_increment() {
+        let context = get_context(vec![], false);
+        testing_env!(context);
+
+        let mut contract = Counter { val: 127 };
+        contract.increment();
+
+        assert_eq!(127, contract.get_num());
+    }
+
+    #[test]
+    fn test_saturating_decrement() {
+        let context = get_context(vec![], false);
+        testing_env!(context);
+
+        let mut contract = Counter { val: -128 };
+        contract.decrement();
+
+        assert_eq!(-128, contract.get_num());
+    }
+
+    #[test]
+    fn test_increment_and_reset() {
+        let context = get_context(vec![], false);
+        testing_env!(context);
+
+        let mut contract = Counter { val: 42 };
+        contract.reset();
+
+        assert_eq!(0, contract.get_num());
+    }
+}
+
+'''
+'''--- exercises/2/README.md ---
+# Wrapping Counter Contract
+
+In the last exercise we improved the simple `Counter` smart contract utilizing the `saturating_*` methods. In this exercise we'll try an alternative approach using the `wrapping_*` methods.
+
+## Improve increment
+
+Update the `increment` method so that it wraps at the `i8::MAX` value.
+
+## Improve decrement
+
+Update the `decrement` method so that it wraps at the `i8::MIN` value.
+
+## Resources
+
+- [wrapping_add](https://doc.rust-lang.org/std/primitive.i8.html#method.wrapping_add)
+- [wrapping_sub](https://doc.rust-lang.org/std/primitive.i8.html#method.wrapping_sub)
+
+'''
+'''--- exercises/2/lib.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::near_bindgen;
+
+near_sdk::setup_alloc!();
+
+#[near_bindgen]
+#[derive(Default, BorshDeserialize, BorshSerialize)]
+pub struct Counter {
+    val: i8,
+}
+
+#[near_bindgen]
+impl Counter {
+    pub fn get_num(&self) -> i8 {
+        self.val
+    }
+
+    pub fn increment(&mut self) {
+        self.val += 1;
+    }
+
+    pub fn decrement(&mut self) {
+        self.val -= 1;
+    }
+
+    pub fn reset(&mut self) {
+        self.val = 0;
+    }
+}
+
+'''
+'''--- exercises/2/test.rs ---
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use near_sdk::MockedBlockchain;
+    use near_sdk::{testing_env, VMContext};
+
+    fn get_context(input: Vec<u8>, is_view: bool) -> VMContext {
+        VMContext {
+            current_account_id: "alice.testnet".to_string(),
+            signer_account_id: "robert.testnet".to_string(),
+            signer_account_pk: vec![0, 1, 2],
+            predecessor_account_id: "jane.testnet".to_string(),
+            input,
+            block_index: 0,
+            block_timestamp: 0,
+            account_balance: 0,
+            account_locked_balance: 0,
+            storage_usage: 0,
+            attached_deposit: 0,
+            prepaid_gas: 10u64.pow(18),
+            random_seed: vec![0, 1, 2],
+            is_view,
+            output_data_receivers: vec![],
+            epoch_height: 19,
+        }
+    }
+
+    #[test]
+    fn test_get_num() {
+        let context = get_context(vec![], false);
+        testing_env!(context);
+
+        let contract = Counter { val: 15 };
+
+        assert_eq!(15, contract.get_num());
+    }
+
+    #[test]
+    fn test_increment() {
+        let context = get_context(vec![], false);
+        testing_env!(context);
+
+        let mut contract = Counter { val: 0 };
+        contract.increment();
+
+        assert_eq!(1, contract.get_num());
+    }
+
+    #[test]
+    fn test_decrement() {
+        let context = get_context(vec![], false);
+        testing_env!(context);
+
+        let mut contract = Counter { val: 0 };
+        contract.decrement();
+
+        assert_eq!(-1, contract.get_num());
+    }
+
+    #[test]
+    fn test_wrapping_increment() {
+        let context = get_context(vec![], false);
+        testing_env!(context);
+
+        let mut contract = Counter { val: 127 };
+        contract.increment();
+
+        assert_eq!(-128, contract.get_num());
+    }
+
+    #[test]
+    fn test_wrapping_decrement() {
+        let context = get_context(vec![], false);
+        testing_env!(context);
+
+        let mut contract = Counter { val: -128 };
+        contract.decrement();
+
+        assert_eq!(127, contract.get_num());
+    }
+
+    #[test]
+    fn test_increment_and_reset() {
+        let context = get_context(vec![], false);
+        testing_env!(context);
+
+        let mut contract = Counter { val: 42 };
+        contract.reset();
+
+        assert_eq!(0, contract.get_num());
+    }
+}
+
+'''
+'''--- exercises/3/README.md ---
+# Status Message
+
+Implement a Smart Contract that can `set_status` and `get_status` using a `LookupMap`.
+
+## set_status
+
+The `set_status` smart contract method should `insert` a message into the `self.records` `LookupMap`.
+
+## get_status
+
+The `get_status` smart contract method should get a message stored at the `account_id` key inside the `self.records` `LookupMap`.
+
+## Resources
+
+- [LookupMap](https://docs.rs/near-sdk/3.1.0/near_sdk/collections/struct.LookupMap.html)
+
+'''
+'''--- exercises/3/lib.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::{LookupMap};
+use near_sdk::json_types::ValidAccountId;
+use near_sdk::{env, near_bindgen, BorshStorageKey};
+
+near_sdk::setup_alloc!();
+
+#[derive(BorshSerialize, BorshStorageKey)]
+enum StorageKey {
+    Records,
+}
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct StatusMessage {
+    pub records: LookupMap<String, String>,
+}
+
+impl Default for StatusMessage {
+    fn default() -> Self {
+        Self {
+            records: LookupMap::new(StorageKey::Records),
+        }
+    }
+}
+
+#[near_bindgen]
+impl StatusMessage {
+    pub fn set_status(&mut self, message: String) {
+        let key = env::signer_account_id();
+    }
+
+    pub fn get_status(&self, account_id: ValidAccountId) -> Option<String> {
+        
+    }
+}
+
+'''
+'''--- exercises/3/test.rs ---
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use near_sdk::test_utils::VMContextBuilder;
+    use near_sdk::MockedBlockchain;
+    use near_sdk::{testing_env, VMContext};
+    use std::convert::TryInto;
+
+    fn get_context(is_view: bool) -> VMContext {
+        VMContextBuilder::new()
+            .signer_account_id("bob_near".try_into().unwrap())
+            .is_view(is_view)
+            .build()
+    }
+
+    #[test]
+    fn test_set_status() {
+        let context = get_context(false);
+        testing_env!(context);
+        let mut contract = StatusMessage::default();
+        contract.set_status("hello".to_string());
+        assert_eq!(
+            "hello".to_string(),
+            contract.records.get(&"bob_near".to_string()).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_get_status() {
+        let context = get_context(false);
+        testing_env!(context);
+        let mut contract = StatusMessage::default();
+        contract
+            .records
+            .insert(&"francis.near".to_string(), &"hello".to_string());
+        assert_eq!(
+            Some("hello".to_string()),
+            contract.get_status("francis.near".try_into().unwrap())
+        );
+    }
+
+    #[test]
+    fn test_get_status_nonexistent() {
+        let context = get_context(true);
+        testing_env!(context);
+        let contract = StatusMessage::default();
+        assert_eq!(
+            None,
+            contract.get_status("francis.near".try_into().unwrap())
+        );
+    }
+}
+
+'''
+'''--- next.config.js ---
+module.exports = {
+  reactStrictMode: true,
+  images: {
+    domains: ["avatars.githubusercontent.com"],
+  },
+};
+
+'''
+'''--- package.json ---
+{
+  "name": "near-to-rust",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "marked": "^2.1.2",
+    "near-api-js": "^0.41.0",
+    "next": "11.0.0",
+    "node-fetch": "^2.6.1",
+    "react": "17.0.2",
+    "react-ace": "^9.4.1",
+    "react-dom": "17.0.2",
+    "sass": "^1.35.1"
+  },
+  "devDependencies": {
+    "eslint": "7.29.0",
+    "eslint-config-next": "11.0.0"
+  }
+}
+
+'''
+'''--- pages/_app.js ---
+import '../styles/globals.css'
+
+function MyApp({ Component, pageProps }) {
+  return <Component {...pageProps} />
+}
+
+export default MyApp
+
+'''
+'''--- pages/api/execute.js ---
+import fetch from "node-fetch";
+
+export default function handler(req, res) {
+  fetch(process.env.EXECUTE_API, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(req.body),
+  })
+    .then((res) => res.json())
+    .then((json) => res.status(200).json(json))
+    .catch((err) => res.status(400).json({ error: err.message }));
+}
+
+'''
+'''--- pages/api/exercises/[id]/index.js ---
+import { readFile } from "fs/promises";
+import fetch from "node-fetch";
+import { join } from "path";
+
+const resolveFiles = (id) => {
+  const files = ["README.md", "lib.rs", "test.rs"];
+  if (process.env.LOCAL) {
+    return Promise.all(
+      files.map((file) =>
+        readFile(join(process.cwd(), "exercises", id, file), "utf-8")
+      )
+    );
+  } else {
+    return Promise.all(
+      files.map((file) =>
+        fetch(
+          `https://raw.githubusercontent.com/NEAR-Edu/near-by-example-rust/main/exercises/${id}/${file}`
+        ).then((res) => res.text())
+      )
+    );
+  }
+};
+
+export default async function handler(req, res) {
+  const { id } = req.query;
+
+  const [explanation, starterCode, testCode] = await resolveFiles(id);
+
+  res.send({ explanation, starterCode, testCode });
+}
+
+'''
+'''--- pages/exercises/[id]/index.js ---
+import { useEffect } from "react";
+import { useRouter } from "next/router";
+import { useCompile, useExercise } from "../../../state/exercise";
+import Exercise from "../../../components/exercise/Exercise";
+import styles from "../../../styles/ExercisePage.module.scss";
+import Loading from "../../../components/loading/Loading";
+import { useSetExerciseStatus } from "../../../state/near";
+
+const ForwardButton = ({ success, inProgress, onClick }) => {
+  if (success) {
+    return (
+      <button
+        className={styles.navButton}
+        disabled={inProgress}
+        onClick={onClick}
+      >
+        &rsaquo;
+      </button>
+    );
+  } else {
+    return (
+      <button className={styles.run} disabled={inProgress} onClick={onClick}>
+        {inProgress ? <Loading /> : "Run Tests"}
+      </button>
+    );
+  }
+};
+
+export default function ExercisePage() {
+  const router = useRouter();
+  const { id } = router.query;
+  const { explanation, code, testCode, loading, onCodeChange } =
+    useExercise(id);
+  const { stdout, annotations, success, inProgress, compileAndTest } =
+    useCompile(id);
+  const setExerciseStatus = useSetExerciseStatus(id);
+
+  useEffect(() => {
+    if (loading) return;
+    compileAndTest({ code, testCode });
+  }, [loading]);
+
+  if (loading) return <Loading />;
+
+  const handleClick = async () => {
+    if (success) {
+      setExerciseStatus(success);
+    } else {
+      await compileAndTest({ code, testCode });
+    }
+  };
+
+  return (
+    <section className={styles.ExercisePage}>
+      <section className={styles.controls}>
+        <button
+          className={styles.navButton}
+          disabled={Number(id) <= 0}
+          onClick={() => router.push(`/exercises/${+id - 1}`)}
+        >
+          &lsaquo;
+        </button>
+        <p className={success ? styles.pass : styles.fail}>
+          {success
+            ? `Passed ${String.fromCharCode(10003)}`
+            : `Failed ${String.fromCharCode(215)}`}
+        </p>
+        <ForwardButton
+          success={success}
+          inProgress={inProgress}
+          onClick={handleClick}
+        />
+      </section>
+      <Exercise
+        explanation={explanation}
+        code={code}
+        testCode={testCode}
+        stdout={stdout}
+        annotations={annotations}
+        onCodeChange={onCodeChange}
+      />
+    </section>
+  );
+}
+
+'''
+'''--- pages/exercises/index.js ---
+import Link from "next/link";
+import { useExercises } from "../../state/near";
+import styles from "../../styles/ExercisesPage.module.scss";
+
+export default function ExercisesPage() {
+  const exercises = useExercises();
+
+  return (
+    <ul className={styles.Exercises}>
+      {exercises.map(({ title, status }, i) => (
+        <li key={title}>
+          <Link href={`/exercises/${i}`}>
+            <a>
+              <span className={styles.title}>{title}</span>
+              {status ? (
+                <span className={styles.pass}>✓</span>
+              ) : (
+                <span className={styles.fail}>&otimes;</span>
+              )}
+            </a>
+          </Link>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+'''
+'''--- pages/index.js ---
+import { useEffect, useState } from "react";
+import { useRouter } from "next/router";
+import { connect, keyStores, WalletConnection } from "near-api-js";
+import Image from "next/image";
+import Loading from "../components/loading/Loading";
+import styles from "../styles/Home.module.scss";
+
+export default function Home() {
+  const router = useRouter();
+  const [wallet, setWallet] = useState();
+
+  useEffect(() => {
+    (async () => {
+      const near = await connect({
+        nodeUrl: "https://rpc.testnet.near.org",
+        networkId: "testnet",
+        walletUrl: "https://wallet.testnet.near.org",
+        keyStore: new keyStores.BrowserLocalStorageKeyStore(),
+      });
+      setWallet(new WalletConnection(near, "near-by-example-rust"));
+    })();
+  }, []);
+
+  if (!wallet) return <Loading />;
+  if (wallet.isSignedIn()) {
+    router.push("/exercises");
+    return <Loading />;
+  }
+
+  const handleSignin = async () => {
+    wallet.requestSignIn({
+      contractId: process.env.NEXT_PUBLIC_CONTRACT_ID,
+    });
+  };
+
+  return (
+    <section className={styles.Home}>
+      <Image
+        src="https://avatars.githubusercontent.com/u/85355517"
+        alt="Logo"
+        width="auto"
+        height="100%"
+      />
+      <section>
+        <p>
+          Learn to write{" "}
+          <span className={styles.bold}>Rust Smart Contracts on NEAR</span> by
+          following interactive coding examples.
+        </p>
+
+        <p>Get started by logging in with your NEAR testnet wallet</p>
+
+        <button onClick={handleSignin}>Signin with NEAR</button>
+      </section>
+    </section>
+  );
+}
+
+'''
+'''--- public/vercel.svg ---
+<svg width="283" height="64" viewBox="0 0 283 64" fill="none" 
+    xmlns="http://www.w3.org/2000/svg">
+    <path d="M141.04 16c-11.04 0-19 7.2-19 18s8.96 18 20 18c6.67 0 12.55-2.64 16.19-7.09l-7.65-4.42c-2.02 2.21-5.09 3.5-8.54 3.5-4.79 0-8.86-2.5-10.37-6.5h28.02c.22-1.12.35-2.28.35-3.5 0-10.79-7.96-17.99-19-17.99zm-9.46 14.5c1.25-3.99 4.67-6.5 9.45-6.5 4.79 0 8.21 2.51 9.45 6.5h-18.9zM248.72 16c-11.04 0-19 7.2-19 18s8.96 18 20 18c6.67 0 12.55-2.64 16.19-7.09l-7.65-4.42c-2.02 2.21-5.09 3.5-8.54 3.5-4.79 0-8.86-2.5-10.37-6.5h28.02c.22-1.12.35-2.28.35-3.5 0-10.79-7.96-17.99-19-17.99zm-9.45 14.5c1.25-3.99 4.67-6.5 9.45-6.5 4.79 0 8.21 2.51 9.45 6.5h-18.9zM200.24 34c0 6 3.92 10 10 10 4.12 0 7.21-1.87 8.8-4.92l7.68 4.43c-3.18 5.3-9.14 8.49-16.48 8.49-11.05 0-19-7.2-19-18s7.96-18 19-18c7.34 0 13.29 3.19 16.48 8.49l-7.68 4.43c-1.59-3.05-4.68-4.92-8.8-4.92-6.07 0-10 4-10 10zm82.48-29v46h-9V5h9zM36.95 0L73.9 64H0L36.95 0zm92.38 5l-27.71 48L73.91 5H84.3l17.32 30 17.32-30h10.39zm58.91 12v9.69c-1-.29-2.06-.49-3.2-.49-5.81 0-10 4-10 10V51h-9V17h9v9.2c0-5.08 5.91-9.2 13.2-9.2z" fill="#000"/>
+</svg>
+'''
+'''--- state/exercise.js ---
+import { useEffect, useState } from "react";
+
+const getCompilationErrorsAnnotations = (stderr) => {
+  return stderr
+    .split("\n\n")
+    .map(
+      (msg) =>
+        msg.match(
+          /(?<type>warning|error)\[?.*\]?:(?<message>.*)\n\s+--> src\/lib.rs:(?<line>\d+):.*\n(?<detail>.*\n\d+ \| [\s\w\b:{},;^=`|#[\]()&->]*)/
+        )?.groups
+    )
+    .filter((match) => match)
+    .map(({ type, line, message, detail }) => ({
+      type,
+      row: Number(line) - 1,
+      text: `${message}\n\n${detail}`,
+    }));
+};
+
+const getTestCompilationErrorsAnnotations = (stdout) => {
+  return stdout
+    .split("\n\n")
+    .map(
+      (msg) =>
+        msg.match(
+          /---- tests::(?<name>\w+) stdout ----\n(?<message>.*), src\/lib.rs:(?<line>\d+)/
+        )?.groups
+    )
+    .filter((match) => match)
+    .map(({ line, message }) => ({
+      type: "error",
+      row: Number(line) - 1,
+      text: message,
+    }));
+};
+
+const getTestFailuresAnnotations = (stdout, code) => {
+  const fnNames = code
+    .split("\n")
+    .map((line, lineNumber) => ({
+      fnName: line.match(/pub fn (?<name>.*)\(.*\)/)?.groups?.name,
+      lineNumber,
+    }))
+    .filter(({ fnName }) => fnName);
+  return stdout
+    .split("\n\n")
+    .map(
+      (msg) =>
+        msg.match(
+          /---- tests::(?<name>\w+) stdout ----\n(?<message>.*assertion failed(.|\n)*)/
+        )?.groups
+    )
+    .filter((match) => match)
+    .map(({ name, message }) => ({
+      type: "error",
+      row: fnNames.find(({ fnName }) => name.endsWith(fnName))?.lineNumber,
+      text: message,
+    }));
+};
+
+export const useExercise = (id) => {
+  const [explanation, setExplanation] = useState();
+  const [code, setCode] = useState();
+  const [testCode, setTestCode] = useState();
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (!id) return;
+    setLoading(true);
+    setExplanation();
+    setCode();
+    setTestCode();
+    fetch(`/api/exercises/${id}`)
+      .then((res) => res.json())
+      .then(({ explanation, starterCode, testCode }) => {
+        setExplanation(explanation);
+        setCode(starterCode);
+        setTestCode(testCode);
+      })
+      .finally(() => setLoading(false));
+  }, [id]);
+
+  return {
+    explanation,
+    code,
+    testCode,
+    loading,
+    onCodeChange: (code) => setCode(code),
+  };
+};
+
+export const useCompile = () => {
+  const [stdout, setStdout] = useState("");
+  const [annotations, setAnnotations] = useState([]);
+  const [success, setSuccess] = useState(false);
+  const [inProgress, setInProgress] = useState(false);
+
+  const compileAndTest = async ({ code, testCode }) => {
+    if (inProgress) return;
+    setInProgress(true);
+
+    try {
+      const res = await fetch("/api/execute", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          code: `${code}\n\n${testCode}`,
+          backtrace: false,
+          channel: "stable",
+          crateType: "lib",
+          edition: "2018",
+          mode: "debug",
+          tests: true,
+        }),
+      });
+      const { stderr = "", stdout, success } = await res.json();
+      console.log(getTestFailuresAnnotations(stdout, code));
+      setAnnotations([
+        ...getCompilationErrorsAnnotations(stderr),
+        ...getTestCompilationErrorsAnnotations(stdout),
+        ...getTestFailuresAnnotations(stdout, code),
+      ]);
+      setStdout(`${stderr}\n\n${stdout}`);
+      setSuccess(success);
+    } finally {
+      setInProgress(false);
+    }
+  };
+
+  return {
+    stdout,
+    annotations,
+    success,
+    inProgress,
+    compileAndTest,
+  };
+};
+
+'''
+'''--- state/near.js ---
+import { connect, keyStores, WalletConnection } from "near-api-js";
+import { useRouter } from "next/router";
+import { useCallback, useEffect, useState } from "react";
+
+export const useWallet = () => {
+  const [loading, setLoading] = useState(true);
+  const [wallet, setWallet] = useState();
+
+  useEffect(() => {
+    (async () => {
+      setLoading(true);
+      const near = await connect({
+        networkId: "testnet",
+        keyStore: new keyStores.BrowserLocalStorageKeyStore(),
+        nodeUrl: "https://rpc.testnet.near.org",
+        walletUrl: "https://wallet.testnet.near.org",
+      });
+      setWallet(new WalletConnection(near, "near-by-example-rust"));
+      setLoading(false);
+    })();
+  }, []);
+
+  return [loading, wallet];
+};
+
+export const useExercises = () => {
+  const [loading, wallet] = useWallet();
+  const [exercises, setExercises] = useState([]);
+
+  useEffect(() => {
+    if (loading) return;
+
+    (async () => {
+      const results = await wallet
+        .account()
+        .viewFunction(process.env.NEXT_PUBLIC_CONTRACT_ID, "get_status", {
+          account_id: wallet.getAccountId(),
+        });
+
+      setExercises(results.map(([title, status]) => ({ title, status })));
+    })();
+  }, [loading]);
+
+  return exercises;
+};
+
+export const useSetExerciseStatus = (id) => {
+  const router = useRouter();
+  const [loading, wallet] = useWallet();
+  const exercises = useExercises();
+
+  const setExerciseStatus = useCallback(
+    (success) => {
+      if (loading) return;
+      const index = Number(id);
+      const baseUrl = `${window.location.protocol}//${window.location.host}`;
+      const callbackUrl =
+        index < exercises.length - 1
+          ? `${baseUrl}/exercises/${index + 1}`
+          : `${baseUrl}/exercises`;
+      wallet.account().functionCall({
+        contractId: process.env.NEXT_PUBLIC_CONTRACT_ID,
+        methodName: "set_status",
+        args: {
+          account_id: wallet.getAccountId(),
+          exercise_index: index,
+          success,
+        },
+        walletCallbackUrl: callbackUrl,
+      });
+    },
+    [id, loading, exercises]
+  );
+
+  return setExerciseStatus;
+};
+
+'''
+'''--- styles/globals.css ---
+:root {
+  --bg: #2c2828;
+  --fg: #8f938f;
+  --bg-secondary: #353030;
+  --primary: #757ad8;
+  --secondary: #4fb7c5;
+
+  --pass: #66a968;
+  --fail: #ff0033;
+}
+
+html,
+body {
+  padding: 0;
+  margin: 0;
+  height: 100%;
+  background-color: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Oxygen,
+    Ubuntu, Cantarell, Fira Sans, Droid Sans, Helvetica Neue, sans-serif;
+}
+
+body::-webkit-scrollbar {
+  width: 5px;
+}
+
+#__next {
+  height: 100%;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+'''

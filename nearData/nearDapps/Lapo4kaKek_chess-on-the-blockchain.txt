@@ -1,0 +1,4835 @@
+*GitHub Repository "Lapo4kaKek/chess-on-the-blockchain"*
+
+'''--- near-chess-master/.gitpod.yml ---
+image:
+  file: .gitpod.Dockerfile
+# Options to prebuild the image after github events and set notifications/badges
+# More here: https://www.gitpod.io/docs/prebuilds/
+github:
+  prebuilds:
+    # enable for the master/default branch (defaults to true)
+    master: true
+    # enable for pull requests coming from this repo (defaults to true)
+    pullRequests: true
+    # enable for pull requests coming from forks (defaults to false)
+    pullRequestsFromForks: true
+    # add a check to pull requests (defaults to true)
+    addCheck: true
+    # add a "Review in Gitpod" button as a comment to pull requests (defaults to false)
+    addComment: true
+
+# List the start up tasks. You can start them in parallel in multiple terminals. See https://www.gitpod.io/docs/config-start-tasks/
+tasks:
+  - before: nvm use default
+    init: yarn && alias near=./node_modules/near-shell/bin/near
+    command: yarn dev
+ports:
+  - port: 1234
+    onOpen: open-browser
+
+'''
+'''--- near-chess-master/.travis.yml ---
+language: node_js
+node_js:
+  - 12
+
+- env:
+  - NODE_ENV=ci
+  - NODE_ENV=ci-staging
+
+cache: yarn
+
+jobs:
+  include:
+    - name: yarn
+      script:
+      - yarn build
+      - yarn test
+
+    - name: fossa
+      before_script:
+        - "curl -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/fossas/fossa-cli/fc60c6631a5d372d5a45fea35e31665b338f260d/install.sh | sudo bash"
+      script:
+        - fossa init
+        - fossa analyze --server-scan
+        - fossa test
+
+'''
+'''--- near-chess-master/README.md ---
+# Lapo4kaKek Chess
+
+## To Run
+
+```
+yarn
+yarn start
+```
+'''
+'''--- near-chess-master/as-pect.config.js ---
+module.exports = require("near-sdk-as/imports");
+
+'''
+'''--- near-chess-master/asconfig.js ---
+
+const compile = require("near-sdk-as/compiler").compile;
+
+compile("assembly/main.ts", // input file
+        "out/main.wasm",    // output file
+        [
+        //   "-O1",          // Optional arguments
+        "--debug",
+        "--measure",         // Shows compiler runtime
+        "--validate"         // Validate the generated wasm module
+        ], {
+          verbose: true     // Output the cli args passed to asc
+        });
+
+'''
+'''--- near-chess-master/assembly/__tests__/as-pect.d.ts ---
+/// <reference types="@as-pect/assembly/types/as-pect" />
+
+'''
+'''--- near-chess-master/assembly/__tests__/chess.spec.ts ---
+import * as chess from "../main";
+import { Context, context } from 'near-sdk-as';
+import { Game } from "../model";
+
+const PLAYER1 = "Bobby";
+const PLAYER2 = "Garry"
+function getCurrentGame(player: string): Game {
+  return chess.getGame(chess.getCurrentGame(player));
+}
+
+describe("Game", () => {
+  beforeAll(() => {
+    Context.setSigner_account_id(PLAYER1);
+  });
+
+  it("create a new game", () => {
+    chess.createOrJoinGame();
+    const game = getCurrentGame(PLAYER1);
+    expect(game.player1).toBe(PLAYER1, "Only one player.");
+    expect(game.player2).toBeNull("No second player");
+  });  
+
+  it("join a game", () => {
+    Context.setSigner_account_id(PLAYER2);
+    chess.createOrJoinGame();
+    const game = getCurrentGame(PLAYER1);
+    expect(game.player1).toBe(PLAYER1, "Only one player.");
+    expect(game.player2).not.toBeNull("Should be a second player");
+    expect(game.player2).toBe(PLAYER2);
+  });
+});
+
+'''
+'''--- near-chess-master/assembly/main.ts ---
+// @nearfile
+
+import { context, storage, logging } from "near-sdk-as";
+import { Game, GameWithId } from "./model";
+
+// --- contract code goes below
+
+export function getRecentGames(): Array<GameWithId> {
+  let lastId = storage.getSome<u64>('lastId');
+  let games = new Array<GameWithId>();
+  for (let id = lastId; id + 10 > lastId && id > 0; --id) {
+    let game = new GameWithId();
+    game.id = id;
+    game.game = getGame(id);
+    games.push(game);
+  }
+  return games;
+}
+
+export function giveUpCurrentGame(): void {
+  let gameId = getCurrentGame(context.sender);
+  if (gameId == 0) {
+    return;
+  }
+  let game = getGame(gameId);
+  if (game.outcome != null || game.player2 == null) {
+    return;
+  }
+  game.outcome = "Player " + context.sender + " gave up";
+  setGame(gameId, game);
+}
+
+export function createOrJoinGame(): void {
+  giveUpCurrentGame();
+  let lastId = storage.getPrimitive<u64>('lastId', 0);
+  let gameKey: string;
+  let game: Game | null = null;
+  if (lastId > 0) {
+    game = getGame(lastId);
+    if (game.player2) {
+      game = null;
+    } else {
+      if (game.player1 == context.sender) {
+        return;
+      }
+      game.player2 = context.sender;
+    }
+  }
+  if (game == null) {
+    game = new Game();
+    lastId++;
+    storage.set<u64>('lastId', lastId);
+    gameKey = getGameKey(lastId);
+    game.player1 = context.sender;
+  }
+  setGame(lastId, game);
+  // TODO: Make it possible to return result from method to avoid this
+  logging.log("sender: " + context.sender);
+  storage.set<u64>("gameId:" + context.sender, lastId);
+}
+
+export function getCurrentGame(player: string): u64 {
+  return storage.getPrimitive<u64>("gameId:" + player, 0);
+}
+
+export function getGame(gameId: u64): Game {
+  return storage.getSome<Game>(getGameKey(gameId));
+}
+
+function setGame(gameId: u64, game: Game): void {
+  storage.set(getGameKey(gameId), game);
+}
+
+export function makeMove(gameId: u64, fen: string): void {
+  let game = getGame(gameId);
+  assert(game.outcome == null, "Game over");
+  let turn = getCurrentTurn(game.fen);
+  let nextTurn = getCurrentTurn(fen);
+  let validTurn =
+    nextTurn != turn && (
+      (context.sender == game.player1 && turn == 'w') ||
+      (context.sender == game.player2 && turn == 'b'));
+  logging.log("turn " + turn);
+  logging.log("nextTurn " + nextTurn);
+  logging.log("sender " + context.sender);
+  
+  assert(validTurn, 'Wrong side to make move');
+  // TODO: Validate chess rules
+  game.fen = fen;
+  setGame(gameId, game);
+}
+
+function getGameKey(gameId: u64): string {
+  return 'game:' + gameId.toString();
+}
+
+function getCurrentTurn(fen: string): string {
+  // TODO: Pull all of chess.js working with fen
+  var tokens = fen.split(' ');
+  var position = tokens[0];
+  let turn = tokens[1];
+  return turn;
+}
+
+'''
+'''--- near-chess-master/assembly/model.ts ---
+// @nearfile
+
+export class Game {
+  player1: string;
+  player2: string;
+  fen: string = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+  outcome: string;
+}
+
+export class GameWithId {
+  id: u64;
+  game: Game;
+}
+
+'''
+'''--- near-chess-master/assembly/tsconfig.json ---
+{
+  "extends": "assemblyscript/std/assembly.json",
+  "include": [
+    "./**/*.ts",
+    "../**/*/as_types.d.ts"
+  ]
+}
+
+'''
+'''--- near-chess-master/babel.config.js ---
+{
+    "plugins": ["@babel/plugin-proposal-class-static-block"]
+}
+  
+'''
+'''--- near-chess-master/neardev/default/lapo4kakek.testnet.json ---
+{"account_id":"lapo4kakek.testnet","private_key":"ed25519:64vFyTuBuJ5tyjD88tTzCP8hMadfM6HqpiLYvpQrZQZKPYV9s9gVpNbAz1LcVhj6Xp6JzHuNefh2nB8dVbi9JzDc"}
+'''
+'''--- near-chess-master/neardev/shared-test-staging/test.near.json ---
+{"account_id":"test.near","private_key":"ed25519:2wyRcSwSuHtRVmkMCGjPwnzZmQLeXLzLLyED1NDMt4BjnKgQL6tF85yBx6Jr26D2dUNeC716RBoTxntVHsegogYw"}
+
+'''
+'''--- near-chess-master/neardev/shared-test/test.near.json ---
+{"account_id":"test.near","private_key":"ed25519:2wyRcSwSuHtRVmkMCGjPwnzZmQLeXLzLLyED1NDMt4BjnKgQL6tF85yBx6Jr26D2dUNeC716RBoTxntVHsegogYw"}
+
+'''
+'''--- near-chess-master/package.json ---
+{
+  "name": "near-chess",
+  "description": "Shows example of how to implement on-chain chess game and deploy to GitHub pages",
+  "version": "0.0.1",
+  "scripts": {
+    "build": "npm run build:contract && npm run build:web",
+    "build:contract": "node asconfig.js",
+    "build:web": "parcel build src/index.html --public-url ./",
+    "dev:deploy:contract": "near dev-deploy",
+    "deploy:contract": "near deploy",
+    "deploy:pages": "gh-pages -d dist/",
+    "deploy": "npm run build && npm run deploy:contract && npm run deploy:pages",
+    "prestart": "npm run build:contract && npm run dev:deploy:contract",
+    "start": "CONTRACT_NAME=$(cat neardev/dev-account) parcel src/index.html",
+    "dev": "nodemon --watch assembly -e ts --exec 'npm run start'",
+    "test": "asp && npm run build:contract && jest test",
+    "asp": "asp --verbose"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.21.8",
+    "@babel/plugin-proposal-class-static-block": "^7.21.0",
+    "assemblyscript": "^0.9.4",
+    "gh-pages": "^2.0.1",
+    "gulp": "^4.0.2",
+    "jest": "^22.4.4",
+    "jest-environment-node": "^24.5.0",
+    "near-sdk-as": "^0.1.2",
+    "near-shell": "^0.20.1",
+    "nodemon": "^2.0.2",
+    "parcel-bundler": "^1.12.4"
+  },
+  "dependencies": {
+    "nearlib": "^0.20.0",
+    "regenerator-runtime": "^0.13.3"
+  },
+  "jest": {
+    "testEnvironment": "near-shell/test_environment",
+    "testPathIgnorePatterns": [
+      "<rootDir>/assembly/",
+      "<rootDir>/node_modules/"
+    ]
+  }
+}
+
+'''
+'''--- near-chess-master/setup.js ---
+// This file is not required when running the project locally. Its purpose is to set up the
+// AssemblyScript compiler when a new project has been loaded in WebAssembly Studio.
+
+// Path manipulation lifted from https://gist.github.com/creationix/7435851
+
+// Joins path segments.  Preserves initial "/" and resolves ".." and "."
+// Does not support using ".." to go above/outside the root.
+// This means that join("foo", "../../bar") will not resolve to "../bar"
+function join(/* path segments */) {
+  // Split the inputs into a list of path commands.
+  var parts = [];
+  for (var i = 0, l = arguments.length; i < l; i++) {
+    parts = parts.concat(arguments[i].split("/"));
+  }
+  // Interpret the path commands to get the new resolved path.
+  var newParts = [];
+  for (i = 0, l = parts.length; i < l; i++) {
+    var part = parts[i];
+    // Remove leading and trailing slashes
+    // Also remove "." segments
+    if (!part || part === ".") continue;
+    // Interpret ".." to pop the last segment
+    if (part === "..") newParts.pop();
+    // Push new path segments.
+    else newParts.push(part);
+  }
+  // Preserve the initial slash if there was one.
+  if (parts[0] === "") newParts.unshift("");
+  // Turn back into a single string path.
+  return newParts.join("/") || (newParts.length ? "/" : ".");
+}
+
+// A simple function to get the dirname of a path
+// Trailing slashes are ignored. Leading slash is preserved.
+function dirname(path) {
+  return join(path, "..");
+}
+
+require.config({
+  paths: {
+    "binaryen": "https://cdn.jsdelivr.net/gh/AssemblyScript/binaryen.js@e41ec5c177e3d2cacccd4ccb1877ae29a7352dc1/index",
+    "assemblyscript": "https://cdn.jsdelivr.net/gh/nearprotocol/assemblyscript@a4aa1a5/dist/assemblyscript",
+    "assemblyscript/bin/asc": "https://cdn.jsdelivr.net/gh/nearprotocol/assemblyscript@a4aa1a5/dist/asc",
+  }
+});
+logLn("Loading AssemblyScript compiler ...");
+require(["assemblyscript/bin/asc"], asc => {
+  monaco.languages.typescript.typescriptDefaults.addExtraLib(asc.definitionFiles.assembly);
+  asc.runningInStudio = true;
+  asc.main = (main => (args, options, fn) => {
+    if (typeof options === "function") {
+      fn = options;
+      options = undefined;
+    }
+
+    return main(args, options || {
+      stdout: asc.createMemoryStream(),
+      stderr: asc.createMemoryStream(logLn),
+      readFile: (filename, baseDir) => {
+        let path = join(baseDir, filename);
+        console.log("readFile", path);
+        if (path.startsWith("out/") && path.indexOf(".near.ts") == -1) {
+          path = path.replace(/^out/, baseDir );
+          console.log("path", path);
+        } else if (path.startsWith(baseDir) && path.indexOf(".near.ts") != -1) {
+          path = path.replace(new RegExp("^" + baseDir), "out");
+          console.log("path", path);
+        }
+        const file = project.getFile(path);
+        return file ? file.data : null;
+      },
+      writeFile: (filename, contents) => {
+        const name = filename.startsWith("../") ? filename.substring(3) : filename;
+        const type = fileTypeForExtension(name.substring(name.lastIndexOf(".") + 1));
+        project.newFile(name, type, true).setData(contents);
+      },
+      listFiles: () => []
+    }, fn);
+  })(asc.main);
+  logLn("AssemblyScript compiler is ready!");
+});
+
+'''
+'''--- near-chess-master/src/config.js ---
+const CONTRACT_NAME = process.env.CONTRACT_NAME || 'near-chess-devnet';
+
+function getConfig(env) {
+    switch (env) {
+
+    case 'production':
+    case 'development':
+        return {
+            networkId: 'default',
+            nodeUrl: 'https://rpc.nearprotocol.com',
+            contractName: CONTRACT_NAME,
+            walletUrl: 'https://wallet.nearprotocol.com',
+            helperUrl: 'https://near-contract-helper.onrender.com',
+        };
+    case 'staging':
+        return {
+            networkId: 'staging',
+            nodeUrl: 'https://staging-rpc.nearprotocol.com/',
+            contractName: CONTRACT_NAME,
+            walletUrl: 'https://near-wallet-staging.onrender.com',
+            helperUrl: 'https://near-contract-helper-staging.onrender.com',
+        };
+    case 'local':
+        return {
+            networkId: 'local',
+            nodeUrl: 'http://localhost:3030',
+            keyPath: `${process.env.HOME}/.near/validator_key.json`,
+            walletUrl: 'http://localhost:4000/wallet',
+            contractName: CONTRACT_NAME,
+        };
+    case 'test':
+    case 'test-remote':
+    case 'ci':
+        return {
+            networkId: 'shared-test',
+            nodeUrl: 'http://shared-test.nearprotocol.com:3030',
+            contractName: CONTRACT_NAME,
+            masterAccount: 'test.near',
+        };
+    case 'ci-staging':
+        return {
+            networkId: 'shared-test-staging',
+            nodeUrl: 'http://staging-shared-test.nearprotocol.com:3030',
+            contractName: CONTRACT_NAME,
+            masterAccount: 'test.near',
+        };
+    case 'tatooine':
+        return {
+            networkId: 'tatooine',
+            nodeUrl: 'https://rpc.tatooine.nearprotocol.com',
+            contractName: CONTRACT_NAME,
+            walletUrl: 'https://wallet.tatooine.nearprotocol.com',
+        };
+    default:
+        throw Error(`Unconfigured environment '${env}'. Can be configured in src/config.js.`);
+    }
+}
+
+module.exports = getConfig;
+
+'''
+'''--- near-chess-master/src/index.html ---
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.2.1/css/bootstrap.min.css" integrity="sha384-GJzZqFGwb1QTTN6wy59ffF1BuGJpLSa9DkKMp0DgiMDm4iYMj70gZWKYbI706tWS" crossorigin="anonymous">
+  <link rel="stylesheet" href="https://chessboardjs.com/css/chessboard.css">
+  <style>
+    .container {
+      margin-top: 2em;
+    }
+    .game-actions {
+      margin-top: 1em;
+    }
+    .small-game {
+      margin-bottom: 1em;
+    }
+    .link-unstyled, .link-unstyled:link, .link-unstyled:hover {
+      color: inherit;
+      text-decoration: inherit;
+    }
+  </style>
+</head>
+<body>
+  <nav class="navbar navbar-expand-lg navbar-light bg-light">
+    <a class="navbar-brand" href="#">Lapo4kaKek Chess on the NEAR</a>
+    <button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#navbarSupportedContent" aria-controls="navbarSupportedContent" aria-expanded="false" aria-label="Toggle navigation">
+      <span class="navbar-toggler-icon"></span>
+    </button>
+
+    <div class="collapse navbar-collapse" id="navbarSupportedContent">
+      <ul class="navbar-nav mr-auto">
+        <li class="nav-item active">
+          <a class="nav-link" href="#">Home <span class="sr-only">(current)</span></a>
+        </li>
+        <li class="nav-item">
+          <a class="nav-link" href="https://github.com/Lapo4kaKek">Source on GitHub</a>
+        </li>
+      </ul>
+      <form class="signed-in-flow login-info d-none form-inline my-2 my-lg-0">
+        <div class="mr-sm-2">Hi, <b id="account-id"></b>!</div>
+        <button id="sign-out-button" class="btn btn-outline-danger my-2 my-sm-0">Sign-out</button>
+      </form>
+    </div>
+  </nav>
+  <div class="container">
+    <div class="signed-out-flow d-none">
+      <div class="row">
+        <div class="col">
+          <h2>Show us your moves</h2>
+          <p>Pease sign-in to start playing.</p>
+          <button id="sign-in-button" class="btn btn-primary btn-lg">Sign-in with NEAR</button>
+        </div>
+      </div>
+    </div> 
+    <div class="signed-in-flow d-none">
+      <div class="row">        
+        <div class="col">
+          <div class="row">        
+            <div class="col">
+              <h1 class="status d-none"></h1>
+              <h4 class="server-status d-none"></h4>
+            </div>
+          </div>
+          <div class="row">
+            <div class="col">
+                <div id="board" style="width: 510px"></div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="game-actions col">
+              <button class="new-game btn btn-success">New Game</button>
+              <button class="give-up btn btn-danger">Give Up</button>
+            </div>
+          </div>
+        </div>
+        <div class="col">
+          <h3>Recent games</h3>
+          <div id="recent-games">
+          </div>
+          <div class="row">
+            <div class="col">
+              <button class="get-recent-games btn btn-success">Refresh games</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div> 
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/js-cookie@2/src/js.cookie.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.3.1/jquery.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.2/chess.js"></script>
+  <script src="https://chessboardjs.com/js/chessboard.js"></script>
+  <script src="./main.js"></script>
+</body>
+</html>
+
+'''
+'''--- near-chess-master/src/loader.html ---
+<head>
+    <script>
+        window.paceOptions = {
+            elements: {
+                selectors: ['.never-appears']
+            }
+        };
+    </script>
+    <script src="https://cdn.jsdelivr.net/gh/HubSpot/pace@v0.5.3/pace.min.js"></script>
+    <link href="https://cdn.jsdelivr.net/gh/HubSpot/pace@v0.5.3/themes/black/pace-theme-center-radar.css" rel="stylesheet" />
+</head>
+'''
+'''--- near-chess-master/src/main.js ---
+import "regenerator-runtime/runtime";
+
+import * as nearlib from "nearlib"
+import getConfig from "./config"
+
+let nearConfig = getConfig(process.env.NODE_ENV || "development")
+
+async function doInitContract() {
+  window.near = await nearlib.connect(Object.assign(nearConfig, { deps: { keyStore: new nearlib.keyStores.BrowserLocalStorageKeyStore() }}));
+  window.walletAccount = new nearlib.WalletAccount(window.near);
+
+  // Getting the Account ID. If unauthorized yet, it's just empty string.
+  window.accountId = window.walletAccount.getAccountId();
+  
+  // Initializing our contract APIs by contract name and configuration.
+    // NOTE: This configuration only needed while NEAR is still in development
+  window.contract = await near.loadContract(nearConfig.contractName, {
+    // View methods are read only. They don't modify the state, but usually return some value. 
+    viewMethods: ["getCurrentGame", "getGame", "getRecentGames"],
+    // Change methods can modify the state. But you don't receive the returned value when called.
+    changeMethods: ["createOrJoinGame", "makeMove", "giveUpCurrentGame"],
+    // Sender is the account ID to initialize transactions.
+    sender: window.accountId,
+  });
+
+  // Once everything is ready, we can start using contract
+  return doWork();
+}
+
+// Using initialized contract
+async function doWork() {
+  // Based on whether you've authorized, checking which flow we should go.
+  if (!window.walletAccount.isSignedIn()) {
+    signedOutFlow();
+  } else {
+    signedInFlow();
+  }
+}
+
+// Function that initializes the signIn button using WalletAccount 
+function signedOutFlow() {
+  // Displaying the signed out flow elements.
+  $('.signed-out-flow').removeClass('d-none');
+  // Adding an event to a sing-in button.
+  $('#sign-in-button').click(() => {
+    window.walletAccount.requestSignIn(
+      // The contract name that would be authorized to be called by the user's account.
+      nearConfig.contractName,
+      // This is the app name. It can be anything.
+      'NEAR Chess',
+      // We can also provide URLs to redirect on success and failure.
+      // The current URL is used by default.
+    );
+  });
+}
+
+// Main function for the signed-in flow (already authorized by the wallet).
+function signedInFlow() {
+  // Displaying the signed in flow elements.
+  $('.signed-in-flow').removeClass('d-none');
+
+  // Displaying current account name.
+  document.getElementById('account-id').innerText = window.accountId;
+
+  document.querySelector('.new-game').addEventListener('click', () => {
+    newGame().catch(console.error); 
+  });
+
+  document.querySelector('.give-up').addEventListener('click', () => {
+    giveUp().catch(console.error);
+  });
+
+  document.querySelector('.get-recent-games').addEventListener('click', () => {
+    loadRecentGames().catch(console.error);
+  });
+
+  document.getElementById('sign-out-button').addEventListener('click', () => {
+    walletAccount.signOut();
+    // Forcing redirect.
+    window.location.replace(window.location.origin + window.location.pathname);
+  });
+
+  loadGame().catch(console.error);
+  loadRecentGames().catch(console.error);
+
+}
+
+async function loadRecentGames() {
+  let recentGames = await window.contract.getRecentGames();
+  $("#recent-games").empty();
+  recentGames.forEach(game => {
+    let gameEl = $(`<a href="javascript:loadGame('${game.id}')" class="link-unstyled"><div class="small-game row">
+        <div class="board col-sm-5"></div>
+        <div class="game-info col-sm">
+          <h4 class="player-top">${game.game.player1}</h4>
+          <h4 class="player-bottom">${game.game.player2 || "Waiting for player to join..."}</h4>
+        </div>
+    </div></a>`);
+    $("#recent-games").append(gameEl);
+    let board = ChessBoard(gameEl.find(".board")[0], {
+      pieceTheme: 'http://chessboardjs.com/img/chesspieces/alpha/{piece}.png',
+      showNotation: false
+    });
+    board.position(game.game.fen, false);
+    // TODO: Is this detached when element removed?
+    $(window).resize(board.resize);
+  });
+}
+
+let serverGame;
+let currentGameId;
+let playerSide;
+async function loadGame(gameId) {
+  if (gameId) {
+    currentGameId = gameId;
+  } else if (!currentGameId) {
+    currentGameId = await window.contract.getCurrentGame({player: window.accountId});
+  }
+  if (!currentGameId) {
+    return;
+  }
+
+  console.log("currentGameId", currentGameId);
+  serverGame = await window.contract.getGame({gameId: currentGameId});
+  console.log("game", serverGame);
+  playerSide = null;
+  if (serverGame.player1 == window.accountId) {
+    playerSide = "w";
+  }
+  if (serverGame.player2 == window.accountId) {
+    playerSide = "b";
+  }
+  updateServerStatus();
+
+  if (game.fen() != serverGame.fen) {
+    game.load(serverGame.fen);
+    updateBoard();
+  }
+
+  if ((game.turn() != playerSide || !serverGame.player2) && serverGame.outcome == null) {
+    setTimeout(() => loadGame().catch(console.error), 3000);
+  }
+}
+
+async function newGame() {
+  await window.contract.createOrJoinGame();
+  loadRecentGames().catch(console.error);
+  currentGameId = 0;
+  await loadGame();
+}
+
+async function giveUp() {
+  await window.contract.giveUpCurrentGame();
+  await loadGame();
+}
+
+let board;
+let game = new Chess();
+game.clear();
+
+// do not pick up pieces if the game is over
+// only pick up pieces for the side to move
+var onDragStart = function(source, piece, position, orientation) {
+  if (game.game_over() === true ||
+      (game.turn() === 'w' && piece.search(/^b/) !== -1) ||
+      (game.turn() === 'b' && piece.search(/^w/) !== -1) ||
+      !playerSide || playerSide != game.turn()) {
+    return false;
+  }
+};
+
+var onDrop = function(source, target) {
+  if (!serverGame || !serverGame.player2 || serverGame.outcome != null) {
+    return "snapback";
+  }
+  // see if the move is legal
+  var move = game.move({
+    from: source,
+    to: target,
+    promotion: 'q' // NOTE: always promote to a queen for example simplicity
+  });
+
+  // illegal move
+  if (move === null) return 'snapback';
+
+  updateStatus();
+
+  // Make move on chain
+  window.contract.makeMove({gameId: currentGameId, fen: game.fen()}).finally(loadGame);
+};
+
+// update the board position after the piece snap 
+// for castling, en passant, pawn promotion
+var onSnapEnd = function() {
+  board.position(game.fen());
+};
+
+function updateBoard() {
+  board.position(game.fen());
+  updateStatus();
+}
+
+function getStatusText() {
+  let moveColor = game.turn() === 'b' ? 'Black' : 'White';
+
+  // checkmate?
+  if (game.in_checkmate() === true) {
+    return 'Game over, ' + moveColor + ' is in checkmate.';
+  }
+
+  // draw?
+  else if (game.in_draw() === true) {
+    return 'Game over, drawn position';
+  }
+
+  // game still on
+  else {
+    let status = moveColor + ' to move';
+
+    // check?
+    if (game.in_check() === true) {
+      return status + ', ' + moveColor + ' is in check';
+    }
+
+    return status;
+  }
+
+  return '';
+} 
+ 
+function updateStatus() {
+  $('.status').removeClass('d-none');
+  $('.status').text(getStatusText());
+  updateServerStatus();
+}
+
+function getServerStatus() {
+  if (!serverGame || !serverGame.player2) {
+    return 'Waiting for player to join...';
+  }
+  if (serverGame.outcome != null) {
+    return serverGame.outcome;
+  }
+  if (!(playerSide == "w" || playerSide == "b")) {
+    return `Watching ${serverGame.player1} vs ${serverGame.player2}`;
+  }
+  if (playerSide == "w") {
+    return `Playing as white against ${serverGame.player2}`;
+  } else {
+    return `Playing as black against ${serverGame.player1}`;
+  }
+}
+
+function updateServerStatus() {
+  $('.server-status').removeClass('d-none');
+  $('.server-status').html(getServerStatus());
+}
+
+var cfg = {
+  pieceTheme: 'http://chessboardjs.com/img/chesspieces/alpha/{piece}.png',
+  draggable: true,
+  onDragStart: onDragStart,
+  onDrop: onDrop,
+  onSnapEnd: onSnapEnd
+};
+board = ChessBoard('board', cfg);
+
+updateStatus();
+
+// COMMON CODE BELOW:
+// Loads nearlib and this contract into window scope.
+
+window.nearInitPromise = doInitContract().catch(console.error);
+
+'''
+'''--- near-chess-master/src/test.html ---
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" type="text/css" href="https://cdnjs.cloudflare.com/ajax/libs/jasmine/3.3.0/jasmine.css">
+  <script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/jasmine/3.3.0/jasmine.js"></script>
+  <script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/jasmine/3.3.0/jasmine-html.js"></script>
+  <script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/jasmine/3.3.0/boot.js"></script>
+</head>
+<body style="background: #fff">
+  <script src="https://cdn.jsdelivr.net/npm/nearlib@0.3.3/dist/nearlib.js"></script>
+  <script src="./test.js"></script>
+</body>
+</html>
+
+'''
+'''--- near-chess-master/src/test.js ---
+describe("Authorizer", function() {
+    let near;
+    let contract;
+    let alice;
+
+    jasmine.DEFAULT_TIMEOUT_INTERVAL = 10000;
+
+    // Common setup below
+    beforeAll(async function() {
+      near = await nearlib.connect(nearConfig);
+      alice = nearConfig.contractName;
+      contract = await near.loadContract(nearConfig.contractName, {
+        // NOTE: This configuration only needed while NEAR is still in development
+        // View methods are read only. They don't modify the state, but usually return some value. 
+        viewMethods: ["getCurrentGame", "getGame", "getRecentGames"],
+        // Change methods can modify the state. But you don't receive the returned value when called.
+        changeMethods: ["createOrJoinGame", "makeMove", "giveUpCurrentGame"],
+        sender: alice
+      });
+    });
+
+    // Multiple tests can be described below. Search Jasmine JS for documentation.
+    describe("simple", function() {
+      beforeAll(async function() {
+        // There can be some common setup for each test.
+      });
+
+      it("creates a game that shows up as expected in recent games", async function() {
+        await contract.createOrJoinGame();
+        const recentGames = await contract.getRecentGames();
+        console.log("aloha recentGames", recentGames);
+        expect(recentGames.length).toBe(1);
+        expect(recentGames[0]['game']['player1']).toBe(nearConfig.contractName);
+      });
+    });
+});
+
+'''
+'''--- near-contract/.travis.yml ---
+language: rust
+rust: 1.1.0
+
+'''
+'''--- near-contract/Cargo.toml ---
+[package]
+name = "rusty-checkers"
+version = "0.1.0"
+authors = ["dboone <boonesoftware@gmail.com>"]
+
+[dependencies.corrosion]
+git = "https://github.com/drbassett/corrosion.git"
+'''
+'''--- near-contract/README.md ---
+
+'''
+'''--- near-contract/contract/Cargo.toml ---
+[package]
+name = "checkers"
+version = "0.1.0"
+authors = ["Near Inc <hello@near.org>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "3.1.0"
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+# Opt into extra safety checks on arithmetic operations https://stackoverflow.com/a/64136471/249801
+overflow-checks = true
+
+[workspace]
+members = []
+
+'''
+'''--- near-contract/contract/README.md ---
+How to deploy
+==================
+
+- Create & deploy game contract (`/contract`)
+
+`yarn build:contract`
+
+`near deploy app.chess.near --wasmFile=./out/main.wasm --accountId app.chess.near`
+
+'''
+'''--- near-contract/contract/compile.js ---
+// This file does two things:
+//
+// 1. Compile the Rust contract using cargo (see buildCmd below). This will
+//    create a wasm file in the 'build' folder.
+// 2. Create a symbolic link (symlink) to the generated wasm file in the root
+//    project's `out` folder, for easy use with near-cli.
+//
+// First, import some helper libraries. `shelljs` is included in the
+// devDependencies of the root project, which is why it's available here. It
+// makes it easy to use *NIX-style scripting (which works on Linux distros,
+// macOS, and Unix systems) on Windows as well.
+const sh = require('shelljs')
+
+// Figure out which directory the user called this script from, which we'll use
+// later to set up the symlink.
+const calledFromDir = sh.pwd().toString()
+
+// For the duration of this script, we want to operate from within the
+// Rust project's folder. Let's change into that directory.
+sh.cd(__dirname)
+
+// You can call this script with `node compile.js` or `node compile.js
+// --debug`. Let's set a variable to track whether `--debug` was used.
+const debug = process.argv.pop() === '--debug'
+
+// You can call this script with `node compile.js` or `node compile.js --debug`.
+// Let's set a variable to track whether `--debug` was used.
+// Note: see other flags in ./cargo/config. Unfortunately, you cannot set the
+// `--target option` in Cargo.toml.
+const buildCmd = debug
+  ? 'cargo build --target wasm32-unknown-unknown'
+  : 'cargo build --target wasm32-unknown-unknown --release'
+
+// Execute the build command, storing exit code for later use
+const { code } = sh.exec(buildCmd)
+
+// Assuming this is compiled from the root project directory, link the compiled
+// contract to the `out` folder –
+// When running commands like `near deploy`, near-cli looks for a contract at
+// <CURRENT_DIRECTORY>/out/main.wasm
+if (code === 0 && calledFromDir !== __dirname) {
+  const linkDir = `${calledFromDir}/out`
+  const link = `${calledFromDir}/out/main.wasm`
+  const packageName = require('fs').readFileSync(`${__dirname}/Cargo.toml`).toString().match(/name = "([^"]+)"/)[1]
+  const outFile = `./target/wasm32-unknown-unknown/${debug ? 'debug' : 'release'}/${packageName}.wasm`
+  sh.mkdir('-p', linkDir)
+  sh.rm('-f', link)
+  //fixes #831: copy-update instead of linking .- sometimes sh.ln does not work on Windows
+  sh.cp('-u',outFile,link)
+}
+
+// exit script with the same code as the build command
+process.exit(code)
+
+'''
+'''--- near-contract/contract/src/ai.rs ---
+use near_sdk::serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+
+use crate::*;
+use crate::board::*;
+use crate::player::Player;
+
+#[derive(BorshDeserialize, BorshSerialize, Copy, Clone)]
+pub enum Direction {
+    /// The piece is moving such that its rank is increasing
+    IncreasingRank,
+
+    /// The piece is moving such that its rank is decreasing
+    DecreasingRank,
+}
+
+// A move from one tile to an adjacent diagonal one
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct SimpleMove {
+    from_row: usize,
+    from_col: usize,
+    to_row: usize,
+    to_col: usize,
+}
+
+impl SimpleMove {
+    pub fn new
+    (from_row: usize,
+     from_column: usize,
+     to_row: usize,
+     to_column: usize)
+     -> SimpleMove {
+        SimpleMove {
+            from_row,
+            from_col: from_column,
+            to_row,
+            to_col: to_column,
+		}
+    }
+
+    pub fn from_row(&self) -> usize {
+        self.from_row
+    }
+
+    pub fn from_column(&self) -> usize {
+        self.from_col
+    }
+
+    pub fn to_row(&self) -> usize {
+        self.to_row
+    }
+
+    pub fn to_column(&self) -> usize {
+        self.to_col
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct JumpMove {
+    from_row: usize,
+    from_col: usize,
+    jumps: Vec<JumpMove>,
+}
+
+impl JumpMove {
+    fn new(from_row: usize, from_col: usize) -> JumpMove {
+        JumpMove { from_row, from_col, jumps: Vec::new() }
+    }
+
+    #[cfg(test)]
+    fn with_jumps(from_row: usize, from_col: usize, jumps: Vec<JumpMove>) -> JumpMove {
+        JumpMove { from_row, from_col, jumps }
+    }
+
+    pub fn jumps(&self) -> &Vec<JumpMove> {
+        &self.jumps
+    }
+
+    pub fn contains_jump_sequence(&self, jumps: &[BoardPosition]) -> bool {
+        if jumps.len() == 0 {
+            true
+        } else {
+            self.contains_jump_sequence_recursive(jumps)
+        }
+    }
+
+    fn contains_jump_sequence_recursive(&self, jumps: &[BoardPosition]) -> bool {
+        if jumps[0].row == self.from_row && jumps[0].column == self.from_col {
+            jumps.len() == 1 || self.jumps.iter()
+                .any(|subtree| subtree.contains_jump_sequence(&jumps[1..]))
+        } else {
+            false
+        }
+    }
+}
+
+/// Given the position of a main piece on a board, and the
+/// direction this man piece is moving, determines the simple
+/// moves available to this piece.
+pub fn find_simple_moves_for_man
+(board: &Board,
+ direction: Direction,
+ row: usize,
+ col: usize)
+ -> Vec<SimpleMove> {
+    let row_offset = match direction {
+        Direction::DecreasingRank => TileOffset::Negative(1),
+        Direction::IncreasingRank => TileOffset::Positive(1),
+    };
+
+    let mut moves = Vec::new();
+
+    {
+        let col_offset = TileOffset::Negative(1);
+        push_simple_move_if_valid(
+            board, row, col, &row_offset, &col_offset, &mut moves);
+    }
+
+    {
+        let col_offset = TileOffset::Positive(1);
+        push_simple_move_if_valid(
+            board, row, col, &row_offset, &col_offset, &mut moves);
+    }
+
+    moves
+}
+
+/// Given the position of a main piece on a board, and the
+/// direction this man piece is moving, determines the simple
+/// moves available to this piece.
+pub fn find_jump_moves_for_man
+(board: &Board,
+ player: &Player,
+ direction: Direction,
+ row: usize,
+ col: usize)
+ -> JumpMove {
+    let mut jump_root = JumpMove::new(row, col);
+
+    let (pwnd_row_offset, jump_row_offset) = get_row_offsets(direction);
+
+    find_jump_moves_for_man_rustcursive(
+        board, player, &pwnd_row_offset, &jump_row_offset, &mut jump_root);
+
+    jump_root
+}
+
+fn find_jump_moves_for_man_rustcursive
+(board: &Board,
+ player: &Player,
+ pwnd_row_offset: &TileOffset,
+ jump_row_offset: &TileOffset,
+ jumps: &mut JumpMove) {
+    let col_offset_left = (TileOffset::Negative(1), TileOffset::Negative(2));
+    let col_offset_right = (TileOffset::Positive(1), TileOffset::Positive(2));
+
+    try_jump_moves_for_man(
+        board, player, &pwnd_row_offset, &jump_row_offset, col_offset_left, jumps);
+    try_jump_moves_for_man(
+        board, player, &pwnd_row_offset, &jump_row_offset, col_offset_right, jumps);
+}
+
+fn try_jump_moves_for_man
+(board: &Board,
+ player: &Player,
+ pwnd_row_offset: &TileOffset,
+ jump_row_offset: &TileOffset,
+ col_offset: (TileOffset, TileOffset),
+ jumps: &mut JumpMove) {
+    let start_row = jumps.from_row;
+    let start_col = jumps.from_col;
+    let (pwnd_col_offset, jump_col_offset) = col_offset;
+
+    let tile_on_board = is_tile_offset_in_bounds(
+        board, start_row, start_col, &jump_row_offset, &jump_col_offset);
+
+    if !tile_on_board {
+        return;
+    }
+
+    let (offset_row, offset_col)
+        = offset_tile(start_row, start_col, &pwnd_row_offset, &pwnd_col_offset);
+    let pwnd_tile = board.get_tile(offset_row, offset_col);
+
+    let (offset_row, offset_col)
+        = offset_tile(start_row, start_col, &jump_row_offset, &jump_col_offset);
+    let jump_tile = board.get_tile(offset_row, offset_col);
+
+    if jump_tile.get_piece().is_some() {
+        return;
+    }
+
+    let pwnd_piece_enemy = pwnd_tile
+        .get_piece()
+        .map(|piece| piece.get_player_id() != player.id)
+        .unwrap_or(false);
+
+    if !pwnd_piece_enemy {
+        return;
+    }
+
+    let mut the_move = JumpMove::new(offset_row, offset_col);
+
+    find_jump_moves_for_man_rustcursive(
+        board, player, &pwnd_row_offset, &jump_row_offset, &mut the_move);
+
+    jumps.jumps.push(the_move);
+}
+
+pub fn find_jump_moves_for_king
+(board: &Board,
+ player: &Player,
+ row: usize,
+ col: usize)
+ -> JumpMove {
+    let mut jump_root = JumpMove::new(row, col);
+    let mut jumped_tiles = HashSet::new();
+
+    find_jump_moves_for_king_rustcursive(
+        board, player, BoardPosition::new(row, col), &mut jump_root, &mut jumped_tiles);
+
+    jump_root
+}
+
+fn find_jump_moves_for_king_rustcursive
+(board: &Board,
+ player: &Player,
+ init_position: BoardPosition,
+ curr_jump_root: &mut JumpMove,
+ jumped_tiles: &mut HashSet<BoardPosition>) {
+    push_jump_for_king_if_valid(
+        board,
+        player,
+        init_position,
+        curr_jump_root,
+        jumped_tiles,
+        TileOffset::Negative(1),
+        TileOffset::Negative(2),
+        TileOffset::Negative(1),
+        TileOffset::Negative(2));
+
+    push_jump_for_king_if_valid(
+        board,
+        player,
+        init_position,
+        curr_jump_root,
+        jumped_tiles,
+        TileOffset::Negative(1),
+        TileOffset::Negative(2),
+        TileOffset::Positive(1),
+        TileOffset::Positive(2));
+
+    push_jump_for_king_if_valid(
+        board,
+        player,
+        init_position,
+        curr_jump_root,
+        jumped_tiles,
+        TileOffset::Positive(1),
+        TileOffset::Positive(2),
+        TileOffset::Negative(1),
+        TileOffset::Negative(2));
+
+    push_jump_for_king_if_valid(
+        board,
+        player,
+        init_position,
+        curr_jump_root,
+        jumped_tiles,
+        TileOffset::Positive(1),
+        TileOffset::Positive(2),
+        TileOffset::Positive(1),
+        TileOffset::Positive(2));
+}
+
+fn push_jump_for_king_if_valid
+(board: &Board,
+ player: &Player,
+ init_position: BoardPosition,
+ curr_jump_root: &mut JumpMove,
+ jumped_tiles: &mut HashSet<BoardPosition>,
+ pwnd_row_offset: TileOffset,
+ jump_row_offset: TileOffset,
+ pwnd_col_offset: TileOffset,
+ jump_col_offset: TileOffset) {
+    let start_row = curr_jump_root.from_row;
+    let start_col = curr_jump_root.from_col;
+
+    let tile_on_board = is_tile_offset_in_bounds(
+        board, start_row, start_col, &jump_row_offset, &jump_col_offset);
+    if !tile_on_board {
+        return;
+    }
+
+    let (jumped_row, jumped_col)
+        = offset_tile(start_row, start_col, &pwnd_row_offset, &pwnd_col_offset);
+    let pwnd_tile = board.get_tile(jumped_row, jumped_col);
+
+    let (end_row, end_col)
+        = offset_tile(start_row, start_col, &jump_row_offset, &jump_col_offset);
+    let end_tile = board.get_tile(end_row, end_col);
+
+    let tile_blocked = end_tile.get_piece().is_some();
+
+    // The initial position of the jumping piece is OK to jump back to. This is because
+    // the jumping piece "floats" around the board while the other pieces remain fixed.
+    let at_initial_position = init_position == BoardPosition::new(end_row, end_col);
+    if tile_blocked && !at_initial_position {
+        return;
+    }
+
+    let pwnd_piece_enemy = pwnd_tile
+        .get_piece()
+        .map(|piece| piece.get_player_id() != player.id)
+        .unwrap_or(false);
+
+    if !pwnd_piece_enemy {
+        return;
+    }
+
+    // check to see if we have already jumped the tile
+    let jumped_position = BoardPosition::new(jumped_row, jumped_col);
+    if jumped_tiles.contains(&jumped_position) {
+        return;
+    }
+
+    let mut jump = JumpMove::new(end_row, end_col);
+
+    jumped_tiles.insert(jumped_position);
+
+    find_jump_moves_for_king_rustcursive(board, player, init_position, &mut jump, jumped_tiles);
+
+    jumped_tiles.remove(&jumped_position);
+
+    curr_jump_root.jumps.push(jump);
+}
+
+fn get_row_offsets(direction: Direction) -> (TileOffset, TileOffset) {
+    let (pwnd_row_offset, jump_row_offset) = match direction {
+        Direction::DecreasingRank =>
+            (TileOffset::Negative(1), TileOffset::Negative(2)),
+        Direction::IncreasingRank =>
+            (TileOffset::Positive(1), TileOffset::Positive(2))
+    };
+
+    (pwnd_row_offset, jump_row_offset)
+}
+
+/// Given the position of a king piece on a board, determines
+/// the simple moves available to this piece.
+///
+/// This function does not require a Direction like the
+/// find_simple_moves_for_man function, because kings can move
+/// in all directions.
+pub fn find_simple_moves_for_king
+(board: &Board,
+ row: usize,
+ col: usize)
+ -> Vec<SimpleMove> {
+    let mut moves = Vec::new();
+
+    {
+        let row_offset = TileOffset::Negative(1);
+        let col_offset = TileOffset::Negative(1);
+        push_simple_move_if_valid(
+            board, row, col, &row_offset, &col_offset, &mut moves);
+    }
+
+    {
+        let row_offset = TileOffset::Negative(1);
+        let col_offset = TileOffset::Positive(1);
+        push_simple_move_if_valid(
+            board, row, col, &row_offset, &col_offset, &mut moves);
+    }
+
+    {
+        let row_offset = TileOffset::Positive(1);
+        let col_offset = TileOffset::Negative(1);
+        push_simple_move_if_valid(
+            board, row, col, &row_offset, &col_offset, &mut moves);
+    }
+
+    {
+        let row_offset = TileOffset::Positive(1);
+        let col_offset = TileOffset::Positive(1);
+        push_simple_move_if_valid(
+            board, row, col, &row_offset, &col_offset, &mut moves);
+    }
+
+    moves
+}
+
+// checks if it is possible to make a simple move with the given row
+// and tile offset, and if so, adds the move to the vector
+fn push_simple_move_if_valid
+(board: &Board,
+ start_row: usize,
+ start_col: usize,
+ row_offset: &TileOffset,
+ col_offset: &TileOffset,
+ moves: &mut Vec<SimpleMove>) {
+    let tile_on_board = is_tile_offset_in_bounds(
+        board, start_row, start_col, &row_offset, &col_offset);
+    if tile_on_board {
+        let (offset_row, offset_col)
+            = offset_tile(start_row, start_col, &row_offset, &col_offset);
+        let tile = board.get_tile(offset_row, offset_col);
+        if tile.get_piece().is_none() {
+            let the_move = SimpleMove::new(
+                start_row, start_col, offset_row, offset_col);
+            moves.push(the_move);
+        }
+    }
+}
+
+// This enum describes an offset direction and magnitude.
+enum TileOffset {
+    Positive(usize),
+    Negative(usize),
+}
+
+// offsets a value based on the given offset direction and magnitude
+fn offset_value
+(start_value: usize, value_offset: &TileOffset)
+ -> usize {
+    match *value_offset {
+        TileOffset::Negative(magnitude) => start_value - magnitude,
+        TileOffset::Positive(magnitude) => start_value + magnitude,
+    }
+}
+
+// Offsets a tile based on the given offset direction
+// and magnitude in the row and column dimensions.
+//
+// Returns a 2 element tuple, where the first element
+// is the offset row, and the second element is the
+// offset column.
+fn offset_tile
+(start_row: usize,
+ start_col: usize,
+ row_offset: &TileOffset,
+ col_offset: &TileOffset)
+ -> (usize, usize) {
+    (offset_value(start_row, row_offset),
+     offset_value(start_col, col_offset))
+}
+
+// checks if a value is in the given range using the given offset
+//TODO maybe a range object can be used here as a param instead
+// of the start and max values
+fn is_offset_value_in_range
+(start_value: usize,
+ max_value: usize,
+ value_offset: &TileOffset)
+ -> bool {
+    match *value_offset {
+        TileOffset::Negative(magnitude) => start_value >= magnitude,
+        TileOffset::Positive(magnitude) => start_value + magnitude <= max_value
+    }
+}
+
+// checks if a tile on the board can be reached when
+// moving from one position on the board to another
+fn is_tile_offset_in_bounds
+(board: &Board,
+ start_row: usize,
+ start_col: usize,
+ row_offset: &TileOffset,
+ col_offset: &TileOffset)
+ -> bool {
+    let max_row_index = board.number_rows() - 1;
+    let max_col_index = board.number_columns() - 1;
+
+    is_offset_value_in_range(start_row, max_row_index, row_offset)
+        && is_offset_value_in_range(start_col, max_col_index, col_offset)
+}
+
+#[cfg(test)]
+mod test {
+    mod jump_tree {
+        use BoardPosition;
+        use crate::BoardPosition;
+
+        use super::super::JumpMove;
+
+        #[test]
+        fn empty_sequence() {
+            let jump_tree = JumpMove::new(0, 0);
+            let result = jump_tree.contains_jump_sequence(&Vec::new());
+            assert_eq!(true, result);
+        }
+
+        #[test]
+        fn single_element_sequence_matching_start_position() {
+            let jump_tree = JumpMove::new(0, 0);
+            let jumps = vec![BoardPosition::new(0, 0)];
+            let result = jump_tree.contains_jump_sequence(&jumps);
+            assert_eq!(true, result);
+        }
+
+        #[test]
+        fn single_element_sequence_different_start_position() {
+            let jump_tree = JumpMove::new(0, 0);
+            let jumps = vec![BoardPosition::new(1, 1)];
+            let result = jump_tree.contains_jump_sequence(&jumps);
+            assert_eq!(false, result);
+        }
+
+        #[test]
+        fn single_jump_empty_tree() {
+            let jump_tree = JumpMove::new(0, 0);
+            let jumps = vec![BoardPosition::new(0, 0), BoardPosition::new(2, 2)];
+            let result = jump_tree.contains_jump_sequence(&jumps);
+            assert_eq!(false, result);
+        }
+
+        #[test]
+        fn single_jump_tree_containing_jump() {
+            let jump_tree = JumpMove::with_jumps(0, 0, vec![JumpMove::new(2, 2)]);
+            let jumps = vec![BoardPosition::new(0, 0), BoardPosition::new(2, 2)];
+            let result = jump_tree.contains_jump_sequence(&jumps);
+            assert_eq!(true, result);
+        }
+
+        #[test]
+        fn single_jump_tree_missing_jump() {
+            let jump_tree = JumpMove::with_jumps(2, 2, vec![JumpMove::new(2, 0)]);
+            let jumps = vec![BoardPosition::new(2, 2), BoardPosition::new(2, 4)];
+            let result = jump_tree.contains_jump_sequence(&jumps);
+            assert_eq!(false, result);
+        }
+
+        #[test]
+        fn branching_jump_tree_containing_jump() {
+            let jump_tree = JumpMove::with_jumps(
+                5, 5, vec![
+                    JumpMove::new(3, 3),
+                    JumpMove::new(3, 7),
+                    JumpMove::new(7, 3),
+                    JumpMove::new(7, 7)]);
+
+            let jumps = vec![BoardPosition::new(5, 5), BoardPosition::new(7, 3)];
+            let result = jump_tree.contains_jump_sequence(&jumps);
+            assert_eq!(true, result);
+        }
+
+        #[test]
+        fn branching_jump_tree_missing_jump() {
+            let jump_tree = JumpMove::with_jumps(
+                5, 5, vec![
+                    JumpMove::new(3, 3),
+                    JumpMove::new(3, 7),
+                    JumpMove::new(7, 3),
+                    JumpMove::new(7, 7)]);
+
+            let jumps = vec![BoardPosition::new(5, 5), BoardPosition::new(5, 5)];
+            let result = jump_tree.contains_jump_sequence(&jumps);
+            assert_eq!(false, result);
+        }
+
+        #[test]
+        fn multi_jump_tree_containing_single_jump() {
+            let jump_tree = JumpMove::with_jumps(
+                5, 5, vec![
+                    JumpMove::with_jumps(
+                        3, 3, vec![
+                            JumpMove::new(1, 1)])]);
+
+            let jumps = vec![BoardPosition::new(5, 5), BoardPosition::new(3, 3)];
+            let result = jump_tree.contains_jump_sequence(&jumps);
+            assert_eq!(true, result);
+        }
+
+        #[test]
+        fn multi_jump_tree_missing_single_jump() {
+            let jump_tree = JumpMove::with_jumps(
+                5, 5, vec![
+                    JumpMove::with_jumps(
+                        3, 3, vec![
+                            JumpMove::new(1, 1)])]);
+
+            let jumps = vec![
+                BoardPosition::new(5, 5),
+                BoardPosition::new(3, 3),
+                BoardPosition::new(5, 5)];
+            let result = jump_tree.contains_jump_sequence(&jumps);
+            assert_eq!(false, result);
+        }
+
+        #[test]
+        fn multi_jump_tree_containing_multi_jump() {
+            let jump_tree = JumpMove::with_jumps(
+                5, 5, vec![
+                    JumpMove::with_jumps(
+                        3, 3, vec![
+                            JumpMove::new(1, 1)])]);
+
+            let jumps = vec![
+                BoardPosition::new(5, 5),
+                BoardPosition::new(3, 3),
+                BoardPosition::new(1, 1)];
+            let result = jump_tree.contains_jump_sequence(&jumps);
+            assert_eq!(true, result);
+        }
+    }
+
+    mod simple_move {
+        mod man_piece {
+            use Board;
+            use ManPiece;
+            use OccupiedTile;
+            use Player;
+            use crate::{ManPiece, OccupiedTile};
+
+            use super::super::super::*;
+
+            #[test]
+            fn single_tile_board_has_no_moves() {
+                let board = Board::new(1, 1);
+                let result = find_simple_moves_for_man(
+                    &board, Direction::IncreasingRank, 0, 0);
+                assert_eq!(Vec::<SimpleMove>::new(), result);
+            }
+
+            fn test_move
+            (dir: Direction,
+             start_row: usize,
+             start_col: usize,
+             exp_result: Vec<SimpleMove>) {
+                let board = Board::new(8, 8);
+                let result = find_simple_moves_for_man(
+                    &board, dir, start_row, start_col);
+                assert_eq!(exp_result, result);
+            }
+
+            ptest!(test_move [
+	no_moves_when_min_rank_and_decreasing_rank(
+		Direction::DecreasingRank, 0, 4, Vec::new()),
+
+	no_moves_when_max_rank_and_increasing_rank(
+		Direction::IncreasingRank, 7, 4, Vec::new()),
+
+	single_move_when_min_file(
+		Direction::IncreasingRank, 4, 0, vec![SimpleMove::new(4, 0, 5, 1)]),
+
+	single_move_when_max_file(
+		Direction::DecreasingRank, 3, 7, vec![SimpleMove::new(3, 7, 2, 6)]),
+
+	two_moves_when_middle_of_board_1(
+		Direction::IncreasingRank,
+		3,
+		5,
+		vec![SimpleMove::new(3, 5, 4, 4), SimpleMove::new(3, 5, 4, 6)]),
+
+	two_moves_when_middle_of_board_2(
+		Direction::DecreasingRank,
+		1,
+		2,
+		vec![SimpleMove::new(1, 2, 0, 1), SimpleMove::new(1, 2, 0, 3)])
+]);
+
+            fn test_move_blocked
+            (piece_row: usize,
+             piece_col: usize,
+             dir: Direction,
+             start_row: usize,
+             start_col: usize,
+             exp_result: Vec<SimpleMove>) {
+                let mut board = Board::new(8, 8);
+                let player = Player { id: 0 };
+                let piece = ManPiece::new(&player);
+                let tile = OccupiedTile::new(Box::new(piece));
+                board.set_tile(piece_row, piece_col, Box::new(tile));
+
+                let result = find_simple_moves_for_man(
+                    &board, dir, start_row, start_col);
+                assert_eq!(exp_result, result);
+            }
+
+            ptest!(test_move_blocked [
+	move_blocked_when_tile_occupied_1(
+		3, 3, Direction::DecreasingRank, 4, 4, vec![SimpleMove::new(4, 4, 3, 5)]),
+
+	move_blocked_when_tile_occupied_2(
+		3, 5, Direction::DecreasingRank, 4, 4, vec![SimpleMove::new(4, 4, 3, 3)])
+]);
+        }
+
+        mod king_piece {
+            use Board;
+            use ManPiece;
+            use OccupiedTile;
+            use Player;
+            use crate::{ManPiece, OccupiedTile};
+
+            use super::super::super::*;
+
+            #[test]
+            fn single_tile_board_has_no_moves() {
+                let board = Board::new(1, 1);
+                let result = find_simple_moves_for_king(
+                    &board, 0, 0);
+                assert_eq!(Vec::<SimpleMove>::new(), result);
+            }
+
+            fn test_move
+            (start_row: usize,
+             start_col: usize,
+             exp_result: Vec<SimpleMove>) {
+                let board = Board::new(8, 8);
+                let result = find_simple_moves_for_king(
+                    &board, start_row, start_col);
+                assert_eq!(exp_result, result);
+            }
+
+            ptest!(test_move [
+	single_move_when_min_rank_and_min_file(
+		7, 0, vec![SimpleMove::new(7, 0, 6, 1)]),
+
+	single_move_when_min_rank_and_max_file(
+		7, 7, vec![SimpleMove::new(7, 7, 6, 6)]),
+
+	single_move_when_max_rank_and_min_file(
+		0, 0, vec![SimpleMove::new(0, 0, 1, 1)]),
+
+	single_move_when_max_rank_and_max_file(
+		0, 7, vec![SimpleMove::new(0, 7, 1, 6)]),
+
+	four_moves_when_middle_of_board(
+		3, 5, vec![
+			SimpleMove::new(3, 5, 2, 4),
+			SimpleMove::new(3, 5, 2, 6),
+			SimpleMove::new(3, 5, 4, 4),
+			SimpleMove::new(3, 5, 4, 6)])
+]);
+
+            fn test_move_blocked
+            (piece_row: usize,
+             piece_col: usize,
+             start_row: usize,
+             start_col: usize,
+             exp_result: Vec<SimpleMove>) {
+                let mut board = Board::new(8, 8);
+                let player = Player { id: 0 };
+                let piece = ManPiece::new(&player);
+                let tile = OccupiedTile::new(Box::new(piece));
+                board.set_tile(piece_row, piece_col, Box::new(tile));
+
+                let result = find_simple_moves_for_king(
+                    &board, start_row, start_col);
+                assert_eq!(exp_result, result);
+            }
+
+            ptest!(test_move_blocked [
+	move_blocked_when_tile_occupied_1(
+		2, 4, 3, 5, vec![
+			SimpleMove::new(3, 5, 2, 6),
+			SimpleMove::new(3, 5, 4, 4),
+			SimpleMove::new(3, 5, 4, 6)]),
+
+	move_blocked_when_tile_occupied_2(
+		2, 6, 3, 5, vec![
+			SimpleMove::new(3, 5, 2, 4),
+			SimpleMove::new(3, 5, 4, 4),
+			SimpleMove::new(3, 5, 4, 6)]),
+
+	move_blocked_when_tile_occupied_3(
+		4, 4, 3, 5, vec![
+			SimpleMove::new(3, 5, 2, 4),
+			SimpleMove::new(3, 5, 2, 6),
+			SimpleMove::new(3, 5, 4, 6)]),
+
+	move_blocked_when_tile_occupied_4(
+		4, 6, 3, 5, vec![
+			SimpleMove::new(3, 5, 2, 4),
+			SimpleMove::new(3, 5, 2, 6),
+			SimpleMove::new(3, 5, 4, 4)])
+]);
+        }
+    }
+
+    mod jump_move {
+        mod man_piece {
+            use Board;
+            use ManPiece;
+            use OccupiedTile;
+            use Player;
+            use crate::{ManPiece, OccupiedTile};
+
+            use super::super::super::*;
+
+            fn test_jumping_alone
+            (start_row: usize, start_col: usize) {
+                let board = Board::new(8, 8);
+                let player = Player { id: 0 };
+                let direction = Direction::IncreasingRank;
+
+                let result = find_jump_moves_for_man(
+                    &board, &player, direction, start_row, start_col);
+
+                let exp_result = JumpMove::new(start_row, start_col);
+
+                assert_eq!(exp_result, result);
+            }
+
+            ptest!(test_jumping_alone [
+	jumping_left_off_board(6, 1),
+	jumping_right_off_board(6, 6),
+	jumping_middle_of_board(4, 3)
+]);
+
+            fn test_single_jump_single_enemy
+            (start_row: usize,
+             start_col: usize,
+             enemy_row: usize,
+             enemy_col: usize,
+             exp_result: JumpMove) {
+                let mut board = Board::new(8, 8);
+                let player = Player { id: 0 };
+                let direction = Direction::IncreasingRank;
+
+                let opponent = Player { id: 1 };
+
+                let enemy_piece = ManPiece::new(&opponent);
+                let enemy_tile = OccupiedTile::new(Box::new(enemy_piece));
+                board.set_tile(enemy_row, enemy_col, Box::new(enemy_tile));
+
+                let result = find_jump_moves_for_man(
+                    &board, &player, direction, start_row, start_col);
+
+                assert_eq!(exp_result, result);
+            }
+
+            ptest!(test_single_jump_single_enemy [
+	jumping_adjacent_enemy_left(
+	4, 3, 5, 2, JumpMove::with_jumps(4, 3, vec![JumpMove::new(6, 1)])),
+
+	jumping_adjacent_enemy_right(
+		4, 3, 5, 4, JumpMove::with_jumps(4, 3, vec![JumpMove::new(6, 5)]))
+]);
+
+            fn test_single_jump_two_enemies
+            (start_row: usize,
+             start_col: usize,
+             left_enemy_row: usize,
+             left_enemy_col: usize,
+             right_enemy_row: usize,
+             right_enemy_col: usize,
+             exp_result: JumpMove) {
+                let mut board = Board::new(8, 8);
+                let player = Player { id: 0 };
+                let direction = Direction::IncreasingRank;
+
+                let opponent = Player { id: 1 };
+
+                let left_enemy_piece = ManPiece::new(&opponent);
+                let left_enemy_tile = OccupiedTile::new(Box::new(left_enemy_piece));
+                board.set_tile(left_enemy_row, left_enemy_col, Box::new(left_enemy_tile));
+
+                let right_enemy_piece = ManPiece::new(&opponent);
+                let right_enemy_tile = OccupiedTile::new(Box::new(right_enemy_piece));
+                board.set_tile(right_enemy_row, right_enemy_col, Box::new(right_enemy_tile));
+
+                let result = find_jump_moves_for_man(
+                    &board, &player, direction, start_row, start_col);
+
+                assert_eq!(exp_result, result);
+            }
+
+            ptest!(test_single_jump_two_enemies [
+	jumping_two_forward_adjacent_enemies(
+		4, 3, 5, 2, 5, 4, JumpMove::with_jumps(4, 3, vec![JumpMove::new(6, 1), JumpMove::new(6, 5)])),
+
+	jumping_two_backward_adjacent_enemies(
+		6, 3, 5, 2, 5, 4, JumpMove::new(6, 3))
+]);
+
+            fn test_jumping_friendly_piece
+            (start_row: usize,
+             start_col: usize,
+             friendly_row: usize,
+             friendly_col: usize) {
+                let mut board = Board::new(8, 8);
+                let player = Player { id: 0 };
+                let direction = Direction::IncreasingRank;
+
+                let left_piece = ManPiece::new(&player);
+                let left_tile = OccupiedTile::new(Box::new(left_piece));
+                board.set_tile(friendly_row, friendly_col, Box::new(left_tile));
+
+                let result = find_jump_moves_for_man(
+                    &board, &player, direction, start_row, start_col);
+
+                let exp_result = JumpMove::new(start_row, start_col);
+
+                assert_eq!(exp_result, result);
+            }
+
+            ptest!(test_jumping_friendly_piece [
+	jumping_adjacent_friendly_piece_left(6, 3, 5, 2),
+	jumping_adjacent_friendly_piece_right(6, 3, 5, 4)
+]);
+
+            fn test_single_jump_blocked
+            (start_row: usize,
+             start_col: usize,
+             pwnd_row: usize,
+             pwnd_col: usize,
+             blocked_row: usize,
+             blocked_col: usize) {
+                let mut board = Board::new(8, 8);
+                let player = Player { id: 0 };
+                let direction = Direction::IncreasingRank;
+
+                let opponent = Player { id: 1 };
+                let pwnd_piece = ManPiece::new(&opponent);
+                let pwnd_tile = OccupiedTile::new(Box::new(pwnd_piece));
+                board.set_tile(pwnd_row, pwnd_col, Box::new(pwnd_tile));
+
+                let block_piece = ManPiece::new(&player);
+                let block_tile = OccupiedTile::new(Box::new(block_piece));
+                board.set_tile(blocked_row, blocked_col, Box::new(block_tile));
+
+                let result = find_jump_moves_for_man(
+                    &board, &player, direction, start_row, start_col);
+
+                let exp_result = JumpMove::new(start_row, start_col);
+
+                assert_eq!(exp_result, result);
+            }
+
+            ptest!(test_single_jump_blocked [
+	jumping_adjacent_enemy_blocked_left(4, 3, 5, 2, 6, 1),
+	jumping_adjacent_enemy_blocked_right(4, 3, 5, 4, 6, 5)
+]);
+
+            #[test]
+            fn jumping_two_forward_adjacent_enemies_left_blocked() {
+                let mut board = Board::new(8, 8);
+                let player = Player { id: 0 };
+                let direction = Direction::IncreasingRank;
+                let start_row = 4;
+                let start_col = 3;
+
+                let opponent = Player { id: 1 };
+
+                let left_piece = ManPiece::new(&opponent);
+                let left_tile = OccupiedTile::new(Box::new(left_piece));
+                board.set_tile(5, 2, Box::new(left_tile));
+
+                let block_piece = ManPiece::new(&player);
+                let block_tile = OccupiedTile::new(Box::new(block_piece));
+                board.set_tile(6, 1, Box::new(block_tile));
+
+                let right_piece = ManPiece::new(&opponent);
+                let right_tile = OccupiedTile::new(Box::new(right_piece));
+                board.set_tile(5, 4, Box::new(right_tile));
+
+                let result = find_jump_moves_for_man(
+                    &board, &player, direction, start_row, start_col);
+
+                let exp_result = JumpMove::with_jumps(
+                    start_row, start_col, vec![JumpMove::new(6, 5)]);
+
+                assert_eq!(exp_result, result);
+            }
+
+            #[test]
+            fn jumping_two_forward_adjacent_enemies_right_blocked() {
+                let mut board = Board::new(8, 8);
+                let player = Player { id: 0 };
+                let direction = Direction::IncreasingRank;
+                let start_row = 4;
+                let start_col = 3;
+
+                let opponent = Player { id: 1 };
+
+                let left_piece = ManPiece::new(&opponent);
+                let left_tile = OccupiedTile::new(Box::new(left_piece));
+                board.set_tile(5, 2, Box::new(left_tile));
+
+                let block_piece = ManPiece::new(&player);
+                let block_tile = OccupiedTile::new(Box::new(block_piece));
+                board.set_tile(6, 5, Box::new(block_tile));
+
+                let right_piece = ManPiece::new(&opponent);
+                let right_tile = OccupiedTile::new(Box::new(right_piece));
+                board.set_tile(5, 4, Box::new(right_tile));
+
+                let result = find_jump_moves_for_man(
+                    &board, &player, direction, start_row, start_col);
+
+                let exp_result = JumpMove::with_jumps(
+                    start_row, start_col, vec![JumpMove::new(6, 1)]);
+
+                assert_eq!(exp_result, result);
+            }
+
+            #[test]
+            fn the_one_true_test() {
+                let mut board = Board::new(8, 8);
+                let player = Player { id: 0 };
+                let direction = Direction::DecreasingRank;
+
+                let opponent = Player { id: 1 };
+
+                let piece12 = ManPiece::new(&opponent);
+                let tile12 = OccupiedTile::new(Box::new(piece12));
+                board.set_tile(1, 2, Box::new(tile12));
+
+                let piece14 = ManPiece::new(&opponent);
+                let tile14 = OccupiedTile::new(Box::new(piece14));
+                board.set_tile(1, 4, Box::new(tile14));
+
+                let piece32 = ManPiece::new(&opponent);
+                let tile32 = OccupiedTile::new(Box::new(piece32));
+                board.set_tile(3, 2, Box::new(tile32));
+
+                let piece34 = ManPiece::new(&opponent);
+                let tile34 = OccupiedTile::new(Box::new(piece34));
+                board.set_tile(3, 4, Box::new(tile34));
+
+                let piece36 = ManPiece::new(&opponent);
+                let tile36 = OccupiedTile::new(Box::new(piece36));
+                board.set_tile(3, 6, Box::new(tile36));
+
+                let piece52 = ManPiece::new(&opponent);
+                let tile52 = OccupiedTile::new(Box::new(piece52));
+                board.set_tile(5, 2, Box::new(tile52));
+
+                let piece54 = ManPiece::new(&opponent);
+                let tile54 = OccupiedTile::new(Box::new(piece54));
+                board.set_tile(5, 4, Box::new(tile54));
+
+                let piece63 = ManPiece::new(&player);
+                let tile63 = OccupiedTile::new(Box::new(piece63));
+                board.set_tile(6, 3, Box::new(tile63));
+
+                let start_row = 6;
+                let start_col = 3;
+
+                let result = find_jump_moves_for_man(
+                    &board, &player, direction, start_row, start_col);
+
+                let exp_result = JumpMove::with_jumps(
+                    start_row,
+                    start_col,
+                    vec![JumpMove::with_jumps(
+                        4,
+                        1,
+                        vec![
+                            JumpMove::with_jumps(
+                                2,
+                                3,
+                                vec![JumpMove::new(0, 1), JumpMove::new(0, 5)])]),
+                         JumpMove::with_jumps(
+                             4,
+                             5,
+                             vec![
+                                 JumpMove::with_jumps(
+                                     2,
+                                     3,
+                                     vec![JumpMove::new(0, 1), JumpMove::new(0, 5)]),
+                                 JumpMove::new(2, 7)])]);
+
+                assert_eq!(exp_result, result);
+            }
+        }
+
+        mod king_piece {
+            use Board;
+            use ManPiece;
+            use OccupiedTile;
+            use Player;
+            use crate::{ManPiece, OccupiedTile};
+
+            use super::super::super::*;
+
+            #[test]
+            fn no_adjacent_enemy_pieces() {
+                let board = Board::new(8, 8);
+                let player = Player { id: 0 };
+
+                let start_row = 6;
+                let start_col = 3;
+
+                let result = find_jump_moves_for_king(
+                    &board, &player, start_row, start_col);
+                let exp_result = JumpMove::new(start_row, start_col);
+
+                assert_eq!(exp_result, result);
+            }
+
+            fn test_single_jump
+            (enemy_row: usize, enemy_col: usize, exp_result: JumpMove) {
+                let mut board = Board::new(8, 8);
+
+                let player = Player { id: 0 };
+                let opponent = Player { id: 1 };
+
+                let enemy_piece = ManPiece::new(&opponent);
+                let enemy_tile = OccupiedTile::new(Box::new(enemy_piece));
+                board.set_tile(enemy_row, enemy_col, Box::new(enemy_tile));
+
+                let result = find_jump_moves_for_king(
+                    &board, &player, 4, 3);
+
+                assert_eq!(exp_result, result);
+            }
+
+            ptest!(test_single_jump [
+	single_jump_decr_rank_decr_file(5, 2, JumpMove::with_jumps(4, 3, vec![JumpMove::new(6, 1)])),
+	single_jump_decr_rank_incr_file(5, 4, JumpMove::with_jumps(4, 3, vec![JumpMove::new(6, 5)])),
+	single_jump_incr_rank_decr_file(3, 4, JumpMove::with_jumps(4, 3, vec![JumpMove::new(2, 5)])),
+	single_jump_incr_rank_incr_file(3, 2, JumpMove::with_jumps(4, 3, vec![JumpMove::new(2, 1)]))
+]);
+
+            #[test]
+            fn jump_multiple_directions() {
+                let mut board = Board::new(8, 8);
+
+                let player = Player { id: 0 };
+                let opponent = Player { id: 1 };
+
+                let enemy_piece1 = ManPiece::new(&opponent);
+                let enemy_tile1 = OccupiedTißle::new(Box::new(enemy_piece1));
+                board.set_tile(3, 2, Box::new(enemy_tile1));
+
+                let enemy_piece2 = ManPiece::new(&opponent);
+                let enemy_tile2 = OccupiedTile::new(Box::new(enemy_piece2));
+                board.set_tile(3, 4, Box::new(enemy_tile2));
+
+                let enemy_piece3 = ManPiece::new(&opponent);
+                let enemy_tile3 = OccupiedTile::new(Box::new(enemy_piece3));
+                board.set_tile(5, 4, Box::new(enemy_tile3));
+
+                let enemy_piece4 = ManPiece::new(&opponent);
+                let enemy_tile4 = OccupiedTile::new(Box::new(enemy_piece4));
+                board.set_tile(5, 2, Box::new(enemy_tile4));
+
+                let start_row = 4;
+                let start_col = 3;
+
+                let result = find_jump_moves_for_king(
+                    &board, &player, start_row, start_col);
+                let exp_result = JumpMove::with_jumps(
+                    start_row,
+                    start_col,
+                    vec![
+                        JumpMove::new(2, 1),
+                        JumpMove::new(2, 5),
+                        JumpMove::new(6, 1),
+                        JumpMove::new(6, 5)]);
+
+                assert_eq!(exp_result, result);
+            }
+
+            #[test]
+            fn jump_in_a_circle() {
+                let mut board = Board::new(8, 8);
+
+                let player = Player { id: 0 };
+                let opponent = Player { id: 1 };
+
+                let start_row = 4;
+                let start_col = 1;
+
+                let friendly_piece = ManPiece::new(&player);
+                let friendly_tile = OccupiedTile::new(Box::new(friendly_piece));
+                board.set_tile(start_row, start_col, Box::new(friendly_tile));
+
+                let enemy_piece1 = ManPiece::new(&opponent);
+                let enemy_tile1 = OccupiedTile::new(Box::new(enemy_piece1));
+                board.set_tile(3, 2, Box::new(enemy_tile1));
+
+                let enemy_piece2 = ManPiece::new(&opponent);
+                let enemy_tile2 = OccupiedTile::new(Box::new(enemy_piece2));
+                board.set_tile(3, 4, Box::new(enemy_tile2));
+
+                let enemy_piece3 = ManPiece::new(&opponent);
+                let enemy_tile3 = OccupiedTile::new(Box::new(enemy_piece3));
+                board.set_tile(5, 4, Box::new(enemy_tile3));
+
+                let enemy_piece4 = ManPiece::new(&opponent);
+                let enemy_tile4 = OccupiedTile::new(Box::new(enemy_piece4));
+                board.set_tile(5, 2, Box::new(enemy_tile4));
+
+                let result = find_jump_moves_for_king(
+                    &board, &player, start_row, start_col);
+                let exp_result = JumpMove::with_jumps(
+                    start_row,
+                    start_col,
+                    vec![
+                        JumpMove::with_jumps(2, 3,
+                                             vec![JumpMove::with_jumps(4, 5,
+                                                                       vec![JumpMove::with_jumps(6, 3,
+                                                                                                 vec![JumpMove::new(start_row, start_col)])])]),
+                        JumpMove::with_jumps(6, 3,
+                                             vec![JumpMove::with_jumps(4, 5,
+                                                                       vec![JumpMove::with_jumps(2, 3,
+                                                                                                 vec![JumpMove::new(start_row, start_col)])])])]);
+
+                assert_eq!(exp_result, result);
+            }
+        }
+    }
+}
+
+'''
+'''--- near-contract/contract/src/board.rs ---
+use piece::ManPiece;
+use player::Player;
+use tile::{EmptyTile, OccupiedTile, Tile};
+
+use crate::*;
+use crate::tile::TileToSave;
+
+#[derive(PartialEq, Eq, Debug, Hash, Copy, Clone)]
+pub struct BoardPosition {
+    pub row: usize,
+    pub column: usize,
+}
+
+impl BoardPosition {
+    pub fn new(row: usize, column: usize) -> BoardPosition {
+        BoardPosition { row, column }
+    }
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct BoardToSave {
+    pub(crate) number_rows: usize,
+    pub(crate) number_columns: usize,
+    pub(crate) tiles: Vec<Option<TileToSave>>,
+}
+
+impl From<BoardToSave> for Board {
+    fn from(board_to_save: BoardToSave) -> Self {
+        let mut board = Board {
+            number_rows: CHECKERBOARD_SIZE,
+            number_columns: CHECKERBOARD_SIZE,
+            tiles: Vec::with_capacity(CHECKERS_NUMBER_TILES),
+        };
+
+        for row in 0..board_to_save.number_rows {
+            for column in 0..board_to_save.number_columns {
+                let idx = board_to_save.indices_to_index(row, column);
+                let tile: Box<dyn Tile> =
+                    if let Some(tile_to_save) = &board_to_save.tiles[idx] {
+                        if tile_to_save.piece_type == PieceType::Man {
+                            let piece = ManPiece::new(&Player {
+                                id: tile_to_save.player_id
+                            });
+                            Box::new(OccupiedTile::new(Box::new(piece)))
+                        } else if tile_to_save.piece_type == PieceType::King {
+                            let piece = KingPiece::new(&Player {
+                                id: tile_to_save.player_id
+                            });
+                            Box::new(OccupiedTile::new(Box::new(piece)))
+                        } else {
+                            Box::new(EmptyTile)
+                        }
+                    } else {
+                        Box::new(EmptyTile)
+                    };
+
+                board.tiles.push(tile);
+            }
+        }
+
+        board
+    }
+}
+
+impl BoardToSave {
+    pub fn new_checkerboard(player1: &Player, player2: &Player) -> BoardToSave {
+        if player1.id == player2.id {
+            panic!("Player 1 and Player 2 have the same ID: {}", player1.id)
+        }
+
+        let mut board = BoardToSave {
+            number_rows: CHECKERBOARD_SIZE,
+            number_columns: CHECKERBOARD_SIZE,
+            tiles: Vec::with_capacity(CHECKERS_NUMBER_TILES),
+        };
+
+        BoardToSave::fill_even_row(&mut board, player1);
+        BoardToSave::fill_odd_row(&mut board, player1);
+        BoardToSave::fill_even_row(&mut board, player1);
+
+        BoardToSave::fill_empty_row(&mut board);
+        BoardToSave::fill_empty_row(&mut board);
+
+        BoardToSave::fill_odd_row(&mut board, player2);
+        BoardToSave::fill_even_row(&mut board, player2);
+        BoardToSave::fill_odd_row(&mut board, player2);
+
+        board
+    }
+
+    fn fill_even_row(board: &mut BoardToSave, player: &Player) {
+        for t in 0..board.number_columns {
+            let tile: Option<TileToSave> = if t % 2 == 0 {
+                Some(TileToSave {
+                    player_id: player.id,
+                    piece_type: PieceType::Man,
+                })
+            } else {
+                None
+            };
+            board.tiles.push(tile);
+        }
+    }
+
+    fn fill_odd_row(board: &mut BoardToSave, player: &Player) {
+        for t in 0..board.number_columns {
+            let tile: Option<TileToSave> = if t % 2 == 1 {
+                Some(TileToSave {
+                    player_id: player.id,
+                    piece_type: PieceType::Man,
+                })
+            } else {
+                None
+            };
+            board.tiles.push(tile);
+        }
+    }
+
+    fn fill_empty_row(board: &mut BoardToSave) {
+        for _ in 0..board.number_columns {
+            board.tiles.push(None);
+        }
+    }
+
+    fn indices_to_index(&self, row: usize, column: usize) -> usize {
+        self.number_columns * row + column
+    }
+}
+
+pub struct Board {
+    number_rows: usize,
+    number_columns: usize,
+    tiles: Vec<Box<dyn Tile>>,
+}
+
+impl From<Board> for BoardToSave {
+    fn from(board: Board) -> Self {
+        let mut board_to_save = BoardToSave {
+            number_rows: CHECKERBOARD_SIZE,
+            number_columns: CHECKERBOARD_SIZE,
+            tiles: Vec::with_capacity(CHECKERS_NUMBER_TILES),
+        };
+
+        for row in 0..board.number_rows {
+            for column in 0..board.number_columns {
+                let idx = board.indices_to_index(row, column);
+
+                let tile = &board.tiles[idx];
+                let tile_to_save: Option<TileToSave> =
+                    match tile.get_piece() {
+                        None => None,
+                        Some(piece) =>
+                            Some(TileToSave {
+                                player_id: piece.get_player_id(),
+                                piece_type: piece.get_type(),
+                            })
+                    };
+
+                board_to_save.tiles.push(tile_to_save);
+            }
+        }
+
+        board_to_save
+    }
+}
+
+impl From<Board> for BoardOutput {
+    fn from(board: Board) -> Self {
+
+        let mut board_output = [
+            Vec::with_capacity(CHECKERBOARD_SIZE),
+            Vec::with_capacity(CHECKERBOARD_SIZE),
+            Vec::with_capacity(CHECKERBOARD_SIZE),
+            Vec::with_capacity(CHECKERBOARD_SIZE),
+            Vec::with_capacity(CHECKERBOARD_SIZE),
+            Vec::with_capacity(CHECKERBOARD_SIZE),
+            Vec::with_capacity(CHECKERBOARD_SIZE),
+            Vec::with_capacity(CHECKERBOARD_SIZE)
+            ];
+
+        for row in 0..board.number_rows {
+            for column in 0..board.number_columns {
+                let idx = board.indices_to_index(row, column);
+
+                let tile = &board.tiles[idx];
+                let tile_to_save: i8 =
+                    match tile.get_piece() {
+                        None => 0,
+                        Some(piece) =>
+                            match piece.get_type() {
+                                PieceType::Man => piece.get_player_id() as i8,
+                                PieceType::King => piece.get_player_id() as i8 * -1
+                            }
+                    };
+
+                board_output[row].push(tile_to_save);
+            }
+        }
+
+        board_output
+
+    }
+}
+
+impl Board {
+    #[cfg(test)]
+    pub fn new(number_rows: usize, number_columns: usize) -> Board {
+        let number_tiles = number_rows * number_columns;
+        let mut board = Board {
+            number_rows: number_rows,
+            number_columns: number_columns,
+            tiles: Vec::with_capacity(number_tiles),
+        };
+
+        for _ in 0..number_tiles {
+            board.tiles.push(Box::new(EmptyTile));
+        }
+
+        board
+    }
+
+    pub fn new_checkerboard(player1: &Player, player2: &Player) -> Board {
+        if player1.id == player2.id {
+            panic!("Player 1 and Player 2 have the same ID: {}", player1.id)
+        }
+
+        let mut board = Board {
+            number_rows: CHECKERBOARD_SIZE,
+            number_columns: CHECKERBOARD_SIZE,
+            tiles: Vec::with_capacity(CHECKERS_NUMBER_TILES),
+        };
+
+        Board::fill_even_row(&mut board, player1);
+        Board::fill_odd_row(&mut board, player1);
+        Board::fill_even_row(&mut board, player1);
+
+        Board::fill_empty_row(&mut board);
+        Board::fill_empty_row(&mut board);
+
+        Board::fill_odd_row(&mut board, player2);
+        Board::fill_even_row(&mut board, player2);
+        Board::fill_odd_row(&mut board, player2);
+
+        board
+    }
+
+    pub fn number_rows(&self) -> usize {
+        self.number_rows
+    }
+
+    pub fn number_columns(&self) -> usize {
+        self.number_columns
+    }
+
+    fn indices_to_index(&self, row: usize, column: usize) -> usize {
+        self.number_columns * row + column
+    }
+
+    pub fn get_tile(&self, row: usize, column: usize) -> &dyn Tile {
+        let idx = self.indices_to_index(row, column);
+        &*self.tiles[idx]
+    }
+
+    pub fn set_tile(
+        &mut self,
+        row: usize,
+        column: usize,
+        tile: Box<dyn Tile>) {
+        let idx = self.indices_to_index(row, column);
+        self.tiles[idx] = tile;
+    }
+
+    pub fn clear_tile(&mut self, row: usize, column: usize) {
+        self.set_tile(row, column, Box::new(EmptyTile));
+    }
+
+    pub fn swap_tiles(
+        &mut self,
+        row1: usize,
+        column1: usize,
+        row2: usize,
+        column2: usize) {
+        let idx1 = self.indices_to_index(row1, column1);
+        let idx2 = self.indices_to_index(row2, column2);
+        self.tiles.swap(idx1, idx2);
+    }
+
+    fn fill_even_row(board: &mut Board, player: &Player) {
+        for t in 0..board.number_columns {
+            let tile: Box<dyn Tile> = if t % 2 == 0 {
+                let piece = ManPiece::new(player);
+                Box::new(OccupiedTile::new(Box::new(piece)))
+            } else {
+                Box::new(EmptyTile)
+            };
+            board.tiles.push(tile);
+        }
+    }
+
+    fn fill_odd_row(board: &mut Board, player: &Player) {
+        for t in 0..board.number_columns {
+            let tile: Box<dyn Tile> = if t % 2 == 1 {
+                let piece = ManPiece::new(player);
+                Box::new(OccupiedTile::new(Box::new(piece)))
+            } else {
+                Box::new(EmptyTile)
+            };
+            board.tiles.push(tile);
+        }
+    }
+
+    fn fill_empty_row(board: &mut Board) {
+        for _ in 0..board.number_columns {
+            board.tiles.push(Box::new(EmptyTile));
+        }
+    }
+}
+
+'''
+'''--- near-contract/contract/src/display.rs ---
+use near_sdk::{log};
+
+extern crate std;
+
+use crate::*;
+use piece::PieceType;
+use std::{char};
+
+const EMPTY_PIECE_STR : &str = " ";
+
+const RED_MAN_STR : &str = "r";
+const RED_KING_STR : &str = "R";
+const BLACK_MAN_STR : &str = "b";
+const BLACK_KING_STR : &str = "B";
+
+fn print_justified_file (logs: &mut String, columns : usize, padding : usize) {
+    for _ in 0..padding {
+		logs.push_str(" ");
+    }
+
+	let initial_file = 'A' as u32;
+    for c in 0..columns {
+        let file = char::from_u32(initial_file + c as u32).unwrap();
+		logs.push_str(&*format!("  {}", file));
+    }
+
+	logs.push_str("\n");
+}
+
+fn print_justified_rank(logs: &mut String, rank : usize, padding : usize) {
+    let cur_rank = rank.to_string();
+
+    for _ in 0..padding - cur_rank.len() {
+		logs.push_str(" ");
+    }
+	logs.push_str(&*format!("{} ", cur_rank));
+}
+
+pub fn print_board (board : &Board) {
+	let mut logs: String = "\n".to_string();
+    let file_padding = board.number_columns().to_string().len();
+    let rank_padding = board.number_rows().to_string().len();
+
+    print_justified_file(&mut logs,board.number_columns(), file_padding);
+
+	for r in (0..board.number_rows()).rev() {
+        print_justified_rank(&mut logs, r + 1, rank_padding);
+		for c in 0..board.number_columns() {
+			let tile = board.get_tile(r, c);
+			let piece_str = match tile.get_piece() {
+				None => EMPTY_PIECE_STR,
+				Some(piece) =>
+					match (piece.get_type(), piece.get_player_id()) {
+						(PieceType::Man, 1) => RED_MAN_STR,
+						(PieceType::King, 1) => RED_KING_STR,
+						(PieceType::Man, 2) => BLACK_MAN_STR,
+						(PieceType::King, 2) => BLACK_KING_STR,
+						_ => unreachable!()
+					}
+			};
+
+			logs.push_str(&*format!("[{}]", piece_str));
+		}
+
+		logs.push_str(&*format!(" {}\n", r + 1));
+	}
+
+    print_justified_file( &mut logs,board.number_columns(), file_padding);
+	log!(logs);
+}
+
+#[cfg(test)]
+mod test {
+	use super::*;
+
+	use board;
+	use piece::{KingPiece, ManPiece};
+	use player;
+	use tile::OccupiedTile;
+
+	#[test]
+	fn empty_1x1_board() {
+		let board = Board::new(1, 1);
+
+		let mut result = Vec::<u8>::new();
+		print_board(&board);
+
+		let exp_result = "   A\n1 [ ] 1\n   A\n";
+
+		assert_eq!(exp_result.as_bytes(), &*result);
+	}
+
+	#[test]
+	fn empty_3x3_board() {
+		let board = Board::new(3, 3);
+
+		let mut result = Vec::<u8>::new();
+		print_board(&board);
+
+		let exp_result = concat!(
+			"   A  B  C\n",
+			"3 [ ][ ][ ] 3\n",
+			"2 [ ][ ][ ] 2\n",
+			"1 [ ][ ][ ] 1\n",
+			"   A  B  C\n");
+
+		assert_eq!(exp_result.as_bytes(), &*result);
+	}
+
+	#[test]
+	fn empty_5x3_board() {
+		let board = Board::new(5, 3);
+
+		let mut result = Vec::<u8>::new();
+		print_board(&board);
+
+		let exp_result = concat!(
+			"   A  B  C\n",
+			"5 [ ][ ][ ] 5\n",
+			"4 [ ][ ][ ] 4\n",
+			"3 [ ][ ][ ] 3\n",
+			"2 [ ][ ][ ] 2\n",
+			"1 [ ][ ][ ] 1\n",
+			"   A  B  C\n");
+
+		assert_eq!(exp_result.as_bytes(), &*result);
+	}
+
+	#[test]
+	fn board_with_pieces() {
+		let mut result = Vec::<u8>::new();
+
+		let red_player = Player{id : 1};
+		let black_player = Player{id : 2};
+
+		let mut board = Board::new(5, 3);
+
+		let red_man = ManPiece::new(&red_player);
+		let red_king = KingPiece::new(&red_player);
+		let black_man = ManPiece::new(&black_player);
+		let black_king = KingPiece::new(&black_player);
+		board.set_tile(0, 0, Box::new(OccupiedTile::new(Box::new(red_man))));
+		board.set_tile(4, 2, Box::new(OccupiedTile::new(Box::new(red_king))));
+		board.set_tile(0, 2, Box::new(OccupiedTile::new(Box::new(black_man))));
+		board.set_tile(4, 0, Box::new(OccupiedTile::new(Box::new(black_king))));
+
+		print_board(&board);
+
+		let exp_result = concat!(
+			"   A  B  C\n",
+			"5 [B][ ][R] 5\n",
+			"4 [ ][ ][ ] 4\n",
+			"3 [ ][ ][ ] 3\n",
+			"2 [ ][ ][ ] 2\n",
+			"1 [r][ ][b] 1\n",
+			"   A  B  C\n");
+
+		assert_eq!(exp_result.as_bytes(), &*result);
+	}
+}
+
+'''
+'''--- near-contract/contract/src/game.rs ---
+// Need the following import statement for compiling
+// the tests but not for compiling the application.
+use near_sdk::{PanicOnDefault, Timestamp};
+
+use crate::*;
+use crate::board::BoardToSave;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum GameState {
+    /// The game has not yet finished
+    InProgress,
+
+    /// The game has finished. The `usize` is the index of the winning player: current_player_index
+    GameOver { winner_id: usize },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum MoveError {
+    InvalidMove,
+    ShouldHaveJumped,
+}
+
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault, Clone)]
+pub struct PlayerInfo {
+    player: Player,
+    direction: Direction,
+    pub(crate) account_id: AccountId,
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct GameToSave {
+    pub(crate) player_1: PlayerInfo,
+    pub(crate) player_2: PlayerInfo,
+    pub(crate) reward: TokenBalance,
+    pub(crate) winner_index: Option<usize>,
+    pub(crate) turns: u64,
+    pub(crate) last_turn_timestamp: Timestamp,
+    pub(crate) total_time_spent: Vec<Timestamp>,
+
+    pub(crate) board: BoardToSave,
+
+    pub(crate) current_player_index: usize,
+}
+
+impl From<GameToSave> for Game {
+    fn from(game_to_save: GameToSave) -> Self {
+        let board: Board = game_to_save.board.into();
+
+        let mut game = Game {
+            players: [game_to_save.player_1, game_to_save.player_2],
+            reward: game_to_save.reward,
+            winner_index: game_to_save.winner_index,
+            turns: game_to_save.turns,
+            last_turn_timestamp: game_to_save.last_turn_timestamp,
+            total_time_spent: game_to_save.total_time_spent,
+            board,
+            current_player_index: game_to_save.current_player_index,
+            available_simple_moves: Vec::new(),
+            available_jump_moves: Vec::new(),
+        };
+
+        game.find_available_moves();
+
+        game
+    }
+}
+
+impl GameToSave {
+    pub fn new(account_id_1: AccountId, account_id_2: AccountId, reward: TokenBalance) -> GameToSave {
+        let (player1, player2) = Game::create_two_players();
+
+        let board: BoardToSave = BoardToSave::new_checkerboard(&player1, &player2);
+
+        GameToSave::with_board_and_players(board, player1, player2, account_id_1, account_id_2, reward)
+    }
+
+    fn with_board_and_players(board: BoardToSave, player1: Player, player2: Player,
+                              account_id_1: AccountId, account_id_2: AccountId, reward: TokenBalance)
+                              -> GameToSave {
+        let player1_info = PlayerInfo {
+            player: player1,
+            direction: Direction::IncreasingRank,
+            account_id: account_id_1,
+        };
+        let player2_info = PlayerInfo {
+            player: player2,
+            direction: Direction::DecreasingRank,
+            account_id: account_id_2,
+        };
+
+        GameToSave {
+            player_1: player1_info,
+            player_2: player2_info,
+            reward,
+            winner_index: None,
+            turns: 0,
+            last_turn_timestamp: env::block_timestamp(),
+            total_time_spent: [0, 0].to_vec(),
+            board,
+            current_player_index: 0,
+        }
+    }
+}
+
+pub struct Game {
+    pub(crate) players: [PlayerInfo; 2],
+    pub(crate) reward: TokenBalance,
+    pub(crate) winner_index: Option<usize>,
+    pub(crate) turns: u64,
+    pub(crate) last_turn_timestamp: Timestamp,
+    pub(crate) total_time_spent: Vec<Timestamp>,
+    pub(crate) board: Board,
+
+    pub(crate) current_player_index: usize,
+
+    pub(crate) available_simple_moves: Vec<SimpleMove>,
+    pub(crate) available_jump_moves: Vec<JumpMove>,
+}
+
+impl From<Game> for GameToSave {
+    fn from(game: Game) -> Self {
+        let board: BoardToSave = game.board.into();
+
+        let already_spent = game.total_time_spent[1 - game.current_player_index];
+        let spent_for_this_turn = env::block_timestamp() - game.last_turn_timestamp;
+
+        let mut total_time_spent = game.total_time_spent;
+        total_time_spent[1 - game.current_player_index] = already_spent + spent_for_this_turn;
+
+        GameToSave {
+            player_1: game.players[0].clone(),
+            player_2: game.players[1].clone(),
+            reward: game.reward,
+            winner_index: game.winner_index,
+            turns: game.turns,
+            last_turn_timestamp: env::block_timestamp(),
+            total_time_spent,
+            board,
+            current_player_index: game.current_player_index,
+        }
+    }
+}
+
+impl Game {
+    pub fn new(account_id_1: AccountId, account_id_2: AccountId, reward: TokenBalance) -> Game {
+        let (player1, player2) = Game::create_two_players();
+
+        let board = Board::new_checkerboard(&player1, &player2);
+
+        Game::with_board_and_players(board, player1, player2, account_id_1, account_id_2, reward)
+    }
+
+    /// Creates a new Checkers game with an 8x8 board and the specified piece
+    /// layout `player1_positions` contains the pieces for the first player,
+    /// and `player2_positions` contains the pieces for the second player. All
+    /// pieces are initially `ManPiece`s.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any element in *player1_positions* or *player2_positions*
+    /// is a `BoardPosition` with a row or column outside the range [0, 7].
+    /// Also panics if any two positions are exactly the same.
+    #[cfg(test)]
+    pub fn with_piece_positions(player1_positions: Vec<BoardPosition>,
+                                player2_positions: Vec<BoardPosition>)
+                                -> Game {
+        let checkerboard_size: usize = 8;
+        let mut board = Board::new(checkerboard_size, checkerboard_size);
+
+        let (player1, player2) = Game::create_two_players();
+
+        Game::initialize_pieces(&mut board, &player1, &player1_positions);
+        Game::initialize_pieces(&mut board, &player2, &player2_positions);
+
+        Game::with_board_and_players(board, player1, player2, "alice".into(),
+                                     "bob".into(),
+                                     TokenBalance{ token_id: Some("NEAR".into()), balance: 1 })
+    }
+
+    // creates and returns two players with distinct IDs
+    fn create_two_players() -> (Player, Player) {
+        (
+            Player { id: 1 },
+            Player { id: 2 }
+        )
+    }
+
+    // adds man pieces belonging to a particular player
+    // at the specified positions on a board
+    #[cfg(test)]
+    fn initialize_pieces(board: &mut Board, player: &Player, positions: &Vec<BoardPosition>) {
+        for pos in positions {
+            let piece = checkers::ManPiece::new(&player);
+            let tile = OccupiedTile::new(Box::new(piece));
+            assert!(board.get_tile(pos.row, pos.column).get_piece().is_none());
+            board.set_tile(pos.row, pos.column, Box::new(tile));
+        }
+    }
+
+    fn with_board_and_players(board: Board, player1: Player, player2: Player,
+                              account_id_1: AccountId, account_id_2: AccountId, reward: TokenBalance)
+                              -> Game {
+        let player1_info = PlayerInfo {
+            player: player1,
+            direction: Direction::IncreasingRank,
+            account_id: account_id_1,
+        };
+        let player2_info = PlayerInfo {
+            player: player2,
+            direction: Direction::DecreasingRank,
+            account_id: account_id_2,
+        };
+
+        let mut game = Game {
+            players: [player1_info, player2_info],
+            reward,
+            winner_index: None,
+            turns: 0,
+            last_turn_timestamp: 0,
+            total_time_spent: [0, 0].to_vec(),
+            board,
+            current_player_index: 0,
+            available_simple_moves: Vec::new(),
+            available_jump_moves: Vec::new(),
+        };
+
+        game.find_available_moves();
+
+        game
+    }
+
+    fn current_player_info(&self) -> &PlayerInfo {
+        &self.players[self.current_player_index]
+    }
+
+    fn find_available_simple_moves(&self) -> Vec<SimpleMove> {
+        let mut moves = Vec::new();
+
+        let curr_player_info = self.current_player_info();
+        let curr_player = &curr_player_info.player;
+        let curr_player_id = curr_player.id;
+        let curr_direction = curr_player_info.direction;
+        for r in 0..self.board.number_rows() {
+            for c in 0..self.board.number_columns() {
+                match self.board.get_tile(r, c).get_piece() {
+                    Some(piece) =>
+                        if piece.get_player_id() == curr_player_id {
+                            let piece_moves = match piece.get_type() {
+                                PieceType::Man =>
+                                    ai::find_simple_moves_for_man(
+                                        &self.board, curr_direction, r, c),
+                                PieceType::King =>
+                                    ai::find_simple_moves_for_king(
+                                        &self.board, r, c),
+                            };
+                            moves.extend(piece_moves);
+                        },
+                    None => {}
+                }
+            }
+        }
+
+        moves
+    }
+
+    fn find_available_jump_moves(&self) -> Vec<JumpMove> {
+        let mut moves = Vec::new();
+
+        let curr_player_info = self.current_player_info();
+        let curr_player = &curr_player_info.player;
+        let curr_player_id = curr_player.id;
+        let curr_direction = curr_player_info.direction;
+        for r in 0..self.board.number_rows() {
+            for c in 0..self.board.number_columns() {
+                match self.board.get_tile(r, c).get_piece() {
+                    Some(piece) =>
+                        if piece.get_player_id() == curr_player_id {
+                            let jump_move = match piece.get_type() {
+                                PieceType::Man =>
+                                    ai::find_jump_moves_for_man(
+                                        &self.board, curr_player, curr_direction, r, c),
+                                PieceType::King =>
+                                    ai::find_jump_moves_for_king(
+                                        &self.board, curr_player, r, c),
+                            };
+                            if !jump_move.jumps().is_empty() {
+                                moves.push(jump_move);
+                            }
+                        },
+                    None => {}
+                }
+            }
+        }
+
+        moves
+    }
+
+    fn find_available_moves(&mut self) {
+        self.available_simple_moves = self.find_available_simple_moves();
+        self.available_jump_moves = self.find_available_jump_moves();
+    }
+
+    pub fn board(&self) -> &Board {
+        &self.board
+    }
+
+    pub fn current_player(&self) -> &Player {
+        &self.current_player_info().player
+    }
+
+    pub fn current_player_account_id(&self) -> AccountId {
+        let index = self.current_player_index;
+        self.players[index].account_id.clone()
+    }
+
+    fn check_for_coronation
+    (&mut self, row: usize, col: usize) {
+        let coronate = match self.board.get_tile(row, col).get_piece() {
+            Some(piece) =>
+                match piece.get_type() {
+                    PieceType::Man =>
+                        match self.current_player_info().direction {
+                            Direction::IncreasingRank =>
+                                row + 1 == self.board.number_rows(),
+                            Direction::DecreasingRank => row == 0
+                        },
+                    PieceType::King => false
+                },
+            None => unreachable!()
+        };
+
+        if coronate {
+            let king = KingPiece::new(&self.current_player_info().player);
+            let tile = OccupiedTile::new(Box::new(king));
+            self.board.set_tile(row, col, Box::new(tile))
+        }
+    }
+
+    fn select_next_player(&mut self) {
+        // this assumes a two player game
+        self.current_player_index = 1 - self.current_player_index;
+    }
+
+    fn is_game_over(&self) -> bool {
+        // This works if it is called after the available moves for the
+        // next player are computed. If this player has no moves, it means
+        // they have no pieces left, or all of their pieces are stuck.
+        // Either way, they lose.
+        self.available_simple_moves.is_empty()
+            && self.available_jump_moves.is_empty()
+    }
+
+    fn finish_move(&mut self, final_row: usize, final_col: usize)
+                   -> GameState {
+        self.check_for_coronation(final_row, final_col);
+
+        self.select_next_player();
+        self.find_available_moves();
+
+        if self.is_game_over() {
+            //let winner_id = self.players[1 - self.current_player_index].player.id;
+            GameState::GameOver { winner_id: (1 - self.current_player_index) }
+        } else {
+            GameState::InProgress
+        }
+    }
+
+    pub fn apply_simple_move(&mut self, the_move: SimpleMove) -> Result<GameState, MoveError> {
+        if self.available_jump_moves.is_empty() {
+            if self.available_simple_moves.contains(&the_move) {
+                self.board.swap_tiles(
+                    the_move.from_row(),
+                    the_move.from_column(),
+                    the_move.to_row(),
+                    the_move.to_column());
+
+                let game_state = self.finish_move(
+                    the_move.to_row(), the_move.to_column());
+                Ok(game_state)
+            } else {
+                Err(MoveError::InvalidMove)
+            }
+        } else {
+            Err(MoveError::ShouldHaveJumped)
+        }
+    }
+
+    pub fn apply_jump_move(&mut self, the_move: Vec<BoardPosition>) -> Result<GameState, MoveError> {
+        let jump_valid = self.available_jump_moves.iter()
+            .any(|jump_tree| jump_tree.contains_jump_sequence(&the_move));
+        if jump_valid {
+            let start_position = the_move.first().unwrap();
+            let final_position = the_move.last().unwrap();
+
+            // move the jumping piece
+            self.board.swap_tiles(
+                start_position.row,
+                start_position.column,
+                final_position.row,
+                final_position.column);
+
+            // remove all jumped pieces
+            let iter = the_move[0..].iter().zip(the_move[1..].iter());
+            for (jump_from_pos, jump_to_pos) in iter {
+                let jumped_row = (jump_from_pos.row + jump_to_pos.row) / 2;
+                let jumped_col = (jump_from_pos.column + jump_to_pos.column) / 2;
+                self.board.clear_tile(jumped_row, jumped_col);
+            }
+
+            let game_state = self.finish_move(
+                final_position.row, final_position.column);
+            Ok(game_state)
+        } else {
+            Err(MoveError::InvalidMove)
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use checkers::BoardPosition;
+    use checkers::PieceType;
+    use checkers::SimpleMove;
+
+    use super::*;
+
+    fn get_new_game() -> Game {
+        Game::new("alice".into(),
+                  "bob".into(),
+                  TokenBalance{ token_id: Some("NEAR".into()), balance: 1 }
+        )
+    }
+
+    #[test]
+    fn good_simple_move() {
+        let mut game = get_new_game();
+        let result = game.apply_simple_move(SimpleMove::new(2, 0, 3, 1));
+        let exp_result: Result<GameState, MoveError> = Ok(GameState::InProgress);
+        assert_eq!(exp_result, result);
+
+        let player_id = game.current_player().id;
+        assert_eq!(2, player_id);
+
+        //TODO this test should be more thorough (e.g. check the piece
+        // type, player ID, etc.), but it's good enough for now
+        assert!(game.board().get_tile(3, 1).get_piece().is_some());
+    }
+
+    #[test]
+    fn bad_simple_move() {
+        let mut game = get_new_game();
+        let result = game.apply_simple_move(SimpleMove::new(2, 0, 3, 0));
+        let exp_result: Result<GameState, MoveError> = Err(MoveError::InvalidMove);
+        assert_eq!(exp_result, result);
+
+        let player_id = game.current_player().id;
+        assert_eq!(1, player_id);
+
+        //TODO this test should be more thorough (e.g. check the piece
+        // type, player ID, etc.), but it's good enough for now
+        assert!(game.board().get_tile(3, 0).get_piece().is_none());
+    }
+
+    #[test]
+    fn good_single_jump_move() {
+        let mut game = Game::with_piece_positions(
+            vec![BoardPosition::new(3, 3)],
+            vec![BoardPosition::new(4, 4), BoardPosition::new(2, 2)]);
+
+        let result = game.apply_jump_move(
+            vec![BoardPosition::new(3, 3), BoardPosition::new(5, 5)]);
+        let exp_result: Result<GameState, MoveError> = Ok(GameState::InProgress);
+        assert_eq!(exp_result, result);
+
+        let jumped_piece = game.board().get_tile(4, 4).get_piece();
+        assert!(jumped_piece.is_none());
+
+        let jumping_piece = game.board().get_tile(5, 5).get_piece();
+        //TODO this test should be more thorough (e.g. check the piece
+        // type, player ID, etc.), but it's good enough for now
+        assert!(jumping_piece.is_some());
+    }
+
+    #[test]
+    fn good_multi_jump_move() {
+        let mut game = Game::with_piece_positions(
+            vec![BoardPosition::new(3, 3)],
+            vec![
+                BoardPosition::new(4, 4),
+                BoardPosition::new(6, 4),
+                BoardPosition::new(2, 2)]);
+
+        let result = game.apply_jump_move(
+            vec![
+                BoardPosition::new(3, 3),
+                BoardPosition::new(5, 5),
+                BoardPosition::new(7, 3)]);
+        let exp_result: Result<GameState, MoveError> = Ok(GameState::InProgress);
+        assert_eq!(exp_result, result);
+
+        let jumped_piece1 = game.board().get_tile(4, 4).get_piece();
+        assert!(jumped_piece1.is_none());
+
+        let jumped_piece2 = game.board().get_tile(6, 4).get_piece();
+        assert!(jumped_piece2.is_none());
+
+        let jumping_piece = game.board().get_tile(7, 3).get_piece();
+        //TODO this test should be more thorough (e.g. check the piece
+        // type, player ID, etc.), but it's good enough for now
+        assert!(jumping_piece.is_some());
+    }
+
+    #[test]
+    fn bad_jump_move() {
+        let mut game = get_new_game();
+        let result = game.apply_jump_move(
+            vec![BoardPosition::new(2, 0), BoardPosition::new(4, 2)]);
+        let exp_result: Result<GameState, MoveError> = Err(MoveError::InvalidMove);
+        assert_eq!(exp_result, result);
+
+        let player_id = game.current_player().id;
+        assert_eq!(1, player_id);
+
+        //TODO these tests should be more thorough (e.g. check the piece
+        // type, player ID, etc.), but it's good enough for now
+        assert!(game.board().get_tile(2, 0).get_piece().is_some());
+        assert!(game.board().get_tile(4, 2).get_piece().is_none());
+    }
+
+    #[test]
+    fn not_jumping_when_jump_available() {
+        let mut game = Game::with_piece_positions(
+            vec![BoardPosition::new(3, 3)],
+            vec![BoardPosition::new(4, 4)]);
+
+        let result = game.apply_simple_move(SimpleMove::new(3, 3, 4, 2));
+        let exp_result: Result<GameState, MoveError> = Err(MoveError::ShouldHaveJumped);
+        assert_eq!(exp_result, result);
+    }
+
+    #[test]
+    fn player1_coronation() {
+        let mut game = Game::with_piece_positions(
+            vec![BoardPosition::new(6, 5)],
+            vec![BoardPosition::new(1, 1)]);
+
+        let result = game.apply_simple_move(SimpleMove::new(6, 5, 7, 4));
+        let exp_result: Result<GameState, MoveError> = Ok(GameState::InProgress);
+        assert_eq!(exp_result, result);
+
+        let piece_type = game.board().get_tile(7, 4).get_piece().unwrap().get_type();
+        match piece_type {
+            PieceType::King => {}
+            _ => panic!("Expected piece to be a King"),
+        }
+    }
+
+    #[test]
+    fn player2_coronation() {
+        let mut game = Game::with_piece_positions(
+            vec![BoardPosition::new(4, 4)],
+            vec![BoardPosition::new(1, 1)]);
+
+        game.apply_simple_move(SimpleMove::new(4, 4, 5, 5)).unwrap();
+        game.apply_simple_move(SimpleMove::new(1, 1, 0, 0)).unwrap();
+
+        let piece_type = game.board().get_tile(0, 0).get_piece().unwrap().get_type();
+        match piece_type {
+            PieceType::King => {}
+            _ => panic!("Expected piece to be a King"),
+        }
+    }
+
+    #[test]
+    fn game_over_when_no_moves_for_current_player() {
+        let mut game = Game::with_piece_positions(
+            vec![BoardPosition::new(4, 4)],
+            vec![]);
+
+        let result = game.apply_simple_move(SimpleMove::new(4, 4, 5, 5));
+        let exp_result: Result<GameState, MoveError> = Ok(GameState::GameOver { winner_id: 1 });
+        assert_eq!(exp_result, result);
+    }
+}
+
+'''
+'''--- near-contract/contract/src/input.rs ---
+use crate::board::BoardPosition;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum InputError {
+	TooFewTokens,
+	InvalidTokens { tokens : Vec<TokenError> }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum TokenError {
+	MissingFile { token : String },
+	MissingRank { token : String },
+	ZeroRank { token : String },
+	InvalidCharacter { token : String, char_index : usize }
+}
+
+///
+/// Parse a move from a string
+///
+pub fn parse_move(the_move : &str) -> Result<Vec<BoardPosition>, InputError> {
+	let results : Vec<_> = the_move.split_whitespace()
+		.map(token_validator)
+		.collect();
+
+	let (ok_iter, err_iter) : (Vec<_>, Vec<_>) = results.into_iter()
+		.map(
+			|result|
+				match result {
+					Ok(v) => (Some(v), None),
+					Err(e) => (None, Some(e))
+				})
+		.unzip();
+
+	let errors : Vec<_> = err_iter.into_iter()
+		.filter_map(|error| error)
+		.collect();
+
+	if !errors.is_empty() {
+		return Err(InputError::InvalidTokens { tokens : errors });
+	}
+
+	let positions : Vec<_> = ok_iter.into_iter()
+		.filter_map(|position| position)
+		.collect();
+
+	if positions.len() < 2 {
+		return Err(InputError::TooFewTokens);
+	}
+
+	Ok(positions)
+}
+
+//
+// Determines whether a position string is valid.
+// Expects a strict sequence of alphabetic characters (rank)
+// followed by a sequence of numeric characters (file).
+//
+fn token_validator(token : &str) -> Result<BoardPosition, TokenError> {
+	let parse_file_rank_result = parse_file_rank(token);
+	match parse_file_rank_result {
+		Ok((file, rank)) => {
+			if file.is_empty() {
+				return Err(TokenError::MissingFile { token : token.to_string() });
+			}
+			if rank.is_empty() {
+				return Err(TokenError::MissingRank { token : token.to_string() });
+			}
+
+			let row : usize = rank.parse::<usize>().unwrap();
+			let col : usize = file_to_row_position(&file);
+
+			if row == 0 {
+				return Err(TokenError::ZeroRank { token : token.to_string() });
+			}
+
+			Ok(BoardPosition::new(row - 1, col - 1))
+		},
+		Err(e) => Err(e)
+	}
+}
+
+enum ParseState {
+	File,
+	Rank
+}
+
+//
+// Parse a string and return a tuple containing
+// the file and rank, respectively
+//
+fn parse_file_rank(token : &str) -> Result<(String, String), TokenError> {
+	let mut file : String = String::new();
+	let mut rank : String = String::new();
+
+	let mut iter = token.chars().enumerate();
+	let mut char_opt = iter.next();
+	let mut parse_state = ParseState::File;
+
+	while char_opt.is_some() {
+		let (index, ch) = char_opt.unwrap();
+		match parse_state {
+			ParseState::File => {
+				if ch.is_alphabetic() {
+					file.push(ch);
+					char_opt = iter.next();
+				} else if ch.is_numeric() {
+					parse_state = ParseState::Rank;
+				} else {
+					return Err(TokenError::InvalidCharacter {
+						token : token.to_string(), char_index : index });
+				}
+			}
+			ParseState::Rank => {
+				if ch.is_numeric() {
+					rank.push(ch);
+					char_opt = iter.next();
+				} else {
+					return Err(TokenError::InvalidCharacter {
+						token : token.to_string(), char_index : index });
+				}
+			}
+		}
+	}
+
+	Ok((file, rank))
+}
+
+//
+// Convert string of alphabetic characters to an index
+//
+fn file_to_row_position(file : &str) -> usize {
+	let mut row : usize = 0;
+	let alphabet_length = 26;
+
+	for c in file.chars() {
+		row = row * alphabet_length + char_to_position(c);
+	}
+
+	row
+}
+
+//
+// Convert a single alphabetic character to number
+// Case insensitive [a-z] -> [1-26]
+//
+fn char_to_position( c : char ) -> usize {
+	debug_assert!(c.is_alphabetic());
+
+	match c {
+		'A'..='Z' => (c as usize) - ('A' as usize) + 1,
+		'a'..='z' => (c as usize) - ('a' as usize) + 1,
+		_ => unreachable!()
+	}
+}
+
+#[cfg(test)]
+mod test {
+
+use super::*;
+use checkers::BoardPosition;
+
+fn test_parse_move(the_move : &str, exp_result : Vec<BoardPosition>) {
+	let result = parse_move(the_move).ok().unwrap();
+
+	assert_eq!(exp_result, result);
+}
+
+ptest!(test_parse_move[
+	test_parse_move_a1_a1("a1 a1", vec![BoardPosition::new(0, 0), BoardPosition::new(0, 0)]),
+	test_parse_move_a2_a1("a2 a1", vec![BoardPosition::new(1, 0), BoardPosition::new(0, 0)]),
+	test_parse_move_a1_a2("a1 a2", vec![BoardPosition::new(0, 0), BoardPosition::new(1, 0)]),
+	test_parse_move_a2_a2("a2 a2", vec![BoardPosition::new(1, 0), BoardPosition::new(1, 0)]),
+	test_parse_move_aa1_aa1("aa1 aa1", vec![BoardPosition::new(0, 26), BoardPosition::new(0, 26)]),
+	test_parse_move_aa1_ab1("aa1 ab1", vec![BoardPosition::new(0, 26), BoardPosition::new(0, 27)]),
+	test_parse_move_ab1_aa1("ab1 aa1", vec![BoardPosition::new(0, 27), BoardPosition::new(0, 26)]),
+	test_parse_move_yy99_zz99("yy99 zz99", vec![BoardPosition::new(98, 674), BoardPosition::new(98, 701)]),
+	test_parse_move_aaa99_aaa99("aaa99 aaa99", vec![BoardPosition::new(98, 702), BoardPosition::new(98, 702)]),
+	test_parse_move_xfd13_ahh37("xfd13 ahh37", vec![BoardPosition::new(12, 16383), BoardPosition::new(36, 891)]),
+	test_parse_move_xx123_yy456_zz789("xx123 yy456 zz789", vec![BoardPosition::new(122, 647), BoardPosition::new(455, 674), BoardPosition::new(788, 701)])
+]);
+
+fn test_parse_move_fail(the_move : &str, exp_result : InputError ) {
+	let result = parse_move(the_move).err().unwrap();
+
+	assert_eq!(exp_result, result);
+}
+
+ptest!(test_parse_move_fail[
+	test_parse_move_fail_too_few_tokens_empty("", InputError::TooFewTokens),
+	test_parse_move_fail_too_few_tokens_a1("a1", InputError::TooFewTokens),
+	test_parse_move_fail_too_few_tokens_z9("z9", InputError::TooFewTokens),
+
+	test_parse_move_fail_missing_rank_a1_a("a1 a",
+		InputError::InvalidTokens {
+			tokens : vec![TokenError::MissingRank {
+				token : "a".to_string() } ] }),
+
+	test_parse_move_fail_missing_file_a1_1("a1 1",
+		InputError::InvalidTokens {
+			tokens : vec![TokenError::MissingFile {
+				token : "1".to_string() } ] }),
+
+	test_parse_move_fail_missing_rank_file_a_1("a 1",
+		InputError::InvalidTokens {
+			tokens : vec![
+				TokenError::MissingRank {
+					token : "a".to_string() },
+				TokenError::MissingFile {
+					token : "1".to_string() } ] }),
+
+	test_parse_move_fail_zero_rank("a1 a0",
+		InputError::InvalidTokens {
+			tokens : vec![
+				TokenError::ZeroRank {
+					token : "a0".to_string() } ] }),
+
+	test_parse_move_fail_invalid_character("a1 a$",
+		InputError::InvalidTokens {
+			tokens : vec![
+				TokenError::InvalidCharacter {
+					token : "a$".to_string(),
+					char_index : 1 } ] }),
+
+	test_parse_move_fail_invalid_characters("#1 a$",
+		InputError::InvalidTokens {
+			tokens : vec![
+				TokenError::InvalidCharacter {
+					token : "#1".to_string(),
+					char_index : 0 },
+				TokenError::InvalidCharacter {
+					token : "a$".to_string(),
+					char_index : 1 } ] })
+]);
+}
+
+'''
+'''--- near-contract/contract/src/lib.rs ---
+use near_sdk::{AccountId, Balance, BorshStorageKey, env, log, near_bindgen, PanicOnDefault, setup_alloc, Timestamp};
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::{LookupMap, LookupSet, UnorderedMap};
+use near_sdk::serde::{Deserialize, Serialize};
+
+pub use ai::{
+    Direction,
+    find_jump_moves_for_king,
+    find_jump_moves_for_man,
+    find_simple_moves_for_king,
+    find_simple_moves_for_man,
+    JumpMove,
+    SimpleMove};
+pub use board::{Board, BoardPosition};
+pub use display::print_board;
+pub use game::{Game, GameState, MoveError};
+pub use input::{InputError, parse_move, TokenError};
+pub use piece::{KingPiece, ManPiece, Piece, PieceType};
+pub use player::Player;
+pub use tile::{EmptyTile, OccupiedTile, Tile};
+
+use crate::game::GameToSave;
+use crate::manager::*;
+
+mod ai;
+mod board;
+mod display;
+mod game;
+mod input;
+mod piece;
+mod player;
+mod tile;
+mod util;
+mod manager;
+
+type GameId = u64;
+
+// 0.01 NEAR
+const MIN_DEPOSIT: Balance = 10_000_000_000_000_000_000_000;
+const ONE_YOCTO: Balance = 1;
+const ONE_HOUR: Timestamp = 3_600_000_000_000;
+
+const CHECKERBOARD_SIZE: usize = 8;
+const CHECKERS_NUMBER_TILES: usize = CHECKERBOARD_SIZE * CHECKERBOARD_SIZE;
+
+setup_alloc!();
+
+#[derive(BorshSerialize, BorshStorageKey)]
+enum StorageKey {
+    Games,
+    AvailablePlayers,
+    Stats,
+    AvailableGames,
+    Affiliates {account_id: AccountId},
+    TotalRewards {account_id: AccountId},
+    TotalAffiliateRewards{ account_id: AccountId},
+    WhitelistedTokens
+}
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Checkers {
+    games: LookupMap<GameId, GameToSave>,
+    available_players: UnorderedMap<AccountId, VGameConfig>,
+    stats: UnorderedMap<AccountId, VStats>,
+    available_games: UnorderedMap<GameId, (AccountId, AccountId)>,
+    whitelisted_tokens: LookupSet<AccountId>,
+
+    next_game_id: GameId,
+    service_fee: Balance,
+}
+
+#[near_bindgen]
+impl Checkers {
+    #[init]
+    pub fn new() -> Self {
+        Self {
+            games: LookupMap::new(StorageKey::Games),
+            available_players: UnorderedMap::new(StorageKey::AvailablePlayers),
+            stats: UnorderedMap::new(StorageKey::Stats),
+            available_games: UnorderedMap::new(StorageKey::AvailableGames),
+            whitelisted_tokens: LookupSet::new(StorageKey::WhitelistedTokens),
+
+            next_game_id: 0,
+            service_fee: 0,
+        }
+    }
+}
+
+#[near_bindgen]
+impl Checkers {
+    pub(crate) fn internal_add_referral(&mut self, account_id: &AccountId, referrer_id: &Option<AccountId>) {
+        if self.stats.get(account_id).is_none() && self.is_account_exists(referrer_id) {
+            if let Some(referrer_id_unwrapped) = referrer_id.clone() {
+                self.internal_update_stats(account_id, UpdateStatsAction::AddReferral, referrer_id.clone(), None);
+                self.internal_update_stats(&referrer_id_unwrapped, UpdateStatsAction::AddAffiliate, Some(account_id.clone()), None);
+                log!("Referrer {} added for {}", referrer_id_unwrapped, account_id);
+            }
+        }
+    }
+
+    #[payable]
+    pub fn make_available(&mut self, config: GameConfig, referrer_id: Option<AccountId>) {
+        let account_id: &AccountId = &env::predecessor_account_id();
+        assert!(self.available_players.get(account_id).is_none(), "Already in the waiting list the list");
+        let deposit: Balance = env::attached_deposit();
+        assert!(deposit >= MIN_DEPOSIT, "Deposit is too small. Attached: {}, Required: {}", deposit, MIN_DEPOSIT);
+
+        self.internal_check_if_has_game_started(account_id);
+
+        self.internal_add_referral(account_id, &referrer_id);
+
+        self.available_players.insert(account_id,
+                                      &VGameConfig::Current(GameConfig {
+                                          deposit: Some(deposit),
+                                          first_move: config.first_move,
+                                          opponent_id: config.opponent_id,
+                                      }));
+    }
+
+    pub(crate) fn internal_check_if_has_game_started(&self, account_id: &AccountId) {
+        let games_already_started: Vec<(AccountId, AccountId)> = self.available_games.values_as_vector()
+            .iter()
+            .filter(|(player_1, player_2)| *player_1 == *account_id || *player_2 == *account_id)
+            .collect();
+        assert_eq!(games_already_started.len(), 0, "Another game already started");
+    }
+
+    #[payable]
+    pub fn start_game(&mut self, opponent_id: AccountId, referrer_id: Option<AccountId>) -> GameId {
+        if let Some(opponent_config) = self.available_players.get(&opponent_id) {
+            let config: GameConfig = opponent_config.into();
+            assert_eq!(env::attached_deposit(), config.deposit.unwrap_or(0), "Wrong deposit");
+
+            let account_id = env::predecessor_account_id();
+            assert_ne!(account_id.clone(), opponent_id.clone(), "Find a friend to play");
+
+            self.internal_check_if_has_game_started(&account_id);
+
+            if let Some(player_id) = config.opponent_id {
+                assert_eq!(player_id, account_id, "Wrong account");
+            }
+
+            let game_id = self.next_game_id;
+
+            // TODO Add FT
+            let reward = TokenBalance {
+                token_id: Some("NEAR".into()),
+                balance: config.deposit.unwrap_or(0) * 2,
+            };
+
+            let game_to_save =
+                match config.first_move {
+                    FirstMoveOptions::First => GameToSave::new(
+                        account_id.clone(),
+                        opponent_id.clone(),
+                        reward),
+
+                    FirstMoveOptions::Second => GameToSave::new(
+                        opponent_id.clone(),
+                        account_id.clone(),
+                        reward),
+
+                    FirstMoveOptions::Random => {
+                        let seed = near_sdk::env::random_seed();
+                        match seed[0] % 2 {
+                            0 => GameToSave::new(
+                                opponent_id.clone(),
+                                account_id.clone(),
+                                reward),
+                            _ => GameToSave::new(
+                                account_id.clone(),
+                                opponent_id.clone(),
+                                reward)
+                        }
+                    }
+                };
+
+            self.games.insert(&game_id, &game_to_save);
+
+            self.available_games.insert(&game_id, &(account_id.clone(), opponent_id.clone()));
+
+            self.next_game_id += 1;
+
+            self.available_players.remove(&opponent_id);
+            self.available_players.remove(&account_id);
+
+            self.internal_add_referral(&account_id, &referrer_id);
+
+            self.internal_update_stats(&account_id, UpdateStatsAction::AddPlayedGame, None, None);
+            self.internal_update_stats(&opponent_id, UpdateStatsAction::AddPlayedGame, None, None);
+
+            game_id
+        } else {
+            panic!("Your opponent is not ready");
+        }
+    }
+
+    pub fn draw(&self, game_id: GameId) {
+        let game: Game = self.internal_get_game(&game_id).into();
+        display::print_board(game.board());
+    }
+
+    #[payable]
+    pub fn give_up(&mut self, game_id: GameId) {
+        assert_eq!(env::attached_deposit(), ONE_YOCTO, "Attach 1 yocto");
+        let mut game: GameToSave = self.internal_get_game(&game_id);
+        assert!(game.winner_index.is_none(), "Game already finished");
+        let account_id = env::predecessor_account_id();
+
+        let player_1 = game.player_1.account_id.clone();
+        let player_2 = game.player_2.account_id.clone();
+
+        let (winner_index, winner_account) = if account_id == player_1 {
+            (1, player_2)
+        } else if account_id == player_2 {
+            (0, player_1)
+        } else { panic!("No access") };
+
+        self.internal_distribute_reward(&game.reward, &winner_account);
+        game.winner_index = Some(winner_index);
+        self.games.insert(&game_id, &game);
+
+        self.internal_stop_game(game_id);
+    }
+
+    pub fn make_move(&mut self, game_id: GameId, line: String) {
+        let mut game: Game = self.internal_get_game(&game_id).into();
+        assert!(game.winner_index.is_none(), "Game already finished");
+
+        let mut update_game = false;
+        let active_player = game.current_player_account_id();
+        assert_eq!(active_player, env::predecessor_account_id(), "No access");
+
+        // display::print_board(game.board());
+
+        let parse_result = input::parse_move(&line);
+
+        match parse_result {
+            Ok(positions) => {
+                let move_result = util::apply_positions_as_move(&mut game, positions);
+                match move_result {
+                    Ok(game_state) => match game_state {
+                        GameState::InProgress => {
+                            update_game = true;
+                        }
+                        GameState::GameOver { winner_id: winner_index } => {
+                            let winner_account = game.players[winner_index].account_id.clone();
+                            self.internal_distribute_reward(&game.reward, &winner_account);
+                            game.winner_index = Some(winner_index);
+
+                            self.internal_stop_game(game_id);
+
+                            update_game = true;
+
+                            log!("\nGame over! {} won!", winner_account);
+                        }
+                    },
+                    Err(e) => match e {
+                        MoveError::InvalidMove => panic!("\n *** Illegal move"),
+                        MoveError::ShouldHaveJumped => panic!("\n *** Must take jump")
+                    }
+                }
+            }
+            Err(e) => match e {
+                InputError::TooFewTokens =>
+                    panic!("\n *** You must specify at least two board positions"),
+                InputError::InvalidTokens { tokens: errors } => {
+                    for error in errors {
+                        match error {
+                            TokenError::MissingFile { token } =>
+                                panic!("\n *** Board position '{}' must specify file", token),
+                            TokenError::MissingRank { token } =>
+                                panic!("\n *** Board position '{}' must specify rank", token),
+                            TokenError::ZeroRank { token } =>
+                                panic!("\n *** Rank cannot be zero: {}", token),
+                            TokenError::InvalidCharacter { token, char_index } => {
+                                let ch = token.chars().nth(char_index).unwrap();
+                                panic!("\n *** Board position '{}' contains invalid character '{}'", token, ch);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if update_game {
+            // display::print_board(game.board());
+            game.turns += 1;
+            let game_to_save: GameToSave = game.into();
+            self.games.insert(&game_id, &game_to_save);
+        }
+    }
+
+    fn internal_stop_game(&mut self, game_id: GameId) {
+        self.available_games.remove(&game_id);
+    }
+
+    pub fn stop_game(&mut self, game_id: GameId) {
+        let mut game: GameToSave = self.internal_get_game(&game_id);
+        assert!(game.winner_index.is_none(), "Game already finished");
+
+        let account_id = env::predecessor_account_id();
+
+        let player_1 = game.player_1.account_id.clone();
+        let player_2 = game.player_2.account_id.clone();
+
+        let (winner_index, winner_account, looser_account) = if account_id == player_1 {
+            let total_spent =
+                if game.current_player_index == 0{
+                    game.total_time_spent[1]
+                }
+                else{
+                    env::block_timestamp() - game.last_turn_timestamp + game.total_time_spent[1]
+                };
+            log!("Player {} already spent: {} nanoseconds", player_2, total_spent);
+            assert!(total_spent > ONE_HOUR, "Too early to stop the game");
+
+            (0, player_1, player_2)
+        } else if account_id == player_2 {
+            let total_spent =
+                if game.current_player_index == 1{
+                    game.total_time_spent[0]
+                }
+                else{
+                    env::block_timestamp() - game.last_turn_timestamp + game.total_time_spent[0]
+                };
+            log!("Player {} already spent: {} nanoseconds", player_1, total_spent);
+            assert!(total_spent > ONE_HOUR, "Too early to stop the game");
+
+            (1, player_2, player_1)
+        } else { panic!("No access") };
+
+        self.internal_update_stats( &looser_account,UpdateStatsAction::AddPenaltyGame, None, None);
+
+        self.internal_distribute_reward(&game.reward, &winner_account);
+        game.winner_index = Some(winner_index);
+        self.games.insert(&game_id, &game);
+
+        self.internal_stop_game(game_id);
+    }
+}
+
+'''
+'''--- near-contract/contract/src/manager.rs ---
+use near_sdk::{Promise, PromiseOrValue, Timestamp};
+use near_sdk::collections::UnorderedSet;
+use near_sdk::json_types::U128;
+
+use crate::*;
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub enum FirstMoveOptions {
+    Random,
+    First,
+    Second,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct GameConfig {
+    pub(crate) deposit: Option<Balance>,
+    pub(crate) first_move: FirstMoveOptions,
+    pub(crate) opponent_id: Option<AccountId>,
+}
+
+#[derive(BorshSerialize, BorshDeserialize)]
+pub enum VGameConfig {
+    Current(GameConfig)
+}
+
+impl From<VGameConfig> for GameConfig {
+    fn from(v_game_config: VGameConfig) -> Self {
+        match v_game_config {
+            VGameConfig::Current(game_config) => game_config,
+        }
+    }
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct GameConfigOutput {
+    deposit: U128,
+    first_move: FirstMoveOptions,
+    opponent_id: Option<AccountId>,
+}
+
+impl From<GameConfig> for GameConfigOutput {
+    fn from(config: GameConfig) -> Self {
+        GameConfigOutput {
+            deposit: U128::from(config.deposit.unwrap_or(0)),
+            first_move: config.first_move,
+            opponent_id: config.opponent_id,
+        }
+    }
+}
+
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct Stats {
+    referrer_id: Option<AccountId>,
+    affiliates: UnorderedSet<AccountId>,
+    games_num: u64,
+    victories_num: u64,
+    penalties_num: u64,
+    total_reward: UnorderedMap<Option<AccountId>, Balance>,
+    total_affiliate_reward: UnorderedMap<Option<AccountId>, Balance>,
+}
+
+impl Stats {
+    pub fn new(account_id: &AccountId) -> Stats {
+        Stats {
+            referrer_id: None,
+            affiliates: UnorderedSet::new(StorageKey::Affiliates { account_id: account_id.clone() }),
+            games_num: 0,
+            victories_num: 0,
+            penalties_num: 0,
+            total_reward: UnorderedMap::new(StorageKey::TotalRewards { account_id: account_id.clone() }),
+            total_affiliate_reward: UnorderedMap::new(StorageKey::TotalAffiliateRewards { account_id: account_id.clone() }),
+        }
+    }
+}
+
+#[derive(BorshSerialize, BorshDeserialize)]
+pub enum VStats {
+    Current(Stats),
+}
+
+impl From<VStats> for Stats {
+    fn from(v_stats: VStats) -> Self {
+        match v_stats {
+            VStats::Current(stats) => stats,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct StatsOutput {
+    referrer_id: Option<AccountId>,
+    affiliates: Vec<AccountId>,
+    games_num: u64,
+    victories_num: u64,
+    penalties_num: u64,
+    total_reward: U128,
+    total_affiliate_reward: U128
+}
+
+impl From<Stats> for StatsOutput {
+    fn from(stats: Stats) -> Self {
+        StatsOutput {
+            referrer_id: stats.referrer_id,
+            affiliates: stats.affiliates.to_vec(),
+            games_num: stats.games_num,
+            victories_num: stats.victories_num,
+            penalties_num: stats.penalties_num,
+            // TODO Add FT
+            total_reward: U128::from(stats.total_reward.get(&None).unwrap_or(0)),
+            total_affiliate_reward: U128::from(stats.total_affiliate_reward.get(&None).unwrap_or(0)),
+        }
+    }
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct TokenBalance {
+    pub(crate) token_id: Option<AccountId>,
+    pub(crate) balance: Balance,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct TokenBalanceOutput {
+    token_id: AccountId,
+    balance: U128,
+}
+
+impl From<TokenBalance> for TokenBalanceOutput {
+    fn from(token_balance: TokenBalance) -> Self {
+        TokenBalanceOutput {
+            token_id: token_balance.token_id.unwrap_or_else(|| "NEAR".into()),
+            balance: U128::from(token_balance.balance),
+        }
+    }
+}
+
+pub type BoardOutput = [Vec<i8>; 8];
+
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct GameOutput {
+    player_1: AccountId,
+    player_2: AccountId,
+    current_player_index: usize,
+    reward: TokenBalanceOutput,
+    winner_index: Option<usize>,
+    turns: u64,
+    last_turn_timestamp: Timestamp,
+    total_time_spent: Vec<Timestamp>,
+    board: BoardOutput,
+}
+
+#[derive(PartialEq)]
+pub enum UpdateStatsAction {
+    AddPlayedGame,
+    AddReferral,
+    AddAffiliate,
+    AddWonGame,
+    AddTotalReward,
+    AddAffiliateReward,
+    AddPenaltyGame,
+}
+
+impl Checkers {
+    pub(crate) fn internal_distribute_reward(&mut self, token_balance: &TokenBalance, winner_id: &AccountId) {
+        // TODO add for FT
+        let amount = token_balance.balance;
+        let fee = amount / 10;
+        let winner_reward: Balance = amount - fee;
+        Promise::new(winner_id.clone()).transfer(winner_reward);
+        log!("Winner is {}. Reward: {}", winner_id, winner_reward);
+
+        let stats = self.internal_get_stats(winner_id);
+        let referrer_fee = if let Some(referrer_id) = stats.referrer_id {
+            let referrer_fee = fee / 2;
+            log!("Affiliate reward for {} is {}", referrer_id, referrer_fee);
+            self.internal_update_stats(&referrer_id, UpdateStatsAction::AddAffiliateReward, None, Some(referrer_fee));
+            Promise::new(referrer_id.clone()).transfer(referrer_fee);
+            referrer_fee
+        } else {
+            0
+        };
+
+        self.service_fee += fee - referrer_fee;
+
+        self.internal_update_stats(winner_id, UpdateStatsAction::AddWonGame, None   , None);
+        self.internal_update_stats(winner_id, UpdateStatsAction::AddTotalReward, None, Some(winner_reward));
+
+        // finish
+        // TODO add to stats
+    }
+
+    pub(crate) fn internal_update_stats(&mut self,
+                                        account_id: &AccountId,
+                                        action: UpdateStatsAction,
+                                        additional_account_id: Option<AccountId>,
+                                        balance: Option<Balance>) {
+        let mut stats = self.internal_get_stats(account_id);
+
+        if action == UpdateStatsAction::AddPlayedGame {
+            stats.games_num += 1
+        } else if action == UpdateStatsAction::AddReferral {
+            if additional_account_id.is_some() {
+                stats.referrer_id = additional_account_id;
+            }
+        } else if action == UpdateStatsAction::AddAffiliate {
+            if let Some(additional_account_id_unwrapped) = additional_account_id {
+                stats.affiliates.insert(&additional_account_id_unwrapped);
+            }
+        } else if action == UpdateStatsAction::AddWonGame {
+            stats.victories_num += 1;
+        } else if action == UpdateStatsAction::AddTotalReward {
+            if let Some(balance_unwrapped) = balance {
+                // TODO Add FT
+                let total_reward = stats.total_reward.get(&None).unwrap_or(0);
+                stats.total_reward.insert(&None, &(total_reward + balance_unwrapped));
+            }
+        } else if action == UpdateStatsAction::AddAffiliateReward {
+            if let Some(balance_unwrapped) = balance {
+                // TODO Add FT
+                let total_affiliate_reward = stats.total_affiliate_reward.get(&None).unwrap_or(0);
+                stats.total_affiliate_reward.insert(&None, &(total_affiliate_reward + balance_unwrapped));
+            }
+        } else if action == UpdateStatsAction::AddPenaltyGame {
+            stats.penalties_num += 1;
+        }
+
+        self.stats.insert(account_id, &VStats::Current(stats));
+    }
+
+    pub(crate) fn internal_get_game(&self, game_id: &GameId) -> GameToSave {
+        self.games.get(game_id).expect("Game not found")
+    }
+
+    pub(crate) fn is_account_exists(&self, account_id: &Option<AccountId>) -> bool {
+        if let Some(account_id_unwrapped) = account_id {
+            self.stats.get(account_id_unwrapped).is_some()
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn internal_get_stats(&self, account_id: &AccountId) -> Stats {
+        if let Some(stats) = self.stats.get(account_id) {
+            stats.into()
+        } else {
+            Stats::new(&account_id)
+        }
+    }
+}
+
+#[near_bindgen]
+impl Checkers {
+    pub fn get_available_games(&self, from_index: u64, limit: u64) -> Vec<(GameId, (AccountId, AccountId))> {
+        let keys = self.available_games.keys_as_vector();
+        let values = self.available_games.values_as_vector();
+        (from_index..std::cmp::min(from_index + limit, keys.len()))
+            .map(|index| {
+                let accounts: (AccountId, AccountId) = values.get(index).unwrap().into();
+                (keys.get(index).unwrap(), accounts)
+            })
+            .collect()
+    }
+
+    pub fn make_unavailable(&mut self) -> PromiseOrValue<bool> {
+        let account_id = env::predecessor_account_id();
+        if let Some(v_game_config) = self.available_players.get(&account_id) {
+            let config: GameConfig = v_game_config.into();
+            self.available_players.remove(&account_id);
+            PromiseOrValue::Promise(Promise::new(account_id).transfer(config.deposit.unwrap_or(0)))
+        } else {
+            PromiseOrValue::Value(false)
+        }
+    }
+
+    pub fn get_stats(&self, account_id: AccountId) -> StatsOutput {
+        self.internal_get_stats(&account_id).into()
+    }
+
+    pub fn get_game(&self, game_id: GameId) -> GameOutput {
+        let game: Game = self.internal_get_game(&game_id).into();
+
+        GameOutput {
+            player_1: game.players[0].account_id.clone(),
+            player_2: game.players[1].account_id.clone(),
+            current_player_index: game.current_player_index,
+            reward: game.reward.into(),
+            winner_index: game.winner_index,
+            turns: game.turns,
+            last_turn_timestamp: game.last_turn_timestamp,
+            total_time_spent: game.total_time_spent,
+            board: game.board.into(),
+        }
+    }
+
+    pub fn get_available_moves(&self, game_id: GameId) -> (Vec<SimpleMove>, Vec<JumpMove>) {
+        let game: Game = self.internal_get_game(&game_id).into();
+        (game.available_simple_moves, game.available_jump_moves)
+    }
+
+    pub fn get_available_players(&self, from_index: u64, limit: u64) -> Vec<(AccountId, GameConfigOutput)> {
+        let keys = self.available_players.keys_as_vector();
+        let values = self.available_players.values_as_vector();
+        (from_index..std::cmp::min(from_index + limit, keys.len()))
+            .map(|index| {
+                let config: GameConfig = values.get(index).unwrap().into();
+                (keys.get(index).unwrap(), config.into())
+            })
+            .collect()
+    }
+
+    pub fn get_active_player(&self, game_id: GameId) -> AccountId {
+        let game: Game = self.internal_get_game(&game_id).into();
+        game.current_player_account_id()
+    }
+
+    pub fn get_service_fee(&self) -> U128 {
+        U128::from(self.service_fee)
+    }
+
+    #[private]
+    pub fn whitelist_token(&mut self, token_id: AccountId) {
+        self.whitelisted_tokens.insert(&token_id);
+    }
+
+    pub fn is_whitelisted_token(&self, token_id: AccountId) -> bool {
+        self.whitelisted_tokens.contains(&token_id)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn assert_check_whitelisted_token(&self, token_id: &Option<AccountId>) {
+        if let Some(token_id) = token_id {
+            assert!(self.whitelisted_tokens.contains(&token_id), "Token wasn't whitelisted");
+        }
+    }
+}
+
+'''
+'''--- near-contract/contract/src/mod.rs ---
+mod ai;
+
+pub use checkers::ai::{
+	Direction,
+	find_simple_moves_for_king,
+	find_jump_moves_for_king,
+	find_simple_moves_for_man,
+	find_jump_moves_for_man,
+	JumpMove,
+	SimpleMove};
+
+mod board;
+pub use checkers::board::{Board, BoardPosition};
+
+mod display;
+pub use checkers::display::print_board;
+
+mod game;
+pub use checkers::game::{Game, GameState, MoveError};
+
+mod input;
+pub use checkers::input::{InputError, parse_move, TokenError};
+
+mod piece;
+pub use checkers::piece::{KingPiece, ManPiece, Piece, PieceType};
+
+mod player;
+pub use checkers::player::Player;
+
+mod tile;
+pub use checkers::tile::{EmptyTile, OccupiedTile, Tile};
+
+'''
+'''--- near-contract/contract/src/piece.rs ---
+use crate::*;
+use crate::player::Player;
+
+#[derive(BorshDeserialize, BorshSerialize, PartialEq)]
+pub enum PieceType {
+	Man,
+	King
+}
+
+pub trait Piece {
+	fn get_player_id(&self) -> u32;
+
+	fn get_type(&self) -> PieceType;
+}
+
+pub struct ManPiece {
+	player_id : u32
+}
+
+impl ManPiece {
+	pub fn new(player : &Player) -> ManPiece {
+		ManPiece{ player_id : player.id }
+	}
+}
+
+impl Piece for ManPiece {
+	fn get_player_id(&self) -> u32 {
+		self.player_id
+	}
+
+	fn get_type(&self) -> PieceType {
+		PieceType::Man
+	}
+}
+
+pub struct KingPiece {
+	player_id : u32
+}
+
+impl KingPiece {
+	pub fn new(player : &Player) -> KingPiece {
+		KingPiece{ player_id : player.id }
+	}
+}
+
+impl Piece for KingPiece {
+	fn get_player_id(&self) -> u32 {
+		self.player_id
+	}
+
+	fn get_type(&self) -> PieceType {
+		PieceType::King
+	}
+}
+
+'''
+'''--- near-contract/contract/src/player.rs ---
+use crate::*;
+
+#[derive(BorshDeserialize, BorshSerialize, Clone)]
+pub struct Player {
+	pub id : u32
+}
+
+'''
+'''--- near-contract/contract/src/tile.rs ---
+use crate::*;
+use std::ops::Deref;
+use crate::piece::Piece;
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct TileToSave {
+    pub player_id: u32,
+    pub piece_type: PieceType
+}
+
+pub trait Tile {
+    fn get_piece(&self) -> Option<&dyn Piece>;
+}
+
+pub struct EmptyTile;
+
+impl Tile for EmptyTile {
+    fn get_piece(&self) -> Option<&dyn Piece> {
+       Option::None
+    }
+}
+
+pub struct OccupiedTile {
+    piece : Box<dyn Piece>
+}
+
+impl OccupiedTile {
+    pub fn new( piece : Box<dyn Piece> ) -> OccupiedTile {
+        OccupiedTile {
+            piece
+        }
+    }
+}
+
+impl Tile for OccupiedTile {
+    fn get_piece(&self) -> Option<&dyn Piece> {
+       Option::Some(self.piece.deref())
+    }
+}
+
+'''
+'''--- near-contract/contract/src/util.rs ---
+use crate::*;
+extern crate std;
+
+/// Computes the absolute value of the difference
+/// between two number. Supports unsigned types.
+///
+/// # Examples
+///
+/// ```
+/// let diff = absolute_diff(2u8, 5u8);
+/// assert_eq!(3, diff);
+///
+/// let inv_diff = absolute_diff(5u8, 2u8);
+/// assert_eq!(3, inv_diff);
+/// ```
+pub fn absolute_diff
+<T : std::ops::Sub<Output=T> + std::cmp::Ord>
+(a : T, b : T)
+-> T {
+	if a > b {
+		a - b
+	} else {
+		b - a
+	}
+}
+
+pub fn apply_positions_as_move (game : &mut Game, positions : Vec<BoardPosition>) -> Result<GameState, MoveError> {
+	if positions.len() == 2 {
+		let start = positions[0];
+		let end = positions[1];
+
+		let row_diff = util::absolute_diff(start.row, end.row);
+		let col_diff = util::absolute_diff(start.column, end.column);
+
+		if row_diff == 1 && col_diff == 1 {
+			game.apply_simple_move(SimpleMove::new(
+				start.row, start.column, end.row, end.column))
+		} else {
+			game.apply_jump_move(positions)
+		}
+	} else {
+		game.apply_jump_move(positions)
+	}
+}
+
+/*
+pub enum PlayerColor {
+    Red,
+    Black,
+}
+
+pub fn player_id_to_color(player_id : u32) -> PlayerColor {
+	match player_id {
+		1 => PlayerColor::Red,
+		2 => PlayerColor::Black,
+		_ => unreachable!()
+	}
+}
+
+pub fn player_color_to_name(color : PlayerColor) -> &'static str {
+	match color {
+		PlayerColor::Red => "Red",
+		PlayerColor::Black => "Black"
+	}
+}*/
+
+#[cfg(test)]
+mod test {
+	use super::*;
+
+	fn test_absolute_diff(a : usize, b : usize, expected : usize) {
+		let result = absolute_diff(a, b);
+		assert_eq!(expected, result);
+	}
+
+	ptest!(test_absolute_diff [
+		test_absolute_diff_0_0(0, 0, 0),
+		test_absolute_diff_0_1(0, 1, 1),
+		test_absolute_diff_1_0(1, 0, 1),
+		test_absolute_diff_1_1(1, 1, 0),
+		test_absolute_diff_9_3(9, 3, 6),
+		test_absolute_diff_3_12(3, 12, 9)
+	]);
+}
+
+'''
+'''--- near-contract/nft-contract/Cargo.toml ---
+[package]
+name = "checkers_nft"
+version = "0.1.0"
+authors = ["Vadim Ilin <vadim@near.org>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = { version = "4.0.0-pre.3" }
+near-contract-standards = "4.0.0-pre.3"
+qrcode = "0.11"
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+# Opt into extra safety checks on arithmetic operations https://stackoverflow.com/a/64136471/249801
+overflow-checks = true
+
+[workspace]
+members = []
+
+'''
+'''--- near-contract/nft-contract/README.md ---
+nfticket Smart Contract
+==================
+
+A [smart contract] written in [Rust] for an app initialized with [create-near-app]
+
+Quick Start
+===========
+
+Before you compile this code, you will need to install Rust with [correct target]
+
+Exploring The Code
+==================
+
+1. The main smart contract code lives in `src/lib.rs`. You can compile it with
+   the `./compile` script.
+2. Tests: You can run smart contract tests with the `./test` script. This runs
+   standard Rust tests using [cargo] with a `--nocapture` flag so that you
+   can see any debug info you print to the console.
+
+  [smart contract]: https://docs.near.org/docs/develop/contracts/overview
+  [Rust]: https://www.rust-lang.org/
+  [create-near-app]: https://github.com/near/create-near-app
+  [correct target]: https://github.com/near/near-sdk-rs#pre-requisites
+  [cargo]: https://doc.rust-lang.org/book/ch01-03-hello-cargo.html
+
+'''
+'''--- near-contract/nft-contract/compile.js ---
+// This file does two things:
+//
+// 1. Compile the Rust contract using cargo (see buildCmd below). This will
+//    create a wasm file in the 'build' folder.
+// 2. Create a symbolic link (symlink) to the generated wasm file in the root
+//    project's `out` folder, for easy use with near-cli.
+//
+// First, import some helper libraries. `shelljs` is included in the
+// devDependencies of the root project, which is why it's available here. It
+// makes it easy to use *NIX-style scripting (which works on Linux distros,
+// macOS, and Unix systems) on Windows as well.
+const sh = require('shelljs')
+
+// Figure out which directory the user called this script from, which we'll use
+// later to set up the symlink.
+const calledFromDir = sh.pwd().toString()
+
+// For the duration of this script, we want to operate from within the
+// Rust project's folder. Let's change into that directory.
+sh.cd(__dirname)
+
+// You can call this script with `node compile.js` or `node compile.js
+// --debug`. Let's set a variable to track whether `--debug` was used.
+const debug = process.argv.pop() === '--debug'
+
+// You can call this script with `node compile.js` or `node compile.js --debug`.
+// Let's set a variable to track whether `--debug` was used.
+// Note: see other flags in ./cargo/config. Unfortunately, you cannot set the
+// `--target option` in Cargo.toml.
+const buildCmd = debug
+  ? 'cargo build --target wasm32-unknown-unknown'
+  : 'cargo build --target wasm32-unknown-unknown --release'
+
+// Execute the build command, storing exit code for later use
+const { code } = sh.exec(buildCmd)
+
+// Assuming this is compiled from the root project directory, link the compiled
+// contract to the `out` folder –
+// When running commands like `near deploy`, near-cli looks for a contract at
+// <CURRENT_DIRECTORY>/out/main.wasm
+if (code === 0 && calledFromDir !== __dirname) {
+  const linkDir = `${calledFromDir}/out`
+  const packageName = require('fs').readFileSync(`${__dirname}/Cargo.toml`).toString().match(/name = "([^"]+)"/)[1]
+  const link = `${calledFromDir}/out/${packageName}.wasm`
+  const outFile = `./target/wasm32-unknown-unknown/${debug ? 'debug' : 'release'}/${packageName}.wasm`
+  sh.mkdir('-p', linkDir)
+  sh.rm('-f', link)
+  //fixes #831: copy-update instead of linking .- sometimes sh.ln does not work on Windows
+  sh.cp('-u',outFile,link)
+}
+
+// exit script with the same code as the build command
+process.exit(code)
+
+'''
+'''--- near-contract/nft-contract/src/lib.rs ---
+use near_contract_standards::non_fungible_token::{NonFungibleToken, Token, TokenId};
+use near_contract_standards::non_fungible_token::metadata::{NFT_METADATA_SPEC, NFTContractMetadata, NonFungibleTokenMetadataProvider, TokenMetadata};
+use near_sdk::{AccountId, BorshStorageKey, env, near_bindgen, PanicOnDefault, Promise, PromiseOrValue};
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::LazyOption;
+use near_sdk::serde::{Deserialize, Serialize};
+
+use crate::web4::*;
+
+mod web4;
+const DEFAULT_ICON: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAAABmJLR0QA/wD/AP+gvaeTAAACAUlEQVRIidXVOWhVURAG4C8vxmAwcSmCCIIiWrjggmBhYyfYiQoKoiDaCGKrha2FWAiCQqxcUlmlsBEttBAUJNHGQlwCbhGekSDRkOTF4szBm+vbsMvAcA+z/LOec1no1NlC340zuIQqtmMz1uE6luMlZv8n+GmMYS74aImzfAynGoFUGsjuYgD9bSTSj5u40wDvHzostWOuxKOYCh6to6/iUBmsPIM1WItH4bShkNWysO+Mc6YZDOFa+PzARFYWS6pIQxRZvm6z5E68CR/YUfQrVrBe2o6c7UVpi0jlDwQP4V1U2osObMOTCLIYv/C9HGAQu/AW+8Ipg1/Ae6kdM/iMp9iDJQE6jY84Fv6DInqmL1iFyQDpC/lVPG/Qnt04F+cJLEJPYK0Wgkwr4ttTAnnVALys6yucV+ZDW3vbhDpaGRQDjMd3UmHNsLWJ/5bCeSJ8iQEzv0Uj6MI9aUgHQn5EWtmfJfClocv0EA+kizqdhcUteia9K1P4hL3SdvRK21KNzLqwE2elpRDBb0QVw9LTMc78HlawPwBz+ee1ntMcLkuvag52H7UMmqlWMOrGpmzUgmax0d9LOdzKr9lj9zv4Qx19FQfbSEgFt+sANPofZL6lTjvr9beG4ziJb20kNBa2J9RpTbNf5oj0BH+Vtulx2NekQfbjSiTzoo1EFij9AUQdkBPH3hCPAAAAAElFTkSuQmCC";
+const NFT_CSS_SOURCE: &str = "/style";
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct NfTCheckers {
+    owner_id: AccountId,
+    tokens: NonFungibleToken,
+    metadata: LazyOption<NFTContractMetadata>,
+}
+
+#[derive(BorshSerialize, BorshStorageKey)]
+enum StorageKey {
+    NonFungibleToken,
+    Metadata,
+    TokenMetadata,
+    Enumeration,
+    Approval
+}
+
+#[near_bindgen]
+impl NfTCheckers {
+    #[init]
+    pub fn new_with_default_meta(owner_id: AccountId) -> Self {
+        Self::new(
+            owner_id,
+            NFTContractMetadata {
+                spec: NFT_METADATA_SPEC.to_string(),
+                name: "NFT Checkers".to_string(),
+                symbol: "NCHK".to_string(),
+                icon: Some(DEFAULT_ICON.to_string()),
+                base_uri: None,
+                reference: None,
+                reference_hash: None,
+            },
+        )
+    }
+
+    #[init]
+    pub fn new(owner_id: AccountId, metadata: NFTContractMetadata) -> Self {
+        assert!(!env::state_exists(), "Already initialized");
+        metadata.assert_valid();
+        Self {
+            owner_id: owner_id.clone(),
+            tokens: NonFungibleToken::new(
+                StorageKey::NonFungibleToken,
+                owner_id,
+                Some(StorageKey::TokenMetadata),
+                Some(StorageKey::Enumeration),
+                Some(StorageKey::Approval),
+            ),
+            metadata: LazyOption::new(StorageKey::Metadata, Some(&metadata)),
+        }
+    }
+
+    #[payable]
+    pub fn nft_mint(
+        &mut self,
+        token_id: TokenId,
+        receiver_id: AccountId,
+        token_metadata: TokenMetadata,
+    ) -> Token {
+        assert_eq!(self.owner_id, env::predecessor_account_id(), "ERR_NO_ACCESS");
+        self.tokens.internal_mint(token_id, receiver_id, Some(token_metadata))
+    }
+
+    pub fn web4_get(&self, request: Web4Request) -> Web4Response {
+        let path = request.path.expect("Path expected");
+
+        let token_id = get_token_id(&path).unwrap_or_default();
+
+        if !token_id.is_empty() {
+            if path.starts_with(NFT_CSS_SOURCE) {
+                if let Some(token) = self.tokens.nft_token(token_id) {
+                    let owner_id_css = token.owner_id.to_string().replace(".", "_").replace("-", "_");
+                    let token_id_css = token.token_id.to_string().replace(".", "_").replace(" ", "_").replace("-", "_");
+                    return Web4Response::css_response(
+                        format!("div#board .piece.{}.{} {{
+background-image: url('{}');
+background-size: cover;
+background-repeat: unset;
+}}", owner_id_css, token_id_css, token.metadata.expect("ERR_MISSING_DATA").media.unwrap_or_default()));
+                }
+            }
+        }
+
+        Web4Response::webpage_template("NEAR NFT CHECKERS".to_string())
+    }
+}
+
+fn get_token_id(token_id: &TokenId) -> Option<String> {
+    let start = token_id.rfind('/').unwrap_or(0);
+    let end = token_id.rfind('.').unwrap_or(0);
+
+    if start * end != 0 && start + 1 < end {
+        Some(token_id[start+1..end].to_string())
+    }
+    else {
+        None
+    }
+}
+
+near_contract_standards::impl_non_fungible_token_core!(NfTCheckers, tokens);
+near_contract_standards::impl_non_fungible_token_approval!(NfTCheckers, tokens);
+near_contract_standards::impl_non_fungible_token_enumeration!(NfTCheckers, tokens);
+
+#[near_bindgen]
+impl NonFungibleTokenMetadataProvider for NfTCheckers {
+    fn nft_metadata(&self) -> NFTContractMetadata {
+        self.metadata.get().unwrap()
+    }
+}
+
+'''
+'''--- near-contract/nft-contract/src/web4.rs ---
+use crate::*;
+use std::collections::HashMap;
+use near_sdk::AccountId;
+
+#[allow(dead_code)]
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Web4Request {
+   #[serde(rename = "accountId")]
+   pub(crate) account_id: Option<AccountId>,
+   pub(crate) path: Option<String>,
+   pub(crate) params: Option<HashMap<String, String>>,
+   pub(crate) query: Option<HashMap<String, Vec<String>>>,
+   pub(crate) preloads: Option<HashMap<String, Web4Response>>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Web4Response {
+   #[serde(rename = "contentType")]
+   pub(crate) content_type: Option<String>,
+   pub(crate) status: Option<u32>,
+   pub(crate) body: Option<Vec<u8>>,
+   #[serde(rename = "bodyUrl")]
+   pub(crate) body_url: Option<String>,
+   #[serde(rename = "preloadUrls")]
+   pub(crate) preload_urls: Option<Vec<String>>,
+}
+
+impl Web4Response {
+   // returns vertical & horizontal centered block
+   pub fn webpage_template(html: String) -> Self {
+      let page = format!("\
+      <div style='height: 100%; position: relative;'>\
+         <div style='margin: 0; position: absolute; top: 50%; left: 50%; margin-right: -50%; transform: translate(-50%, -50%); text-align: center;'>\
+            {}\
+         </div>\
+      </div>", html);
+      Web4Response::html_response(page)
+   }
+
+   pub fn html_response(text: String) -> Self {
+      Self {
+         content_type: Some(String::from("text/html; charset=UTF-8")),
+         body: Some(text.into_bytes()),
+         ..Default::default()
+      }
+   }
+
+   pub fn plain_response(text: String) -> Self {
+      Self {
+         content_type: Some(String::from("text/plain; charset=UTF-8")),
+         body: Some(text.into_bytes()),
+         ..Default::default()
+      }
+   }
+
+   pub fn css_response(text: String) -> Self {
+      Self {
+         content_type: Some(String::from("text/css; charset=UTF-8")),
+         body: Some(text.into_bytes()),
+         ..Default::default()
+      }
+   }
+
+   pub fn svg_response(text: String) -> Self {
+      Self {
+         content_type: Some(String::from("image/svg+xml")),
+         body: Some(text.into_bytes()),
+         ..Default::default()
+      }
+   }
+
+   pub fn preload_urls(urls: Vec<String>) -> Self {
+      Self {
+         preload_urls: Some(urls),
+         ..Default::default()
+      }
+   }
+
+   pub fn body_url(url: String) -> Self {
+      Self {
+         body_url: Some(url),
+         ..Default::default()
+      }
+   }
+
+   pub fn status(status: u32) -> Self {
+      Self {
+         status: Some(status),
+         ..Default::default()
+      }
+   }
+}
+
+'''
+'''--- near-contract/package.json ---
+{
+  "name": "near-rusty-chekers",
+  "version": "0.0.1",
+  "license": "UNLICENSED",
+  "scripts": {
+    "build": "npm run build:contract && npm run build:web",
+    "build:contract": "node contract/compile.js",
+    "build:nft-contract": "node nft-contract/compile.js",
+    "build:contract:debug": "node contract/compile.js --debug",
+    "build:web": "parcel build src/index.html --public-url ./",
+    "dev:deploy:contract": "near dev-deploy",
+    "deploy:contract": "near deploy",
+    "deploy:pages": "gh-pages -d dist/",
+    "deploy": "npm run build && npm run deploy:contract && npm run deploy:pages",
+    "prestart": "npm run build:contract:debug && npm run dev:deploy:contract",
+    "start": "echo The app is starting! It will automatically open in your browser when ready && env-cmd -f ./neardev/dev-account.env parcel src/index.html --open",
+    "dev": "nodemon --watch contract/src -e rs --exec \"npm run start\"",
+    "test": "npm run build:contract:debug && cd contract && cargo test -- --nocapture && cd .. && jest test --runInBand"
+  },
+  "devDependencies": {
+    "env-cmd": "~10.1.0",
+    "gh-pages": "~3.1.0",
+    "jest": "~26.6.2",
+    "jest-environment-node": "~26.6.2",
+    "near-cli": "~2.1.1",
+    "nodemon": "~2.0.3",
+    "parcel-bundler": "~1.12.4",
+    "shelljs": "~0.8.4"
+  },
+  "dependencies": {
+    "near-api-js": "~0.43.1",
+    "regenerator-runtime": "~0.13.5"
+  },
+  "jest": {
+    "testEnvironment": "near-cli/test_environment",
+    "testPathIgnorePatterns": [
+      "<rootDir>/contract/",
+      "<rootDir>/node_modules/"
+    ]
+  }
+}
+
+'''

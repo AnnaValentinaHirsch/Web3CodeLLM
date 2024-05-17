@@ -1,0 +1,913 @@
+*GitHub Repository "Godslovelee/near-chess"*
+
+'''--- .gitpod.yml ---
+image:
+  file: .gitpod.Dockerfile
+# Options to prebuild the image after github events and set notifications/badges
+# More here: https://www.gitpod.io/docs/prebuilds/
+github:
+  prebuilds:
+    # enable for the master/default branch (defaults to true)
+    master: true
+    # enable for pull requests coming from this repo (defaults to true)
+    pullRequests: true
+    # enable for pull requests coming from forks (defaults to false)
+    pullRequestsFromForks: true
+    # add a check to pull requests (defaults to true)
+    addCheck: true
+    # add a "Review in Gitpod" button as a comment to pull requests (defaults to false)
+    addComment: true
+
+# List the start up tasks. You can start them in parallel in multiple terminals. See https://www.gitpod.io/docs/config-start-tasks/
+tasks:
+  - before: nvm use default
+    init: yarn && alias near=./node_modules/near-shell/bin/near
+    command: yarn dev
+ports:
+  - port: 1234
+    onOpen: open-browser
+
+'''
+'''--- .travis.yml ---
+language: node_js
+node_js:
+  - 12
+
+- env:
+  - NODE_ENV=ci
+  - NODE_ENV=ci-staging
+
+cache: yarn
+
+jobs:
+  include:
+    - name: yarn
+      script:
+      - yarn build
+      - yarn test
+
+    - name: fossa
+      before_script:
+        - "curl -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/fossas/fossa-cli/fc60c6631a5d372d5a45fea35e31665b338f260d/install.sh | sudo bash"
+      script:
+        - fossa init
+        - fossa analyze --server-scan
+        - fossa test
+
+'''
+'''--- README.md ---
+# NEAR Chess
+
+## Description
+
+This example demonstrates how to create on-chain turn-based game (chess in this case) integrated with NEAR Wallet.
+
+[![Open in Gitpod](https://gitpod.io/button/open-in-gitpod.svg)](https://gitpod.io/#https://github.com/nearprotocol/near-chess)
+
+## To Run
+
+```
+yarn
+yarn start
+```
+
+## To Explore
+
+- `assembly/main.ts` for the contract code
+- `assembly/modelts` for the data model code
+- `src/main.html` for the front-end HTML
+- `src/main.js` for the JavaScript front-end code and how to integrate contracts
+- `src/test.js` for the JS tests for the contract
+
+'''
+'''--- as-pect.config.js ---
+module.exports = require("near-sdk-as/imports");
+
+'''
+'''--- asconfig.js ---
+
+const compile = require("near-sdk-as/compiler").compile;
+
+compile("assembly/main.ts", // input file
+        "out/main.wasm",    // output file
+        [
+        //   "-O1",          // Optional arguments
+        "--debug",
+        "--measure",         // Shows compiler runtime
+        "--validate"         // Validate the generated wasm module
+        ], {
+          verbose: true     // Output the cli args passed to asc
+        });
+
+'''
+'''--- assembly/__tests__/as-pect.d.ts ---
+/// <reference types="@as-pect/assembly/types/as-pect" />
+
+'''
+'''--- assembly/__tests__/chess.spec.ts ---
+import * as chess from "../main";
+import { Context, context } from 'near-sdk-as';
+import { Game } from "../model";
+
+const PLAYER1 = "Bobby";
+const PLAYER2 = "Garry"
+function getCurrentGame(player: string): Game {
+  return chess.getGame(chess.getCurrentGame(player));
+}
+
+describe("Game", () => {
+  beforeAll(() => {
+    Context.setSigner_account_id(PLAYER1);
+  });
+
+  it("create a new game", () => {
+    chess.createOrJoinGame();
+    const game = getCurrentGame(PLAYER1);
+    expect(game.player1).toBe(PLAYER1, "Only one player.");
+    expect(game.player2).toBeNull("No second player");
+  });  
+
+  it("join a game", () => {
+    Context.setSigner_account_id(PLAYER2);
+    chess.createOrJoinGame();
+    const game = getCurrentGame(PLAYER1);
+    expect(game.player1).toBe(PLAYER1, "Only one player.");
+    expect(game.player2).not.toBeNull("Should be a second player");
+    expect(game.player2).toBe(PLAYER2);
+  });
+});
+
+'''
+'''--- assembly/main.ts ---
+// @nearfile
+
+import { context, storage, logging } from "near-sdk-as";
+import { Game, GameWithId } from "./model";
+
+// --- contract code goes below
+
+export function getRecentGames(): Array<GameWithId> {
+  let lastId = storage.getSome<u64>('lastId');
+  let games = new Array<GameWithId>();
+  for (let id = lastId; id + 10 > lastId && id > 0; --id) {
+    let game = new GameWithId();
+    game.id = id;
+    game.game = getGame(id);
+    games.push(game);
+  }
+  return games;
+}
+
+export function giveUpCurrentGame(): void {
+  let gameId = getCurrentGame(context.sender);
+  if (gameId == 0) {
+    return;
+  }
+  let game = getGame(gameId);
+  if (game.outcome != null || game.player2 == null) {
+    return;
+  }
+  game.outcome = "Player " + context.sender + " gave up";
+  setGame(gameId, game);
+}
+
+export function createOrJoinGame(): void {
+  giveUpCurrentGame();
+  let lastId = storage.getPrimitive<u64>('lastId', 0);
+  let gameKey: string;
+  let game: Game | null = null;
+  if (lastId > 0) {
+    game = getGame(lastId);
+    if (game.player2) {
+      game = null;
+    } else {
+      if (game.player1 == context.sender) {
+        return;
+      }
+      game.player2 = context.sender;
+    }
+  }
+  if (game == null) {
+    game = new Game();
+    lastId++;
+    storage.set<u64>('lastId', lastId);
+    gameKey = getGameKey(lastId);
+    game.player1 = context.sender;
+  }
+  setGame(lastId, game);
+  // TODO: Make it possible to return result from method to avoid this
+  logging.log("sender: " + context.sender);
+  storage.set<u64>("gameId:" + context.sender, lastId);
+}
+
+export function getCurrentGame(player: string): u64 {
+  return storage.getPrimitive<u64>("gameId:" + player, 0);
+}
+
+export function getGame(gameId: u64): Game {
+  return storage.getSome<Game>(getGameKey(gameId));
+}
+
+function setGame(gameId: u64, game: Game): void {
+  storage.set(getGameKey(gameId), game);
+}
+
+export function makeMove(gameId: u64, fen: string): void {
+  let game = getGame(gameId);
+  assert(game.outcome == null, "Game over");
+  let turn = getCurrentTurn(game.fen);
+  let nextTurn = getCurrentTurn(fen);
+  let validTurn =
+    nextTurn != turn && (
+      (context.sender == game.player1 && turn == 'w') ||
+      (context.sender == game.player2 && turn == 'b'));
+  logging.log("turn " + turn);
+  logging.log("nextTurn " + nextTurn);
+  logging.log("sender " + context.sender);
+  
+  assert(validTurn, 'Wrong side to make move');
+  // TODO: Validate chess rules
+  game.fen = fen;
+  setGame(gameId, game);
+}
+
+function getGameKey(gameId: u64): string {
+  return 'game:' + gameId.toString();
+}
+
+function getCurrentTurn(fen: string): string {
+  // TODO: Pull all of chess.js working with fen
+  var tokens = fen.split(' ');
+  var position = tokens[0];
+  let turn = tokens[1];
+  return turn;
+}
+
+'''
+'''--- assembly/model.ts ---
+// @nearfile
+
+export class Game {
+  player1: string;
+  player2: string;
+  fen: string = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+  outcome: string;
+}
+
+export class GameWithId {
+  id: u64;
+  game: Game;
+}
+
+'''
+'''--- assembly/tsconfig.json ---
+{
+  "extends": "assemblyscript/std/assembly.json",
+  "include": [
+    "./**/*.ts",
+    "../**/*/as_types.d.ts"
+  ]
+}
+
+'''
+'''--- neardev/shared-test-staging/test.near.json ---
+{"account_id":"test.near","private_key":"ed25519:2wyRcSwSuHtRVmkMCGjPwnzZmQLeXLzLLyED1NDMt4BjnKgQL6tF85yBx6Jr26D2dUNeC716RBoTxntVHsegogYw"}
+
+'''
+'''--- neardev/shared-test/test.near.json ---
+{"account_id":"test.near","private_key":"ed25519:2wyRcSwSuHtRVmkMCGjPwnzZmQLeXLzLLyED1NDMt4BjnKgQL6tF85yBx6Jr26D2dUNeC716RBoTxntVHsegogYw"}
+
+'''
+'''--- package.json ---
+{
+  "name": "near-chess",
+  "description": "Shows example of how to implement on-chain chess game and deploy to GitHub pages",
+  "version": "0.0.1",
+  "scripts": {
+    "build": "npm run build:contract && npm run build:web",
+    "build:contract": "node asconfig.js",
+    "build:web": "parcel build src/index.html --public-url ./",
+    "dev:deploy:contract": "near dev-deploy",
+    "deploy:contract": "near deploy",
+    "deploy:pages": "gh-pages -d dist/",
+    "deploy": "npm run build && npm run deploy:contract && npm run deploy:pages",
+    "prestart": "npm run build:contract && npm run dev:deploy:contract",
+    "start": "CONTRACT_NAME=$(cat neardev/dev-account) parcel src/index.html",
+    "dev": "nodemon --watch assembly -e ts --exec 'npm run start'",
+    "test": "asp && npm run build:contract && jest test",
+    "asp": "asp --verbose"
+  },
+  "devDependencies": {
+    "assemblyscript": "^0.9.4",
+    "gh-pages": "^2.0.1",
+    "gulp": "^4.0.2",
+    "jest": "^22.4.4",
+    "jest-environment-node": "^24.5.0",
+    "near-sdk-as": "^0.1.2",
+    "near-shell": "^0.20.1",
+    "nodemon": "^2.0.2",
+    "parcel-bundler": "^1.12.4"
+  },
+  "dependencies": {
+    "nearlib": "^0.20.0",
+    "regenerator-runtime": "^0.13.3"
+  },
+  "jest": {
+    "testEnvironment": "near-shell/test_environment",
+    "testPathIgnorePatterns": [
+      "<rootDir>/assembly/",
+      "<rootDir>/node_modules/"
+    ]
+  }
+}
+
+'''
+'''--- setup.js ---
+// This file is not required when running the project locally. Its purpose is to set up the
+// AssemblyScript compiler when a new project has been loaded in WebAssembly Studio.
+
+// Path manipulation lifted from https://gist.github.com/creationix/7435851
+
+// Joins path segments.  Preserves initial "/" and resolves ".." and "."
+// Does not support using ".." to go above/outside the root.
+// This means that join("foo", "../../bar") will not resolve to "../bar"
+function join(/* path segments */) {
+  // Split the inputs into a list of path commands.
+  var parts = [];
+  for (var i = 0, l = arguments.length; i < l; i++) {
+    parts = parts.concat(arguments[i].split("/"));
+  }
+  // Interpret the path commands to get the new resolved path.
+  var newParts = [];
+  for (i = 0, l = parts.length; i < l; i++) {
+    var part = parts[i];
+    // Remove leading and trailing slashes
+    // Also remove "." segments
+    if (!part || part === ".") continue;
+    // Interpret ".." to pop the last segment
+    if (part === "..") newParts.pop();
+    // Push new path segments.
+    else newParts.push(part);
+  }
+  // Preserve the initial slash if there was one.
+  if (parts[0] === "") newParts.unshift("");
+  // Turn back into a single string path.
+  return newParts.join("/") || (newParts.length ? "/" : ".");
+}
+
+// A simple function to get the dirname of a path
+// Trailing slashes are ignored. Leading slash is preserved.
+function dirname(path) {
+  return join(path, "..");
+}
+
+require.config({
+  paths: {
+    "binaryen": "https://cdn.jsdelivr.net/gh/AssemblyScript/binaryen.js@e41ec5c177e3d2cacccd4ccb1877ae29a7352dc1/index",
+    "assemblyscript": "https://cdn.jsdelivr.net/gh/nearprotocol/assemblyscript@a4aa1a5/dist/assemblyscript",
+    "assemblyscript/bin/asc": "https://cdn.jsdelivr.net/gh/nearprotocol/assemblyscript@a4aa1a5/dist/asc",
+  }
+});
+logLn("Loading AssemblyScript compiler ...");
+require(["assemblyscript/bin/asc"], asc => {
+  monaco.languages.typescript.typescriptDefaults.addExtraLib(asc.definitionFiles.assembly);
+  asc.runningInStudio = true;
+  asc.main = (main => (args, options, fn) => {
+    if (typeof options === "function") {
+      fn = options;
+      options = undefined;
+    }
+
+    return main(args, options || {
+      stdout: asc.createMemoryStream(),
+      stderr: asc.createMemoryStream(logLn),
+      readFile: (filename, baseDir) => {
+        let path = join(baseDir, filename);
+        console.log("readFile", path);
+        if (path.startsWith("out/") && path.indexOf(".near.ts") == -1) {
+          path = path.replace(/^out/, baseDir );
+          console.log("path", path);
+        } else if (path.startsWith(baseDir) && path.indexOf(".near.ts") != -1) {
+          path = path.replace(new RegExp("^" + baseDir), "out");
+          console.log("path", path);
+        }
+        const file = project.getFile(path);
+        return file ? file.data : null;
+      },
+      writeFile: (filename, contents) => {
+        const name = filename.startsWith("../") ? filename.substring(3) : filename;
+        const type = fileTypeForExtension(name.substring(name.lastIndexOf(".") + 1));
+        project.newFile(name, type, true).setData(contents);
+      },
+      listFiles: () => []
+    }, fn);
+  })(asc.main);
+  logLn("AssemblyScript compiler is ready!");
+});
+
+'''
+'''--- src/config.js ---
+const CONTRACT_NAME = process.env.CONTRACT_NAME || 'near-chess-devnet';
+
+function getConfig(env) {
+    switch (env) {
+
+    case 'production':
+    case 'development':
+        return {
+            networkId: 'default',
+            nodeUrl: 'https://rpc.nearprotocol.com',
+            contractName: CONTRACT_NAME,
+            walletUrl: 'https://wallet.nearprotocol.com',
+            helperUrl: 'https://near-contract-helper.onrender.com',
+        };
+    case 'staging':
+        return {
+            networkId: 'staging',
+            nodeUrl: 'https://staging-rpc.nearprotocol.com/',
+            contractName: CONTRACT_NAME,
+            walletUrl: 'https://near-wallet-staging.onrender.com',
+            helperUrl: 'https://near-contract-helper-staging.onrender.com',
+        };
+    case 'local':
+        return {
+            networkId: 'local',
+            nodeUrl: 'http://localhost:3030',
+            keyPath: `${process.env.HOME}/.near/validator_key.json`,
+            walletUrl: 'http://localhost:4000/wallet',
+            contractName: CONTRACT_NAME,
+        };
+    case 'test':
+    case 'test-remote':
+    case 'ci':
+        return {
+            networkId: 'shared-test',
+            nodeUrl: 'http://shared-test.nearprotocol.com:3030',
+            contractName: CONTRACT_NAME,
+            masterAccount: 'test.near',
+        };
+    case 'ci-staging':
+        return {
+            networkId: 'shared-test-staging',
+            nodeUrl: 'http://staging-shared-test.nearprotocol.com:3030',
+            contractName: CONTRACT_NAME,
+            masterAccount: 'test.near',
+        };
+    case 'tatooine':
+        return {
+            networkId: 'tatooine',
+            nodeUrl: 'https://rpc.tatooine.nearprotocol.com',
+            contractName: CONTRACT_NAME,
+            walletUrl: 'https://wallet.tatooine.nearprotocol.com',
+        };
+    default:
+        throw Error(`Unconfigured environment '${env}'. Can be configured in src/config.js.`);
+    }
+}
+
+module.exports = getConfig;
+
+'''
+'''--- src/index.html ---
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.2.1/css/bootstrap.min.css" integrity="sha384-GJzZqFGwb1QTTN6wy59ffF1BuGJpLSa9DkKMp0DgiMDm4iYMj70gZWKYbI706tWS" crossorigin="anonymous">
+  <link rel="stylesheet" href="https://chessboardjs.com/css/chessboard.css">
+  <style>
+    .container {
+      margin-top: 2em;
+    }
+    .game-actions {
+      margin-top: 1em;
+    }
+    .small-game {
+      margin-bottom: 1em;
+    }
+    .link-unstyled, .link-unstyled:link, .link-unstyled:hover {
+      color: inherit;
+      text-decoration: inherit;
+    }
+  </style>
+</head>
+<body>
+  <nav class="navbar navbar-expand-lg navbar-light bg-light">
+    <a class="navbar-brand" href="#">NEAR Chess</a>
+    <button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#navbarSupportedContent" aria-controls="navbarSupportedContent" aria-expanded="false" aria-label="Toggle navigation">
+      <span class="navbar-toggler-icon"></span>
+    </button>
+
+    <div class="collapse navbar-collapse" id="navbarSupportedContent">
+      <ul class="navbar-nav mr-auto">
+        <li class="nav-item active">
+          <a class="nav-link" href="#">Home <span class="sr-only">(current)</span></a>
+        </li>
+        <li class="nav-item">
+          <a class="nav-link" href="https://github.com/nearprotocol/near-chess">Source on GitHub</a>
+        </li>
+      </ul>
+      <form class="signed-in-flow login-info d-none form-inline my-2 my-lg-0">
+        <div class="mr-sm-2">Hi, <b id="account-id"></b>!</div>
+        <button id="sign-out-button" class="btn btn-outline-danger my-2 my-sm-0">Sign-out</button>
+      </form>
+    </div>
+  </nav>
+  <div class="container">
+    <div class="signed-out-flow d-none">
+      <div class="row">
+        <div class="col">
+          <h2>Show us your moves</h2>
+          <p>Pease sign-in to start playing. Don't worry – it's just few clicks in a browser, you don't have to install anything.</p>
+          <button id="sign-in-button" class="btn btn-primary btn-lg">Sign-in with NEAR</button>
+        </div>
+      </div>
+    </div> 
+    <div class="signed-in-flow d-none">
+      <div class="row">        
+        <div class="col">
+          <div class="row">        
+            <div class="col">
+              <h1 class="status d-none"></h1>
+              <h4 class="server-status d-none"></h4>
+            </div>
+          </div>
+          <div class="row">
+            <div class="col">
+                <div id="board" style="width: 510px"></div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="game-actions col">
+              <button class="new-game btn btn-success">New Game</button>
+              <button class="give-up btn btn-danger">Give Up</button>
+            </div>
+          </div>
+        </div>
+        <div class="col">
+          <h3>Recent games</h3>
+          <div id="recent-games">
+          </div>
+          <div class="row">
+            <div class="col">
+              <button class="get-recent-games btn btn-success">Refresh games</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div> 
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/js-cookie@2/src/js.cookie.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.3.1/jquery.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.2/chess.js"></script>
+  <script src="https://chessboardjs.com/js/chessboard.js"></script>
+  <script src="./main.js"></script>
+</body>
+</html>
+
+'''
+'''--- src/loader.html ---
+<head>
+    <script>
+        window.paceOptions = {
+            elements: {
+                selectors: ['.never-appears']
+            }
+        };
+    </script>
+    <script src="https://cdn.jsdelivr.net/gh/HubSpot/pace@v0.5.3/pace.min.js"></script>
+    <link href="https://cdn.jsdelivr.net/gh/HubSpot/pace@v0.5.3/themes/black/pace-theme-center-radar.css" rel="stylesheet" />
+</head>
+'''
+'''--- src/main.js ---
+import "regenerator-runtime/runtime";
+
+import * as nearlib from "nearlib"
+import getConfig from "./config"
+
+let nearConfig = getConfig(process.env.NODE_ENV || "development")
+
+async function doInitContract() {
+  window.near = await nearlib.connect(Object.assign(nearConfig, { deps: { keyStore: new nearlib.keyStores.BrowserLocalStorageKeyStore() }}));
+  window.walletAccount = new nearlib.WalletAccount(window.near);
+
+  // Getting the Account ID. If unauthorized yet, it's just empty string.
+  window.accountId = window.walletAccount.getAccountId();
+  
+  // Initializing our contract APIs by contract name and configuration.
+    // NOTE: This configuration only needed while NEAR is still in development
+  window.contract = await near.loadContract(nearConfig.contractName, {
+    // View methods are read only. They don't modify the state, but usually return some value. 
+    viewMethods: ["getCurrentGame", "getGame", "getRecentGames"],
+    // Change methods can modify the state. But you don't receive the returned value when called.
+    changeMethods: ["createOrJoinGame", "makeMove", "giveUpCurrentGame"],
+    // Sender is the account ID to initialize transactions.
+    sender: window.accountId,
+  });
+
+  // Once everything is ready, we can start using contract
+  return doWork();
+}
+
+// Using initialized contract
+async function doWork() {
+  // Based on whether you've authorized, checking which flow we should go.
+  if (!window.walletAccount.isSignedIn()) {
+    signedOutFlow();
+  } else {
+    signedInFlow();
+  }
+}
+
+// Function that initializes the signIn button using WalletAccount 
+function signedOutFlow() {
+  // Displaying the signed out flow elements.
+  $('.signed-out-flow').removeClass('d-none');
+  // Adding an event to a sing-in button.
+  $('#sign-in-button').click(() => {
+    window.walletAccount.requestSignIn(
+      // The contract name that would be authorized to be called by the user's account.
+      nearConfig.contractName,
+      // This is the app name. It can be anything.
+      'NEAR Chess',
+      // We can also provide URLs to redirect on success and failure.
+      // The current URL is used by default.
+    );
+  });
+}
+
+// Main function for the signed-in flow (already authorized by the wallet).
+function signedInFlow() {
+  // Displaying the signed in flow elements.
+  $('.signed-in-flow').removeClass('d-none');
+
+  // Displaying current account name.
+  document.getElementById('account-id').innerText = window.accountId;
+
+  document.querySelector('.new-game').addEventListener('click', () => {
+    newGame().catch(console.error); 
+  });
+
+  document.querySelector('.give-up').addEventListener('click', () => {
+    giveUp().catch(console.error);
+  });
+
+  document.querySelector('.get-recent-games').addEventListener('click', () => {
+    loadRecentGames().catch(console.error);
+  });
+
+  document.getElementById('sign-out-button').addEventListener('click', () => {
+    walletAccount.signOut();
+    // Forcing redirect.
+    window.location.replace(window.location.origin + window.location.pathname);
+  });
+
+  loadGame().catch(console.error);
+  loadRecentGames().catch(console.error);
+
+}
+
+async function loadRecentGames() {
+  let recentGames = await window.contract.getRecentGames();
+  $("#recent-games").empty();
+  recentGames.forEach(game => {
+    let gameEl = $(`<a href="javascript:loadGame('${game.id}')" class="link-unstyled"><div class="small-game row">
+        <div class="board col-sm-5"></div>
+        <div class="game-info col-sm">
+          <h4 class="player-top">${game.game.player1}</h4>
+          <h4 class="player-bottom">${game.game.player2 || "Waiting for player to join..."}</h4>
+        </div>
+    </div></a>`);
+    $("#recent-games").append(gameEl);
+    let board = ChessBoard(gameEl.find(".board")[0], {
+      pieceTheme: 'http://chessboardjs.com/img/chesspieces/alpha/{piece}.png',
+      showNotation: false
+    });
+    board.position(game.game.fen, false);
+    // TODO: Is this detached when element removed?
+    $(window).resize(board.resize);
+  });
+}
+
+let serverGame;
+let currentGameId;
+let playerSide;
+async function loadGame(gameId) {
+  if (gameId) {
+    currentGameId = gameId;
+  } else if (!currentGameId) {
+    currentGameId = await window.contract.getCurrentGame({player: window.accountId});
+  }
+  if (!currentGameId) {
+    return;
+  }
+
+  console.log("currentGameId", currentGameId);
+  serverGame = await window.contract.getGame({gameId: currentGameId});
+  console.log("game", serverGame);
+  playerSide = null;
+  if (serverGame.player1 == window.accountId) {
+    playerSide = "w";
+  }
+  if (serverGame.player2 == window.accountId) {
+    playerSide = "b";
+  }
+  updateServerStatus();
+
+  if (game.fen() != serverGame.fen) {
+    game.load(serverGame.fen);
+    updateBoard();
+  }
+
+  if ((game.turn() != playerSide || !serverGame.player2) && serverGame.outcome == null) {
+    setTimeout(() => loadGame().catch(console.error), 3000);
+  }
+}
+
+async function newGame() {
+  await window.contract.createOrJoinGame();
+  loadRecentGames().catch(console.error);
+  currentGameId = 0;
+  await loadGame();
+}
+
+async function giveUp() {
+  await window.contract.giveUpCurrentGame();
+  await loadGame();
+}
+
+let board;
+let game = new Chess();
+game.clear();
+
+// do not pick up pieces if the game is over
+// only pick up pieces for the side to move
+var onDragStart = function(source, piece, position, orientation) {
+  if (game.game_over() === true ||
+      (game.turn() === 'w' && piece.search(/^b/) !== -1) ||
+      (game.turn() === 'b' && piece.search(/^w/) !== -1) ||
+      !playerSide || playerSide != game.turn()) {
+    return false;
+  }
+};
+
+var onDrop = function(source, target) {
+  if (!serverGame || !serverGame.player2 || serverGame.outcome != null) {
+    return "snapback";
+  }
+  // see if the move is legal
+  var move = game.move({
+    from: source,
+    to: target,
+    promotion: 'q' // NOTE: always promote to a queen for example simplicity
+  });
+
+  // illegal move
+  if (move === null) return 'snapback';
+
+  updateStatus();
+
+  // Make move on chain
+  window.contract.makeMove({gameId: currentGameId, fen: game.fen()}).finally(loadGame);
+};
+
+// update the board position after the piece snap 
+// for castling, en passant, pawn promotion
+var onSnapEnd = function() {
+  board.position(game.fen());
+};
+
+function updateBoard() {
+  board.position(game.fen());
+  updateStatus();
+}
+
+function getStatusText() {
+  let moveColor = game.turn() === 'b' ? 'Black' : 'White';
+
+  // checkmate?
+  if (game.in_checkmate() === true) {
+    return 'Game over, ' + moveColor + ' is in checkmate.';
+  }
+
+  // draw?
+  else if (game.in_draw() === true) {
+    return 'Game over, drawn position';
+  }
+
+  // game still on
+  else {
+    let status = moveColor + ' to move';
+
+    // check?
+    if (game.in_check() === true) {
+      return status + ', ' + moveColor + ' is in check';
+    }
+
+    return status;
+  }
+
+  return '';
+} 
+ 
+function updateStatus() {
+  $('.status').removeClass('d-none');
+  $('.status').text(getStatusText());
+  updateServerStatus();
+}
+
+function getServerStatus() {
+  if (!serverGame || !serverGame.player2) {
+    return 'Waiting for player to join...';
+  }
+  if (serverGame.outcome != null) {
+    return serverGame.outcome;
+  }
+  if (!(playerSide == "w" || playerSide == "b")) {
+    return `Watching ${serverGame.player1} vs ${serverGame.player2}`;
+  }
+  if (playerSide == "w") {
+    return `Playing as white against ${serverGame.player2}`;
+  } else {
+    return `Playing as black against ${serverGame.player1}`;
+  }
+}
+
+function updateServerStatus() {
+  $('.server-status').removeClass('d-none');
+  $('.server-status').html(getServerStatus());
+}
+
+var cfg = {
+  pieceTheme: 'http://chessboardjs.com/img/chesspieces/alpha/{piece}.png',
+  draggable: true,
+  onDragStart: onDragStart,
+  onDrop: onDrop,
+  onSnapEnd: onSnapEnd
+};
+board = ChessBoard('board', cfg);
+
+updateStatus();
+
+// COMMON CODE BELOW:
+// Loads nearlib and this contract into window scope.
+
+window.nearInitPromise = doInitContract().catch(console.error);
+
+'''
+'''--- src/test.html ---
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" type="text/css" href="https://cdnjs.cloudflare.com/ajax/libs/jasmine/3.3.0/jasmine.css">
+  <script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/jasmine/3.3.0/jasmine.js"></script>
+  <script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/jasmine/3.3.0/jasmine-html.js"></script>
+  <script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/jasmine/3.3.0/boot.js"></script>
+</head>
+<body style="background: #fff">
+  <script src="https://cdn.jsdelivr.net/npm/nearlib@0.3.3/dist/nearlib.js"></script>
+  <script src="./test.js"></script>
+</body>
+</html>
+
+'''
+'''--- src/test.js ---
+describe("Authorizer", function() {
+    let near;
+    let contract;
+    let alice;
+
+    jasmine.DEFAULT_TIMEOUT_INTERVAL = 10000;
+
+    // Common setup below
+    beforeAll(async function() {
+      near = await nearlib.connect(nearConfig);
+      alice = nearConfig.contractName;
+      contract = await near.loadContract(nearConfig.contractName, {
+        // NOTE: This configuration only needed while NEAR is still in development
+        // View methods are read only. They don't modify the state, but usually return some value. 
+        viewMethods: ["getCurrentGame", "getGame", "getRecentGames"],
+        // Change methods can modify the state. But you don't receive the returned value when called.
+        changeMethods: ["createOrJoinGame", "makeMove", "giveUpCurrentGame"],
+        sender: alice
+      });
+    });
+
+    // Multiple tests can be described below. Search Jasmine JS for documentation.
+    describe("simple", function() {
+      beforeAll(async function() {
+        // There can be some common setup for each test.
+      });
+
+      it("creates a game that shows up as expected in recent games", async function() {
+        await contract.createOrJoinGame();
+        const recentGames = await contract.getRecentGames();
+        console.log("aloha recentGames", recentGames);
+        expect(recentGames.length).toBe(1);
+        expect(recentGames[0]['game']['player1']).toBe(nearConfig.contractName);
+      });
+    });
+});
+
+'''

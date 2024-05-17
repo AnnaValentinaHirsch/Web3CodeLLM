@@ -1,0 +1,478 @@
+*GitHub Repository "Kerite/Amm-Demo"*
+
+'''--- Cargo.toml ---
+[package]
+name = "rust-counter-tutorial"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "4.0.0"
+near-contract-standards = "4.0.0"
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+# Opt into extra safety checks on arithmetic operations https://stackoverflow.com/a/64136471/249801
+overflow-checks = true
+
+'''
+'''--- README.md ---
+```shell
+near view kerite.testnet get_balance_a
+near view kerite.testnet get_balance_b
+
+near call test-token-a.testnet storage_deposit --accountId kerite.testnet --amount 0.00125
+near call test-token-a.testnet ft_transfer '{"receiver_id": "kerite.testnet", "amount": "200"}' --accountId test-token-a.testnet --depositYocto 1
+near call kerite.testnet add_liquidity '{"token": "test-token-a.testnet", "amount_in": 200}' --accountId keriteal.testnet
+
+near call test-token-b.testnet storage_deposit --accountId kerite.testnet --amount 0.00125
+near call test-token-b.testnet ft_transfer '{"receiver_id": "kerite.testnet", "amount": "2000"}' --accountId test-token-b.testnet --depositYocto 1
+near call kerite.testnet add_liquidity '{"token": "test-token-b.testnet", "amount_in": 2000}' --accountId keriteal.testnet
+
+near call test-token-a.testnet storage_deposit --accountId user-test-amm-1.testnet --amount 0.00125
+near call test-token-b.testnet storage_deposit --accountId user-test-amm-1.testnet --amount 0.00125
+
+near call test-token-b.testnet ft_transfer '{"receiver_id": "kerite.testnet", "amount": "40"}' --accountId test-token-b.testnet --depositYocto 1
+near call kerite.testnet swap '{"token_in": "test-token-b.testnet", "amount_in": 40}' --accountId user-test-amm-1.testnet --depositYocto 1
+```
+
+'''
+'''--- src/ft.rs ---
+/*!
+Fungible Token implementation with JSON serialization.
+NOTES:
+  - The maximum balance value is limited by U128 (2**128 - 1).
+  - JSON calls should pass U128 as a base-10 string. E.g. "100".
+  - The contract optimizes the inner trie structure by hashing account IDs. It will prevent some
+    abuse of deep tries. Shouldn't be an issue, once NEAR clients implement full hashing of keys.
+  - The contract tracks the change in storage before and after the call. If the storage increases,
+    the contract requires the caller of the contract to attach enough deposit to the function call
+    to cover the storage cost.
+    This is done to prevent a denial of service attack on the contract by taking all available storage.
+    If the storage decreases, the contract will issue a refund for the cost of the released storage.
+    The unused tokens from the attached deposit are also refunded, so it's safe to
+    attach more deposit than required.
+  - To prevent the deployed contract from being modified or deleted, it should not have any access
+    keys on its account.
+*/
+use near_contract_standards::fungible_token::metadata::{
+    FungibleTokenMetadata, FungibleTokenMetadataProvider, FT_METADATA_SPEC,
+};
+use near_contract_standards::fungible_token::FungibleToken;
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::LazyOption;
+use near_sdk::json_types::U128;
+use near_sdk::{env, log, near_bindgen, AccountId, Balance, PanicOnDefault, PromiseOrValue};
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct FtContract {
+    token: FungibleToken,
+    metadata: LazyOption<FungibleTokenMetadata>,
+}
+
+const DATA_IMAGE_SVG_NEAR_ICON: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 288 288'%3E%3Cg id='l' data-name='l'%3E%3Cpath d='M187.58,79.81l-30.1,44.69a3.2,3.2,0,0,0,4.75,4.2L191.86,103a1.2,1.2,0,0,1,2,.91v80.46a1.2,1.2,0,0,1-2.12.77L102.18,77.93A15.35,15.35,0,0,0,90.47,72.5H87.34A15.34,15.34,0,0,0,72,87.84V201.16A15.34,15.34,0,0,0,87.34,216.5h0a15.35,15.35,0,0,0,13.08-7.31l30.1-44.69a3.2,3.2,0,0,0-4.75-4.2L96.14,186a1.2,1.2,0,0,1-2-.91V104.61a1.2,1.2,0,0,1,2.12-.77l89.55,107.23a15.35,15.35,0,0,0,11.71,5.43h3.13A15.34,15.34,0,0,0,216,201.16V87.84A15.34,15.34,0,0,0,200.66,72.5h0A15.35,15.35,0,0,0,187.58,79.81Z'/%3E%3C/g%3E%3C/svg%3E";
+
+impl FtContract {
+    /// Initializes the contract with the given total supply owned by the given `owner_id` with
+    /// default metadata (for example purposes only).
+    pub fn new_default_meta(owner_id: AccountId, total_supply: U128) -> Self {
+        Self::new(
+            owner_id,
+            total_supply,
+            FungibleTokenMetadata {
+                spec: FT_METADATA_SPEC.to_string(),
+                name: "Example NEAR fungible token".to_string(),
+                symbol: "TESTA".to_string(),
+                icon: Some(DATA_IMAGE_SVG_NEAR_ICON.to_string()),
+                reference: None,
+                reference_hash: None,
+                decimals: 24,
+            },
+        )
+    }
+
+    /// Initializes the contract with the given total supply owned by the given `owner_id` with
+    /// the given fungible token metadata.
+    pub fn new(owner_id: AccountId, total_supply: U128, metadata: FungibleTokenMetadata) -> Self {
+        assert!(!env::state_exists(), "Already initialized");
+        metadata.assert_valid();
+        let mut this = Self {
+            token: FungibleToken::new(b"a".to_vec()),
+            metadata: LazyOption::new(b"m".to_vec(), Some(&metadata)),
+        };
+        this.token.internal_register_account(&owner_id);
+        this.token.internal_deposit(&owner_id, total_supply.into());
+        near_contract_standards::fungible_token::events::FtMint {
+            owner_id: &owner_id,
+            amount: &total_supply,
+            memo: Some("Initial tokens supply is minted"),
+        }
+        .emit();
+        this
+    }
+
+    fn on_account_closed(&mut self, account_id: AccountId, balance: Balance) {
+        log!("Closed @{} with {}", account_id, balance);
+    }
+
+    fn on_tokens_burned(&mut self, account_id: AccountId, amount: Balance) {
+        log!("Account @{} burned {}", account_id, amount);
+    }
+}
+
+near_contract_standards::impl_fungible_token_core!(FtContract, token, on_tokens_burned);
+near_contract_standards::impl_fungible_token_storage!(FtContract, token, on_account_closed);
+
+impl FungibleTokenMetadataProvider for FtContract {
+    fn ft_metadata(&self) -> FungibleTokenMetadata {
+        self.metadata.get().unwrap()
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod ft_tests {
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::MockedBlockchain;
+    use near_sdk::{testing_env, Balance};
+
+    use super::*;
+
+    const TOTAL_SUPPLY: Balance = 1_000_000_000_000_000;
+
+    fn get_context(predecessor_account_id: AccountId) -> VMContextBuilder {
+        let mut builder = VMContextBuilder::new();
+        builder
+            .current_account_id(accounts(0))
+            .signer_account_id(predecessor_account_id.clone())
+            .predecessor_account_id(predecessor_account_id);
+        builder
+    }
+
+    #[test]
+    fn test_new() {
+        let mut context = get_context(accounts(1));
+        testing_env!(context.build());
+        let contract = FtContract::new_default_meta(accounts(1).into(), TOTAL_SUPPLY.into());
+        testing_env!(context.is_view(true).build());
+        assert_eq!(contract.ft_total_supply().0, TOTAL_SUPPLY);
+        assert_eq!(contract.ft_balance_of(accounts(1)).0, TOTAL_SUPPLY);
+    }
+
+    #[test]
+    fn test_transfer() {
+        let mut context = get_context(accounts(2));
+        testing_env!(context.build());
+        let mut contract = FtContract::new_default_meta(accounts(2).into(), TOTAL_SUPPLY.into());
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .attached_deposit(contract.storage_balance_bounds().min.into())
+            .predecessor_account_id(accounts(1))
+            .build());
+        // Paying for account registration, aka storage deposit
+        contract.storage_deposit(None, None);
+
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .attached_deposit(1)
+            .predecessor_account_id(accounts(2))
+            .build());
+        let transfer_amount = TOTAL_SUPPLY / 3;
+        contract.ft_transfer(accounts(1), transfer_amount.into(), None);
+
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .account_balance(env::account_balance())
+            .is_view(true)
+            .attached_deposit(0)
+            .build());
+        assert_eq!(
+            contract.ft_balance_of(accounts(2)).0,
+            (TOTAL_SUPPLY - transfer_amount)
+        );
+        assert_eq!(contract.ft_balance_of(accounts(1)).0, transfer_amount);
+    }
+}
+
+'''
+'''--- src/lib.rs ---
+pub mod ft;
+
+use ft::FtContract;
+use std::default;
+
+use near_contract_standards::fungible_token::core::ext_ft_core;
+use near_contract_standards::fungible_token::receiver::FungibleTokenReceiver;
+use near_contract_standards::fungible_token::resolver::ext_ft_resolver;
+use near_contract_standards::fungible_token::{
+    core::FungibleTokenCore, metadata::FungibleTokenMetadata, FungibleToken,
+};
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::json_types::U128;
+use near_sdk::{
+    env, ext_contract, log, near_bindgen, require, AccountId, PanicOnDefault, Promise,
+    PromiseResult,
+};
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct AmmDemo {
+    token_a: AccountId,
+    token_b: AccountId,
+    owner: AccountId,
+    balance_a: u128,
+    balance_b: u128,
+}
+
+#[near_bindgen]
+impl AmmDemo {
+    #[init]
+    pub fn new(owner_id: AccountId, token_a: AccountId, token_b: AccountId) -> Self {
+        Self {
+            token_a,
+            token_b,
+            owner: owner_id,
+            balance_a: 0,
+            balance_b: 0,
+        }
+    }
+
+    #[payable]
+    pub fn swap(&mut self, token_in: AccountId, amount_in: u128) -> Promise {
+        // ext_ft_core::ext(env::current_account_id()).ft_transfer(
+        //     env::signer_account_id(),
+        //     U128(amount_in),
+        //     Some("uniswap out".to_string()),
+        // );
+
+        require!(
+            token_in == self.token_a || token_in == self.token_b,
+            "TOKEN_NOT_SUPPORTED"
+        );
+
+        let (balance_in, balance_out) = if token_in == self.token_a {
+            (self.balance_a, self.balance_b)
+        } else {
+            (self.balance_b, self.balance_a)
+        };
+        let token_out = if token_in == self.token_a {
+            self.token_b.clone()
+        } else {
+            self.token_a.clone()
+        };
+        // let caller = env::signer_account_id();
+        // let contract_account_id = env::current_account_id();
+        require!(amount_in < balance_in, "INSUFFICIENT_OUTPUT_AMOUNT");
+        // if amount_a_out > 0 {
+        //     safe_transfer(self.token_a.clone(), caller.clone(), amount_a_out);
+        // }
+        // if amount_b_out > 0 {
+        //     safe_transfer(self.token_b.clone(), caller.clone(), amount_b_out);
+        // }
+
+        let invariant = self.balance_a * self.balance_b;
+        let new_balance_in = balance_in + amount_in;
+        let new_balance_out = invariant / new_balance_in;
+
+        let amount_out = balance_out - new_balance_out;
+
+        if token_in == self.token_a {
+            self.balance_a = new_balance_in;
+            self.balance_b = new_balance_out;
+            log!(
+                "Swap {} token A to {} token B, Invariant is {}",
+                amount_in,
+                amount_out,
+                invariant
+            );
+            ext_ft_core::ext(self.token_b.clone())
+                .with_attached_deposit(1)
+                .ft_transfer(
+                    env::signer_account_id(),
+                    U128(amount_out),
+                    Some("uniswap out".to_string()),
+                )
+        } else {
+            self.balance_a = new_balance_out;
+            self.balance_b = new_balance_in;
+            log!(
+                "Swap {} token B to {} token A, Invariant is {}",
+                amount_in,
+                amount_out,
+                invariant
+            );
+            ext_ft_core::ext(self.token_b.clone())
+                .with_attached_deposit(1)
+                .ft_transfer(
+                    env::signer_account_id(),
+                    U128(amount_out),
+                    Some("uniswap out".to_string()),
+                )
+        }
+    }
+
+    #[payable]
+    pub fn add_liquidity(&mut self, token: AccountId, amount_in: u128) {
+        require!(
+            env::predecessor_account_id() == self.owner,
+            "NOT_CONTRACT_OWNER"
+        );
+        require!(
+            token == self.token_a || token == self.token_b,
+            "TOKEN_NOT_SUPPORTED"
+        );
+        if token == self.token_a {
+            self.balance_a += amount_in;
+            log!("Added {} token A", amount_in);
+        } else {
+            self.balance_b += amount_in;
+            log!("Added {} token B", amount_in);
+        }
+    }
+
+    pub fn get_balance_a(&self) -> u128 {
+        self.balance_a
+    }
+
+    pub fn get_balance_b(&self) -> u128 {
+        self.balance_b
+    }
+
+    pub fn get_token_a(&self) -> AccountId {
+        self.token_a.clone()
+    }
+
+    pub fn get_token_b(&self) -> AccountId {
+        self.token_b.clone()
+    }
+
+    pub fn get_invariant(&self) -> u128 {
+        self.balance_a * self.balance_b
+    }
+}
+
+impl FungibleTokenReceiver for AmmDemo {
+    fn ft_on_transfer(
+        &mut self,
+        sender_id: AccountId,
+        amount: U128,
+        msg: String,
+    ) -> near_sdk::PromiseOrValue<U128> {
+        log!(
+            "Received {:?} tokens {} from {}, message is {}",
+            amount,
+            env::predecessor_account_id(),
+            sender_id,
+            msg
+        );
+        if sender_id == self.owner {
+            if self.token_a == env::predecessor_account_id() {
+                self.balance_a += amount.0;
+                near_sdk::PromiseOrValue::Value(U128::from(0))
+            } else if self.token_b == env::predecessor_account_id() {
+                self.balance_b += amount.0;
+                near_sdk::PromiseOrValue::Value(U128::from(0))
+            } else {
+                near_sdk::PromiseOrValue::Value(amount)
+            }
+        } else {
+            near_sdk::PromiseOrValue::Value(amount)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use near_sdk::serde_json::from_str;
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::{testing_env, VMContext};
+    use near_sdk::{AccountId, Gas, MockedBlockchain, PublicKey};
+
+    #[test]
+    fn test_swap() {
+        let mut context = VMContextBuilder::new();
+        context.predecessor_account_id(accounts(0));
+        testing_env!(context.build());
+
+        let amm_owner_id = accounts(0);
+        let token_a_account = accounts(1);
+        let token_b_account = accounts(2);
+        let amm_contract_id = accounts(3);
+
+        // Deploying Token A
+        testing_env!(context
+            .current_account_id(token_a_account.clone())
+            .signer_account_id(amm_owner_id.clone())
+            .predecessor_account_id(amm_owner_id.clone())
+            .build());
+        let mut token_a_contract = FtContract::new(
+            accounts(0),
+            U128::from(1000000000000000),
+            FungibleTokenMetadata {
+                spec: "ft-1.0.0".to_string(),
+                name: "Test Token A".to_string(),
+                symbol: "TESTA".to_string(),
+                icon: None,
+                reference: None,
+                reference_hash: None,
+                decimals: 8,
+            },
+        );
+
+        // Deploying Token B
+        testing_env!(context
+            .current_account_id(token_b_account.clone())
+            .signer_account_id(amm_owner_id.clone())
+            .predecessor_account_id(amm_owner_id.clone())
+            .build());
+        let mut token_a_contract = FtContract::new(
+            accounts(0),
+            U128::from(1000000000000000),
+            FungibleTokenMetadata {
+                spec: "ft-1.0.0".to_string(),
+                name: "Test Token B".to_string(),
+                symbol: "TESTB".to_string(),
+                icon: None,
+                reference: None,
+                reference_hash: None,
+                decimals: 8,
+            },
+        );
+
+        // Deploying SwapContract
+        testing_env!(context
+            .current_account_id(amm_contract_id.clone())
+            .signer_account_id(amm_owner_id.clone())
+            .predecessor_account_id(amm_owner_id.clone())
+            .build());
+        let mut demo_contract = AmmDemo::new(
+            amm_owner_id.clone(),
+            token_a_account.clone(),
+            token_b_account.clone(),
+        );
+
+        let init_amount_a = demo_contract.balance_a;
+        let init_amount_b = demo_contract.balance_b;
+        demo_contract.add_liquidity(token_a_account, 2000);
+        demo_contract.add_liquidity(token_b_account, 4000);
+        assert_eq!(init_amount_a + 2000, demo_contract.get_balance_a());
+        assert_eq!(init_amount_b + 4000, demo_contract.get_balance_b());
+        assert_eq!(
+            demo_contract.get_invariant(),
+            (init_amount_a + demo_contract.get_balance_a())
+                * (init_amount_b + demo_contract.get_balance_b())
+        );
+    }
+}
+
+'''

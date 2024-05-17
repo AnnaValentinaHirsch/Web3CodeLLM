@@ -1,0 +1,1807 @@
+*GitHub Repository "idos-network/idos-extensions"*
+
+'''--- README.md ---
+# idOS Kwil extensions
+
+This is a Kwil extension that exposes idOS smart contract functions (external view/pure) on various blockchains to Kwil.
+
+Developers can call those functions in Kuneiform.
+
+### Kuneiform Interface
+
+The extension has two methods:
+
+- `get_block_height() returns (int)`: Returns the most recent block height for the chain it is listening to.
+- `has_grants(grantee_address, credential_id) returns (int)`: Returns whether or not a wallet has grants allowing it to access the credential id.  Returns a 1 if they have grants, or a 0 if they do not.
+
+_For convenience, Kwil v0.5 added support for raising errors in an extension as a way of canceling action execution.  This extension can update the `has_grants` method to make this more consumable within Kuneiform._
+
+### Supported Blockchains
+
+This extension currently supports:
+
+- Ethereum mainnet
+- NEAR mainnet
+
+### Configuration
+
+The IDOS extension requires two configuration variables: `ETH_RPC_URL` and `NEAR_RPC_URL`.  They need to be provided at startup.
+
+```bash
+export ETH_RPC_URL=xxx
+export NEAR_RPC_URL=xxx
+```
+By default, `ETH_RPC_URL` is `http://127.0.0.1:8545/`. If you're using macOS and want to connect the chain running in your host machine (i.e. hardhat running locally in development environment), you should use `http://host.docker.internal:8545/` instead to access host machine port from the container.
+
+### Initialization
+
+When initializing the IDOS extension (in a Kuneiform schema), the database deployer needs to provide a contract address.  All extensions must also provide an alias for which the newly initialized extension can be referenced.  For example:
+
+```SQL
+database idos_db;
+
+use idos {
+    registry_address: "0xcd321d2211918124F24971604fCfA9f22370e46f",
+    chain: "eth"
+} as grants_eth;
+```
+
+In the above example, we are initializing the extension `idos` to the contract address `0xcd321d2211918124F24971604fCfA9f22370e46f` on NEAR, and aliasing the initialized extension as `grants_eth`.  The extension can now be used within an action block:
+
+```SQL
+action get_credential ($id) public {
+    $can_access = grants_eth.has_grants(@caller, $id);
+    SELECT CASE WHEN $can_access != 1
+    THEN ERROR('caller does not have access') END;
+
+    SELECT content
+    FROM credentials
+    WHERE id = $id;
+}
+```
+
+The above query will prevent a caller from executing the SELECT query if they do not have grant(s) for the credential id.  This example can be found in the [test schema](./schemas/idos.kf).
+
+The extensions should work for any Solidity smart contract that fulfills the following interface:
+
+```TS
+interface IKwilWhitelist {
+    struct Grant {
+      address owner;
+      address grantee;
+      string dataId;
+      uint256 lockedUntil;
+    }
+
+    function grants_for(address grantee, string dataId)
+        public view
+        returns(Grant[] memory)
+}
+```
+
+The extension can also be initialized to several chains at the same time:
+
+```SQL
+database idos_db;
+
+use idos {
+    registry_address: "0xcd321d2211918124F24971604fCfA9f22370e46f",
+    chain: "eth"
+} as grants_eth;
+
+use idos {
+    registry_address: "0xcd321d2211918124F24971604fCfA9f22370e46f",
+    chain: "near"
+} as grants_near;
+```
+
+## Run
+If non-existing in `docker network list`, create a network to allow other containers to connect to extension via bridge mode: `docker network create kwil-dev`
+
+```bash
+# run with go
+go run go/main.go
+
+# or docker
+make docker
+# configure using docker-compose.yml
+docker compose up -d
+```
+
+## Building
+
+The [makefile](<./makefile>) contains functionalities for building Docker images.
+
+### Build Local Architecture
+
+For local tesing, you only need to build for your local architecture.  To do this, run:
+
+```bash
+make docker
+```
+
+### Build Multi-Architecture
+
+When building for public usage, it's important that you build for all architectures you plan to support. For more info on this, see [this helpful blog](<https://www.thorsten-hans.com/how-to-build-multi-arch-docker-images-with-ease/>).
+
+To build for linux amd64 and linux arm64, run:
+
+```bash
+make docker-multi-arch
+```
+
+To build multi-arch and push it to Dockerhub, run:
+
+```bash
+make docker-multi-arch PUSH=1
+```
+
+'''
+'''--- docker-compose.yml ---
+version: '3'
+services:
+  idos-extension:
+    build:
+      context: ./go
+    ports:
+      - 50055:50055
+    restart: on-failure
+
+networks:
+  default:
+    name: kwil-dev
+    external: true
+
+'''
+'''--- go/extension/chains.go ---
+package extension
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/idos-network/idos-extensions/extension/chains"
+	"github.com/idos-network/idos-extensions/extension/chains/ethereum"
+	"github.com/idos-network/idos-extensions/extension/chains/near"
+)
+
+func startChainBackend(chain, url string) (chains.ChainBackend, error) {
+	be, err := newChainBackend(chain, url)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	height, err := be.Height(ctx)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("unable to get height of chain %v: %w", chain, err)
+	}
+	fmt.Printf("Started chain %v at height %v\n", chain, height)
+	return be, nil
+}
+
+func newChainBackend(chain, url string) (chains.ChainBackend, error) {
+	switch chain {
+	case "eth":
+		return ethereum.New(url)
+	case "arbitrum":
+		return ethereum.New(url)
+	case "near":
+		return near.New(url)
+	default:
+		return nil, errors.New("unsupported chain")
+	}
+}
+
+'''
+'''--- go/extension/chains/common.go ---
+package chains
+
+import (
+	"context"
+	"time"
+)
+
+func LockedGrantsFor(gc GrantChecker, ctx context.Context, registry, owner, resource string) ([]*Grant, error) {
+	now := uint64(time.Now().Unix())
+	anyAddress := "0x0000000000000000000000000000000000000000"
+
+	allGrants, err := gc.FindGrants(ctx, registry, owner, anyAddress, resource)
+	if err != nil {
+		return nil, err
+	}
+	if len(allGrants) < 1 {
+		return allGrants, nil
+	}
+
+	result := make([]*Grant, 0, len(allGrants))
+	for _, g := range allGrants {
+		if g.LockedUntil > now {
+			result = append(result, g)
+		}
+	}
+
+	return result, nil
+}
+
+'''
+'''--- go/extension/chains/common_test.go ---
+package chains
+
+import (
+	"context"
+	"fmt"
+	"testing"
+	"time"
+)
+
+type stubGrantChecker struct {
+	timelockDeltasFromNow *[]int64
+}
+
+func (sc *stubGrantChecker) GrantsFor(_ctx context.Context, registry, addr, resource string) ([]*Grant, error) {
+	now := uint64(time.Now().Unix())
+
+	result := make([]*Grant, 0, len(*sc.timelockDeltasFromNow))
+
+	for _, delta := range *sc.timelockDeltasFromNow {
+		result = append(result, &Grant{
+			Owner:       "fake owner",
+			LockedUntil: uint64(int64(now) + delta),
+			Grantee:     "fake grantee",
+			DataID:      "fake data_id",
+		})
+	}
+	return result, nil
+}
+
+func Test_LockedGrantsFor(t *testing.T) {
+	tests := []struct {
+		timelockDeltasFromNow []int64
+		wantedLen             int
+	}{
+		{
+			[]int64{},
+			0,
+		},
+		{
+			[]int64{10},
+			1,
+		},
+		{
+			[]int64{10, 20},
+			2,
+		},
+		{
+			[]int64{-10},
+			0,
+		},
+		{
+			[]int64{-10, 10},
+			1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%+v", tt), func(t *testing.T) {
+			mockGrantChecker := &stubGrantChecker{timelockDeltasFromNow: &tt.timelockDeltasFromNow}
+			if res, _ := LockedGrantsFor(mockGrantChecker, nil, "irrelevant", "irrelevant", "irrelevant"); len(res) != tt.wantedLen {
+				t.Errorf("LockedGrantsFor() = %+v, wanted len %v", res, tt.wantedLen)
+			}
+		})
+	}
+
+}
+
+'''
+'''--- go/extension/chains/ethereum/ethereum.go ---
+package ethereum
+
+import (
+	"context"
+	"fmt"
+	"regexp"
+
+	"github.com/idos-network/idos-extensions/extension/chains"
+	"github.com/idos-network/idos-extensions/extension/chains/ethereum/registry"
+
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/ethclient"
+)
+
+// Backend is the Ethereum implementation of a chains.ChainBackend for the
+// Fractal extension.
+type Backend struct {
+	cl *ethclient.Client
+}
+
+// New creates a new Ethereum backend using the provided RPC URL.
+func New(url string) (*Backend, error) {
+	client, err := ethclient.Dial(url)
+	if err != nil {
+		return nil, fmt.Errorf("dial rpc failed: %w", err)
+	}
+	return &Backend{client}, nil
+}
+
+func (b *Backend) Height(ctx context.Context) (uint64, error) {
+	return b.cl.BlockNumber(ctx)
+}
+
+func (b *Backend) GrantsFor(ctx context.Context, contract, addr, resource string) ([]*chains.Grant, error) {
+	if !common.IsHexAddress(contract) {
+		return nil, nil
+	}
+	if !common.IsHexAddress(addr) {
+		return nil, nil
+	}
+
+	reg, err := registry.NewRegistryCaller(common.HexToAddress(contract), b.cl)
+	if err != nil {
+		return nil, fmt.Errorf("create registry failed: %w", err)
+	}
+	grantList, err := reg.GrantsFor(&bind.CallOpts{
+		Context: ctx,
+	}, common.HexToAddress(addr), resource)
+	if err != nil {
+		return nil, fmt.Errorf("get grants for failed: %w", err)
+	}
+
+	grants := make([]*chains.Grant, len(grantList))
+	for i := range grantList {
+		gIn := &grantList[i]
+		grants[i] = &chains.Grant{
+			Owner:       gIn.Owner.Hex(),
+			LockedUntil: gIn.LockedUntil.Uint64(),
+			Grantee:     gIn.Grantee.Hex(),
+			DataID:      gIn.DataId,
+		}
+	}
+
+	return grants, nil
+}
+
+func (b *Backend) FindGrants(ctx context.Context, contract, owner, grantee, resource string) ([]*chains.Grant, error) {
+	if !common.IsHexAddress(contract) {
+		return nil, nil
+	}
+	if !common.IsHexAddress(owner) {
+		return nil, nil
+	}
+	if !common.IsHexAddress(grantee) {
+		return nil, nil
+	}
+
+	reg, err := registry.NewRegistryCaller(common.HexToAddress(contract), b.cl)
+	if err != nil {
+		return nil, fmt.Errorf("create registry failed: %w", err)
+	}
+	grantList, err := reg.FindGrants(&bind.CallOpts{Context: ctx}, common.HexToAddress(owner), common.HexToAddress(grantee), resource)
+	if err != nil {
+		return nil, fmt.Errorf("finding grants failed: %w", err)
+	}
+	grants := make([]*chains.Grant, len(grantList))
+	for i := range grantList {
+		gIn := &grantList[i]
+		grants[i] = &chains.Grant{
+			Owner:       gIn.Owner.Hex(),
+			LockedUntil: gIn.LockedUntil.Uint64(),
+			Grantee:     gIn.Grantee.Hex(),
+			DataID:      gIn.DataId,
+		}
+	}
+
+	return grants, nil
+}
+
+var publicKeyRegex = regexp.MustCompile("^(:?0x)?[0-9a-fA-F]{130}$")
+
+// Extracted this to be able to test without having to create an RPC connection.
+func isValidPublicKey(publicKey string) bool {
+	return publicKeyRegex.MatchString(publicKey)
+}
+
+func (b *Backend) IsValidPublicKey(publicKey string) bool {
+	return isValidPublicKey(publicKey)
+}
+
+'''
+'''--- go/extension/chains/ethereum/ethereum_test.go ---
+package ethereum
+
+import (
+	"testing"
+)
+
+func Test_isValidPublicKey(t *testing.T) {
+	tests := []struct {
+		publicKey string
+		want      bool
+	}{
+		{
+			"",
+			false,
+		},
+		{
+			"some random string",
+			false,
+		},
+		{
+			// Address; not a public key
+			"0x9E660ba85118b722147BBaf04ED697C95549dF03",
+			false,
+		},
+		{
+			"0408cf359417716c8c4dd03ab0c3b243b383599cb05c1b276b326c92a8f4b2b4acdcbdd98e9443f8bfc370b40e80f677142dab8cffd348a22fdf4b68ab61c7d78f",
+			true,
+		},
+		{
+			"0x0408cf359417716c8c4dd03ab0c3b243b383599cb05c1b276b326c92a8f4b2b4acdcbdd98e9443f8bfc370b40e80f677142dab8cffd348a22fdf4b68ab61c7d78f",
+			true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.publicKey, func(t *testing.T) {
+			if got := isValidPublicKey(tt.publicKey); got != tt.want {
+				t.Errorf("isValidPublicKey() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+'''
+'''--- go/extension/chains/ethereum/registry/registry-abi.json ---
+[
+    {
+      "inputs": [],
+      "stateMutability": "nonpayable",
+      "type": "constructor"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "grantee",
+          "type": "address"
+        },
+        {
+          "internalType": "string",
+          "name": "dataId",
+          "type": "string"
+        },
+        {
+          "internalType": "uint256",
+          "name": "lockedUntil",
+          "type": "uint256"
+        }
+      ],
+      "name": "deleteGrant",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "owner",
+          "type": "address"
+        },
+        {
+          "internalType": "address",
+          "name": "grantee",
+          "type": "address"
+        },
+        {
+          "internalType": "string",
+          "name": "dataId",
+          "type": "string"
+        }
+      ],
+      "name": "findGrants",
+      "outputs": [
+        {
+          "components": [
+            {
+              "internalType": "address",
+              "name": "owner",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "grantee",
+              "type": "address"
+            },
+            {
+              "internalType": "string",
+              "name": "dataId",
+              "type": "string"
+            },
+            {
+              "internalType": "uint256",
+              "name": "lockedUntil",
+              "type": "uint256"
+            }
+          ],
+          "internalType": "struct AccessGrants.Grant[]",
+          "name": "",
+          "type": "tuple[]"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "grantee",
+          "type": "address"
+        },
+        {
+          "internalType": "string",
+          "name": "dataId",
+          "type": "string"
+        }
+      ],
+      "name": "grantsFor",
+      "outputs": [
+        {
+          "components": [
+            {
+              "internalType": "address",
+              "name": "owner",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "grantee",
+              "type": "address"
+            },
+            {
+              "internalType": "string",
+              "name": "dataId",
+              "type": "string"
+            },
+            {
+              "internalType": "uint256",
+              "name": "lockedUntil",
+              "type": "uint256"
+            }
+          ],
+          "internalType": "struct AccessGrants.Grant[]",
+          "name": "",
+          "type": "tuple[]"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "grantee",
+          "type": "address"
+        },
+        {
+          "internalType": "string",
+          "name": "dataId",
+          "type": "string"
+        },
+        {
+          "internalType": "uint256",
+          "name": "lockedUntil",
+          "type": "uint256"
+        }
+      ],
+      "name": "insertGrant",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    }
+  ]
+
+'''
+'''--- go/extension/chains/ethereum/registry/registry.go ---
+// Code generated - DO NOT EDIT.
+// This file is a generated binding and any manual changes will be lost.
+
+package registry
+
+import (
+	"errors"
+	"math/big"
+	"strings"
+
+	ethereum "github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/event"
+)
+
+// Reference imports to suppress errors if they are not otherwise used.
+var (
+	_ = errors.New
+	_ = big.NewInt
+	_ = strings.NewReader
+	_ = ethereum.NotFound
+	_ = bind.Bind
+	_ = common.Big1
+	_ = types.BloomLookup
+	_ = event.NewSubscription
+	_ = abi.ConvertType
+)
+
+// AccessGrantsGrant is an auto generated low-level Go binding around an user-defined struct.
+type AccessGrantsGrant struct {
+	Owner       common.Address
+	Grantee     common.Address
+	DataId      string
+	LockedUntil *big.Int
+}
+
+// RegistryMetaData contains all meta data concerning the Registry contract.
+var RegistryMetaData = &bind.MetaData{
+	ABI: "[{\"inputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"constructor\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"grantee\",\"type\":\"address\"},{\"internalType\":\"string\",\"name\":\"dataId\",\"type\":\"string\"},{\"internalType\":\"uint256\",\"name\":\"lockedUntil\",\"type\":\"uint256\"}],\"name\":\"deleteGrant\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"owner\",\"type\":\"address\"},{\"internalType\":\"address\",\"name\":\"grantee\",\"type\":\"address\"},{\"internalType\":\"string\",\"name\":\"dataId\",\"type\":\"string\"}],\"name\":\"findGrants\",\"outputs\":[{\"components\":[{\"internalType\":\"address\",\"name\":\"owner\",\"type\":\"address\"},{\"internalType\":\"address\",\"name\":\"grantee\",\"type\":\"address\"},{\"internalType\":\"string\",\"name\":\"dataId\",\"type\":\"string\"},{\"internalType\":\"uint256\",\"name\":\"lockedUntil\",\"type\":\"uint256\"}],\"internalType\":\"structAccessGrants.Grant[]\",\"name\":\"\",\"type\":\"tuple[]\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"grantee\",\"type\":\"address\"},{\"internalType\":\"string\",\"name\":\"dataId\",\"type\":\"string\"}],\"name\":\"grantsFor\",\"outputs\":[{\"components\":[{\"internalType\":\"address\",\"name\":\"owner\",\"type\":\"address\"},{\"internalType\":\"address\",\"name\":\"grantee\",\"type\":\"address\"},{\"internalType\":\"string\",\"name\":\"dataId\",\"type\":\"string\"},{\"internalType\":\"uint256\",\"name\":\"lockedUntil\",\"type\":\"uint256\"}],\"internalType\":\"structAccessGrants.Grant[]\",\"name\":\"\",\"type\":\"tuple[]\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"grantee\",\"type\":\"address\"},{\"internalType\":\"string\",\"name\":\"dataId\",\"type\":\"string\"},{\"internalType\":\"uint256\",\"name\":\"lockedUntil\",\"type\":\"uint256\"}],\"name\":\"insertGrant\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"}]",
+}
+
+// RegistryABI is the input ABI used to generate the binding from.
+// Deprecated: Use RegistryMetaData.ABI instead.
+var RegistryABI = RegistryMetaData.ABI
+
+// Registry is an auto generated Go binding around an Ethereum contract.
+type Registry struct {
+	RegistryCaller     // Read-only binding to the contract
+	RegistryTransactor // Write-only binding to the contract
+	RegistryFilterer   // Log filterer for contract events
+}
+
+// RegistryCaller is an auto generated read-only Go binding around an Ethereum contract.
+type RegistryCaller struct {
+	contract *bind.BoundContract // Generic contract wrapper for the low level calls
+}
+
+// RegistryTransactor is an auto generated write-only Go binding around an Ethereum contract.
+type RegistryTransactor struct {
+	contract *bind.BoundContract // Generic contract wrapper for the low level calls
+}
+
+// RegistryFilterer is an auto generated log filtering Go binding around an Ethereum contract events.
+type RegistryFilterer struct {
+	contract *bind.BoundContract // Generic contract wrapper for the low level calls
+}
+
+// RegistrySession is an auto generated Go binding around an Ethereum contract,
+// with pre-set call and transact options.
+type RegistrySession struct {
+	Contract     *Registry         // Generic contract binding to set the session for
+	CallOpts     bind.CallOpts     // Call options to use throughout this session
+	TransactOpts bind.TransactOpts // Transaction auth options to use throughout this session
+}
+
+// RegistryCallerSession is an auto generated read-only Go binding around an Ethereum contract,
+// with pre-set call options.
+type RegistryCallerSession struct {
+	Contract *RegistryCaller // Generic contract caller binding to set the session for
+	CallOpts bind.CallOpts   // Call options to use throughout this session
+}
+
+// RegistryTransactorSession is an auto generated write-only Go binding around an Ethereum contract,
+// with pre-set transact options.
+type RegistryTransactorSession struct {
+	Contract     *RegistryTransactor // Generic contract transactor binding to set the session for
+	TransactOpts bind.TransactOpts   // Transaction auth options to use throughout this session
+}
+
+// RegistryRaw is an auto generated low-level Go binding around an Ethereum contract.
+type RegistryRaw struct {
+	Contract *Registry // Generic contract binding to access the raw methods on
+}
+
+// RegistryCallerRaw is an auto generated low-level read-only Go binding around an Ethereum contract.
+type RegistryCallerRaw struct {
+	Contract *RegistryCaller // Generic read-only contract binding to access the raw methods on
+}
+
+// RegistryTransactorRaw is an auto generated low-level write-only Go binding around an Ethereum contract.
+type RegistryTransactorRaw struct {
+	Contract *RegistryTransactor // Generic write-only contract binding to access the raw methods on
+}
+
+// NewRegistry creates a new instance of Registry, bound to a specific deployed contract.
+func NewRegistry(address common.Address, backend bind.ContractBackend) (*Registry, error) {
+	contract, err := bindRegistry(address, backend, backend, backend)
+	if err != nil {
+		return nil, err
+	}
+	return &Registry{RegistryCaller: RegistryCaller{contract: contract}, RegistryTransactor: RegistryTransactor{contract: contract}, RegistryFilterer: RegistryFilterer{contract: contract}}, nil
+}
+
+// NewRegistryCaller creates a new read-only instance of Registry, bound to a specific deployed contract.
+func NewRegistryCaller(address common.Address, caller bind.ContractCaller) (*RegistryCaller, error) {
+	contract, err := bindRegistry(address, caller, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	return &RegistryCaller{contract: contract}, nil
+}
+
+// NewRegistryTransactor creates a new write-only instance of Registry, bound to a specific deployed contract.
+func NewRegistryTransactor(address common.Address, transactor bind.ContractTransactor) (*RegistryTransactor, error) {
+	contract, err := bindRegistry(address, nil, transactor, nil)
+	if err != nil {
+		return nil, err
+	}
+	return &RegistryTransactor{contract: contract}, nil
+}
+
+// NewRegistryFilterer creates a new log filterer instance of Registry, bound to a specific deployed contract.
+func NewRegistryFilterer(address common.Address, filterer bind.ContractFilterer) (*RegistryFilterer, error) {
+	contract, err := bindRegistry(address, nil, nil, filterer)
+	if err != nil {
+		return nil, err
+	}
+	return &RegistryFilterer{contract: contract}, nil
+}
+
+// bindRegistry binds a generic wrapper to an already deployed contract.
+func bindRegistry(address common.Address, caller bind.ContractCaller, transactor bind.ContractTransactor, filterer bind.ContractFilterer) (*bind.BoundContract, error) {
+	parsed, err := RegistryMetaData.GetAbi()
+	if err != nil {
+		return nil, err
+	}
+	return bind.NewBoundContract(address, *parsed, caller, transactor, filterer), nil
+}
+
+// Call invokes the (constant) contract method with params as input values and
+// sets the output to result. The result type might be a single field for simple
+// returns, a slice of interfaces for anonymous returns and a struct for named
+// returns.
+func (_Registry *RegistryRaw) Call(opts *bind.CallOpts, result *[]interface{}, method string, params ...interface{}) error {
+	return _Registry.Contract.RegistryCaller.contract.Call(opts, result, method, params...)
+}
+
+// Transfer initiates a plain transaction to move funds to the contract, calling
+// its default method if one is available.
+func (_Registry *RegistryRaw) Transfer(opts *bind.TransactOpts) (*types.Transaction, error) {
+	return _Registry.Contract.RegistryTransactor.contract.Transfer(opts)
+}
+
+// Transact invokes the (paid) contract method with params as input values.
+func (_Registry *RegistryRaw) Transact(opts *bind.TransactOpts, method string, params ...interface{}) (*types.Transaction, error) {
+	return _Registry.Contract.RegistryTransactor.contract.Transact(opts, method, params...)
+}
+
+// Call invokes the (constant) contract method with params as input values and
+// sets the output to result. The result type might be a single field for simple
+// returns, a slice of interfaces for anonymous returns and a struct for named
+// returns.
+func (_Registry *RegistryCallerRaw) Call(opts *bind.CallOpts, result *[]interface{}, method string, params ...interface{}) error {
+	return _Registry.Contract.contract.Call(opts, result, method, params...)
+}
+
+// Transfer initiates a plain transaction to move funds to the contract, calling
+// its default method if one is available.
+func (_Registry *RegistryTransactorRaw) Transfer(opts *bind.TransactOpts) (*types.Transaction, error) {
+	return _Registry.Contract.contract.Transfer(opts)
+}
+
+// Transact invokes the (paid) contract method with params as input values.
+func (_Registry *RegistryTransactorRaw) Transact(opts *bind.TransactOpts, method string, params ...interface{}) (*types.Transaction, error) {
+	return _Registry.Contract.contract.Transact(opts, method, params...)
+}
+
+// FindGrants is a free data retrieval call binding the contract method 0x7e0cc3a2.
+//
+// Solidity: function findGrants(address owner, address grantee, string dataId) view returns((address,address,string,uint256)[])
+func (_Registry *RegistryCaller) FindGrants(opts *bind.CallOpts, owner common.Address, grantee common.Address, dataId string) ([]AccessGrantsGrant, error) {
+	var out []interface{}
+	err := _Registry.contract.Call(opts, &out, "findGrants", owner, grantee, dataId)
+
+	if err != nil {
+		return *new([]AccessGrantsGrant), err
+	}
+
+	out0 := *abi.ConvertType(out[0], new([]AccessGrantsGrant)).(*[]AccessGrantsGrant)
+
+	return out0, err
+
+}
+
+// FindGrants is a free data retrieval call binding the contract method 0x7e0cc3a2.
+//
+// Solidity: function findGrants(address owner, address grantee, string dataId) view returns((address,address,string,uint256)[])
+func (_Registry *RegistrySession) FindGrants(owner common.Address, grantee common.Address, dataId string) ([]AccessGrantsGrant, error) {
+	return _Registry.Contract.FindGrants(&_Registry.CallOpts, owner, grantee, dataId)
+}
+
+// FindGrants is a free data retrieval call binding the contract method 0x7e0cc3a2.
+//
+// Solidity: function findGrants(address owner, address grantee, string dataId) view returns((address,address,string,uint256)[])
+func (_Registry *RegistryCallerSession) FindGrants(owner common.Address, grantee common.Address, dataId string) ([]AccessGrantsGrant, error) {
+	return _Registry.Contract.FindGrants(&_Registry.CallOpts, owner, grantee, dataId)
+}
+
+// GrantsFor is a free data retrieval call binding the contract method 0xb7dd8865.
+//
+// Solidity: function grantsFor(address grantee, string dataId) view returns((address,address,string,uint256)[])
+func (_Registry *RegistryCaller) GrantsFor(opts *bind.CallOpts, grantee common.Address, dataId string) ([]AccessGrantsGrant, error) {
+	var out []interface{}
+	err := _Registry.contract.Call(opts, &out, "grantsFor", grantee, dataId)
+
+	if err != nil {
+		return *new([]AccessGrantsGrant), err
+	}
+
+	out0 := *abi.ConvertType(out[0], new([]AccessGrantsGrant)).(*[]AccessGrantsGrant)
+
+	return out0, err
+
+}
+
+// GrantsFor is a free data retrieval call binding the contract method 0xb7dd8865.
+//
+// Solidity: function grantsFor(address grantee, string dataId) view returns((address,address,string,uint256)[])
+func (_Registry *RegistrySession) GrantsFor(grantee common.Address, dataId string) ([]AccessGrantsGrant, error) {
+	return _Registry.Contract.GrantsFor(&_Registry.CallOpts, grantee, dataId)
+}
+
+// GrantsFor is a free data retrieval call binding the contract method 0xb7dd8865.
+//
+// Solidity: function grantsFor(address grantee, string dataId) view returns((address,address,string,uint256)[])
+func (_Registry *RegistryCallerSession) GrantsFor(grantee common.Address, dataId string) ([]AccessGrantsGrant, error) {
+	return _Registry.Contract.GrantsFor(&_Registry.CallOpts, grantee, dataId)
+}
+
+// DeleteGrant is a paid mutator transaction binding the contract method 0xc28c6524.
+//
+// Solidity: function deleteGrant(address grantee, string dataId, uint256 lockedUntil) returns()
+func (_Registry *RegistryTransactor) DeleteGrant(opts *bind.TransactOpts, grantee common.Address, dataId string, lockedUntil *big.Int) (*types.Transaction, error) {
+	return _Registry.contract.Transact(opts, "deleteGrant", grantee, dataId, lockedUntil)
+}
+
+// DeleteGrant is a paid mutator transaction binding the contract method 0xc28c6524.
+//
+// Solidity: function deleteGrant(address grantee, string dataId, uint256 lockedUntil) returns()
+func (_Registry *RegistrySession) DeleteGrant(grantee common.Address, dataId string, lockedUntil *big.Int) (*types.Transaction, error) {
+	return _Registry.Contract.DeleteGrant(&_Registry.TransactOpts, grantee, dataId, lockedUntil)
+}
+
+// DeleteGrant is a paid mutator transaction binding the contract method 0xc28c6524.
+//
+// Solidity: function deleteGrant(address grantee, string dataId, uint256 lockedUntil) returns()
+func (_Registry *RegistryTransactorSession) DeleteGrant(grantee common.Address, dataId string, lockedUntil *big.Int) (*types.Transaction, error) {
+	return _Registry.Contract.DeleteGrant(&_Registry.TransactOpts, grantee, dataId, lockedUntil)
+}
+
+// InsertGrant is a paid mutator transaction binding the contract method 0xb14d52d5.
+//
+// Solidity: function insertGrant(address grantee, string dataId, uint256 lockedUntil) returns()
+func (_Registry *RegistryTransactor) InsertGrant(opts *bind.TransactOpts, grantee common.Address, dataId string, lockedUntil *big.Int) (*types.Transaction, error) {
+	return _Registry.contract.Transact(opts, "insertGrant", grantee, dataId, lockedUntil)
+}
+
+// InsertGrant is a paid mutator transaction binding the contract method 0xb14d52d5.
+//
+// Solidity: function insertGrant(address grantee, string dataId, uint256 lockedUntil) returns()
+func (_Registry *RegistrySession) InsertGrant(grantee common.Address, dataId string, lockedUntil *big.Int) (*types.Transaction, error) {
+	return _Registry.Contract.InsertGrant(&_Registry.TransactOpts, grantee, dataId, lockedUntil)
+}
+
+// InsertGrant is a paid mutator transaction binding the contract method 0xb14d52d5.
+//
+// Solidity: function insertGrant(address grantee, string dataId, uint256 lockedUntil) returns()
+func (_Registry *RegistryTransactorSession) InsertGrant(grantee common.Address, dataId string, lockedUntil *big.Int) (*types.Transaction, error) {
+	return _Registry.Contract.InsertGrant(&_Registry.TransactOpts, grantee, dataId, lockedUntil)
+}
+
+'''
+'''--- go/extension/chains/interface.go ---
+package chains
+
+import (
+	"context"
+)
+
+// Grant models a Fractal grant for certain data to a grantee.
+type Grant struct {
+	Owner       string `json:"owner"`
+	LockedUntil uint64 `json:"locked_until"` // uint256
+	Grantee     string `json:"grantee"`
+	DataID      string `json:"data_id"`
+}
+
+// GrantChecker specifies the method required of a type to retrieve grants.
+type GrantChecker interface {
+	GrantsFor(ctx context.Context, registry, addr, resource string) ([]*Grant, error)
+	FindGrants(ctx context.Context, registry, owner, grantee, dataId string) ([]*Grant, error)
+	// NOTE: HasGrant just returns a boolean at present, but presumably we'll
+	// want to return the entire slice of grants, which includes lock times.
+}
+
+// ChainBackend must be implemented for a block chain backend to provide height
+// and account grant data to the extension.
+type ChainBackend interface {
+	GrantChecker
+	Height(context.Context) (uint64, error)
+	IsValidPublicKey(public_key string) bool
+	// TODO: Close(), for ws connections
+}
+
+'''
+'''--- go/extension/chains/near/near.go ---
+package near
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/eteu-technologies/near-api-go/pkg/client"
+	"github.com/eteu-technologies/near-api-go/pkg/client/block"
+	"github.com/idos-network/idos-extensions/extension/chains"
+	"github.com/mr-tron/base58"
+)
+
+// isNearAcct checks if the string is a valid near account name. This is either
+// an "implicit" account, which is 64 hexadecimal characters, or a named account
+// that is suffixed by the network name. For example. fractal.near or
+// app0.testnet.
+func isNearAcct(acct string) bool {
+	if strings.HasSuffix(acct, ".near") || strings.HasSuffix(acct, ".testnet") ||
+		strings.HasSuffix(acct, ".shardnet") || strings.HasSuffix(acct, ".guildnet") {
+		return true
+	}
+	if len(acct) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(acct)
+	return err == nil
+}
+
+// chainClient is implemented by the near-api-go/pkg/client.Client type, but is
+// defined as an interface so it may be stubbed out for testing.
+type chainClient interface {
+	BlockDetails(ctx context.Context, block block.BlockCharacteristic) (resp client.BlockView, err error)
+	ContractViewCallFunction(ctx context.Context, accountID, methodName, argsBase64 string, block block.BlockCharacteristic) (res client.CallResult, err error)
+}
+
+// Backend is the NEAR implementation of a chains.ChainBackend for the Fractal
+// extension.
+type Backend struct {
+	cl chainClient
+}
+
+// New creates a new NEAR backend using the provided RPC URL.
+func New(url string) (*Backend, error) {
+	cl, err := client.NewClient(url)
+	if err != nil {
+		return nil, err
+	}
+	return &Backend{&cl}, nil
+}
+
+func (nb *Backend) Height(ctx context.Context) (uint64, error) {
+	res, err := nb.cl.BlockDetails(ctx, block.FinalityFinal())
+	if err != nil {
+		return 0, err
+	}
+	return res.Header.Height, nil
+}
+
+type grantsForArgs struct {
+	Grantee string `json:"grantee"`
+	DataID  string `json:"data_id"`
+}
+
+type findGrantsArgs struct {
+	Owner   string `json:"owner"`
+	Grantee string `json:"grantee"`
+	DataID  string `json:"data_id"`
+}
+
+type grantResp struct {
+	Owner       string `json:"owner"`
+	Grantee     string `json:"grantee"`
+	DataID      string `json:"data_id"`
+	LockedUntil uint64 `json:"locked_until"` // uint256
+}
+
+func base64CallArgs(thing any) (string, error) {
+	b, err := json.Marshal(thing)
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(b), nil
+}
+
+func (nb *Backend) GrantsFor(ctx context.Context, registry, acct, resource string) ([]*chains.Grant, error) {
+	if !isNearAcct(registry) || !isNearAcct(acct) {
+		return make([]*chains.Grant, 0), nil
+	}
+
+	base64Args, err := base64CallArgs(grantsForArgs{
+		Grantee: acct,
+		DataID:  resource,
+	})
+	if err != nil {
+		return nil, err
+	}
+	res, err := nb.cl.ContractViewCallFunction(ctx, registry, `grants_for`, base64Args,
+		block.FinalityFinal())
+	if err != nil {
+		return nil, err
+	}
+
+	var grantList []grantResp
+	if err = json.Unmarshal(res.Result, &grantList); err != nil {
+		return nil, fmt.Errorf("unmarshal failed (%w) - res: %v",
+			err, string(res.Result))
+	}
+
+	grants := make([]*chains.Grant, len(grantList))
+	for i := range grantList {
+		gIn := &grantList[i]
+		grants[i] = &chains.Grant{
+			Owner:       gIn.Owner,
+			LockedUntil: gIn.LockedUntil,
+			Grantee:     gIn.Grantee,
+			DataID:      gIn.DataID,
+		}
+	}
+
+	return grants, nil
+}
+
+func (b *Backend) FindGrants(ctx context.Context, contract, owner, grantee, resource string) ([]*chains.Grant, error) {
+	if !isNearAcct(contract) || !isNearAcct(owner) || !isNearAcct(grantee) {
+		return make([]*chains.Grant, 0), nil
+	}
+
+	base64Args, err := base64CallArgs(findGrantsArgs{
+		Owner:   owner,
+		Grantee: owner,
+		DataID:  resource,
+	})
+	if err != nil {
+		return nil, err
+	}
+	res, err := b.cl.ContractViewCallFunction(ctx, contract, `find_grants`, base64Args,
+		block.FinalityFinal())
+	if err != nil {
+		return nil, err
+	}
+
+	var grantList []grantResp
+	if err = json.Unmarshal(res.Result, &grantList); err != nil {
+		return nil, fmt.Errorf("unmarshal failed (%w) - res: %v",
+			err, string(res.Result))
+	}
+
+	grants := make([]*chains.Grant, len(grantList))
+	for i := range grantList {
+		gIn := &grantList[i]
+		grants[i] = &chains.Grant{
+			Owner:       gIn.Owner,
+			LockedUntil: gIn.LockedUntil,
+			Grantee:     gIn.Grantee,
+			DataID:      gIn.DataID,
+		}
+	}
+
+	return grants, nil
+}
+
+const NEAR_KEY_LENGTH = 32
+
+func isValidPublicKey(publicKey string) (bool, error) {
+	pieces := strings.SplitN(publicKey, ":", 2)
+	if len(pieces) != 2 {
+		return false, fmt.Errorf("unrecognized format for NEAR public key: %s", publicKey)
+	}
+	if pieces[0] != "ed25519" {
+		return false, fmt.Errorf("unsupported NEAR public key type: %s", pieces[0])
+	}
+
+	binaryPayload, err := base58.Decode(pieces[1])
+	if err != nil {
+		return false, fmt.Errorf("unable to decode %s: %w", pieces[1], err)
+	}
+
+	binaryPayloadLen := len(binaryPayload)
+	if binaryPayloadLen != NEAR_KEY_LENGTH {
+		return false, fmt.Errorf("wrong binary length: was expecting %d, got %d", NEAR_KEY_LENGTH, binaryPayloadLen)
+	}
+
+	return true, nil
+}
+
+func (b *Backend) IsValidPublicKey(publicKey string) bool {
+	result, _ := isValidPublicKey(publicKey)
+	return result
+}
+
+'''
+'''--- go/extension/chains/near/near_test.go ---
+package near
+
+import (
+	"context"
+	"fmt"
+	"testing"
+
+	"github.com/eteu-technologies/near-api-go/pkg/client"
+	"github.com/eteu-technologies/near-api-go/pkg/client/block"
+	"github.com/eteu-technologies/near-api-go/pkg/types"
+)
+
+type stubClient struct {
+	height        uint64
+	grantsForResp []byte
+}
+
+func (sc *stubClient) BlockDetails(ctx context.Context, block block.BlockCharacteristic) (resp client.BlockView, err error) {
+	return client.BlockView{
+		Author: types.AccountID("whateverpoolv42.near"),
+		Header: client.BlockHeaderView{
+			Height: sc.height, // this is all we need for (*Backend).Height
+		},
+		Chunks: []client.ChunkHeaderView{},
+	}, nil
+}
+
+func (sc *stubClient) ContractViewCallFunction(ctx context.Context, accountID, methodName, argsBase64 string, block block.BlockCharacteristic) (res client.CallResult, err error) {
+	return client.CallResult{
+		Result: sc.grantsForResp,
+	}, nil
+}
+
+func TestBackend(t *testing.T) {
+	wantHeight := uint64(123413241234)
+	cl := &stubClient{
+		height:        wantHeight,
+		grantsForResp: []byte{}, // len zero to start (no grants)
+	}
+	be := &Backend{cl}
+
+	height, err := be.Height(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if height != wantHeight {
+		t.Errorf("wanted height %v got %v", wantHeight, height)
+	}
+
+	grantee := "jchappelow.testnet"
+	registry := "grants.jchappelow.testnet"
+	dataID := "blah"
+
+	cl.grantsForResp = []byte(fmt.Sprintf(`[
+		{
+			"data_id": "%s",
+			"grantee": "%s",
+			"locked_until": 2690839560,
+			"owner": "jchappelow.testnet"
+		}
+	]`, dataID, grantee))
+
+	grants, err := be.GrantsFor(context.Background(), registry, grantee, dataID)
+	if err != nil {
+		t.Fatalf("HasGrant unexpectedly failed: %v", err)
+	}
+	if len(grants) == 0 {
+		t.Error("expected to have grants, but did not")
+	}
+
+	cl.grantsForResp = []byte(`null`) // nil
+	grants, err = be.GrantsFor(context.Background(), registry, grantee, dataID)
+	if err != nil {
+		t.Fatalf("HasGrant unexpectedly failed: %v", err)
+	}
+	if len(grants) > 0 {
+		t.Error("expected to not have grants, but did")
+	}
+
+	cl.grantsForResp = []byte(`[]`)
+	grants, err = be.GrantsFor(context.Background(), registry, grantee, dataID)
+	if err != nil {
+		t.Fatalf("HasGrant unexpectedly failed: %v", err)
+	}
+	if len(grants) > 0 {
+		t.Error("expected to not have grants, but did")
+	}
+
+	// invalid account name
+	entries, _ := be.GrantsFor(context.Background(), "not-a-registry", grantee, dataID)
+	if len(entries) != 0 {
+		t.Fatalf("HasGrant accepted a bogus registry acct name")
+	}
+
+	// valid implicit acct name
+	hex64Chars := "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef"
+	_, err = be.GrantsFor(context.Background(), hex64Chars, grantee, dataID)
+	if err != nil {
+		t.Fatalf("HasGrant unexpectedly failed: %v", err)
+	}
+}
+
+func Test_isNearAcct(t *testing.T) {
+	tests := []struct {
+		name string
+		acct string
+		want bool
+	}{
+		{
+			"ok .near",
+			"blah.near",
+			true,
+		},
+		{
+			"ok 64 hex chars",
+			"beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef",
+			true,
+		},
+		{
+			"ok .testnet",
+			"blah.testnet",
+			true,
+		},
+		{
+			"not ok",
+			"wrong.eth",
+			false,
+		},
+		{
+			"not ok empty",
+			"",
+			false,
+		},
+		{
+			"not ok non-hex 64 chars",
+			"ppefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef",
+			false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isNearAcct(tt.acct); got != tt.want {
+				t.Errorf("isNearAcct() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_isValidPublicKey(t *testing.T) {
+	tests := []struct {
+		publicKey string
+		want      bool
+	}{
+		{
+			"",
+			false,
+		},
+		{
+			"blah.near",
+			false,
+		},
+		{
+			"derp:herp",
+			false,
+		},
+		{
+			"ed25519:INVALID",
+			false,
+		},
+		{
+			"ed25519:7dLLbzqc6kgGAC6smmJUUh9xqxH9habnLhptauA",
+			false,
+		},
+		{
+			"ed25519:7dLLbzqc6kgGAC6smmJUUh9xqxH9habnLhptauAymmUJ",
+			true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.publicKey, func(t *testing.T) {
+			if res, _ := isValidPublicKey(tt.publicKey); res != tt.want {
+				t.Errorf("isNearAcct() = %v, want %v", res, tt.want)
+			}
+		})
+	}
+}
+
+'''
+'''--- go/extension/chains/near/registry/Cargo.toml ---
+[package]
+name = "registry"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+near-sdk = "4.1.1"
+
+[profile.release]
+codegen-units = 1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+
+'''
+'''--- go/extension/chains/near/registry/src/lib.rs ---
+use near_sdk::serde::Serialize;
+use near_sdk::{env, AccountId, EpochHeight, require, near_bindgen};
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::UnorderedMap;
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct FractalRegistry {
+    // Mapping of grantee and dataId to an array of grants.
+    pub grants: UnorderedMap<AccountId, UnorderedMap<String, Vec<Grant>>>,
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Clone)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Grant {
+    owner: AccountId,
+    grantee: AccountId,
+    data_id: String,
+    locked_until: EpochHeight,
+}
+
+// This implementation is terrible Rust and probably doesn't work right. ONLY
+// USE IT TO TEST the interface. The grants_for method is also a dummy, always
+// returning the same result regardless of input, because I couldn't make it a
+// read-only method despite only using &self (not mut):
+// https://docs.near.org/sdk/rust/contract-interface/contract-mutability
+
+impl Default for FractalRegistry {
+    fn default() -> Self {
+        let def_acct = &AccountId::new_unchecked("jchappelow.testnet".to_string());
+        let mut grants = UnorderedMap::new(b"o");
+        grants.insert(
+            def_acct,
+            &UnorderedMap::new(b"i"),
+        );
+        grants
+            .get(def_acct)
+            .unwrap()
+            .insert(
+                &"blah".to_string(),
+                &vec![Grant {
+                    owner: def_acct.clone(),
+                    grantee: def_acct.clone(),
+                    data_id: "blah".to_string(),
+                    locked_until: 0,
+                }],
+            );
+        Self { grants }
+    }
+}
+
+#[near_bindgen]
+impl FractalRegistry {
+    pub fn insert_grant(&mut self, grantee: AccountId, data_id: String) {
+        let new_grant = Grant {
+            owner: env::predecessor_account_id(),
+            grantee: grantee.clone(),
+            data_id: data_id.clone(),
+            locked_until: 0,
+        };
+        self.grants.get(&grantee).as_mut().unwrap()
+            .insert(&data_id, &vec![new_grant]);
+    }
+
+    pub fn delete_grant(&mut self, grantee: AccountId, data_id: String) {
+        let binding = self.grants.get(&grantee);
+        let grants = binding.unwrap().get(&data_id);
+        let mut grants_for_data_id = grants.unwrap();
+
+        require!(grants_for_data_id.len() > 0, "No grants found for this grantee and dataId");
+
+        for (i, grant) in grants_for_data_id.iter_mut().enumerate() {
+            if grant.owner == env::predecessor_account_id() {
+                grants_for_data_id.swap_remove(i);
+                return;
+            }
+        }
+
+        panic!("Grant not found");
+    }
+
+    pub fn grants_for(grantee: AccountId, data_id: String) -> Vec<Grant> {
+        vec!{
+            Grant {
+                owner: AccountId::new_unchecked("jchappelow.testnet".to_string()),
+                grantee: grantee.clone(),
+                data_id: data_id.clone(),
+                locked_until: 2690839560,
+            }
+        }
+        // self.grants
+        //     .get(&grantee)
+        //     .unwrap()
+        //     .get(&data_id)
+        //     .unwrap().clone()
+    }
+}
+
+'''
+'''--- go/extension/config.go ---
+package extension
+
+import "fmt"
+
+type Config struct {
+	EthRpcUrl      string `env:"ETH_RPC_URL" envDefault:"https://ethereum-sepolia-rpc.publicnode.com"`
+	ArbitrumRpcUrl string `env:"ARBITRUM_RPC_URL" envDefault:"https://sepolia-rollup.arbitrum.io/rpc"`
+	NearRpcUrl     string `env:"NEAR_RPC_URL" envDefault:"https://rpc.testnet.near.org"`
+	Port           int    `env:"PORT" envDefault:"50055"`
+}
+
+func (c *Config) ListenAddr() string {
+	return fmt.Sprintf(":%d", c.Port)
+}
+
+func (c *Config) ChainURLs() map[string]string {
+	rpcURLs := make(map[string]string)
+	if url := c.EthRpcUrl; url != "" {
+		rpcURLs["eth"] = url
+	}
+	if url := c.ArbitrumRpcUrl; url != "" {
+		rpcURLs["arbitrum"] = url
+	}
+	if url := c.NearRpcUrl; url != "" {
+		rpcURLs["near"] = url
+	}
+	return rpcURLs
+}
+
+'''
+'''--- go/extension/extension.go ---
+package extension
+
+import (
+	"context"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"log"
+	"regexp"
+
+	"github.com/idos-network/idos-extensions/extension/chains"
+
+	"github.com/kwilteam/kwil-extensions/server"
+	"github.com/kwilteam/kwil-extensions/types"
+
+	"github.com/mr-tron/base58"
+)
+
+const (
+	metaKeyRegistryAddress = "registry_address"
+	metaKeyChain           = "chain"
+)
+
+type metadata map[string]string
+
+func (m metadata) RegistryAddress() string {
+	return m[metaKeyRegistryAddress]
+}
+
+func (m metadata) Chain() string {
+	return m[metaKeyChain]
+}
+
+var requiredMetadata = map[string]string{
+	metaKeyRegistryAddress: "",
+	metaKeyChain:           "eth",
+}
+
+type FractalExt struct {
+	backends map[string]chains.ChainBackend
+}
+
+func NewFractalExt(rpcURLs map[string]string) (*FractalExt, error) {
+	// Construct the chain backends (RPC clients) for each URL.
+	backends := make(map[string]chains.ChainBackend, len(rpcURLs))
+	for chain, url := range rpcURLs {
+		be, err := startChainBackend(chain, url)
+		if err != nil {
+			return nil, err
+		}
+		backends[chain] = be
+	}
+
+	return &FractalExt{
+		backends: backends,
+	}, nil
+}
+
+func (e *FractalExt) BuildServer(logger *log.Logger) (*server.ExtensionServer, error) {
+	return server.Builder().
+		Named(e.Name()).
+		WithInitializer(initialize).
+		WithLoggerFunc(func(l string) {
+			logger.Println(l)
+		}).
+		WithMethods(
+			map[string]server.MethodFunc{
+				"get_block_height":               server.WithOutputsCheck(e.BlockHeight, 1),
+				"has_grants":                     server.WithInputsCheck(server.WithOutputsCheck(e.GrantsFor, 1), 2),
+				"has_locked_grants":              server.WithInputsCheck(server.WithOutputsCheck(e.LockedGrantsFor, 1), 2),
+				"implicit_address_to_public_key": server.WithInputsCheck(server.WithOutputsCheck(e.ImplicitAddressToPublicKey, 1), 1),
+				"determine_wallet_type":          server.WithInputsCheck(server.WithOutputsCheck(e.DetermineWalletType, 1), 1),
+				"is_valid_public_key":            server.WithInputsCheck(server.WithOutputsCheck(e.IsValidPublicKey, 1), 1),
+			}).
+		Build()
+}
+
+func (e *FractalExt) Name() string {
+	return "idos"
+}
+
+// getMetadata returns the metadata from given context. An error will be
+// returned if a required metadata is not provided. Default values should be
+// provided during initialization, not execution.
+func (e *FractalExt) getMetadata(ctx *types.ExecutionContext) (metadata, error) {
+	for k := range requiredMetadata {
+		if _, ok := ctx.Metadata[k]; !ok {
+			return nil, fmt.Errorf("metadata %s is required", k)
+		}
+	}
+	return metadata(ctx.Metadata), nil
+}
+
+func (e *FractalExt) chainBackend(ctx *types.ExecutionContext) (chains.ChainBackend, string, error) {
+	m, err := e.getMetadata(ctx)
+	if err != nil {
+		return nil, "", fmt.Errorf("get metadata failed: %w", err)
+	}
+
+	be, ok := e.backends[m.Chain()]
+	if !ok {
+		return nil, "", errors.New("unsupported")
+	}
+	regAddr := m.RegistryAddress()
+	return be, regAddr, nil
+}
+
+// BlockHeight returns the current block height
+func (e *FractalExt) BlockHeight(ctx *types.ExecutionContext, _ ...*types.ScalarValue) ([]*types.ScalarValue, error) {
+	be, _, err := e.chainBackend(ctx)
+	if err != nil {
+		return nil, err
+	}
+	height, err := be.Height(ctx.Ctx)
+	if err != nil {
+		return nil, err
+	}
+	return encodeScalarValues(height)
+}
+
+// GrantsFor returns whether the given user has grants
+// @return1 1 for true, 0 for false
+func (e *FractalExt) GrantsFor(ctx *types.ExecutionContext, values ...*types.ScalarValue) ([]*types.ScalarValue, error) {
+	be, regAddr, err := e.chainBackend(ctx)
+	if err != nil {
+		return nil, err
+	}
+	granteeAddress, err := values[0].String()
+	if err != nil {
+		return nil, fmt.Errorf("convert value to string failed: %w", err)
+	}
+
+	dataId, err := values[1].String()
+	if err != nil {
+		return nil, fmt.Errorf("convert value to string failed: %w", err)
+	}
+
+	grants, err := be.GrantsFor(ctx.Ctx, regAddr, granteeAddress, dataId)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check grants: %w", err)
+	}
+
+	var exist uint8
+	if grants != nil && len(grants) > 0 {
+		exist = 1
+	}
+	return encodeScalarValues(exist)
+}
+
+// @return1 1 for true, 0 for false
+func (e *FractalExt) LockedGrantsFor(ctx *types.ExecutionContext, values ...*types.ScalarValue) ([]*types.ScalarValue, error) {
+	be, regAddr, err := e.chainBackend(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ownerAddress, err := values[0].String()
+	if err != nil {
+		return nil, fmt.Errorf("convert value to string failed: %w", err)
+	}
+
+	dataId, err := values[1].String()
+	if err != nil {
+		return nil, fmt.Errorf("convert value to string failed: %w", err)
+	}
+
+	lockedGrants, err := chains.LockedGrantsFor(be, ctx.Ctx, regAddr, ownerAddress, dataId)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check for locked grants: %w", err)
+	}
+
+	var result uint8
+	if len(lockedGrants) > 0 {
+		result = 1
+	}
+	return encodeScalarValues(result)
+}
+
+func (e *FractalExt) ImplicitAddressToPublicKey(ctx *types.ExecutionContext, values ...*types.ScalarValue) ([]*types.ScalarValue, error) {
+	inputHex, err := values[0].String()
+	if err != nil {
+		return nil, fmt.Errorf("convert value to string failed: %w", err)
+	}
+	binaryString, _ := hex.DecodeString(inputHex)
+	base58 := base58.Encode(binaryString)
+	var public_key string
+	if len(inputHex) != 64 || base58 == "" {
+		public_key = ""
+	} else {
+		public_key = fmt.Sprintf("ed25519:%s", base58)
+	}
+
+	return encodeScalarValues(public_key)
+}
+
+func (e *FractalExt) IsValidPublicKey(ctx *types.ExecutionContext, values ...*types.ScalarValue) ([]*types.ScalarValue, error) {
+	be, _, err := e.chainBackend(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	public_key, err := values[0].String()
+	if err != nil {
+		return nil, fmt.Errorf("convert value to string failed: %w", err)
+	}
+
+	var result uint8
+	if be.IsValidPublicKey(public_key) {
+		result = 1
+	}
+	return encodeScalarValues(result)
+}
+
+var EVM_ADDRESS_REGEX = regexp.MustCompile("^0x[0-9a-fA-F]{40}$")
+
+// This has very dumb logic: eth address returns EVM type, and NEAR returns otherwise.
+// TODO: make the logic more detailed and return error is the address is neither EVM no NEAR.
+func (e *FractalExt) DetermineWalletType(ctx *types.ExecutionContext, values ...*types.ScalarValue) ([]*types.ScalarValue, error) {
+	address, err := values[0].String()
+	if err != nil {
+		return nil, fmt.Errorf("convert value to string failed: %w", err)
+	}
+
+	var wallet_type string
+	if EVM_ADDRESS_REGEX.MatchString(address) {
+		wallet_type = "EVM"
+	} else {
+		wallet_type = "NEAR"
+	}
+
+	return encodeScalarValues(wallet_type)
+}
+
+// initialize checks that the meta data includes all required fields and applies
+// any default values.
+func initialize(ctx context.Context, metadata map[string]string) (map[string]string, error) {
+	for k, def := range requiredMetadata {
+		_, ok := metadata[k]
+		if ok {
+			continue
+		}
+		if def == "" {
+			return nil, fmt.Errorf("metadata %s is required", k)
+		}
+		metadata[k] = def
+	}
+
+	return metadata, nil
+}
+
+func encodeScalarValues(values ...any) ([]*types.ScalarValue, error) {
+	scalarValues := make([]*types.ScalarValue, len(values))
+	for i, v := range values {
+		scalarValue, err := types.NewScalarValue(v)
+		if err != nil {
+			return nil, fmt.Errorf("convert value to scalar failed: %w", err)
+		}
+
+		scalarValues[i] = scalarValue
+	}
+
+	return scalarValues, nil
+}
+
+'''
+'''--- go/extension/gen.go ---
+package extension
+
+//go:generate abigen --abi=chains/ethereum/registry/registry-abi.json --pkg registry --out=chains/ethereum/registry/registry.go
+
+'''
+'''--- go/main.go ---
+package main
+
+import (
+	"log"
+	"net"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/caarlos0/env/v8"
+	"github.com/idos-network/idos-extensions/extension"
+)
+
+func main() {
+	cfg := &extension.Config{}
+	if err := env.Parse(cfg); err != nil {
+		log.Fatalf("invalid config: %v", err)
+	}
+
+	ext, err := extension.NewFractalExt(cfg.ChainURLs())
+	if err != nil {
+		log.Fatalf("failed to create extension: %v", err)
+	}
+
+	logger := log.New(os.Stdout, "idos: ", log.LstdFlags)
+
+	svr, err := ext.BuildServer(logger)
+	if err != nil {
+		log.Fatalf("failed to construct server: %v", err)
+	}
+
+	lis, err := net.Listen("tcp", cfg.ListenAddr())
+	if err != nil {
+		log.Fatalf("failed to listen: %v", err)
+	}
+
+	go func() {
+		logger.Printf("listening on %s\n", cfg.ListenAddr())
+		if err := svr.Serve(lis); err != nil {
+			logger.Printf("failed to serve: %v", err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	logger.Println("shutting down")
+
+	err = svr.GracefulStop()
+	if err != nil {
+		logger.Printf("failed to shutdown: %v", err)
+		os.Exit(1)
+	}
+
+	logger.Println("shutdown complete")
+}
+
+'''

@@ -1,0 +1,891 @@
+*GitHub Repository "everstake/NEAR-Stake-Pool-Back"*
+
+'''--- README.md ---
+## Deploy & run
+At first, need to prepare a postgres db. The migration will run automatically after the application starts.
+1. copy `.env.example`  to `.env` 
+ ```
+cp .env.example .env
+```
+2. fill `.env` file with your settings
+> NODE - address of NEAR RPC node
+
+> STAKE_POOL - stake pool contract address
+3. build and run application
+```
+go build ./cmd/lido && ./lido
+```
+## Tests
+```
+go test ./...
+```
+'''
+'''--- cmd/lido/main.go ---
+package main
+
+import (
+	"github.com/go-co-op/gocron"
+	"github.com/pkg/errors"
+	"github.com/urfave/cli/v2"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"lido-near-client/internal/application"
+	"lido-near-client/internal/config"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+)
+
+func main() {
+	err := os.Setenv("TZ", "UTC")
+	if err != nil {
+		log.Fatalf("os.Setenv (TZ): %s", err.Error())
+	}
+	app := &cli.App{
+		Action:   mainCommand,
+		Commands: nil,
+	}
+	err = app.Run(os.Args)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func mainCommand(ctxCli *cli.Context) error {
+	ctx, stop := signal.NotifyContext(ctxCli.Context, syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	cfg, err := config.GetConfig()
+	if err != nil {
+		return errors.Wrap(err, "get config")
+	}
+	logger := getLogger(cfg.LogLevel)
+
+	app, err := application.New(application.Params{
+		Ctx: ctx,
+		Log: logger,
+		Cfg: cfg,
+	})
+	if err != nil {
+		logger.Fatal("new application", zap.Error(err))
+	}
+
+	if err != nil {
+		logger.Fatal("new http rest server", zap.Error(err))
+	}
+	startCron(app, logger)
+	<-ctx.Done()
+	return nil
+}
+
+func startCron(app *application.Application, logger *zap.Logger) {
+	cron := gocron.NewScheduler(time.UTC)
+	cron.Every(10).Minutes().Do(func() {
+		err := app.StakePool.PoolUpdate()
+		if err != nil {
+			logger.Error("PoolUpdate", zap.Error(err))
+			return
+		}
+	})
+	cron.Every(10).Minutes().Do(func() {
+		err := app.StakePool.IncreaseStake()
+		if err != nil {
+			logger.Error("IncreaseStake", zap.Error(err))
+			return
+		}
+	})
+	cron.StartAsync()
+}
+
+func getLogger(lvl string) *zap.Logger {
+	atom := zap.NewAtomicLevel()
+
+	encoderCfg := zap.NewProductionEncoderConfig()
+	encoderCfg.TimeKey = "time"
+	encoderCfg.LevelKey = "lvl"
+	encoderCfg.EncodeTime = zapcore.RFC3339TimeEncoder
+
+	switch lvl {
+	case "debug":
+		atom.SetLevel(zap.DebugLevel)
+	case "info":
+		atom.SetLevel(zap.InfoLevel)
+	case "error":
+		atom.SetLevel(zap.ErrorLevel)
+	}
+
+	return zap.New(zapcore.NewCore(
+		zapcore.NewJSONEncoder(encoderCfg),
+		zapcore.Lock(os.Stdout),
+		atom,
+	), zap.AddStacktrace(zap.DPanicLevel), zap.AddCallerSkip(0))
+}
+
+'''
+'''--- internal/application/application.go ---
+package application
+
+import (
+	"context"
+	"github.com/pkg/errors"
+	"go.uber.org/zap"
+	"lido-near-client/internal/application/stakepool"
+	"lido-near-client/internal/config"
+)
+
+type (
+	Application struct {
+		StakePool StakePoolService
+	}
+	Params struct {
+		Ctx context.Context
+		Log *zap.Logger
+		Cfg config.Config
+	}
+	StakePoolService interface {
+		PoolUpdate() error
+		IncreaseStake() error
+	}
+)
+
+func New(params Params) (app *Application, err error) {
+	p, err := stakepool.New(stakepool.ServiceParam{
+		Ctx: params.Ctx,
+		Cfg: params.Cfg,
+		Log: params.Log,
+	})
+	if err != nil {
+		return app, errors.Wrap(err, "new pool")
+	}
+	return &Application{
+		StakePool: p,
+	}, nil
+}
+
+'''
+'''--- internal/application/stakepool/stakepool.go ---
+package stakepool
+
+import (
+	"context"
+	"encoding/json"
+	"github.com/eteu-technologies/near-api-go/pkg/client"
+	"github.com/eteu-technologies/near-api-go/pkg/client/block"
+	"github.com/eteu-technologies/near-api-go/pkg/types/key"
+	"github.com/pkg/errors"
+	"go.uber.org/zap"
+	"lido-near-client/internal/config"
+)
+
+const coinGeckoID = "near"
+
+type (
+	Service struct {
+		ctx context.Context
+		log *zap.Logger
+		cfg config.Config
+		cli *client.Client
+
+		keyPair key.KeyPair
+	}
+	ServiceParam struct {
+		Ctx context.Context
+		Log *zap.Logger
+		Cfg config.Config
+	}
+)
+
+func New(param ServiceParam) (*Service, error) {
+	node, err := client.NewClient(param.Cfg.Node)
+	if err != nil {
+		return nil, errors.Wrap(err, "create client")
+	}
+	keyPair, err := key.NewBase58KeyPair(param.Cfg.KeyPair)
+	if err != nil {
+		return nil, errors.Wrap(err, "NewBase58KeyPair")
+	}
+	return &Service{
+		ctx:     param.Ctx,
+		log:     param.Log,
+		cfg:     param.Cfg,
+		cli:     &node,
+		keyPair: keyPair,
+	}, nil
+}
+
+type callContractResponse struct {
+	BlockHash   string `json:"block_hash"`
+	BlockHeight uint64 `json:"block_height"`
+	Result      []byte `json:"result"`
+	Error       string `json:"error,omitempty"`
+}
+
+func (s *Service) callContract(method string, args string) (result json.RawMessage, err error) {
+	resp, err := s.cli.ContractViewCallFunction(
+		context.Background(),
+		s.cfg.StakePool,
+		method,
+		args,
+		block.FinalityFinal(),
+	)
+	if err != nil {
+		return result, errors.Wrap(err, "ContractViewCallFunction")
+	}
+	var r callContractResponse
+	err = json.Unmarshal(resp.Result, &r)
+	if err != nil {
+		return result, errors.Wrap(err, "json unmarshal")
+	}
+	if r.Error != "" {
+		return result, errors.New(r.Error)
+	}
+	return r.Result, nil
+}
+
+func (s *Service) callContractWithUnmarshal(method string, args string, dst interface{}) error {
+	result, err := s.callContract(method, args)
+	if err != nil {
+		return errors.Wrap(err, "callContract")
+	}
+	err = json.Unmarshal(result, dst)
+	if err != nil {
+		return errors.Wrap(err, "json.Unmarshal")
+	}
+	return nil
+}
+
+'''
+'''--- internal/application/stakepool/types.go ---
+package stakepool
+
+import (
+	"github.com/eteu-technologies/near-api-go/pkg/types"
+	"github.com/shopspring/decimal"
+)
+
+const (
+	ClassicStakeDecreasingType    stakeDecreasingType = "Classic"
+	InvestmentStakeDecreasingType stakeDecreasingType = "Investment"
+)
+
+type (
+	stakeDecreasingType string
+	Validator           struct {
+		AccountID                             types.AccountID `json:"account_id"`
+		ClassicStakedBalance                  decimal.Decimal `json:"classic_staked_balance"`
+		InvestmentStakedBalance               decimal.Decimal `json:"investment_staked_balance"`
+		UnstakedBalance                       decimal.Decimal `json:"unstaked_balance"`
+		IsOnlyForInvestment                   bool            `json:"is_only_for_investment"`
+		LastUpdateEpochHeight                 uint64          `json:"last_update_epoch_height"`
+		LastClassicStakeIncreasingEpochHeight *uint64         `json:"last_classic_stake_increasing_epoch_height"`
+	}
+	AccountView struct {
+		Amount    decimal.Decimal `json:"amount"`
+		BlockHash string          `json:"block_hash"`
+	}
+	GenesisConfig struct {
+		EpochLength   uint64 `json:"epoch_length"`
+		GenesisHeight uint64 `json:"genesis_height"`
+	}
+	AggInfo struct {
+		UnstakedBalance                      decimal.Decimal `json:"unstaked_balance"`
+		StakedBalance                        decimal.Decimal `json:"staked_balance"`
+		TokenTotalSupply                     decimal.Decimal `json:"token_total_supply"`
+		TokenAccountsQuantity                uint64          `json:"token_accounts_quantity"`
+		TotalRewardsFromValidatorsNearAmount decimal.Decimal `json:"total_rewards_from_validators_near_amount"`
+		RewardFee                            *Dividing       `json:"reward_fee"`
+	}
+	Dividing struct {
+		Numerator   decimal.Decimal `json:"numerator"`
+		Denominator decimal.Decimal `json:"denominator"`
+	}
+
+	Fund struct {
+		ClassicUnstakedBalance  decimal.Decimal `json:"classic_unstaked_balance"`
+		ClassicStakedBalance    decimal.Decimal `json:"classic_staked_balance"`
+		InvestmentStakedBalance decimal.Decimal `json:"investment_staked_balance"`
+		CommonStakedBalance     decimal.Decimal `json:"common_staked_balance"`
+		CommonBalance           decimal.Decimal `json:"common_balance"`
+	}
+
+	EpochHeightRegistry struct {
+		PoolEpochHeight    uint64 `json:"pool_epoch_height"`
+		NetworkEpochHeight uint64 `json:"network_epoch_height"`
+	}
+	CallbackResult struct {
+		IsSuccess          bool   `json:"is_success"`
+		NetworkEpochHeight uint64 `json:"network_epoch_height"`
+	}
+)
+
+func (v *Dividing) GetValue() decimal.Decimal {
+	if v.Denominator.IsZero() {
+		return v.Denominator
+	}
+	return v.Numerator.Div(v.Denominator)
+}
+
+'''
+'''--- internal/application/stakepool/update_validators.go ---
+package stakepool
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"github.com/eteu-technologies/near-api-go/pkg/client"
+	"github.com/eteu-technologies/near-api-go/pkg/client/block"
+	"github.com/eteu-technologies/near-api-go/pkg/types"
+	"github.com/eteu-technologies/near-api-go/pkg/types/action"
+	"github.com/pkg/errors"
+	"github.com/shopspring/decimal"
+	"go.uber.org/zap"
+	"sort"
+	"time"
+)
+
+var minRebalanceStake = decimal.New(1, 24)
+
+func (s *Service) PoolUpdate() error {
+	err := s.takeUnstakedBalance()
+	if err != nil {
+		return errors.Wrap(err, "takeUnstakedBalance")
+	}
+
+	var epochs EpochHeightRegistry
+	err = s.callContractWithUnmarshal("get_current_epoch_height", "", &epochs)
+	if err != nil {
+		return errors.Wrap(err, "callContractWithUnmarshal(get_current_epoch_height)")
+	}
+	if epochs.PoolEpochHeight == epochs.NetworkEpochHeight {
+		s.log.Debug("PoolUpdate: not yet")
+		return nil
+	}
+
+	// check balance
+	accRes, err := s.cli.AccountView(s.ctx, s.cfg.KeyPairAccountID, block.FinalityFinal())
+	if err != nil {
+		return errors.Wrap(err, "AccountView")
+	}
+	var accountView AccountView
+	err = json.Unmarshal(accRes.Result, &accountView)
+	if err != nil {
+		return errors.Wrap(err, "json.Unmarshal(AccountView)")
+	}
+	balance := accountView.Amount.Div(decimal.New(1, 24))
+	if balance.LessThan(decimal.NewFromFloat(0.01)) {
+		// TODO notify
+	}
+
+	var validators []Validator
+	err = s.callContractWithUnmarshal("get_validator_registry", "", &validators)
+	if err != nil {
+		return errors.Wrap(err, "callContractWithUnmarshal(get_validator_registry)")
+	}
+	for _, v := range validators {
+		if v.LastUpdateEpochHeight == epochs.NetworkEpochHeight {
+			s.log.Warn("PoolUpdate: validator already updated", zap.String("validator", v.AccountID))
+			continue
+		}
+		argsMarshaled, _ := json.Marshal(map[string]string{"validator_account_id": v.AccountID})
+		res, err := s.cli.TransactionSendAwait(s.ctx, s.cfg.KeyPairAccountID, s.cfg.StakePool, []action.Action{
+			action.NewFunctionCall("update_validator", argsMarshaled, types.DefaultFunctionCallGas*10, types.BalanceFromFloat(0)),
+		}, client.WithLatestBlock(),
+			client.WithKeyPair(s.keyPair),
+		)
+		if err != nil {
+			return errors.Wrapf(err, "TransactionSendAwait[validator:%s]", v.AccountID)
+		}
+		if res.Status.Failure != nil {
+			return errors.New(string(res.Status.Failure))
+		}
+		data, _ := base64.StdEncoding.DecodeString(res.Status.SuccessValue)
+		var resp CallbackResult
+		err = json.Unmarshal(data, &resp)
+		if err != nil {
+			return errors.Wrap(err, "json.Unmarshal(resp)")
+		}
+		if !resp.IsSuccess {
+			return errors.Errorf("fail result from validator %s", v.AccountID)
+		}
+		if resp.NetworkEpochHeight != epochs.NetworkEpochHeight {
+			return errors.Errorf("mismatch epoch after update %d != %d", resp.NetworkEpochHeight, epochs.NetworkEpochHeight)
+		}
+	}
+
+	err = s.requestedDecreaseValidatorStake()
+	if err != nil {
+		return errors.Wrap(err, "requestedDecreaseValidatorStake")
+	}
+
+	// update stake pool
+	res, err := s.cli.TransactionSendAwait(s.ctx, s.cfg.KeyPairAccountID, s.cfg.StakePool, []action.Action{
+		action.NewFunctionCall("update", nil, types.DefaultFunctionCallGas*10, types.BalanceFromFloat(0)),
+	}, client.WithLatestBlock(),
+		client.WithKeyPair(s.keyPair),
+	)
+	if err != nil {
+		return errors.Wrap(err, "TransactionSendAwait(update)")
+	}
+	if res.Status.Failure != nil {
+		return errors.Errorf("pool update %s", string(res.Status.Failure))
+	}
+	s.log.Info("Pool updated", zap.Int("validators", len(validators)), zap.String("tx", res.Transaction.Hash.String()))
+	return nil
+}
+
+func (s *Service) getGenesisCfg() (cfg GenesisConfig, err error) {
+	resp, err := s.cli.GenesisConfig(s.ctx)
+	if err != nil {
+		return cfg, errors.Wrap(err, "GenesisConfig")
+	}
+	err = json.Unmarshal(resp.Result, &cfg)
+	if err != nil {
+		return cfg, errors.Wrap(err, "json.Unmarshal")
+	}
+	return cfg, nil
+}
+
+func (s *Service) IncreaseStake() error {
+	t := time.Now()
+
+	genesis, err := s.getGenesisCfg()
+	if err != nil {
+		return errors.Wrap(err, "getGenesisConfig")
+	}
+	latestBlock, err := s.cli.BlockDetails(s.ctx, block.FinalityFinal())
+	if err != nil {
+		return errors.Wrap(err, "BlockDetails")
+	}
+	remain := latestBlock.Header.Height % genesis.EpochLength
+	if remain < genesis.EpochLength-6480 { // 6480 it`s 15% of EpochLength
+		s.log.Debug("IncreaseStake: not yet")
+		return nil
+	}
+
+	var isDistributed bool
+	err = s.callContractWithUnmarshal("is_stake_distributed", "", &isDistributed)
+	if err != nil {
+		return errors.Wrap(err, "callContractWithUnmarshal(is_stake_distributed)")
+	}
+	if isDistributed {
+		s.log.Debug("IncreaseStake: already distributed")
+		return nil
+	}
+
+	var epochs EpochHeightRegistry
+	err = s.callContractWithUnmarshal("get_current_epoch_height", "", &epochs)
+	if err != nil {
+		return errors.Wrap(err, "callContractWithUnmarshal(get_current_epoch_height)")
+	}
+
+	if epochs.NetworkEpochHeight != epochs.PoolEpochHeight {
+		return errors.Wrap(err, "epochs are different")
+	}
+
+	var validators []Validator
+	err = s.callContractWithUnmarshal("get_validator_registry", "", &validators)
+	if err != nil {
+		return errors.Wrap(err, "callContractWithUnmarshal(get_validator_registry)")
+	}
+
+	var filteredValidators []Validator
+	for _, validator := range validators {
+		if validator.IsOnlyForInvestment {
+			continue
+		}
+		if validator.LastClassicStakeIncreasingEpochHeight == nil || *validator.LastClassicStakeIncreasingEpochHeight < epochs.PoolEpochHeight {
+			filteredValidators = append(filteredValidators, validator)
+		}
+	}
+
+	var fund Fund
+	err = s.callContractWithUnmarshal("get_fund", "", &fund)
+	if err != nil {
+		return errors.Wrap(err, "callContractWithUnmarshal(get_fund)")
+	}
+
+	if fund.ClassicUnstakedBalance.IsZero() {
+		s.log.Info("IncreaseStake: ClassicUnstakedBalance is zero")
+		return nil
+	}
+
+	if len(filteredValidators) == 0 {
+		s.log.Info("IncreaseStake: not found available validators")
+		return nil
+	}
+
+	type validatorShare struct {
+		validator Validator
+		stake     decimal.Decimal
+	}
+	var shares []validatorShare
+	part := fund.ClassicUnstakedBalance.Div(decimal.New(int64(len(filteredValidators)), 0)).Truncate(0)
+	if part.LessThan(minRebalanceStake) {
+		numberOfValidators := fund.ClassicUnstakedBalance.Div(minRebalanceStake).IntPart()
+		for i := 0; i < int(numberOfValidators); i++ {
+			shares = append(shares, validatorShare{
+				validator: filteredValidators[i],
+				stake:     part,
+			})
+		}
+		modAmount := fund.ClassicUnstakedBalance.Mod(minRebalanceStake)
+		shares[len(shares)-1].stake = shares[len(shares)-1].stake.Add(modAmount)
+	} else {
+		for i := 0; i < len(filteredValidators); i++ {
+			shares = append(shares, validatorShare{
+				validator: filteredValidators[i],
+				stake:     part,
+			})
+		}
+		modAmount := fund.ClassicUnstakedBalance.Mod(decimal.New(int64(len(filteredValidators)), 0))
+		shares[len(shares)-1].stake = shares[len(shares)-1].stake.Add(modAmount)
+	}
+
+	// todo make equal sharing via all staking balance
+	for _, share := range shares {
+		argsMarshaled, _ := json.Marshal(map[string]interface{}{
+			"validator_account_id": share.validator.AccountID,
+			"near_amount":          share.stake.Truncate(0).BigInt().String(),
+		})
+		res, err := s.cli.TransactionSendAwait(s.ctx, s.cfg.KeyPairAccountID, s.cfg.StakePool, []action.Action{
+			action.NewFunctionCall("increase_validator_stake", argsMarshaled, types.DefaultFunctionCallGas*10, types.BalanceFromFloat(0)),
+		}, client.WithLatestBlock(),
+			client.WithKeyPair(s.keyPair),
+		)
+		if err != nil {
+			return errors.Wrap(err, "TransactionSendAwait(increase_validator_stake)")
+		}
+		if res.Status.Failure != nil {
+			return errors.Errorf("increase validator stake %s", string(res.Status.Failure))
+		}
+		data, _ := base64.StdEncoding.DecodeString(res.Status.SuccessValue)
+		var resp bool
+		err = json.Unmarshal(data, &resp)
+		if err != nil {
+			return errors.Wrap(err, "json.Unmarshal(resp)")
+		}
+		s.log.Info(
+			"IncreaseStake: call increase_validator_stake",
+			zap.String("validator", share.validator.AccountID),
+			zap.String("amount", share.stake.String()),
+			zap.Bool("response", resp),
+			zap.String("tx_hash", res.Transaction.Hash.String()),
+		)
+		if !resp {
+			return errors.New("false result")
+		}
+	}
+
+	res, err := s.cli.TransactionSendAwait(s.ctx, s.cfg.KeyPairAccountID, s.cfg.StakePool, []action.Action{
+		action.NewFunctionCall("confirm_stake_distribution", nil, types.DefaultFunctionCallGas*10, types.BalanceFromFloat(0)),
+	}, client.WithLatestBlock(),
+		client.WithKeyPair(s.keyPair),
+	)
+	if err != nil {
+		return errors.Wrap(err, "TransactionSendAwait(confirm_stake_distribution)")
+	}
+	if res.Status.Failure != nil {
+		return errors.Errorf("confirm stake distribution %s", string(res.Status.Failure))
+	}
+
+	s.log.Info("IncreaseStake: confirmed", zap.Duration("duration", time.Now().Sub(t)))
+	return nil
+}
+
+type (
+	RequestedToWithdrawalFund struct {
+		ClassicNearAmount            decimal.Decimal `json:"classic_near_amount"`
+		InvestmentNearAmount         decimal.Decimal `json:"investment_near_amount"`
+		InvestmentWithdrawalRegistry [][]interface{} `json:"investment_withdrawal_registry"`
+	}
+)
+
+func (s *Service) requestedDecreaseValidatorStake() error {
+	var epochs EpochHeightRegistry
+	err := s.callContractWithUnmarshal("get_current_epoch_height", "", &epochs)
+	if err != nil {
+		return errors.Wrap(err, "callContractWithUnmarshal(get_current_epoch_height)")
+	}
+	if epochs.NetworkEpochHeight%4 != 0 || epochs.PoolEpochHeight >= epochs.NetworkEpochHeight {
+		s.log.Debug("requestedDecreaseValidatorStake: not yet")
+		return nil
+	}
+
+	var requestedToWithdrawalFund RequestedToWithdrawalFund
+	err = s.callContractWithUnmarshal("get_requested_to_withdrawal_fund", "", &requestedToWithdrawalFund)
+	if err != nil {
+		return errors.Wrap(err, "callContractWithUnmarshal(get_requested_to_withdrawal_fund)")
+	}
+
+	var validators []Validator
+	err = s.callContractWithUnmarshal("get_validator_registry", "", &validators)
+	if err != nil {
+		return errors.Wrap(err, "callContractWithUnmarshal(get_validator_registry)")
+	}
+	var filteredValidators []Validator
+	for _, validator := range validators {
+		if !validator.IsOnlyForInvestment && validator.ClassicStakedBalance.GreaterThan(decimal.Zero) {
+			filteredValidators = append(filteredValidators, validator)
+		}
+	}
+
+	nearAmount := requestedToWithdrawalFund.ClassicNearAmount
+	for _, validator := range filteredValidators {
+		if nearAmount.IsZero() {
+			break
+		}
+		if nearAmount.GreaterThanOrEqual(validator.ClassicStakedBalance) {
+			args, _ := json.Marshal(map[string]interface{}{
+				"validator_account_id":  validator.AccountID,
+				"near_amount":           validator.ClassicStakedBalance.BigInt().String(),
+				"stake_decreasing_type": ClassicStakeDecreasingType,
+			})
+			res, err := s.cli.TransactionSendAwait(s.ctx, s.cfg.KeyPairAccountID, s.cfg.StakePool, []action.Action{
+				action.NewFunctionCall("requested_decrease_validator_stake", args, types.DefaultFunctionCallGas*10, types.BalanceFromFloat(0)),
+			}, client.WithLatestBlock(),
+				client.WithKeyPair(s.keyPair),
+			)
+			if err != nil {
+				return errors.Wrap(err, "TransactionSendAwait(requested_decrease_validator_stake)")
+			}
+			if res.Status.Failure != nil {
+				return errors.Errorf("requested decrease validator stake: %s", string(res.Status.Failure))
+			}
+			data, _ := base64.StdEncoding.DecodeString(res.Status.SuccessValue)
+			var resp CallbackResult
+			err = json.Unmarshal(data, &resp)
+			if err != nil {
+				return errors.Wrap(err, "json.Unmarshal(resp)")
+			}
+			if !resp.IsSuccess {
+				return errors.Errorf("fail result from validator %s", validator.AccountID)
+			}
+			if resp.NetworkEpochHeight != epochs.NetworkEpochHeight {
+				return errors.Errorf("mismatch epoch after update %d != %d", resp.NetworkEpochHeight, epochs.NetworkEpochHeight)
+			}
+			nearAmount = nearAmount.Sub(validator.ClassicStakedBalance)
+		} else {
+			args, _ := json.Marshal(map[string]interface{}{
+				"validator_account_id":  validator.AccountID,
+				"near_amount":           nearAmount.BigInt().String(),
+				"stake_decreasing_type": ClassicStakeDecreasingType,
+			})
+			res, err := s.cli.TransactionSendAwait(s.ctx, s.cfg.KeyPairAccountID, s.cfg.StakePool, []action.Action{
+				action.NewFunctionCall("requested_decrease_validator_stake", args, types.DefaultFunctionCallGas*10, types.BalanceFromFloat(0)),
+			}, client.WithLatestBlock(),
+				client.WithKeyPair(s.keyPair),
+			)
+			if err != nil {
+				return errors.Wrap(err, "TransactionSendAwait(requested_decrease_validator_stake)")
+			}
+			if res.Status.Failure != nil {
+				return errors.Errorf("requested decrease validator stake: %s", string(res.Status.Failure))
+			}
+			data, _ := base64.StdEncoding.DecodeString(res.Status.SuccessValue)
+			var resp CallbackResult
+			err = json.Unmarshal(data, &resp)
+			if err != nil {
+				return errors.Wrap(err, "json.Unmarshal(resp)")
+			}
+			if !resp.IsSuccess {
+				return errors.Errorf("fail result from validator %s", validator.AccountID)
+			}
+			if resp.NetworkEpochHeight != epochs.NetworkEpochHeight {
+				return errors.Errorf("mismatch epoch after update %d != %d", resp.NetworkEpochHeight, epochs.NetworkEpochHeight)
+			}
+			nearAmount = decimal.Zero
+		}
+	}
+
+	for _, v := range requestedToWithdrawalFund.InvestmentWithdrawalRegistry {
+		if len(v) != 2 {
+			return errors.Errorf("unknown format of InvestmentWithdrawalRegistry")
+		}
+		investmentWithdrawalRegistryAccountID, ok := v[0].(string)
+		if !ok {
+			return errors.Errorf("unknown format of InvestmentWithdrawalRegistry(AccountId)")
+		}
+		investmentWithdrawalRegistryAmountStr, ok := v[1].(string)
+		if !ok {
+			return errors.Errorf("unknown format of InvestmentWithdrawalRegistry(Amount)")
+		}
+		investmentWithdrawalRegistryAmount, err := decimal.NewFromString(investmentWithdrawalRegistryAmountStr)
+		if err != nil {
+			return errors.Wrap(err, "decimal.NewFromString(investmentWithdrawalRegistryAmountStr)")
+		}
+		args, _ := json.Marshal(map[string]interface{}{
+			"validator_account_id":  investmentWithdrawalRegistryAccountID,
+			"near_amount":           investmentWithdrawalRegistryAmount.BigInt().String(),
+			"stake_decreasing_type": InvestmentStakeDecreasingType,
+		})
+		res, err := s.cli.TransactionSendAwait(s.ctx, s.cfg.KeyPairAccountID, s.cfg.StakePool, []action.Action{
+			action.NewFunctionCall("requested_decrease_validator_stake", args, types.DefaultFunctionCallGas*10, types.BalanceFromFloat(0)),
+		}, client.WithLatestBlock(),
+			client.WithKeyPair(s.keyPair),
+		)
+		if err != nil {
+			return errors.Wrap(err, "TransactionSendAwait(requested_decrease_validator_stake)")
+		}
+		if res.Status.Failure != nil {
+			return errors.Errorf("requested decrease validator stake: %s", string(res.Status.Failure))
+		}
+		data, _ := base64.StdEncoding.DecodeString(res.Status.SuccessValue)
+		var resp CallbackResult
+		err = json.Unmarshal(data, &resp)
+		if err != nil {
+			return errors.Wrap(err, "json.Unmarshal(resp)")
+		}
+		if !resp.IsSuccess {
+			return errors.Errorf("fail result from validator %s", investmentWithdrawalRegistryAccountID)
+		}
+		if resp.NetworkEpochHeight != epochs.NetworkEpochHeight {
+			return errors.Errorf("mismatch epoch after update %d != %d", resp.NetworkEpochHeight, epochs.NetworkEpochHeight)
+		}
+	}
+	return nil
+}
+
+func (s *Service) takeUnstakedBalance() error {
+	var epochs EpochHeightRegistry
+	err := s.callContractWithUnmarshal("get_current_epoch_height", "", &epochs)
+	if err != nil {
+		return errors.Wrap(err, "callContractWithUnmarshal(get_current_epoch_height)")
+	}
+	if epochs.NetworkEpochHeight%4 != 0 || epochs.PoolEpochHeight >= epochs.NetworkEpochHeight {
+		s.log.Debug("takeUnstakedBalance: not yet")
+		return nil
+	}
+	var validators []Validator
+	err = s.callContractWithUnmarshal("get_validator_registry", "", &validators)
+	if err != nil {
+		return errors.Wrap(err, "callContractWithUnmarshal(get_validator_registry)")
+	}
+	for _, validator := range validators {
+		if validator.LastUpdateEpochHeight == epochs.NetworkEpochHeight {
+			continue
+		}
+		if validator.UnstakedBalance.GreaterThan(decimal.Zero) {
+			argsMarshaled, _ := json.Marshal(map[string]interface{}{
+				"validator_account_id": validator.AccountID,
+			})
+			res, err := s.cli.TransactionSendAwait(s.ctx, s.cfg.KeyPairAccountID, s.cfg.StakePool, []action.Action{
+				action.NewFunctionCall("take_unstaked_balance", argsMarshaled, types.DefaultFunctionCallGas*10, types.BalanceFromFloat(0)),
+			}, client.WithLatestBlock(),
+				client.WithKeyPair(s.keyPair),
+			)
+			if err != nil {
+				return errors.Wrap(err, "TransactionSendAwait(take_unstaked_balance)")
+			}
+			if res.Status.Failure != nil {
+				return errors.Errorf("decrease validator stake: %s", string(res.Status.Failure))
+			}
+			data, _ := base64.StdEncoding.DecodeString(res.Status.SuccessValue)
+			var resp CallbackResult
+			err = json.Unmarshal(data, &resp)
+			if err != nil {
+				return errors.Wrap(err, "json.Unmarshal(resp)")
+			}
+			if !resp.IsSuccess {
+				return errors.Errorf("fail result from validator %s", validator.AccountID)
+			}
+			if resp.NetworkEpochHeight != epochs.NetworkEpochHeight {
+				return errors.Errorf("mismatch epoch after update %d != %d", resp.NetworkEpochHeight, epochs.NetworkEpochHeight)
+			}
+		}
+	}
+	return nil
+}
+
+func stakeDistribution(stakeRemains decimal.Decimal, shares map[string]decimal.Decimal, validators []Validator) {
+	if len(validators) == 0 {
+		return
+	}
+
+	copiedValidators := make([]Validator, len(validators))
+	copy(copiedValidators, validators)
+
+	// fill had been already distributed shares and find max stake
+	max := copiedValidators[0].ClassicStakedBalance
+	for i, v := range copiedValidators {
+		share, ok := shares[v.AccountID]
+		if ok {
+			copiedValidators[i].ClassicStakedBalance = v.ClassicStakedBalance.Add(share)
+		}
+		if copiedValidators[i].ClassicStakedBalance.GreaterThan(max) {
+			max = copiedValidators[i].ClassicStakedBalance.Copy()
+		}
+	}
+
+	// sorting (asc)
+	sort.Slice(copiedValidators, func(i, j int) bool {
+		return copiedValidators[i].ClassicStakedBalance.GreaterThan(copiedValidators[j].ClassicStakedBalance)
+	})
+
+	if copiedValidators[0].ClassicStakedBalance.Equals(max) { // so all validators stake are equal
+		part := stakeRemains.Div(decimal.New(int64(len(validators)), 0)).Truncate(0)
+		if part.GreaterThan(minRebalanceStake) { // div equal part for everyone
+			for validator, stake := range shares {
+				shares[validator] = stake.Add(part)
+			}
+		} else { // delegate all stake remains for one validator
+			shares[copiedValidators[0].AccountID] = stakeRemains
+		}
+		return
+	}
+
+	for _, v := range copiedValidators {
+		lack := max.Sub(v.ClassicStakedBalance)
+		if stakeRemains.GreaterThanOrEqual(lack) {
+			shares[v.AccountID] = shares[v.AccountID].Add(lack)
+			stakeRemains = stakeRemains.Sub(lack)
+		} else {
+			if stakeRemains.GreaterThan(decimal.Zero) {
+				shares[v.AccountID] = shares[v.AccountID].Add(stakeRemains)
+				stakeRemains = decimal.Zero
+			}
+			return
+		}
+	}
+
+	if stakeRemains.Equal(decimal.Zero) {
+		return
+	}
+	stakeDistribution(stakeRemains, shares, copiedValidators)
+}
+
+'''
+'''--- internal/config/config.go ---
+package config
+
+import (
+	"github.com/joho/godotenv"
+	"github.com/kelseyhightower/envconfig"
+	"github.com/pkg/errors"
+)
+
+const envPath = "./.env"
+
+type (
+	Config struct {
+		LogLevel         string `split_words:"true"`
+		Node             string `split_words:"true"`
+		StakePool        string `split_words:"true"`
+		KeyPair          string `split_words:"true"`
+		KeyPairAccountID string `split_words:"true"`
+	}
+)
+
+func GetConfig() (cfg Config, err error) {
+	err = godotenv.Load(envPath)
+	if err != nil {
+		return cfg, errors.Wrap(err, "loading env file")
+	}
+	err = envconfig.Process("", &cfg)
+	if err != nil {
+		return cfg, errors.Wrap(err, "env config precess")
+	}
+	return cfg, nil
+}
+
+'''

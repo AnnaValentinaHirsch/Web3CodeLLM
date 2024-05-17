@@ -1,0 +1,4897 @@
+*GitHub Repository "metaguild/hacker-dao"*
+
+'''--- .github/workflows/tests.yml ---
+name: Tests
+on: push
+jobs:
+  tests:
+    strategy:
+      matrix:
+        platform: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: wasm32-unknown-unknown
+      - name: Build
+        env:
+          IS_GITHUB_ACTION: true
+        run: cargo +stable build --workspace --target wasm32-unknown-unknown --release
+      - name: Run tests
+        env:
+          IS_GITHUB_ACTION: true
+        run: cargo test --workspace -- --nocapture
+'''
+'''--- Cargo.toml ---
+[workspace]
+# include a member for each contract
+members = [
+  "sputnik-staking",
+  "sputnikdao",
+  "sputnikdao2",
+  "sputnikdao-factory",
+  "sputnikdao-factory2",
+  "test-token",
+]
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = true
+panic = "abort"
+# Opt into extra safety checks on arithmetic operations https://stackoverflow.com/a/64136471/249801
+overflow-checks = true
+
+'''
+'''--- README.md ---
+# Sputnik DAO Contracts
+
+A simple version of a DAO to give out tips, bounties and grants.
+Allows anyone to send a proposal to reward other people with funds and get a council to vote for it.
+
+The major difference with Moloch DAO design is that this contract would receive its function via donation and council has equal rights.
+
+Spec for v1:
+ - Contract contains all the $NEAR in itself. It's initialized with it or receives later in form of donation.
+ - There are council members: list of accounts that can vote for various activity. All council members have equal weight.
+ - Next methods are available that can be called by anyone who attaches `bond` $NEAR (to prevent spam):
+     - Add new council member
+     - Remove council member
+     - Given funds to `receiver` for `description` (up to 280 characters) and proposed `amount`
+     - Finalize proposal
+        When proposal has passed the require time, anyone can call to finalize it. Rules for passing proposal see below.
+     - X of votes to approve proposal depends on the "policy": Policy allows to set number of votes required for different amount of funds spent.
+ - Only council members (or self) can call:
+     - `vote` for a given proposal.
+ - ``Finalize proposal can be called 
+        - If this vote achieves >50% of council members saying "YES" - it executes action on success.
+ - Upgradability with super majority vote of the council
+
+Voting policy is a list of amounts and number or percentage of votes required.
+Where the last number in the list is used for all the non payouts (let's call it MAX_VOTE).
+
+## Voting rules
+
+Next rules are used for voting:
+ - There is a policy that defines for `Payout` proposals at different `amount` how much "YES" votes are required. For non-`Payout` proposals - it's always 1/2 + 1 of council.
+ - If there is 0 "NO" votes and given "YES" votes - the expiration date updates to current time + cooldown time.
+ - If there is at least 1 "NO" then MAX_VOTE of "YES" votes is required.
+ - If there is MAX_VOTE "NO" votes - the proposal gets rejected and bond not returned
+ - If there is no super majority and time to withdraw have passed - proposal fails and the bond gets returned.
+
+For example, voting policy:
+  - `[(0, NumOrRation::Ration(1, 2))]` -- meaning that for any amount or vote MAX_VOTE = 1/2 + 1 is used.
+  - `[(100, NumOrRation::Number(2)), (10000000, NumOrRation::Ration(2, 3))]` -- if amount is below 100 - 2 votes is enough within grace period. Otherwise MAX_VOTE = 2/3 + 1 to pass any larger proposal or add/remove council members.  
+
+Specific examples:
+  - If there are 2 councils, with default policy of 50%: proposal needs both of them to vote YES to "Succeed" or both of them to vote NO to be "Rejected". If they vote differently, the vote will be considered "Fail" and `bond` will be returned back to proposer. 
+
+## Use cases
+
+ - A person made a cool video about NEAR Wallet, development IDE, etc. They themself or anyone else can suggest to give them a bounty.
+ - You saw really cool tweet bashing STATE bill - send that person a bounty (need them to create account though).
+ - Someone contributed a small PR to one of NEAR libraries. One of maintainers can send them a bounty.
+ - A person in NEAR Collective went beyond and above - another person in NEAR Collective sent them a grant.
+ - Another GrantDAO applies for a grant to achieve their longer term goal via distributing to their guild members.
+ - Validators have their own GrantDAO to fund ping bot or other helpful tools for validators. 
+
+**Even better: fork this code and create a more interesting ways to distribute.**
+
+Every guild can fork it and expand how this can be made more inclusive or more sophisticated.
+
+## Needs
+
+ - Nice frontend to visualize past and present proposals, creation of proposal, payouts, stats, etc.
+ - This needs some form of notification service
+
+# Development
+
+Follow general WASM / Rust contract instructions.
+
+## Deploy to TestNet
+
+```bash
+
+# Deploy to new account on TestNet
+near dev-deploy res/sputnikdao.wasm
+
+# Set contract Id (fish)
+set CONTRACT_ID "dev-1608720833104-8969578"
+
+# Initialize contract with given council and parameters (this is for testing, where you stil have access key to the contract).
+# For production use either a single command or the factory in ../sputnikdao-factory 
+near call $CONTRACT_ID new '{"purpose": "test", "council": ["testmewell.testnet", "illia"], "bond": "1000000000000000000000000", "vote_period": "1800000000000", "grace_period": "1800000000000"}' --accountId $CONTRACT_ID
+
+# Get current number of proposals.
+near view $CONTRACT_ID get_num_proposals
+
+# Add new proposal to pay `illia` 1N. 
+near call $CONTRACT_ID add_proposal '{"proposal": {"target": "illia", "description": "test", "kind": {"type": "Payout", "amount": "1000000000000000000000000"}}}' --accountId=illia --amount 1
+
+# View proposal #0
+near view $CONTRACT_ID get_proposal '{"id": 0}'
+{
+  status: 'Vote',
+  proposer: 'illia',
+  target: 'illia',
+  description: 'test',
+  kind: { Payout: { amount: '1000000000000000000000000' } },
+  vote_period_end: 1607497778113967900,
+  vote_yes: 0,
+  vote_no: 0,
+  votes: {}
+}
+
+# Get `limit=1` proposals from id=0 
+near view $CONTRACT_ID get_proposals '{"from_index": 0, "limit": 1}'
+
+# Vote for a proposal #0 `Yes` from `illia`
+near call $CONTRACT_ID vote '{"id": 0, "vote": "Yes"}' --accountId illia
+
+# Vote for a proposal #0 `No` from `testmewell.testnet`
+near call $CONTRACT_ID vote '{"id": 0, "vote": "No"}' --accountId testmewell.testnet
+
+# Proposal to add new council `testnet`.
+near call $CONTRACT_ID add_proposal '{"proposal": {"target": "testnet", "description": "test", "kind": {"type": "NewCouncil"}}}' --accountId=illia --amount 1
+
+# Proposal to remove council `illia`.
+near call $CONTRACT_ID add_proposal '{"proposal": {"target": "illia", "description": "test", "kind": {"type": RemoveCouncil"}}}' --accountId=illia --amount 1
+
+# Proposal to change vote period to 30min (in nanoseconds):
+near call $CONTRACT_ID add_proposal '{"proposal": {"target": "illia", "description": "test", "kind": {"type": "ChangeVotePeriod", "vote_period": "1800000000000"}}}' --accountId=illia --amount 1
+
+# Proposal to change purpose of this DAO:
+near call $CONTRACT_ID add_proposal '{"proposal": {"target": "illia", "description": "test", "kind": {"type": "ChangePurpose", "purpose": "test me well"}}}' --accountId=illia --amount 1
+
+# Proposal to change policy for this DAO, with next voting policy:
+# - up until 100N: just need 2 votes
+# - up until 1000N: need 3 votes
+# - up until 2000N: need 50% + 1 votes
+# - for anything larger or other types of proposals need 66% + 1 of votes
+near call $CONTRACT_ID add_proposal '{"proposal": {"target": "illia", "description": "test", "kind": {"type": "ChangePolicy", "policy": [{"max_amount": "100", "votes": 2}, {"max_amount": "1000", "votes": 3}, {"max_amount": "2000", "votes": [1, 2]}, {"max_amount": "10000000", "votes": [2, 3]}]}}}' --accountId=illia --amount 1
+
+# Finalize a proposal that has no deciding vote and expired.
+near call $CONTRACT_ID finalize '{"id": 4}'
+```
+
+# Ideas for improving
+
+## Other tokens
+
+Add support for other tokens in the "bank".
+Proposal can then specify amount in a token from whitelisted set.
+There can be internal exchange function as well in case it's needed.
+
+## Bounties
+
+Bounties management is hard right now and done via github / notion.
+
+Here is the idea to attach bounties to the same council:
+ - Anyone can add a bounty: description + how much to pay for the bounty
+ - Council votes to approve the bounty (same thing with small bounties need less votes)
+ - There is a list of bounties, separate from requests
+ - People can indicate that they are working on it
+ - When someone completed bounty - they ping the bounty for "review" and council votes if the bounty is solved.
+ - When council voted -> bounty gets paid out
+
+## Canceling / redirecting proposals
+
+If proposal is made to a wrong DAO, it's not great to take the bond away from proposer.
+It's possible to add an option to transfer proposals from one DAO to another DAO.
+Also people can vote to dismiss instead of rejecting it, which will return bond.
+
+'''
+'''--- build.sh ---
+#!/bin/bash
+set -e
+
+cargo +stable build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/sputnik_staking.wasm ./sputnik-staking/res/
+cp target/wasm32-unknown-unknown/release/sputnikdao.wasm ./sputnikdao/res/
+cp target/wasm32-unknown-unknown/release/sputnikdao2.wasm ./sputnikdao2/res/
+cp target/wasm32-unknown-unknown/release/sputnikdao_factory.wasm ./sputnikdao-factory/res/
+cp target/wasm32-unknown-unknown/release/sputnikdao_factory2.wasm ./sputnikdao-factory2/res/
+cp target/wasm32-unknown-unknown/release/test_token.wasm ./test-token/res/
+'''
+'''--- sputnik-staking/Cargo.toml ---
+[package]
+name = "sputnik-staking"
+version = "1.0.0"
+authors = ["Sputnik Devs <near-daos@protonmail.com>"]
+edition = "2018"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "3.1.0"
+near-contract-standards = "3.1.0"
+hex = "0.4.2"
+
+[dev-dependencies]
+near-sdk-sim = "3.1.0"
+test-token = { path = "../test-token" }
+
+'''
+'''--- sputnik-staking/README.md ---
+# Sputnik Staking
+
+This is staking contract for Sputnik DAO.
+
+The default version just allows to stake the tokens by users and convert them into "weight" in the Sputnik itself.
+Further modifications can be done to allow to leverage the staked token for other functions (providing liquidity for example).
+
+'''
+'''--- sputnik-staking/build.sh ---
+#!/bin/bash
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo +stable build --target wasm32-unknown-unknown --release
+cp ../target/wasm32-unknown-unknown/release/sputnik_staking.wasm ./res/
+
+'''
+'''--- sputnik-staking/src/lib.rs ---
+use near_contract_standards::fungible_token::core_impl::ext_fungible_token;
+use near_contract_standards::fungible_token::receiver::FungibleTokenReceiver;
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::LookupMap;
+use near_sdk::json_types::{ValidAccountId, WrappedDuration, U128};
+use near_sdk::{
+    env, ext_contract, near_bindgen, AccountId, Balance, BorshStorageKey, Duration, Gas,
+    PanicOnDefault, Promise, PromiseOrValue, PromiseResult,
+};
+
+pub use user::{User, VersionedUser};
+
+mod storage_impl;
+mod user;
+
+#[derive(BorshStorageKey, BorshSerialize)]
+enum StorageKeys {
+    Users,
+}
+
+/// Amount of gas for fungible token transfers.
+pub const GAS_FOR_FT_TRANSFER: Gas = 10_000_000_000_000;
+
+/// Amount of gas for delegate action.
+pub const GAS_FOR_DELEGATE: Gas = 10_000_000_000_000;
+
+/// Amount of gas for register action.
+pub const GAS_FOR_REGISTER: Gas = 10_000_000_000_000;
+
+/// Amount of gas for undelegate action.
+pub const GAS_FOR_UNDELEGATE: Gas = 10_000_000_000_000;
+
+#[ext_contract(ext_sputnik)]
+pub trait Sputnik {
+    fn register_delegation(&mut self, account_id: AccountId);
+    fn delegate(&mut self, account_id: AccountId, amount: U128);
+    fn undelegate(&mut self, account_id: AccountId, amount: U128);
+}
+
+#[near_bindgen]
+#[derive(BorshSerialize, BorshDeserialize, PanicOnDefault)]
+pub struct Contract {
+    /// DAO owner of this staking contract.
+    owner_id: AccountId,
+    /// Vote token account.
+    vote_token_id: AccountId,
+    /// Recording user deposits.
+    users: LookupMap<AccountId, VersionedUser>,
+    /// Total token amount deposited.
+    total_amount: Balance,
+    /// Duration of unstaking. Should be over the possible voting periods.
+    unstake_period: Duration,
+}
+
+#[ext_contract(ext_self)]
+pub trait Contract {
+    fn exchange_callback_post_withdraw(&mut self, sender_id: AccountId, amount: U128);
+}
+
+#[near_bindgen]
+impl Contract {
+    #[init]
+    pub fn new(
+        owner_id: ValidAccountId,
+        token_id: ValidAccountId,
+        unstake_period: WrappedDuration,
+    ) -> Self {
+        Self {
+            owner_id: owner_id.into(),
+            vote_token_id: token_id.into(),
+            users: LookupMap::new(StorageKeys::Users),
+            total_amount: 0,
+            unstake_period: unstake_period.0,
+        }
+    }
+
+    /// Total number of tokens staked in this contract.
+    pub fn ft_total_supply(&self) -> U128 {
+        U128(self.total_amount)
+    }
+
+    /// Total number of tokens staked by given user.
+    pub fn ft_balance_of(&self, account_id: ValidAccountId) -> U128 {
+        U128(self.internal_get_user(account_id.as_ref()).vote_amount.0)
+    }
+
+    /// Returns user information.
+    pub fn get_user(&self, account_id: ValidAccountId) -> User {
+        self.internal_get_user(account_id.as_ref())
+    }
+
+    /// Delegate give amount of votes to given account.
+    /// If enough tokens and storage, forwards this to owner account.
+    pub fn delegate(&mut self, account_id: ValidAccountId, amount: U128) -> Promise {
+        let sender_id = env::predecessor_account_id();
+        self.internal_delegate(sender_id, account_id.clone().into(), amount.0);
+        ext_sputnik::delegate(
+            account_id.into(),
+            amount,
+            &self.owner_id,
+            0,
+            GAS_FOR_DELEGATE,
+        )
+    }
+
+    /// Remove given amount of delegation.
+    pub fn undelegate(&mut self, account_id: ValidAccountId, amount: U128) -> Promise {
+        let sender_id = env::predecessor_account_id();
+        self.internal_undelegate(sender_id, account_id.clone().into(), amount.0);
+        ext_sputnik::undelegate(
+            account_id.into(),
+            amount,
+            &self.owner_id,
+            0,
+            GAS_FOR_UNDELEGATE,
+        )
+    }
+
+    /// Withdraw non delegated tokens back to the user's account.
+    /// If user's account is not registered, will keep funds here.
+    pub fn withdraw(&mut self, amount: U128) -> Promise {
+        let sender_id = env::predecessor_account_id();
+        self.internal_withdraw(&sender_id, amount.0);
+        ext_fungible_token::ft_transfer(
+            sender_id.clone(),
+            amount,
+            None,
+            &self.vote_token_id,
+            1,
+            GAS_FOR_FT_TRANSFER,
+        )
+        .then(ext_self::exchange_callback_post_withdraw(
+            sender_id,
+            amount,
+            &env::current_account_id(),
+            0,
+            GAS_FOR_FT_TRANSFER,
+        ))
+    }
+
+    #[private]
+    pub fn exchange_callback_post_withdraw(&mut self, sender_id: AccountId, amount: U128) {
+        assert_eq!(
+            env::promise_results_count(),
+            1,
+            "ERR_CALLBACK_POST_WITHDRAW_INVALID",
+        );
+        match env::promise_result(0) {
+            PromiseResult::NotReady => unreachable!(),
+            PromiseResult::Successful(_) => {}
+            PromiseResult::Failed => {
+                // This reverts the changes from withdraw function.
+                self.internal_deposit(&sender_id, amount.0);
+            }
+        };
+    }
+}
+
+#[near_bindgen]
+impl FungibleTokenReceiver for Contract {
+    fn ft_on_transfer(
+        &mut self,
+        sender_id: ValidAccountId,
+        amount: U128,
+        msg: String,
+    ) -> PromiseOrValue<U128> {
+        assert_eq!(
+            self.vote_token_id,
+            env::predecessor_account_id(),
+            "ERR_INVALID_TOKEN"
+        );
+        assert!(msg.is_empty(), "ERR_INVALID_MESSAGE");
+        self.internal_deposit(sender_id.as_ref(), amount.0);
+        PromiseOrValue::Value(U128(0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use near_contract_standards::storage_management::StorageManagement;
+    use near_sdk::json_types::U64;
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::{testing_env, MockedBlockchain};
+
+    use near_sdk_sim::to_yocto;
+
+    use super::*;
+
+    #[test]
+    fn test_basics() {
+        let period = 1000;
+        let mut context = VMContextBuilder::new();
+        testing_env!(context.predecessor_account_id(accounts(0)).build());
+        let mut contract = Contract::new(accounts(0), accounts(1), U64(period));
+        testing_env!(context.attached_deposit(to_yocto("1")).build());
+        contract.storage_deposit(Some(accounts(2)), None);
+        testing_env!(context.predecessor_account_id(accounts(1)).build());
+        contract.ft_on_transfer(accounts(2), U128(to_yocto("100")), "".to_string());
+        assert_eq!(contract.ft_total_supply().0, to_yocto("100"));
+        assert_eq!(contract.ft_balance_of(accounts(2)).0, to_yocto("100"));
+        testing_env!(context.predecessor_account_id(accounts(2)).build());
+        contract.withdraw(U128(to_yocto("50")));
+        assert_eq!(contract.ft_total_supply().0, to_yocto("50"));
+        assert_eq!(contract.ft_balance_of(accounts(2)).0, to_yocto("50"));
+        contract.delegate(accounts(3), U128(to_yocto("10")));
+        let user = contract.get_user(accounts(2));
+        assert_eq!(user.delegated_amount(), to_yocto("10"));
+        contract.undelegate(accounts(3), U128(to_yocto("10")));
+        let user = contract.get_user(accounts(2));
+        assert_eq!(user.delegated_amount(), 0);
+        assert_eq!(user.next_action_timestamp, U64(period));
+    }
+}
+
+'''
+'''--- sputnik-staking/src/storage_impl.rs ---
+use std::convert::TryInto;
+
+use near_contract_standards::storage_management::{
+    StorageBalance, StorageBalanceBounds, StorageManagement,
+};
+use near_sdk::{assert_one_yocto, log};
+
+use crate::*;
+
+/// Implements users storage management for the pool.
+#[near_bindgen]
+impl StorageManagement for Contract {
+    #[payable]
+    fn storage_deposit(
+        &mut self,
+        account_id: Option<ValidAccountId>,
+        registration_only: Option<bool>,
+    ) -> StorageBalance {
+        let amount = env::attached_deposit();
+        let account_id = account_id
+            .map(|a| a.into())
+            .unwrap_or_else(|| env::predecessor_account_id());
+        let registration_only = registration_only.unwrap_or(false);
+        let min_balance = User::min_storage() as Balance * env::storage_byte_cost();
+        let already_registered = self.users.contains_key(&account_id);
+        if amount < min_balance && !already_registered {
+            env::panic(b"ERR_DEPOSIT_LESS_THAN_MIN_STORAGE");
+        }
+        if registration_only {
+            // Registration only setups the account but doesn't leave space for tokens.
+            if already_registered {
+                log!("ERR_ACC_REGISTERED");
+                if amount > 0 {
+                    Promise::new(env::predecessor_account_id()).transfer(amount);
+                }
+            } else {
+                self.internal_register_user(&account_id, min_balance);
+                let refund = amount - min_balance;
+                if refund > 0 {
+                    Promise::new(env::predecessor_account_id()).transfer(refund);
+                }
+            }
+        } else {
+            self.internal_register_user(&account_id, amount);
+        }
+        self.storage_balance_of(account_id.try_into().unwrap())
+            .unwrap()
+    }
+
+    #[payable]
+    fn storage_withdraw(&mut self, amount: Option<U128>) -> StorageBalance {
+        assert_one_yocto();
+        let account_id = env::predecessor_account_id();
+        let user = self.internal_get_user(&account_id);
+        let available = user.storage_available();
+        let amount = amount.map(|a| a.0).unwrap_or(available);
+        assert!(amount <= available, "ERR_STORAGE_WITHDRAW_TOO_MUCH");
+        Promise::new(account_id.clone()).transfer(amount);
+        self.storage_balance_of(account_id.try_into().unwrap())
+            .unwrap()
+    }
+
+    #[allow(unused_variables)]
+    #[payable]
+    fn storage_unregister(&mut self, force: Option<bool>) -> bool {
+        assert_one_yocto();
+        let account_id = env::predecessor_account_id();
+        if let Some(user) = self.internal_get_user_opt(&account_id) {
+            // TODO: figure out force option logic.
+            assert!(user.vote_amount.0 > 0, "ERR_STORAGE_UNREGISTER_NOT_EMPTY");
+            self.users.remove(&account_id);
+            Promise::new(account_id.clone()).transfer(user.near_amount.0);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn storage_balance_bounds(&self) -> StorageBalanceBounds {
+        StorageBalanceBounds {
+            min: U128(User::min_storage() as Balance * env::storage_byte_cost()),
+            max: None,
+        }
+    }
+
+    fn storage_balance_of(&self, account_id: ValidAccountId) -> Option<StorageBalance> {
+        self.internal_get_user_opt(account_id.as_ref())
+            .map(|user| StorageBalance {
+                total: user.near_amount,
+                available: U128(user.storage_available()),
+            })
+    }
+}
+
+'''
+'''--- sputnik-staking/src/user.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::json_types::{WrappedTimestamp, U128};
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{env, AccountId, Balance, Duration, StorageUsage};
+
+use crate::*;
+
+const U64_LEN: StorageUsage = 8;
+const U128_LEN: StorageUsage = 16;
+const ACCOUNT_MAX_LENGTH: StorageUsage = 64;
+
+/// User data.
+/// Recording deposited voting tokens, storage used and delegations for voting.
+/// Once delegated - the tokens are used in the votes. It records for each delegate when was the last vote.
+/// When undelegating - the new delegations or withdrawal are only available after cooldown period from last vote of the delegate.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct User {
+    /// Total amount of storage used by this user struct.
+    pub storage_used: StorageUsage,
+    /// Amount of $NEAR to cover storage.
+    pub near_amount: U128,
+    /// Amount of staked token deposited.
+    pub vote_amount: U128,
+    /// Withdrawal or next delegation available timestamp.
+    pub next_action_timestamp: WrappedTimestamp,
+    /// List of delegations to other accounts.
+    pub delegated_amounts: Vec<(AccountId, U128)>,
+}
+
+#[derive(BorshSerialize, BorshDeserialize)]
+pub enum VersionedUser {
+    Default(User),
+}
+
+impl User {
+    pub fn new(near_amount: Balance) -> Self {
+        Self {
+            storage_used: Self::min_storage(),
+            near_amount: U128(near_amount),
+            vote_amount: U128(0),
+            delegated_amounts: vec![],
+            next_action_timestamp: 0.into(),
+        }
+    }
+
+    /// Minimum storage with empty delegations in bytes.
+    /// This includes u128 stored in DAO for delegations to this user.
+    /// They are deposited on internal_register and removed on internal_unregister.
+    pub fn min_storage() -> StorageUsage {
+        ACCOUNT_MAX_LENGTH + 2 * U64_LEN + 4 * U128_LEN
+    }
+
+    fn assert_storage(&self) {
+        assert!(
+            (self.storage_used as Balance) * env::storage_byte_cost() <= self.near_amount.0,
+            "ERR_NOT_ENOUGH_STORAGE"
+        );
+    }
+
+    pub(crate) fn delegated_amount(&self) -> Balance {
+        self.delegated_amounts
+            .iter()
+            .fold(0, |total, (_, amount)| total + amount.0)
+    }
+
+    /// Record delegation from this account to another account.
+    /// Fails if not enough available balance to delegate.
+    pub fn delegate(&mut self, delegate_id: AccountId, amount: Balance) {
+        assert!(
+            self.delegated_amount() + amount <= self.vote_amount.0,
+            "ERR_NOT_ENOUGH_AMOUNT"
+        );
+        assert!(
+            env::block_timestamp() >= self.next_action_timestamp.0,
+            "ERR_NOT_ENOUGH_TIME_PASSED"
+        );
+        self.storage_used += delegate_id.len() as StorageUsage + U128_LEN;
+        self.delegated_amounts.push((delegate_id, U128(amount)));
+        self.assert_storage();
+    }
+
+    /// Remove given amount from delegates. Updates timestamp when next action can be called.
+    /// Fails if delegate not found or not enough amount delegated.
+    pub fn undelegate(
+        &mut self,
+        delegate_id: &AccountId,
+        amount: Balance,
+        undelegation_period: Duration,
+    ) {
+        let f = self
+            .delegated_amounts
+            .iter()
+            .enumerate()
+            .find(|(_, (account_id, _))| account_id == delegate_id)
+            .expect("ERR_NO_DELEGATE");
+        let element = (f.0, ((f.1).1).0);
+        assert!(element.1 >= amount, "ERR_NOT_ENOUGH_AMOUNT");
+        if element.1 == amount {
+            self.delegated_amounts.remove(element.0);
+            self.storage_used -= delegate_id.len() as StorageUsage + U128_LEN;
+        } else {
+            (self.delegated_amounts[element.0].1).0 -= amount;
+        }
+        self.next_action_timestamp = (env::block_timestamp() + undelegation_period).into();
+    }
+
+    /// Withdraw the amount.
+    /// Fails if there is not enough available balance.
+    pub fn withdraw(&mut self, amount: Balance) {
+        assert!(
+            self.delegated_amount() + amount <= self.vote_amount.0,
+            "ERR_NOT_ENOUGH_AVAILABLE_AMOUNT"
+        );
+        assert!(
+            env::block_timestamp() >= self.next_action_timestamp.0,
+            "ERR_NOT_ENOUGH_TIME_PASSED"
+        );
+        self.vote_amount.0 -= amount;
+    }
+
+    /// Deposit given amount of vote tokens.
+    pub fn deposit(&mut self, amount: Balance) {
+        self.vote_amount.0 += amount;
+    }
+
+    /// Returns amount in NEAR that is available for storage.
+    pub fn storage_available(&self) -> Balance {
+        self.near_amount.0 - self.storage_used as Balance * env::storage_byte_cost()
+    }
+}
+
+impl Contract {
+    pub fn internal_get_user(&self, account_id: &AccountId) -> User {
+        self.internal_get_user_opt(account_id).expect("NO_USER")
+    }
+
+    pub fn internal_get_user_opt(&self, account_id: &AccountId) -> Option<User> {
+        self.users
+            .get(account_id)
+            .map(|versioned_user| match versioned_user {
+                VersionedUser::Default(user) => user,
+            })
+    }
+
+    pub fn save_user(&mut self, account_id: &AccountId, user: User) {
+        self.users.insert(account_id, &VersionedUser::Default(user));
+    }
+
+    /// Internal register new user.
+    pub fn internal_register_user(&mut self, sender_id: &AccountId, near_amount: Balance) {
+        let user = User::new(near_amount);
+        self.save_user(sender_id, user);
+        ext_sputnik::register_delegation(
+            sender_id.clone(),
+            &self.owner_id,
+            (U128_LEN as Balance) * env::storage_byte_cost(),
+            GAS_FOR_REGISTER,
+        );
+    }
+
+    /// Deposit voting token.
+    pub fn internal_deposit(&mut self, sender_id: &AccountId, amount: Balance) {
+        let mut sender = self.internal_get_user(&sender_id);
+        sender.deposit(amount);
+        self.save_user(&sender_id, sender);
+        self.total_amount += amount;
+    }
+
+    /// Withdraw voting token.
+    pub fn internal_withdraw(&mut self, sender_id: &AccountId, amount: Balance) {
+        let mut sender = self.internal_get_user(&sender_id);
+        sender.withdraw(amount);
+        self.save_user(&sender_id, sender);
+        assert!(self.total_amount >= amount, "ERR_INTERNAL");
+        self.total_amount -= amount;
+    }
+
+    /// Given user delegates given amount of votes to another user.
+    /// The other user must be registered.
+    pub fn internal_delegate(
+        &mut self,
+        sender_id: AccountId,
+        delegate_id: AccountId,
+        amount: Balance,
+    ) {
+        let mut sender = self.internal_get_user(&sender_id);
+        sender.delegate(delegate_id.clone(), amount);
+        self.save_user(&sender_id, sender);
+    }
+
+    /// Undelegate votes from given delegate.
+    pub fn internal_undelegate(
+        &mut self,
+        sender_id: AccountId,
+        delegate_id: AccountId,
+        amount: Balance,
+    ) {
+        let mut sender = self.internal_get_user(&sender_id);
+        sender.undelegate(&delegate_id, amount, self.unstake_period);
+        self.save_user(&sender_id, sender);
+    }
+}
+
+'''
+'''--- sputnikdao-factory/Cargo.toml ---
+[package]
+name = "sputnikdao-factory"
+version = "0.1.0"
+authors = ["Illia Polosukhin <illia.polosukhin@gmail.com>"]
+edition = "2018"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "3.1.0"
+
+'''
+'''--- sputnikdao-factory/README.md ---
+# SputnikDAO Factory
+
+# Deployment & Usage
+
+## TestNet
+
+```
+near dev-deploy --wasmFile=res/sputnikdao_factory.wasm
+
+# bash
+CONTRACT_ID="dev-1608694678554-8567049"
+# fish
+set CONTRACT_ID "dev-1608694678554-8567049"
+
+# Initialize the factory.
+near call $CONTRACT_ID new '{}' --accountId $CONTRACT_ID 
+
+# bash
+ARGS=`echo '{"purpose": "test", "council": ["testmewell.testnet", "illia"], "bond": "1000000000000000000000000", "vote_period": "1800000000000", "grace_period": "1800000000000"}' | base64`
+# fish
+set ARGS (echo '{"purpose": "test", "council": ["testmewell.testnet", "illia"], "bond": "1000000000000000000000000", "vote_period": "1800000000000", "grace_period": "1800000000000"}' | base64)
+
+# Create a new DAO with the given parameters.
+near call $CONTRACT_ID create "{\"name\": \"test\", \"public_key\": null, \"args\": \"$ARGS\"}"  --accountId $CONTRACT_ID --amount 30 --gas 100000000000000
+
+# Create a new DAO with the given parameters while having Full Access Key to the account (trusted, but useful in case of testing or upgrades)
+near call $CONTRACT_ID create "{\"name\": \"test\", \"public_key\": \"<base58 of public key>\", \"args\": \"$ARGS\"}"  --accountId $CONTRACT_ID --amount 30 --gas 100000000000000
+
+# List all created DAOs.
+near view $CONTRACT_ID get_dao_list
+```
+
+'''
+'''--- sputnikdao-factory/build.sh ---
+#!/bin/bash
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo +stable build --target wasm32-unknown-unknown --release
+cp ../target/wasm32-unknown-unknown/release/sputnikdao_factory.wasm ./res/
+
+'''
+'''--- sputnikdao-factory/src/lib.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::UnorderedSet;
+use near_sdk::json_types::{Base58PublicKey, Base64VecU8};
+use near_sdk::{env, near_bindgen, AccountId, Promise};
+
+#[global_allocator]
+static ALLOC: near_sdk::wee_alloc::WeeAlloc<'_> = near_sdk::wee_alloc::WeeAlloc::INIT;
+
+const CODE: &[u8] = include_bytes!("../../sputnikdao/res/sputnikdao.wasm");
+
+/// This gas spent on the call & account creation, the rest goes to the `new` call.
+const CREATE_CALL_GAS: u64 = 40_000_000_000_000;
+
+#[near_bindgen]
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct SputnikDAOFactory {
+    daos: UnorderedSet<AccountId>,
+}
+
+impl Default for SputnikDAOFactory {
+    fn default() -> Self {
+        env::panic(b"SputnikDAOFactory should be initialized before usage")
+    }
+}
+
+#[near_bindgen]
+impl SputnikDAOFactory {
+    #[init]
+    pub fn new() -> Self {
+        assert!(!env::state_exists(), "The contract is already initialized");
+        Self {
+            daos: UnorderedSet::new(b"d".to_vec()),
+        }
+    }
+
+    pub fn get_dao_list(&self) -> Vec<AccountId> {
+        self.daos.to_vec()
+    }
+
+    #[payable]
+    pub fn create(
+        &mut self,
+        name: AccountId,
+        public_key: Option<Base58PublicKey>,
+        args: Base64VecU8,
+    ) -> Promise {
+        let account_id = format!("{}.{}", name, env::current_account_id());
+        self.daos.insert(&account_id);
+        let mut promise = Promise::new(account_id)
+            .create_account()
+            .deploy_contract(CODE.to_vec())
+            .transfer(env::attached_deposit());
+        if let Some(key) = public_key {
+            promise = promise.add_full_access_key(key.into())
+        }
+        promise.function_call(
+            b"new".to_vec(),
+            args.into(),
+            0,
+            env::prepaid_gas() - CREATE_CALL_GAS,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use near_sdk::{testing_env, MockedBlockchain};
+
+    use super::*;
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+
+    #[test]
+    fn test_basics() {
+        testing_env!(VMContextBuilder::new()
+            .current_account_id(accounts(0))
+            .build());
+        let mut factory = SputnikDAOFactory::new();
+        testing_env!(VMContextBuilder::new()
+            .current_account_id(accounts(0))
+            .attached_deposit(10)
+            .build());
+        factory.create(
+            "test".to_string(),
+            Some(Base58PublicKey(vec![])),
+            "{}".as_bytes().to_vec().into(),
+        );
+        assert_eq!(
+            factory.get_dao_list(),
+            vec![format!("test.{}", accounts(0))]
+        );
+    }
+}
+
+'''
+'''--- sputnikdao-factory2/Cargo.toml ---
+[package]
+name = "sputnikdao-factory2"
+version = "0.2.0"
+authors = ["Illia Polosukhin <illia.polosukhin@gmail.com>"]
+edition = "2018"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "3.1.0"
+
+'''
+'''--- sputnikdao-factory2/README.md ---
+# SputnikDAO Factory
+
+# Deployment & Usage
+
+## TestNet
+
+```
+near dev-deploy --wasmFile=res/sputnikdao_factory2.wasm
+
+# bash
+CONTRACT_ID="dev-1608694678554-8567049"
+# fish
+set CONTRACT_ID "dev-1608694678554-8567049"
+
+# Initialize the factory.
+near call $CONTRACT_ID new '{}' --accountId $CONTRACT_ID 
+
+# bash
+ARGS=`echo '{"purpose": "test", "council": ["testmewell.testnet", "illia"], "bond": "1000000000000000000000000", "vote_period": "1800000000000", "grace_period": "1800000000000"}' | base64`
+# fish
+set ARGS (echo '{"purpose": "test", "council": ["testmewell.testnet", "illia"], "bond": "1000000000000000000000000", "vote_period": "1800000000000", "grace_period": "1800000000000"}' | base64)
+
+# Create a new DAO with the given parameters.
+near call $CONTRACT_ID create "{\"name\": \"test\", \"public_key\": null, \"args\": \"$ARGS\"}"  --accountId $CONTRACT_ID --amount 30 --gas 100000000000000
+
+# Create a new DAO with the given parameters while having Full Access Key to the account (trusted, but useful in case of testing or upgrades)
+near call $CONTRACT_ID create "{\"name\": \"test\", \"public_key\": \"<base58 of public key>\", \"args\": \"$ARGS\"}"  --accountId $CONTRACT_ID --amount 30 --gas 100000000000000
+
+# List all created DAOs.
+near view $CONTRACT_ID get_dao_list
+```
+
+'''
+'''--- sputnikdao-factory2/build.sh ---
+#!/bin/bash
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo +stable build --target wasm32-unknown-unknown --release
+cp ../target/wasm32-unknown-unknown/release/sputnikdao_factory2.wasm ./res/
+
+'''
+'''--- sputnikdao-factory2/src/lib.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::UnorderedSet;
+use near_sdk::json_types::{Base58PublicKey, Base64VecU8, U128};
+use near_sdk::{assert_self, env, ext_contract, near_bindgen, AccountId, Promise};
+
+#[global_allocator]
+static ALLOC: near_sdk::wee_alloc::WeeAlloc<'_> = near_sdk::wee_alloc::WeeAlloc::INIT;
+
+const CODE: &[u8] = include_bytes!("../../sputnikdao2/res/sputnikdao2.wasm");
+
+/// Gas spent on the call & account creation.
+const CREATE_CALL_GAS: u64 = 75_000_000_000_000;
+
+/// Gas allocated on the callback.
+const ON_CREATE_CALL_GAS: u64 = 10_000_000_000_000;
+
+#[ext_contract(ext_self)]
+pub trait ExtSelf {
+    fn on_create(
+        &mut self,
+        account_id: AccountId,
+        attached_deposit: U128,
+        predecessor_account_id: AccountId,
+    ) -> bool;
+}
+
+#[near_bindgen]
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct SputnikDAOFactory {
+    daos: UnorderedSet<AccountId>,
+}
+
+impl Default for SputnikDAOFactory {
+    fn default() -> Self {
+        env::panic(b"SputnikDAOFactory should be initialized before usage")
+    }
+}
+
+#[near_bindgen]
+impl SputnikDAOFactory {
+    #[init]
+    pub fn new() -> Self {
+        assert!(!env::state_exists(), "The contract is already initialized");
+        Self {
+            daos: UnorderedSet::new(b"d".to_vec()),
+        }
+    }
+
+    pub fn get_dao_list(&self) -> Vec<AccountId> {
+        self.daos.to_vec()
+    }
+
+    #[payable]
+    pub fn create(
+        &mut self,
+        name: AccountId,
+        public_key: Option<Base58PublicKey>,
+        args: Base64VecU8,
+    ) -> Promise {
+        let account_id = format!("{}.{}", name, env::current_account_id());
+        let mut promise = Promise::new(account_id.clone())
+            .create_account()
+            .deploy_contract(CODE.to_vec())
+            .transfer(env::attached_deposit());
+        if let Some(key) = public_key {
+            promise = promise.add_full_access_key(key.into())
+        }
+        promise
+            .function_call(
+                b"new".to_vec(),
+                args.into(),
+                0,
+                env::prepaid_gas() - CREATE_CALL_GAS - ON_CREATE_CALL_GAS,
+            )
+            .then(ext_self::on_create(
+                account_id,
+                U128(env::attached_deposit()),
+                env::predecessor_account_id(),
+                &env::current_account_id(),
+                0,
+                ON_CREATE_CALL_GAS,
+            ))
+    }
+
+    pub fn on_create(
+        &mut self,
+        account_id: AccountId,
+        attached_deposit: U128,
+        predecessor_account_id: AccountId,
+    ) -> bool {
+        assert_self();
+        if near_sdk::is_promise_success() {
+            self.daos.insert(&account_id);
+            true
+        } else {
+            Promise::new(predecessor_account_id).transfer(attached_deposit.0);
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use near_sdk::test_utils::{accounts, testing_env_with_promise_results, VMContextBuilder};
+    use near_sdk::{testing_env, MockedBlockchain, PromiseResult};
+
+    use super::*;
+
+    #[test]
+    fn test_basics() {
+        let mut context = VMContextBuilder::new();
+        testing_env!(context.current_account_id(accounts(0)).build());
+        let mut factory = SputnikDAOFactory::new();
+        testing_env!(context.attached_deposit(10).build());
+        factory.create(
+            "test".to_string(),
+            Some(Base58PublicKey(vec![])),
+            "{}".as_bytes().to_vec().into(),
+        );
+        testing_env_with_promise_results(
+            context.predecessor_account_id(accounts(0)).build(),
+            PromiseResult::Successful(vec![]),
+        );
+        factory.on_create(
+            format!("test.{}", accounts(0)),
+            U128(10),
+            accounts(0).to_string(),
+        );
+        assert_eq!(
+            factory.get_dao_list(),
+            vec![format!("test.{}", accounts(0))]
+        );
+    }
+}
+
+'''
+'''--- sputnikdao/Cargo.toml ---
+[package]
+name = "sputnikdao"
+version = "0.1.0"
+authors = ["Illia Polosukhin <illia.polosukhin@gmail.com>"]
+edition = "2018"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "3.1.0"
+
+'''
+'''--- sputnikdao/build.sh ---
+#!/bin/bash
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo +stable build --target wasm32-unknown-unknown --release
+cp ../target/wasm32-unknown-unknown/release/sputnikdao.wasm ./res/
+
+'''
+'''--- sputnikdao/src/bounty.rs ---
+use std::collections::HashSet;
+
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+enum BountyStatus {
+    Open,
+    /// When was bounty claimed and by whom.
+    Claimed { account_id: AccountId, started: Timestamp },
+    /// Bounty is done by given account, review started at given time.
+    InReview { account_id: AccountId, started: Timestamp },
+    /// Bounty is done and closed.
+    Done,
+    /// Review expired, will pay out.
+    Expired,
+}
+
+/// Stores information about bounties that this DAO has open.
+/// Bounty can be `Open`, `InProgress`, `Ready`
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Bounty {
+    /// Status of the given bounty.
+    status: BountyStatus,
+    description: String,
+    /// Maximum how long should this bounty take.
+    duration: Duration,
+    /// Applicants.
+    /// TODO: add details and their proposed duration?
+    applicants: HashSet<AccountId>,
+}
+
+'''
+'''--- sputnikdao/src/lib.rs ---
+use near_sdk::{AccountId, Balance, env, near_bindgen, Promise, Duration};
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::{UnorderedSet, Vector};
+use near_sdk::serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use near_sdk::json_types::{WrappedBalance, WrappedDuration};
+
+#[global_allocator]
+static ALLOC: near_sdk::wee_alloc::WeeAlloc<'_> = near_sdk::wee_alloc::WeeAlloc::INIT;
+
+const MAX_DESCRIPTION_LENGTH: usize = 280;
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub enum Vote {
+    Yes,
+    No,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone)]
+#[serde(crate = "near_sdk::serde")]
+#[serde(untagged)]
+pub enum NumOrRatio {
+    Number(u64),
+    Ratio(u64, u64),
+}
+
+impl NumOrRatio {
+    pub fn as_ratio(&self) -> Option<(u64, u64)> {
+        match self {
+            NumOrRatio::Number(_) => None,
+            NumOrRatio::Ratio(a, b) => Some((*a, *b)),
+        }
+    }
+}
+
+/// Policy item, defining how many votes required to approve up to this much amount.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone)]
+#[serde(crate = "near_sdk::serde")]
+pub struct PolicyItem {
+    pub max_amount: WrappedBalance,
+    pub votes: NumOrRatio,
+}
+
+impl PolicyItem {
+    pub fn num_votes(&self, num_council: u64) -> u64 {
+        match self.votes {
+            NumOrRatio::Number(num_votes) => num_votes,
+            NumOrRatio::Ratio(l, r) => std::cmp::min(num_council * l / r + 1, num_council),
+        }
+    }
+}
+
+fn vote_requirement(policy: &[PolicyItem], num_council: u64, amount: Option<Balance>) -> u64 {
+    if let Some(amount) = amount {
+        // TODO: replace with binary search.
+        for item in policy {
+            if item.max_amount.0 > amount {
+                return item.num_votes(num_council);
+            }
+        }
+    }
+    policy[policy.len() - 1].num_votes(num_council)
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, PartialEq, Debug, Clone)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Eq))]
+#[serde(crate = "near_sdk::serde")]
+pub enum ProposalStatus {
+    /// Proposal is in active voting stage.
+    Vote,
+    /// Proposal has successfully passed.
+    Success,
+    /// Proposal was rejected by the vote.
+    Reject,
+    /// Vote for proposal has failed due (not enough votes).
+    Fail,
+    /// Given voting policy, the uncontested minimum of votes was acquired.
+    /// Delaying the finalization of the proposal to check that there is no contenders (who would vote against).
+    Delay,
+}
+
+impl ProposalStatus {
+    pub fn is_finalized(&self) -> bool {
+        self != &ProposalStatus::Vote && self != &ProposalStatus::Delay
+    }
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+#[serde(tag = "type")]
+pub enum ProposalKind {
+    NewCouncil,
+    RemoveCouncil,
+    Payout { amount: WrappedBalance },
+    ChangeVotePeriod { vote_period: WrappedDuration },
+    ChangeBond { bond: WrappedBalance },
+    ChangePolicy { policy: Vec<PolicyItem> },
+    ChangePurpose { purpose: String },
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Proposal {
+    status: ProposalStatus,
+    proposer: AccountId,
+    target: AccountId,
+    description: String,
+    kind: ProposalKind,
+    vote_period_end: Duration,
+    vote_yes: u64,
+    vote_no: u64,
+    votes: HashMap<AccountId, Vote>,
+}
+
+impl Proposal {
+    pub fn get_amount(&self) -> Option<Balance> {
+        match self.kind {
+            ProposalKind::Payout { amount } => Some(amount.0),
+            _ => None,
+        }
+    }
+
+    /// Compute new vote status given council size and current timestamp.
+    pub fn vote_status(&self, policy: &[PolicyItem], num_council: u64) -> ProposalStatus {
+        let votes_required = vote_requirement(policy, num_council, self.get_amount());
+        let max_votes = policy[policy.len() - 1].num_votes(num_council);
+        if self.vote_yes >= max_votes {
+            ProposalStatus::Success
+        } else if self.vote_yes >= votes_required && self.vote_no == 0 {
+            if env::block_timestamp() > self.vote_period_end {
+                ProposalStatus::Success
+            } else {
+                ProposalStatus::Delay
+            }
+        } else if self.vote_no >= max_votes {
+            ProposalStatus::Reject
+        } else if env::block_timestamp() > self.vote_period_end
+            || self.vote_yes + self.vote_no == num_council
+        {
+            ProposalStatus::Fail
+        } else {
+            ProposalStatus::Vote
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct ProposalInput {
+    target: AccountId,
+    description: String,
+    kind: ProposalKind,
+}
+
+#[near_bindgen]
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct SputnikDAO {
+    purpose: String,
+    bond: Balance,
+    vote_period: Duration,
+    grace_period: Duration,
+    policy: Vec<PolicyItem>,
+    council: UnorderedSet<AccountId>,
+    proposals: Vector<Proposal>,
+}
+
+impl Default for SputnikDAO {
+    fn default() -> Self {
+        env::panic(b"SputnikDAO should be initialized before usage")
+    }
+}
+
+#[near_bindgen]
+impl SputnikDAO {
+    #[init]
+    pub fn new(
+        purpose: String,
+        council: Vec<AccountId>,
+        bond: WrappedBalance,
+        vote_period: WrappedDuration,
+        grace_period: WrappedDuration,
+    ) -> Self {
+        assert!(!env::state_exists(), "The contract is already initialized");
+
+        let mut dao = Self {
+            purpose,
+            bond: bond.into(),
+            vote_period: vote_period.into(),
+            grace_period: grace_period.into(),
+            policy: vec![PolicyItem {
+                max_amount: 0.into(),
+                votes: NumOrRatio::Ratio(1, 2),
+            }],
+            council: UnorderedSet::new(b"c".to_vec()),
+            proposals: Vector::new(b"p".to_vec()),
+        };
+        for account_id in council {
+            dao.council.insert(&account_id);
+        }
+        dao
+    }
+
+    #[payable]
+    pub fn add_proposal(&mut self, proposal: ProposalInput) -> u64 {
+        // TODO: add also extra storage cost for the proposal itself.
+        assert!(env::attached_deposit() >= self.bond, "Not enough deposit");
+        assert!(
+            proposal.description.len() < MAX_DESCRIPTION_LENGTH,
+            "Description length is too long"
+        );
+        // Input verification.
+        match proposal.kind {
+            ProposalKind::ChangePolicy { ref policy } => {
+                assert_ne!(policy.len(), 0, "Policy shouldn't be empty");
+                for i in 1..policy.len() {
+                    assert!(
+                        policy[i].max_amount.0 > policy[i - 1].max_amount.0,
+                        "Policy must be sorted, item {} is wrong",
+                        i
+                    );
+                }
+                let last_ratio = policy[policy.len() - 1]
+                    .votes
+                    .as_ratio()
+                    .expect("Last item in policy must be a ratio");
+                assert!(
+                    last_ratio.0 * 2 / last_ratio.1 >= 1,
+                    "Last item in policy must be equal or above 1/2 ratio"
+                );
+            }
+            _ => {}
+        }
+        let p = Proposal {
+            status: ProposalStatus::Vote,
+            proposer: env::predecessor_account_id(),
+            target: proposal.target,
+            description: proposal.description,
+            kind: proposal.kind,
+            vote_period_end: env::block_timestamp() + self.vote_period,
+            vote_yes: 0,
+            vote_no: 0,
+            votes: HashMap::default(),
+        };
+        self.proposals.push(&p);
+        self.proposals.len() - 1
+    }
+
+    pub fn get_vote_period(&self) -> WrappedDuration {
+        self.vote_period.into()
+    }
+
+    pub fn get_bond(&self) -> WrappedBalance {
+        self.bond.into()
+    }
+
+    pub fn get_council(&self) -> Vec<AccountId> {
+        self.council.to_vec()
+    }
+
+    pub fn get_num_proposals(&self) -> u64 {
+        self.proposals.len()
+    }
+
+    pub fn get_proposals(&self, from_index: u64, limit: u64) -> Vec<Proposal> {
+        (from_index..std::cmp::min(from_index + limit, self.proposals.len()))
+            .map(|index| self.proposals.get(index).unwrap())
+            .collect()
+    }
+
+    pub fn get_proposals_by_status(
+        &self,
+        status: ProposalStatus,
+        from_index: u64,
+        limit: u64,
+    ) -> HashMap<u64, Proposal> {
+        let filtered_proposal_ids: Vec<u64> = (0..self.proposals.len())
+            .filter(|index| self.proposals.get(index.clone()).unwrap().status == status)
+            .collect();
+
+        (from_index..std::cmp::min(from_index + limit, filtered_proposal_ids.len() as u64))
+            .map(|index| {
+                let proposal_id: u64 = filtered_proposal_ids[index as usize];
+                (proposal_id, self.proposals.get(proposal_id).unwrap())
+            })
+            .collect()
+    }
+
+    pub fn get_proposals_by_statuses(
+        &self,
+        statuses: Vec<ProposalStatus>,
+        from_index: u64,
+        limit: u64,
+    ) -> HashMap<u64, Proposal> {
+        let filtered_proposal_ids: Vec<u64> = (0..self.proposals.len())
+            .filter(|index| statuses.contains(&self.proposals.get(index.clone()).unwrap().status))
+            .collect();
+
+        (from_index..std::cmp::min(from_index + limit, filtered_proposal_ids.len() as u64))
+            .map(|index| {
+                let proposal_id: u64 = filtered_proposal_ids[index as usize];
+                (proposal_id, self.proposals.get(proposal_id).unwrap())
+            })
+            .collect()
+    }
+
+    pub fn get_proposal(&self, id: u64) -> Proposal {
+        self.proposals.get(id).expect("Proposal not found")
+    }
+
+    pub fn get_purpose(&self) -> String {
+        self.purpose.clone()
+    }
+
+    pub fn vote(&mut self, id: u64, vote: Vote) {
+        assert!(
+            self.council.contains(&env::predecessor_account_id()),
+            "Only council can vote"
+        );
+        let mut proposal = self.proposals.get(id).expect("No proposal with such id");
+        assert_eq!(
+            proposal.status,
+            ProposalStatus::Vote,
+            "Proposal already finalized"
+        );
+        if proposal.vote_period_end < env::block_timestamp() {
+            env::log(b"Voting period expired, finalizing the proposal");
+            self.finalize(id);
+            return;
+        }
+        assert!(
+            !proposal.votes.contains_key(&env::predecessor_account_id()),
+            "Already voted"
+        );
+        match vote {
+            Vote::Yes => proposal.vote_yes += 1,
+            Vote::No => proposal.vote_no += 1,
+        }
+        proposal.votes.insert(env::predecessor_account_id(), vote);
+        let post_status = proposal.vote_status(&self.policy, self.council.len());
+        // If just changed from vote to Delay, adjust the expiration date to grace period.
+        if !post_status.is_finalized() && post_status != proposal.status {
+            proposal.vote_period_end = env::block_timestamp() + self.grace_period;
+            proposal.status = post_status.clone();
+        }
+        self.proposals.replace(id, &proposal);
+        // Finalize if this vote is done.
+        if post_status.is_finalized() {
+            self.finalize(id);
+        }
+    }
+
+    pub fn finalize(&mut self, id: u64) {
+        let mut proposal = self.proposals.get(id).expect("No proposal with such id");
+        assert!(
+            !proposal.status.is_finalized(),
+            "Proposal already finalized"
+        );
+        proposal.status = proposal.vote_status(&self.policy, self.council.len());
+        match proposal.status {
+            ProposalStatus::Success => {
+                env::log(b"Vote succeeded");
+                let target = proposal.target.clone();
+                Promise::new(proposal.proposer.clone()).transfer(self.bond);
+                match proposal.kind {
+                    ProposalKind::NewCouncil => {
+                        self.council.insert(&target);
+                    }
+                    ProposalKind::RemoveCouncil => {
+                        self.council.remove(&target);
+                    }
+                    ProposalKind::Payout { amount } => {
+                        Promise::new(target).transfer(amount.0);
+                    }
+                    ProposalKind::ChangeVotePeriod { vote_period } => {
+                        self.vote_period = vote_period.into();
+                    }
+                    ProposalKind::ChangeBond { bond } => {
+                        self.bond = bond.into();
+                    }
+                    ProposalKind::ChangePolicy { ref policy } => {
+                        self.policy = policy.clone();
+                    }
+                    ProposalKind::ChangePurpose { ref purpose } => {
+                        self.purpose = purpose.clone();
+                    }
+                };
+            }
+            ProposalStatus::Reject => {
+                env::log(b"Proposal rejected");
+            }
+            ProposalStatus::Fail => {
+                // If no majority vote, let's return the bond.
+                env::log(b"Proposal vote failed");
+                Promise::new(proposal.proposer.clone()).transfer(self.bond);
+            }
+            ProposalStatus::Vote | ProposalStatus::Delay => {
+                env::panic(b"voting period has not expired and no majority vote yet")
+            }
+        }
+        self.proposals.replace(id, &proposal);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use near_sdk::{MockedBlockchain, testing_env};
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+
+    fn vote(dao: &mut SputnikDAO, proposal_id: u64, votes: Vec<(usize, Vote)>) {
+        for (id, vote) in votes {
+            testing_env!(VMContextBuilder::new()
+                .predecessor_account_id(accounts(id))
+                .build());
+            dao.vote(proposal_id, vote);
+        }
+    }
+
+            // vec![accounts(0).as_ref(), accounts(1).as_ref()],
+    #[test]
+    fn test_basics() {
+        testing_env!(VMContextBuilder::new().build());
+        let mut dao = SputnikDAO::new(
+            "test".to_string(),
+            vec![accounts(0).as_ref().into(), accounts(1).as_ref().into()],
+            10.into(),
+            1_000.into(),
+            10.into(),
+        );
+
+        assert_eq!(dao.get_bond(), 10.into());
+        assert_eq!(dao.get_vote_period(), 1_000.into());
+        assert_eq!(dao.get_purpose(), "test");
+
+        testing_env!(VMContextBuilder::new()
+            .predecessor_account_id(accounts(2))
+            .attached_deposit(10)
+            .build());
+        let id = dao.add_proposal(ProposalInput {
+            target: accounts(2).as_ref().into(),
+            description: "add new member".to_string(),
+            kind: ProposalKind::NewCouncil,
+        });
+        assert_eq!(dao.get_num_proposals(), 1);
+        assert_eq!(dao.get_proposals(0, 1).len(), 1);
+        vote(&mut dao, id, vec![(0, Vote::Yes)]);
+        assert_eq!(dao.get_proposal(id).vote_yes, 1);
+        assert_eq!(dao.get_proposal(id).status, ProposalStatus::Vote);
+        let account_0: AccountId = accounts(0).as_ref().into();
+        let account_1: AccountId = accounts(1).as_ref().into();
+        let account_2: AccountId = accounts(2).as_ref().into();
+        assert_eq!(dao.get_council(), vec![account_0.clone(), account_1.clone()]);
+        vote(&mut dao, id, vec![(1, Vote::Yes)]);
+        assert_eq!(
+            dao.get_council(),
+            vec![account_0, account_1, account_2]
+        );
+
+        // Pay out money for proposal. 2 votes yes vs 1 vote no.
+        testing_env!(VMContextBuilder::new()
+            .predecessor_account_id(accounts(2))
+            .attached_deposit(10)
+            .build());
+        let id = dao.add_proposal(ProposalInput {
+            target: accounts(2).as_ref().into(),
+            description: "give me money".to_string(),
+            kind: ProposalKind::Payout { amount: 10.into() },
+        });
+        vote(
+            &mut dao,
+            id,
+            vec![(0, Vote::No), (1, Vote::Yes), (2, Vote::Yes)],
+        );
+        assert_eq!(dao.get_proposal(id).vote_yes, 2);
+        assert_eq!(dao.get_proposal(id).vote_no, 1);
+        assert_eq!(dao.get_proposal(id).status, ProposalStatus::Success);
+
+        // No vote for proposal.
+        testing_env!(VMContextBuilder::new()
+            .predecessor_account_id(accounts(2))
+            .attached_deposit(10)
+            .build());
+        let id = dao.add_proposal(ProposalInput {
+            target: accounts(2).as_ref().into(),
+            description: "give me more money".to_string(),
+            kind: ProposalKind::Payout { amount: 10.into() },
+        });
+        testing_env!(VMContextBuilder::new()
+            .predecessor_account_id(accounts(3))
+            .block_timestamp(1_001)
+            .build());
+        dao.finalize(id);
+        assert_eq!(dao.get_proposal(id).status, ProposalStatus::Fail);
+
+        // Change policy.
+        testing_env!(VMContextBuilder::new()
+            .predecessor_account_id(accounts(2))
+            .attached_deposit(10)
+            .build());
+        let id = dao.add_proposal(ProposalInput {
+            target: accounts(2).as_ref().into(),
+            description: "policy".to_string(),
+            kind: ProposalKind::ChangePolicy {
+                policy: vec![
+                    PolicyItem {
+                        max_amount: 100.into(),
+                        votes: NumOrRatio::Number(2),
+                    },
+                    PolicyItem {
+                        max_amount: 1_000_000.into(),
+                        votes: NumOrRatio::Ratio(1, 1),
+                    },
+                ],
+            },
+        });
+        vote(&mut dao, id, vec![(0, Vote::Yes), (1, Vote::Yes)]);
+
+        // Try new policy with small amount.
+        testing_env!(VMContextBuilder::new()
+            .predecessor_account_id(accounts(2))
+            .attached_deposit(10)
+            .build());
+        let id = dao.add_proposal(ProposalInput {
+            target: accounts(2).as_ref().into(),
+            description: "give me more money".to_string(),
+            kind: ProposalKind::Payout { amount: 10.into() },
+        });
+        assert_eq!(dao.get_proposal(id).vote_period_end, 1_000);
+        vote(&mut dao, id, vec![(0, Vote::Yes)]);
+        assert_eq!(dao.get_proposal(id).vote_period_end, 1_000);
+        assert_eq!(dao.get_proposal(id).status, ProposalStatus::Vote);
+        vote(&mut dao, id, vec![(1, Vote::Yes)]);
+        assert_eq!(dao.get_proposal(id).status, ProposalStatus::Delay);
+        assert_eq!(dao.get_proposal(id).vote_period_end, 10);
+        testing_env!(VMContextBuilder::new()
+            .predecessor_account_id(accounts(3))
+            .block_timestamp(11)
+            .build());
+        dao.finalize(id);
+        assert_eq!(dao.get_proposal(id).status, ProposalStatus::Success);
+
+        // New policy for bigger amounts requires 100% votes.
+        testing_env!(VMContextBuilder::new()
+            .predecessor_account_id(accounts(2))
+            .attached_deposit(10)
+            .build());
+        let id = dao.add_proposal(ProposalInput {
+            target: accounts(2).as_ref().into(),
+            description: "give me more money".to_string(),
+            kind: ProposalKind::Payout {
+                amount: 10_000.into(),
+            },
+        });
+        vote(&mut dao, id, vec![(0, Vote::Yes)]);
+        assert_eq!(dao.get_proposal(id).status, ProposalStatus::Vote);
+        vote(&mut dao, id, vec![(1, Vote::Yes)]);
+        assert_eq!(dao.get_proposal(id).status, ProposalStatus::Vote);
+        vote(&mut dao, id, vec![(2, Vote::Yes)]);
+        assert_eq!(dao.get_proposal(id).status, ProposalStatus::Success);
+    }
+
+    #[test]
+    fn test_expiration() {
+        testing_env!(VMContextBuilder::new().build());
+        let mut dao = SputnikDAO::new(
+            "test".to_string(),
+            vec![accounts(0).as_ref().into(), accounts(1).as_ref().into(), accounts(2).as_ref().into()],
+            10.into(),
+            1_000.into(),
+            10.into(),
+        );
+
+        testing_env!(VMContextBuilder::new()
+            .predecessor_account_id(accounts(2))
+            .attached_deposit(10)
+            .build());
+        let id = dao.add_proposal(ProposalInput {
+            target: accounts(5).as_ref().into(),
+            description: "add new member".to_string(),
+            kind: ProposalKind::NewCouncil,
+        });
+        let vote_period_end = dao.get_proposal(id).vote_period_end;
+        vote(&mut dao, id, vec![(0, Vote::Yes)]);
+        assert_eq!(dao.get_proposal(id).vote_period_end, vote_period_end);
+        vote(&mut dao, id, vec![(1, Vote::Yes)]);
+        assert_eq!(dao.get_proposal(id).vote_period_end, vote_period_end);
+        assert_eq!(dao.get_proposal(id).status, ProposalStatus::Success);
+    }
+
+    #[test]
+    fn test_single_council() {
+        testing_env!(VMContextBuilder::new().build());
+        let mut dao = SputnikDAO::new(
+            "".to_string(),
+            vec![accounts(0).as_ref().into()],
+            10.into(),
+            1_000.into(),
+            10.into(),
+        );
+
+        testing_env!(VMContextBuilder::new()
+            .predecessor_account_id(accounts(2))
+            .attached_deposit(10)
+            .build());
+        let id = dao.add_proposal(ProposalInput {
+            target: accounts(1).as_ref().into(),
+            description: "add new member".to_string(),
+            kind: ProposalKind::NewCouncil,
+        });
+        vote(&mut dao, id, vec![(0, Vote::Yes)]);
+        assert_eq!(dao.get_proposal(id).status, ProposalStatus::Success);
+        let account_0: AccountId = accounts(0).as_ref().into();
+        let account_1: AccountId = accounts(1).as_ref().into();
+        assert_eq!(dao.get_council(), vec![account_0, account_1]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_double_vote() {
+        testing_env!(VMContextBuilder::new().build());
+        let mut dao = SputnikDAO::new(
+            "".to_string(),
+            vec![accounts(0).as_ref().into(), accounts(1).as_ref().into()],
+            10.into(),
+            1000.into(),
+            10.into(),
+        );
+        testing_env!(VMContextBuilder::new()
+            .predecessor_account_id(accounts(2))
+            .attached_deposit(10)
+            .build());
+        let id = dao.add_proposal(ProposalInput {
+            target: accounts(2).as_ref().into(),
+            description: "add new member".to_string(),
+            kind: ProposalKind::NewCouncil,
+        });
+        assert_eq!(dao.get_proposals(0, 1).len(), 1);
+        testing_env!(VMContextBuilder::new()
+            .predecessor_account_id(accounts(0))
+            .build());
+        dao.vote(id, Vote::Yes);
+        dao.vote(id, Vote::Yes);
+    }
+
+    #[test]
+    fn test_two_council() {
+        testing_env!(VMContextBuilder::new().build());
+        let mut dao = SputnikDAO::new(
+            "".to_string(),
+            vec![accounts(0).as_ref().into(), accounts(1).as_ref().into()],
+            10.into(),
+            1_000.into(),
+            10.into(),
+        );
+
+        testing_env!(VMContextBuilder::new()
+            .predecessor_account_id(accounts(2))
+            .attached_deposit(10)
+            .build());
+        let id = dao.add_proposal(ProposalInput {
+            target: accounts(1).as_ref().into(),
+            description: "add new member".to_string(),
+            kind: ProposalKind::Payout { amount: 100.into() },
+        });
+        vote(&mut dao, id, vec![(0, Vote::Yes), (1, Vote::No)]);
+        assert_eq!(dao.get_proposal(id).status, ProposalStatus::Fail);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_run_out_of_money() {
+        testing_env!(VMContextBuilder::new().build());
+        let mut dao = SputnikDAO::new(
+            "".to_string(),
+            vec![accounts(0).as_ref().into()],
+            10.into(),
+            1000.into(),
+            10.into(),
+        );
+        testing_env!(VMContextBuilder::new()
+            .predecessor_account_id(accounts(2))
+            .attached_deposit(10)
+            .build());
+        let id = dao.add_proposal(ProposalInput {
+            target: accounts(2).as_ref().into(),
+            description: "add new member".to_string(),
+            kind: ProposalKind::Payout {
+                amount: 1000.into(),
+            },
+        });
+        assert_eq!(dao.get_proposals(0, 1).len(), 1);
+        testing_env!(VMContextBuilder::new()
+            .predecessor_account_id(accounts(0))
+            .account_balance(10)
+            .build());
+        dao.vote(id, Vote::Yes);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_incorrect_policy() {
+        testing_env!(VMContextBuilder::new().build());
+        let mut dao = SputnikDAO::new(
+            "".to_string(),
+            vec![accounts(0).as_ref().into(), accounts(1).as_ref().into()],
+            10.into(),
+            1000.into(),
+            10.into(),
+        );
+        testing_env!(VMContextBuilder::new()
+            .predecessor_account_id(accounts(2))
+            .attached_deposit(10)
+            .build());
+        dao.add_proposal(ProposalInput {
+            target: accounts(2).as_ref().into(),
+            description: "policy".to_string(),
+            kind: ProposalKind::ChangePolicy {
+                policy: vec![
+                    PolicyItem {
+                        max_amount: 100.into(),
+                        votes: NumOrRatio::Number(5),
+                    },
+                    PolicyItem {
+                        max_amount: 5.into(),
+                        votes: NumOrRatio::Number(3),
+                    },
+                ],
+            },
+        });
+    }
+}
+
+'''
+'''--- sputnikdao2/Cargo.toml ---
+[package]
+name = "sputnikdao2"
+version = "2.0.0"
+authors = ["Sputnik Devs <near-daos@protonmail.com>"]
+edition = "2018"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "3.1.0"
+near-contract-standards = "3.1.0"
+hex = "0.4.2"
+
+[dev-dependencies]
+near-sdk-sim = "3.1.0"
+test-token = { path = "../test-token" }
+sputnik-staking = { path = "../sputnik-staking" }
+'''
+'''--- sputnikdao2/README.md ---
+# Sputnik DAO v2
+
+## Proposals
+
+Proposals is the main way to interact with the DAO.
+Each action on the DAO is done by creating and approving proposal.
+
+## Token voting
+
+DAO votes to select some token to become voting token (only can be done once, can't change later).
+
+User flow is next:
+- User's deposit the token into the DAO.
+- They can then choose who to delegate these tokens. It can be to themself or to other users to increase their vote weight.
+- When users vote for proposals, their vote is weighted by all the delegations to them.
+- Undelegating will block delegating / withdrawing until one voting period passes.
+- Undelegated tokens can be withdrawn by the user.
+
+## Bounties
+
+The lifecycle of a bounty is the next:
+
+ - Anyone with permission can add proposal `AddBounty` which contains the bounty information, including `token` to pay the reward in and `amount` to pay it out.
+ - This proposal gets voted in by the current voting policy
+ - After proposal passed, the bounty get added. Now it has an `id` in the bounty list. Which can be queries via `get_bounties`
+ - Anyone can claim a bounty by calling `bounty_claim(id, deadline)` up to `repeat` times which was specified in the bounty. This allows to have repeatative bounties or multiple working collaboratively. `deadline` specifies how long it will take the sender to complete the bounty.
+ - If claimer decides to give up, they can call `bounty_giveup(id)`, and within `forgiveness_period` their claim bond will be returned. After this period, their bond is kept in the DAO.
+ - When bounty is complete, call `bounty_done(id)`, which will start add a proposal `BountyDone` that when voted will pay to whoever done the bounty.
+
+## Blob storage
+
+DAO supports storing larger blobs of data and content indexing them by hash of the data.
+This is done to allow upgrading the DAO itself and other contracts.
+
+Blob lifecycle:
+ - Store blob in the DAO
+ - Create upgradability proposal
+ - Proposal passes or fails
+ - Remove blob and receive funds locked for storage back
+
+Blob can be removed only by the original storer.
+
+## Testing
+
+To test the sputnik2 DAO you will need a testnet account. If you don't have one yet create it in https://wallet.testnet.near.org/.
+
+Lets assume your account is 'sputnik2.testnet', and you want to deploy your first DAO in 'genesis.sputnik2.testnet'
+
+#### Step 1. Login with your account:
+```
+near login
+```
+
+#### Step 2. Deploy factory:
+
+Use `export CONTRACT_ID=sputnik2.testnet` in the terminal to set the account where to deploy the factory. Then, execute the following command from the root of this repository. 
+
+```
+near deploy $CONTRACT_ID --wasmFile=sputnikdao_factory2/res/sputnikdao_factory2.wasm
+```
+
+#### Step 3. Initialize factory:
+```
+near call $CONTRACT_ID new --accountId $CONTRACT_ID
+```
+
+#### Step 4. Define the parameters of the new DAO, its council and create it:
+
+Define the council of your DAO: `export COUNCIL='["councilmember.testnet", "sputnik2.testnet"]'`
+
+```
+# bash
+ARGS=`echo '{"config": {"name": "genesis", "symbol": "GENESIS", "decimals": 24, "purpose": "test", "bond": "1000000000000000000000000", "metadata": ""}, "policy": '$COUNCIL'}' | base64 -w 0`
+
+# fish
+set ARGS (echo '{"config": {"name": "genesis", "symbol": "GENESIS", "decimals": 24, "purpose": "test", "bond": "1000000000000000000000000", "metadata": ""}, "policy": '$COUNCIL'}' | base64 -w 0)
+
+# Create a new DAO with the given parameters.
+near call $CONTRACT_ID create "{\"name\": \"genesis\", \"args\": \"$ARGS\"}"  --accountId $CONTRACT_ID --amount 5 --gas 150000000000000
+```
+
+Set `export SPUTNIK_ID=genesis.$CONTRACT_ID`.
+
+Validate that it went through, and that it correctly set the policy:
+```
+near view $SPUTNIK_ID get_policy
+```
+
+#### Step 5. Create a proposal and interact with it:
+
+Lets use a third user, called `another-account.testnet` to create a proposal. The proposal asks for `another-account.testnet` they joins the council. The proposal will be votable for only a minute (`"submission_time":"60000000000"`).
+
+```
+near call $SPUTNIK_ID add_proposal '{"proposal": {"description": "test", "submission_time":"60000000000", "kind": {"AddMemberToRole": {"member_id": "another-account.testnet", "role": "council"}}}}' --accountId another-account.testnet --amount 1
+```
+
+Vote "Approve" using the **council members**:
+```
+near call $SPUTNIK_ID act_proposal '{"id": 0, "action": "VoteApprove"}' --accountId sputnik2.testnet
+near call $SPUTNIK_ID act_proposal '{"id": 0, "action": "VoteApprove"}' --accountId councilmember.testnet 
+```
+
+View proposal:
+```
+near view $SPUTNIK_ID get_proposal '{"id": 0}'
+```
+
+After one minute, the user "another-account.testnet" will be added to the council
+```
+near view $SPUTNIK_ID get_policy
+```
+
+View first 10 proposals:
+```
+near view $SPUTNIK_ID get_proposals '{"from_index": 0, "limit": 10}'
+```
+
+## Proposal Kinds
+
+Each kind of proposal represents an operation the DAO can perform. Proposal kinds are:
+```
+ProposalKind::ChangeConfig { .. } => "config",
+ProposalKind::ChangePolicy { .. } => "policy",
+ProposalKind::AddMemberToRole { .. } => "add_member_to_role",
+ProposalKind::RemoveMemberFromRole { .. } => "remove_member_from_role",
+ProposalKind::FunctionCall { .. } => "call",
+ProposalKind::UpgradeSelf { .. } => "upgrade_self",
+ProposalKind::UpgradeRemote { .. } => "upgrade_remote",
+ProposalKind::Transfer { .. } => "transfer",
+ProposalKind::Mint { .. } => "mint",
+ProposalKind::Burn { .. } => "burn",
+ProposalKind::AddBounty { .. } => "add_bounty",
+ProposalKind::BountyDone { .. } => "bounty_done",
+ProposalKind::Vote => "vote",
+```
+### Voting Policy
+
+You can set a different vote policy for each one of the proposal kinds.
+
+Vote policy can be: `TokenWeight`, meaning members vote with tokens, or `RoleWeight(role)` where all users with such role (e.g."council") can vote.
+
+Also a vote policy has a "threshold". The threshold could be a ratio. e.g. `threshold:[1,2]` => 1/2 or 50% of the votes approve the proposal, or the threshold could be a fixed number (weight), so you can say that you need 3 votes to approve a proposal disregarding the amount of people in the rol, and you can say that you need 1m tokens to approve a proposal disregarding total token supply.
+
+When vote policy is `TokenWeight`, vote % is measured against total toke supply, and each member vote weight is based on tokens owned. So if threshold is 1/2 you need half the token supply to vote "yes" to pass a proposal.
+
+When vote policy is `RoleWeight(role)`, vote % is measured against the count of people with that role, and each member has one vote. So if threshold is 1/2 you need half the members with the role to vote "yes" to pass a proposal.
+
+## Roles & Permissions
+
+The DAO can have several roles, and you can define permissions for each role. A permission is a combination of `proposal_kind:VotingAction` so they can become very specific.
+
+Actions are:
+```
+/// Action to add proposal. Used internally.
+AddProposal,
+/// Action to remove given proposal. Used for immediate deletion in special cases.
+RemoveProposal,
+/// Vote to approve given proposal or bounty.
+VoteApprove,
+/// Vote to reject given proposal or bounty.
+VoteReject,
+/// Vote to remove given proposal or bounty (because it's spam).
+VoteRemove,
+/// Finalize proposal, called when it's expired to return the funds
+/// (or in the future can be used for early proposal closure).
+Finalize,
+/// Move a proposal to the hub to shift into another DAO.
+MoveToHub
+```
+
+so, for example a role with: `["mint:VoteReject","mint:VoteRemove"]` means the users with that role can only vote to *reject or remove a mint proposal*, but they can't vote to approve.
+
+You can use `*` as a wildcard, so for example a role with `mint:*` can perform any vote action on mint proposals.
+
+You can also use `*:*` for unlimited permission, normally the `council` role has `*:*` as its configured permission so they can perform any vote action on any kind of proposal.
+
+'''
+'''--- sputnikdao2/build.sh ---
+#!/bin/bash
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo +stable build --target wasm32-unknown-unknown --release
+cp ../target/wasm32-unknown-unknown/release/sputnikdao2.wasm ./res/
+
+'''
+'''--- sputnikdao2/change-policy.sh ---
+#!/bin/bash
+set -e
+
+REPL=$(cat <<-END
+const accountId = "agency.near";
+const contractName = "hack.sputnik-dao.near";
+const account = await near.account(accountId);
+const args = {"proposal": {"description": "Change Policy", "kind": {"ChangePolicy": {
+  "policy": {
+  "roles": [
+    {
+      "name": "all",
+      "kind": "Everyone",
+      "permissions": [
+        "*:AddProposal"
+      ],
+      "vote_policy": {}
+    },
+    {
+      "name": "council",
+      "kind": {
+        "Group": [
+          "hack.near",
+          "agency.near",
+          "tjtc.near",
+          "metabuild.near"
+        ]
+      },
+      "permissions": [
+        "*:*"
+      ],
+      "vote_policy": {
+        "weight_kind": "RoleWeight",
+        "quorum": 0,
+        "threshold": [1,8]
+      }
+    },
+    {
+      "name": "hacker",
+      "kind": {
+        "Group": [
+          "tjtc.near",
+          "create.near",
+          "devs.near"
+        ]
+      },
+      "permissions": [
+        "*:*"
+      ],
+      "vote_policy": {}
+    }
+  ],
+  "default_vote_policy": {
+    "weight_kind": "RoleWeight",
+    "quorum": 0,
+    "threshold": [1,2]
+  },
+  "proposal_bond": "10000000000000000000000",
+  "proposal_period": "604800000000000",
+  "bounty_bond": "1000000000000000000000000",
+  "bounty_forgiveness_period": "86400000000000"
+}}}}};
+
+account.signAndSendTransaction(
+    contractName,
+    [
+        nearAPI.transactions.functionCall("add_proposal", args, 20000000000000, "10000000000000000000000000"),
+    ]);
+END)
+
+echo $REPL | near repl
+'''
+'''--- sputnikdao2/csv.sh ---
+set -e
+declare -a my_accs
+while IFS=, read -r near_id; 
+do
+  # do something... Don't forget to skip the header line!
+  my_accs[0]=$near_id
+  #my_array(near_id)
+done < csv_accounts/council.csv;
+
+echo ${my_accs[@]","}
+'''
+'''--- sputnikdao2/delete_keys.sh ---
+set -e
+NETWORK=mainnet
+OWNER=agency.$NETWORK
+MASTER_ACC=$OWNER
+CONTRACT_ACC=hackr.$MASTER_ACC
+TOKEN_ACC=token.agency.testnet
+TREASURY_ACC=treasury.$MASTER_ACC
+
+COUNCIL_ACC=agency.$NETWORK
+
+KEY_TO_DELETE="ed25519%3A2KUeDQjCkAhmrb8LSN7TjHdyZRevDU4dR37JRxHvjZqR"
+
+export NODE_ENV=$NETWORK
+
+near keys $CONTRACT_ACC
+echo "¡IMPORTANT!"
+echo "Modify the KEY_TO_DELETE parameter in delete_keys with the public_key that is going to be deleted. Are you ready? Ctrl-C to cancel"
+read input
+echo "¡REMEMBER"
+echo "Once you delete all access keys the account will not be possible to be deleted or redeployed. Ctrl-C to cancel"
+read input
+near delete-key $CONTRACT_ACC $KEY_TO_DELETE
+echo "Keys succesfully deleted"
+'''
+'''--- sputnikdao2/deploy-sputnikdao-factory.sh ---
+set -e
+NETWORK=testnet
+OWNER=agency.$NETWORK
+
+COUNCIL_ACC=agency.testnet
+DAO_NAME=hackr.agency.testnet
+
+##Change NODE_ENV between mainnet, testnet and betanet
+export NODE_ENV=testnet
+
+#DAO Policy
+export POLICY='{
+  "roles": [
+    {
+      "name": "council",
+      "kind": { "Group": ["agency.testnet", "metabuild.testnet", "hackathon.testnet"]
+      },
+      "permissions": [ "*:*" ],
+      "vote_policy": { "weight_kind": "RoleWeight", "quorum": "0", "threshold": [ 1,8 ] }
+    },
+    {
+      "name": "hacker",
+      "kind": { "Group": ["hackr.testnet"]
+      },
+      "permissions": [ "*:*" ],
+      "vote_policy": { "weight_kind": "RoleWeight", "quorum": "0", "threshold": [ 1,2 ] }
+    }
+  ],
+  "default_vote_policy": { "weight_kind": "RoleWeight", "quorum": "0", "threshold": [ 1,2 ] },
+  "proposal_bond": "1000000000000000000000000",
+  "proposal_period": "604800000000000",
+  "bounty_bond": "1000000000000000000000000",
+  "bounty_forgiveness_period": "86400000000000"
+}'
+
+#Args for creating DAO in sputnik-factory2
+ARGS=`echo "{\"config\":  {\"name\": \"testpolicy\", \"purpose\": \"Test DAO Policy\", \"metadata\":\"\"}, \"policy\": $POLICY" | base64`
+read input
+# Call sputnik factory for deploying new dao with custom policy
+near call agency.testnet create "{\"name\": \"$DAO_NAME\", \"args\": \"$ARGS\"}" --accountId $COUNCIL_ACC --amount 5 --gas 150000000000000
+near view $DAO_NAME.$OWNER get_policy
+'''
+'''--- sputnikdao2/deploy-sputnikdao.sh ---
+set -e
+
+export NODE_ENV=mainnet
+export POLICY='{
+  "roles": [
+    {
+      "name": "all",
+      "kind": "Everyone",
+      "permissions": [
+        "*:AddProposal"
+      ],
+      "vote_policy": {}
+    },
+    {
+      "name": "council",
+      "kind": {
+        "Group": [
+          "hack.near",
+          "agency.near",
+          "tjtc.near",
+          "metabuild.near"
+        ]
+      },
+      "permissions": [
+        "*:*"
+      ],
+      "vote_policy": {
+        "weight_kind": "RoleWeight",
+        "quorum": 0,
+        "threshold": (1,8)
+      }
+    },
+    {
+      "name": "hacker",
+      "kind": {
+        "Group": [
+          "tjtc.near",
+          "create.near",
+          "devs.near"
+        ]
+      },
+      "permissions": [
+        "*:*"
+      ],
+      "vote_policy": {}
+    }
+  ],
+  "default_vote_policy": {
+    "weight_kind": "RoleWeight",
+    "quorum": 0,
+    "threshold": (1,2)
+  },
+  "proposal_bond": "10000000000000000000000",
+  "proposal_period": "604800000000000",
+  "bounty_bond": "1000000000000000000000000",
+  "bounty_forgiveness_period": "86400000000000"
+}'
+
+export ARGS=`echo '{"config": {"name": "hack", "purpose": "Hack DAO", "metadata":""}, "policy": "'$POLICY'"}' | base64`
+near call sputnik-dao.near create '{"name": "hack", "args": "'$ARGS'"}' --accountId agency.near --amount 5 --gas 150000000000000
+
+#near create-account $CONTRACT_ACC --masterAccount $MASTER_ACC --initialBalance 20
+#near deploy --wasmFile=res/sputnikdao2.wasm --initFunction "new" --initArgs '{"config": {"name": "metabuild", "purpose": "Hackathon DAO", "metadata":""}, "policy": '$POLICY'}' --accountId $CONTRACT_ACC
+#near view $CONTRACT_ACC get_policy
+#echo "DAO succesfully deployed!"
+
+##redeploy only
+#near deploy $CONTRACT_ACC --wasmFile=res/sputnikdao2.wasm  --accountId $MASTER_ACC
+
+#save last deployment 
+#cp ./res/sputnikdao2.wasm ./res/sputnikdao2.`date +%F.%T`.wasm
+#date +%F.%T
+'''
+'''--- sputnikdao2/mint_proposal.sh ---
+set -e
+NETWORK=testnet
+OWNER=agency.$NETWORK
+MASTER_ACC=$OWNER
+CONTRACT_ACC=hackr.$MASTER_ACC
+TOKEN_ACC=token.agency.testnet
+#TREASURY_ACC=treasury.$MASTER_ACC <--Write it directly in the ARGS_MINT
+
+COUNCIL_ACC=agency.$NETWORK
+
+export NODE_ENV=$NETWORK
+
+ARGS_MINT=`echo '{"account_id": "treasury.agency.testnet", "amount": "20000000000000000000000000000000"}' | base64`
+
+near call $CONTRACT_ACC add_proposal "{\"proposal\": {\"description\": \"Cheddar Genesis\", \"kind\": {\"FunctionCall\": {\"receiver_id\": \"$TOKEN_ACC\", \"actions\": [{\"method_name\": \"mint\", \"args\": \"$ARGS_MINT\", \"deposit\": \"1\", \"gas\": \"20000000000000\"}]}}}}" --accountId $COUNCIL_ACC --amount 1
+near view $CONTRACT_ACC get_proposals '{"from_index": 0, "limit": 10}'
+'''
+'''--- sputnikdao2/src/bounties.rs ---
+use std::convert::TryFrom;
+
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::json_types::{WrappedDuration, WrappedTimestamp, U128};
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{env, near_bindgen, AccountId, Promise, PromiseOrValue};
+
+use crate::*;
+
+/// Information recorded about claim of the bounty by given user.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct BountyClaim {
+    /// Bounty id that was claimed.
+    bounty_id: u64,
+    /// Start time of the claim.
+    start_time: WrappedTimestamp,
+    /// Deadline specified by claimer.
+    deadline: WrappedDuration,
+    /// Completed?
+    completed: bool,
+}
+
+/// Bounty information.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Debug))]
+#[serde(crate = "near_sdk::serde")]
+pub struct Bounty {
+    /// Description of the bounty.
+    pub description: String,
+    /// Token the bounty will be paid out.
+    pub token: AccountId,
+    /// Amount to be paid out.
+    pub amount: U128,
+    /// How many times this bounty can be done.
+    pub times: u32,
+    /// Max deadline from claim that can be spend on this bounty.
+    pub max_deadline: WrappedDuration,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Clone, Debug))]
+#[serde(crate = "near_sdk::serde")]
+pub enum VersionedBounty {
+    Default(Bounty),
+}
+
+impl From<VersionedBounty> for Bounty {
+    fn from(v: VersionedBounty) -> Self {
+        match v {
+            VersionedBounty::Default(b) => b,
+        }
+    }
+}
+
+impl Contract {
+    /// Adds bounty to the storage and returns it's id.
+    /// Must not fail.
+    pub(crate) fn internal_add_bounty(&mut self, bounty: &Bounty) -> u64 {
+        let id = self.last_bounty_id;
+        self.bounties
+            .insert(&id, &VersionedBounty::Default(bounty.clone()));
+        self.last_bounty_id += 1;
+        id
+    }
+
+    /// This must be called when proposal to payout bounty has been voted either successfully or not.
+    pub(crate) fn internal_execute_bounty_payout(
+        &mut self,
+        id: u64,
+        receiver_id: &AccountId,
+        success: bool,
+    ) -> PromiseOrValue<()> {
+        let mut bounty: Bounty = self.bounties.get(&id).expect("ERR_NO_BOUNTY").into();
+        let (claims, claim_idx) = self.internal_get_claims(id, &receiver_id);
+        self.internal_remove_claim(id, claims, claim_idx);
+        if success {
+            let res = self.internal_payout(
+                &bounty.token,
+                receiver_id,
+                bounty.amount.0,
+                format!("Bounty {} payout", id),
+                None,
+            );
+            if bounty.times == 0 {
+                self.bounties.remove(&id);
+            } else {
+                bounty.times -= 1;
+                self.bounties.insert(&id, &VersionedBounty::Default(bounty));
+            }
+            res
+        } else {
+            PromiseOrValue::Value(())
+        }
+    }
+
+    fn internal_find_claim(&self, bounty_id: u64, claims: &[BountyClaim]) -> Option<usize> {
+        for i in 0..claims.len() {
+            if claims[i].bounty_id == bounty_id {
+                return Some(i);
+            }
+        }
+        None
+    }
+}
+
+#[near_bindgen]
+impl Contract {
+    /// Claim given bounty by caller with given expected duration to execute.
+    /// Bond must be attached to the claim.
+    /// Fails if already claimed `times` times.
+    #[payable]
+    pub fn bounty_claim(&mut self, id: u64, deadline: WrappedDuration) {
+        let bounty: Bounty = self.bounties.get(&id).expect("ERR_NO_BOUNTY").into();
+        let policy = self.policy.get().unwrap().to_policy();
+        assert_eq!(
+            env::attached_deposit(),
+            policy.bounty_bond.0,
+            "ERR_BOUNTY_WRONG_BOND"
+        );
+        let claims_count = self.bounty_claims_count.get(&id).unwrap_or_default();
+        assert!(claims_count < bounty.times, "ERR_BOUNTY_ALL_CLAIMED");
+        assert!(
+            deadline.0 <= bounty.max_deadline.0,
+            "ERR_BOUNTY_WRONG_DEADLINE"
+        );
+        self.bounty_claims_count.insert(&id, &(claims_count + 1));
+        let mut claims = self
+            .bounty_claimers
+            .get(&env::predecessor_account_id())
+            .unwrap_or_default();
+        claims.push(BountyClaim {
+            bounty_id: id,
+            start_time: WrappedTimestamp::from(env::block_timestamp()),
+            deadline,
+            completed: false,
+        });
+        self.bounty_claimers
+            .insert(&env::predecessor_account_id(), &claims);
+    }
+
+    /// Removes given claims from this bounty and user's claims.
+    fn internal_remove_claim(&mut self, id: u64, mut claims: Vec<BountyClaim>, claim_idx: usize) {
+        claims.remove(claim_idx);
+        if claims.len() == 0 {
+            self.bounty_claimers.remove(&env::predecessor_account_id());
+        } else {
+            self.bounty_claimers
+                .insert(&env::predecessor_account_id(), &claims);
+        }
+        let count = self.bounty_claims_count.get(&id).unwrap() - 1;
+        self.bounty_claims_count.insert(&id, &count);
+    }
+
+    fn internal_get_claims(&mut self, id: u64, sender_id: &AccountId) -> (Vec<BountyClaim>, usize) {
+        let claims = self
+            .bounty_claimers
+            .get(&sender_id)
+            .expect("ERR_NO_BOUNTY_CLAIMS");
+        let claim_idx = self
+            .internal_find_claim(id, &claims)
+            .expect("ERR_NO_BOUNTY_CLAIM");
+        (claims, claim_idx)
+    }
+
+    /// Report that bounty is done. Creates a proposal to vote for paying out the bounty.
+    /// Only creator of the claim can call `done` on bounty that is still in progress.
+    /// On expired, anyone can call it to free up the claim slot.
+    pub fn bounty_done(&mut self, id: u64, account_id: Option<AccountId>, description: String) {
+        let sender_id = account_id.unwrap_or_else(|| env::predecessor_account_id());
+        let (mut claims, claim_idx) = self.internal_get_claims(id, &sender_id);
+        assert!(!claims[claim_idx].completed, "ERR_BOUNTY_CLAIM_COMPLETED");
+        if env::block_timestamp() > claims[claim_idx].start_time.0 + claims[claim_idx].deadline.0 {
+            // Expired. Nothing to do.
+            self.internal_remove_claim(id, claims, claim_idx);
+        } else {
+            // Still under deadline. Only the user themself can call this.
+            assert_eq!(
+                sender_id,
+                env::predecessor_account_id(),
+                "ERR_BOUNTY_DONE_MUST_BE_SELF"
+            );
+            self.add_proposal(ProposalInput {
+                description,
+                kind: ProposalKind::BountyDone {
+                    bounty_id: id,
+                    receiver_id: ValidAccountId::try_from(sender_id.clone()).unwrap(),
+                },
+            });
+            claims[claim_idx].completed = true;
+            self.bounty_claimers.insert(&sender_id, &claims);
+        }
+    }
+
+    /// Give up working on the bounty.
+    pub fn bounty_giveup(&mut self, id: u64) -> PromiseOrValue<()> {
+        let policy = self.policy.get().unwrap().to_policy();
+        let (claims, claim_idx) = self.internal_get_claims(id, &env::predecessor_account_id());
+        let result = if env::block_timestamp() - claims[claim_idx].start_time.0
+            > policy.bounty_forgiveness_period.0
+        {
+            // If user over the forgiveness period.
+            PromiseOrValue::Value(())
+        } else {
+            // Within forgiveness period.
+            Promise::new(env::predecessor_account_id())
+                .transfer(policy.bounty_bond.0)
+                .into()
+        };
+        self.internal_remove_claim(id, claims, claim_idx);
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::{testing_env, MockedBlockchain};
+    use near_sdk_sim::to_yocto;
+
+    use crate::proposals::{ProposalInput, ProposalKind};
+    use crate::types::BASE_TOKEN;
+    use crate::{Action, Config};
+
+    use super::*;
+
+    fn add_bounty(context: &mut VMContextBuilder, contract: &mut Contract, times: u32) -> u64 {
+        testing_env!(context.attached_deposit(to_yocto("1")).build());
+        let id = contract.add_proposal(ProposalInput {
+            description: "test".to_string(),
+            kind: ProposalKind::AddBounty {
+                bounty: Bounty {
+                    description: "test bounty".to_string(),
+                    token: BASE_TOKEN.to_string(),
+                    amount: U128(to_yocto("10")),
+                    times,
+                    max_deadline: WrappedDuration::from(1_000),
+                },
+            },
+        });
+        assert_eq!(contract.get_last_bounty_id(), id);
+        contract.act_proposal(id, Action::VoteApprove, None);
+        id
+    }
+
+    /// Adds a bounty, and tests it's full lifecycle.
+    #[test]
+    fn test_bounty_lifecycle() {
+        let mut context = VMContextBuilder::new();
+        testing_env!(context.predecessor_account_id(accounts(1)).build());
+        let mut contract = Contract::new(
+            Config::test_config(),
+            VersionedPolicy::Default(vec![accounts(1).into()]),
+        );
+        add_bounty(&mut context, &mut contract, 2);
+
+        assert_eq!(contract.get_last_bounty_id(), 1);
+        assert_eq!(contract.get_bounty(0).bounty.times, 2);
+
+        contract.bounty_claim(0, WrappedDuration::from(500));
+        assert_eq!(contract.get_bounty_claims(accounts(1)).len(), 1);
+        assert_eq!(contract.get_bounty_number_of_claims(0), 1);
+
+        contract.bounty_giveup(0);
+        assert_eq!(contract.get_bounty_claims(accounts(1)).len(), 0);
+        assert_eq!(contract.get_bounty_number_of_claims(0), 0);
+
+        contract.bounty_claim(0, WrappedDuration::from(500));
+        assert_eq!(contract.get_bounty_claims(accounts(1)).len(), 1);
+        assert_eq!(contract.get_bounty_number_of_claims(0), 1);
+
+        contract.bounty_done(0, None, "Bounty is done".to_string());
+        assert!(contract.get_bounty_claims(accounts(1))[0].completed);
+
+        assert_eq!(contract.get_last_proposal_id(), 2);
+        assert_eq!(
+            contract.get_proposal(1).proposal.kind.to_policy_label(),
+            "bounty_done"
+        );
+
+        contract.act_proposal(1, Action::VoteApprove, None);
+
+        assert_eq!(contract.get_bounty_claims(accounts(1)).len(), 0);
+        assert_eq!(contract.get_bounty(0).bounty.times, 1);
+
+        contract.bounty_claim(0, WrappedDuration::from(500));
+        contract.bounty_done(0, None, "Bounty is done 2".to_string());
+        contract.act_proposal(2, Action::VoteApprove, None);
+
+        assert_eq!(contract.get_bounty(0).bounty.times, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "ERR_BOUNTY_ALL_CLAIMED")]
+    fn test_bounty_claim_not_allowed() {
+        let mut context = VMContextBuilder::new();
+        testing_env!(context.predecessor_account_id(accounts(1)).build());
+        let mut contract = Contract::new(
+            Config::test_config(),
+            VersionedPolicy::Default(vec![accounts(1).into()]),
+        );
+        let id = add_bounty(&mut context, &mut contract, 1);
+        contract.bounty_claim(id, WrappedDuration::from(500));
+        contract.bounty_done(id, None, "Bounty is done 2".to_string());
+        contract.bounty_claim(id, WrappedDuration::from(500));
+    }
+}
+
+'''
+'''--- sputnikdao2/src/delegation.rs ---
+use crate::*;
+
+impl Contract {
+    pub fn get_user_weight(&self, account_id: &AccountId) -> Balance {
+        self.delegations.get(account_id).unwrap_or_default()
+    }
+}
+
+#[near_bindgen]
+impl Contract {
+    #[payable]
+    pub fn register_delegation(&mut self, account_id: &AccountId) {
+        let staking_id = self.staking_id.clone().expect("ERR_NO_STAKING");
+        assert_eq!(
+            env::predecessor_account_id(),
+            staking_id,
+            "ERR_INVALID_CALLER"
+        );
+        assert_eq!(env::attached_deposit(), 16 * env::storage_byte_cost());
+        self.delegations.insert(account_id, &0);
+    }
+
+    pub fn delegate(&mut self, account_id: &AccountId, amount: U128) {
+        let staking_id = self.staking_id.clone().expect("ERR_NO_STAKING");
+        assert_eq!(
+            env::predecessor_account_id(),
+            staking_id,
+            "ERR_INVALID_CALLER"
+        );
+        let prev_amount = self
+            .delegations
+            .get(account_id)
+            .expect("ERR_NOT_REGISTERED");
+        self.delegations
+            .insert(account_id, &(prev_amount + amount.0));
+        self.total_delegation_amount += amount.0;
+    }
+
+    pub fn undelegate(&mut self, account_id: &AccountId, amount: U128) {
+        let staking_id = self.staking_id.clone().expect("ERR_NO_STAKING");
+        assert_eq!(
+            env::predecessor_account_id(),
+            staking_id,
+            "ERR_INVALID_CALLER"
+        );
+        let prev_amount = self.delegations.get(account_id).unwrap_or_default();
+        assert!(prev_amount >= amount.0, "ERR_INVALID_STAKING_CONTRACT");
+        self.delegations
+            .insert(account_id, &(prev_amount - amount.0));
+        self.total_delegation_amount -= amount.0;
+    }
+}
+
+'''
+'''--- sputnikdao2/src/lib.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::{LazyOption, LookupMap};
+#[cfg(target_arch = "wasm32")]
+use near_sdk::env::BLOCKCHAIN_INTERFACE;
+use near_sdk::json_types::{Base58CryptoHash, ValidAccountId, U128};
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{
+    env, near_bindgen, AccountId, Balance, BorshStorageKey, CryptoHash, PanicOnDefault, Promise,
+};
+
+use crate::bounties::{Bounty, BountyClaim, VersionedBounty};
+pub use crate::policy::{Policy, RoleKind, RolePermission, VersionedPolicy, VotePolicy};
+use crate::proposals::VersionedProposal;
+pub use crate::proposals::{Proposal, ProposalInput, ProposalKind, ProposalStatus};
+pub use crate::types::{Action, Config};
+
+mod bounties;
+mod delegation;
+mod policy;
+mod proposals;
+mod types;
+pub mod views;
+
+near_sdk::setup_alloc!();
+
+#[cfg(target_arch = "wasm32")]
+const BLOCKCHAIN_INTERFACE_NOT_SET_ERR: &str = "Blockchain interface not set.";
+
+#[derive(BorshStorageKey, BorshSerialize)]
+pub enum StorageKeys {
+    Config,
+    Policy,
+    Delegations,
+    Proposals,
+    Bounties,
+    BountyClaimers,
+    BountyClaimCounts,
+    Blobs,
+}
+
+#[near_bindgen]
+#[derive(BorshSerialize, BorshDeserialize, PanicOnDefault)]
+pub struct Contract {
+    /// DAO configuration.
+    pub config: LazyOption<Config>,
+    /// Voting and permissions policy.
+    pub policy: LazyOption<VersionedPolicy>,
+
+    /// Amount of $NEAR locked for storage / bonds.
+    pub locked_amount: Balance,
+
+    /// Vote staking contract id. That contract must have this account as owner.
+    pub staking_id: Option<AccountId>,
+    /// Delegated  token total amount.
+    pub total_delegation_amount: Balance,
+    /// Delegations per user.
+    pub delegations: LookupMap<AccountId, Balance>,
+
+    /// Last available id for the proposals.
+    pub last_proposal_id: u64,
+    /// Proposal map from ID to proposal information.
+    pub proposals: LookupMap<u64, VersionedProposal>,
+
+    /// Last available id for the bounty.
+    pub last_bounty_id: u64,
+    /// Bounties map from ID to bounty information.
+    pub bounties: LookupMap<u64, VersionedBounty>,
+    /// Bounty claimers map per user. Allows quickly to query for each users their claims.
+    pub bounty_claimers: LookupMap<AccountId, Vec<BountyClaim>>,
+    /// Count of claims per bounty.
+    pub bounty_claims_count: LookupMap<u64, u32>,
+
+    /// Large blob storage.
+    pub blobs: LookupMap<CryptoHash, AccountId>,
+}
+
+#[near_bindgen]
+impl Contract {
+    #[init]
+    pub fn new(config: Config, policy: VersionedPolicy) -> Self {
+        Self {
+            config: LazyOption::new(StorageKeys::Config, Some(&config)),
+            policy: LazyOption::new(StorageKeys::Policy, Some(&policy.upgrade())),
+            staking_id: None,
+            total_delegation_amount: 0,
+            delegations: LookupMap::new(StorageKeys::Delegations),
+            last_proposal_id: 0,
+            proposals: LookupMap::new(StorageKeys::Proposals),
+            last_bounty_id: 0,
+            bounties: LookupMap::new(StorageKeys::Bounties),
+            bounty_claimers: LookupMap::new(StorageKeys::BountyClaimers),
+            bounty_claims_count: LookupMap::new(StorageKeys::BountyClaimCounts),
+            blobs: LookupMap::new(StorageKeys::Blobs),
+            // TODO: only accounts for contract but not for this state object. Can just add fixed size of it.
+            locked_amount: env::storage_byte_cost() * (env::storage_usage() as u128),
+        }
+    }
+
+    /// Should only be called by this contract on migration.
+    /// This is NOOP implementation. KEEP IT if you haven't changed contract state.
+    /// If you have changed state, you need to implement migration from old state (keep the old struct with different name to deserialize it first).
+    /// After migrate goes live on MainNet, return this implementation for next updates.
+    #[init(ignore_state)]
+    pub fn migrate() -> Self {
+        assert_eq!(
+            env::predecessor_account_id(),
+            env::current_account_id(),
+            "ERR_NOT_ALLOWED"
+        );
+        let this: Contract = env::state_read().expect("ERR_CONTRACT_IS_NOT_INITIALIZED");
+        this
+    }
+
+    /// Remove blob from contract storage and pay back to original storer.
+    /// Only original storer can call this.
+    pub fn remove_blob(&mut self, hash: Base58CryptoHash) -> Promise {
+        let hash: CryptoHash = hash.into();
+        let account_id = self.blobs.remove(&hash).expect("ERR_NO_BLOB");
+        assert_eq!(
+            env::predecessor_account_id(),
+            account_id,
+            "ERR_INVALID_CALLER"
+        );
+        env::storage_remove(&hash);
+        let blob_len = env::register_len(u64::MAX - 1).unwrap();
+        let storage_cost = ((blob_len + 32) as u128) * env::storage_byte_cost();
+        self.locked_amount -= storage_cost;
+        Promise::new(account_id).transfer(storage_cost)
+    }
+}
+
+/// Stores attached data into blob store and returns hash of it.
+/// Implemented to avoid loading the data into WASM for optimal gas usage.
+#[cfg(target_arch = "wasm32")]
+#[no_mangle]
+pub extern "C" fn store_blob() {
+    env::setup_panic_hook();
+    env::set_blockchain_interface(Box::new(near_blockchain::NearBlockchain {}));
+    let mut contract: Contract = env::state_read().expect("ERR_CONTRACT_IS_NOT_INITIALIZED");
+    unsafe {
+        BLOCKCHAIN_INTERFACE.with(|b| {
+            // Load input into register 0.
+            b.borrow()
+                .as_ref()
+                .expect(BLOCKCHAIN_INTERFACE_NOT_SET_ERR)
+                .input(0);
+            // Compute sha256 hash of register 0 and store in 1.
+            b.borrow()
+                .as_ref()
+                .expect(BLOCKCHAIN_INTERFACE_NOT_SET_ERR)
+                .sha256(u64::MAX as _, 0 as _, 1);
+            // Check if such blob already stored.
+            assert_eq!(
+                b.borrow()
+                    .as_ref()
+                    .expect(BLOCKCHAIN_INTERFACE_NOT_SET_ERR)
+                    .storage_has_key(u64::MAX as _, 1 as _),
+                0,
+                "ERR_ALREADY_EXISTS"
+            );
+            // Get length of the input argument and check that enough $NEAR has been attached.
+            let blob_len = b
+                .borrow()
+                .as_ref()
+                .expect(BLOCKCHAIN_INTERFACE_NOT_SET_ERR)
+                .register_len(0);
+            let storage_cost = ((blob_len + 32) as u128) * env::storage_byte_cost();
+            assert!(
+                env::attached_deposit() >= storage_cost,
+                "ERR_NOT_ENOUGH_DEPOSIT:{}",
+                storage_cost
+            );
+            contract.locked_amount += storage_cost;
+            // Store value of register 0 into key = register 1.
+            b.borrow()
+                .as_ref()
+                .expect(BLOCKCHAIN_INTERFACE_NOT_SET_ERR)
+                .storage_write(u64::MAX as _, 1 as _, u64::MAX as _, 0 as _, 2);
+            // Load register 1 into blob_hash and save into LookupMap.
+            let blob_hash = [0u8; 32];
+            b.borrow()
+                .as_ref()
+                .expect(BLOCKCHAIN_INTERFACE_NOT_SET_ERR)
+                .read_register(1, blob_hash.as_ptr() as _);
+            contract
+                .blobs
+                .insert(&blob_hash, &env::predecessor_account_id());
+            // Return from function value of register 1.
+            let blob_hash_str = near_sdk::serde_json::to_string(&Base58CryptoHash::from(blob_hash))
+                .unwrap()
+                .into_bytes();
+            b.borrow()
+                .as_ref()
+                .expect(BLOCKCHAIN_INTERFACE_NOT_SET_ERR)
+                .value_return(blob_hash_str.len() as _, blob_hash_str.as_ptr() as _);
+        });
+    }
+    env::state_write(&contract);
+}
+
+#[cfg(test)]
+mod tests {
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::{testing_env, MockedBlockchain};
+    use near_sdk_sim::to_yocto;
+
+    use crate::proposals::ProposalStatus;
+    use crate::types::BASE_TOKEN;
+
+    use super::*;
+
+    fn create_proposal(context: &mut VMContextBuilder, contract: &mut Contract) -> u64 {
+        testing_env!(context.attached_deposit(to_yocto("1")).build());
+        contract.add_proposal(ProposalInput {
+            description: "test".to_string(),
+            kind: ProposalKind::Transfer {
+                token_id: BASE_TOKEN.to_string(),
+                receiver_id: accounts(2).into(),
+                amount: U128(to_yocto("100")),
+                msg: None,
+            },
+        })
+    }
+
+    #[test]
+    fn test_basics() {
+        let mut context = VMContextBuilder::new();
+        testing_env!(context.predecessor_account_id(accounts(1)).build());
+        let mut contract = Contract::new(
+            Config::test_config(),
+            VersionedPolicy::Default(vec![accounts(1).into()]),
+        );
+        let id = create_proposal(&mut context, &mut contract);
+        assert_eq!(contract.get_proposal(id).proposal.description, "test");
+        assert_eq!(contract.get_proposals(0, 10).len(), 1);
+
+        let id = create_proposal(&mut context, &mut contract);
+        contract.act_proposal(id, Action::VoteApprove, None);
+        assert_eq!(
+            contract.get_proposal(id).proposal.status,
+            ProposalStatus::Approved
+        );
+
+        let id = create_proposal(&mut context, &mut contract);
+        // proposal expired, finalize.
+        testing_env!(context
+            .block_timestamp(1_000_000_000 * 24 * 60 * 60 * 8)
+            .build());
+        contract.act_proposal(id, Action::Finalize, None);
+        assert_eq!(
+            contract.get_proposal(id).proposal.status,
+            ProposalStatus::Expired
+        );
+
+        // non council adding proposal per default policy.
+        testing_env!(context
+            .predecessor_account_id(accounts(2))
+            .attached_deposit(to_yocto("1"))
+            .build());
+        let _id = contract.add_proposal(ProposalInput {
+            description: "test".to_string(),
+            kind: ProposalKind::AddMemberToRole {
+                member_id: accounts(2).into(),
+                role: "council".to_string(),
+            },
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "ERR_PERMISSION_DENIED")]
+    fn test_remove_proposal_denied() {
+        let mut context = VMContextBuilder::new();
+        testing_env!(context.predecessor_account_id(accounts(1)).build());
+        let mut contract = Contract::new(
+            Config::test_config(),
+            VersionedPolicy::Default(vec![accounts(1).into()]),
+        );
+        let id = create_proposal(&mut context, &mut contract);
+        assert_eq!(contract.get_proposal(id).proposal.description, "test");
+        contract.act_proposal(id, Action::RemoveProposal, None);
+    }
+
+    #[test]
+    fn test_remove_proposal_allowed() {
+        let mut context = VMContextBuilder::new();
+        testing_env!(context.predecessor_account_id(accounts(1)).build());
+        let mut policy = VersionedPolicy::Default(vec![accounts(1).into()]).upgrade();
+        policy.to_policy_mut().roles[1]
+            .permissions
+            .insert("*:RemoveProposal".to_string());
+        let mut contract = Contract::new(Config::test_config(), policy);
+        let id = create_proposal(&mut context, &mut contract);
+        assert_eq!(contract.get_proposal(id).proposal.description, "test");
+        contract.act_proposal(id, Action::RemoveProposal, None);
+        assert_eq!(contract.get_proposals(0, 10).len(), 0);
+    }
+
+    #[test]
+    fn test_vote_expired_proposal() {
+        let mut context = VMContextBuilder::new();
+        testing_env!(context.predecessor_account_id(accounts(1)).build());
+        let mut contract = Contract::new(
+            Config::test_config(),
+            VersionedPolicy::Default(vec![accounts(1).into()]),
+        );
+        let id = create_proposal(&mut context, &mut contract);
+        testing_env!(context
+            .block_timestamp(1_000_000_000 * 24 * 60 * 60 * 8)
+            .build());
+        contract.act_proposal(id, Action::VoteApprove, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "ERR_ALREADY_VOTED")]
+    fn test_vote_twice() {
+        let mut context = VMContextBuilder::new();
+        testing_env!(context.predecessor_account_id(accounts(1)).build());
+        let mut contract = Contract::new(
+            Config::test_config(),
+            VersionedPolicy::Default(vec![accounts(1).into(), accounts(2).into()]),
+        );
+        let id = create_proposal(&mut context, &mut contract);
+        contract.act_proposal(id, Action::VoteApprove, None);
+        contract.act_proposal(id, Action::VoteApprove, None);
+    }
+
+    #[test]
+    fn test_add_to_missing_role() {
+        let mut context = VMContextBuilder::new();
+        testing_env!(context.predecessor_account_id(accounts(1)).build());
+        let mut contract = Contract::new(
+            Config::test_config(),
+            VersionedPolicy::Default(vec![accounts(1).into()]),
+        );
+        testing_env!(context.attached_deposit(to_yocto("1")).build());
+        let id = contract.add_proposal(ProposalInput {
+            description: "test".to_string(),
+            kind: ProposalKind::AddMemberToRole {
+                member_id: accounts(2).into(),
+                role: "missing".to_string(),
+            },
+        });
+        contract.act_proposal(id, Action::VoteApprove, None);
+        let x = contract.get_policy();
+        // still 2 roles: all and council.
+        assert_eq!(x.roles.len(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "ERR_INVALID_POLICY")]
+    fn test_fails_adding_invalid_policy() {
+        let mut context = VMContextBuilder::new();
+        testing_env!(context.predecessor_account_id(accounts(1)).build());
+        let mut contract = Contract::new(
+            Config::test_config(),
+            VersionedPolicy::Default(vec![accounts(1).into()]),
+        );
+        testing_env!(context.attached_deposit(to_yocto("1")).build());
+        let _id = contract.add_proposal(ProposalInput {
+            description: "test".to_string(),
+            kind: ProposalKind::ChangePolicy {
+                policy: VersionedPolicy::Default(vec![]),
+            },
+        });
+    }
+}
+
+'''
+'''--- sputnikdao2/src/policy.rs ---
+use std::cmp::min;
+use std::collections::{HashMap, HashSet};
+
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::json_types::{WrappedDuration, U128};
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{env, AccountId, Balance};
+
+use crate::proposals::{Proposal, ProposalKind, ProposalStatus, Vote};
+use crate::types::Action;
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Debug, PartialEq))]
+#[serde(crate = "near_sdk::serde")]
+pub enum RoleKind {
+    /// Matches everyone, who is not matched by other roles.
+    Everyone,
+    /// Member greater or equal than given balance. Can use `1` as non-zero balance.
+    Member(Balance),
+    /// Set of accounts.
+    Group(HashSet<AccountId>),
+}
+
+impl RoleKind {
+    /// Checks if user matches given role.
+    pub fn match_user(&self, user: &UserInfo) -> bool {
+        match self {
+            RoleKind::Everyone => true,
+            RoleKind::Member(amount) => user.amount >= *amount,
+            RoleKind::Group(accounts) => accounts.contains(&user.account_id),
+        }
+    }
+
+    /// Returns the number of people in the this role or None if not supported role kind.
+    pub fn get_role_size(&self) -> Option<usize> {
+        match self {
+            RoleKind::Group(accounts) => Some(accounts.len()),
+            _ => None,
+        }
+    }
+
+    pub fn add_member_to_group(&mut self, member_id: &AccountId) -> Result<(), ()> {
+        match self {
+            RoleKind::Group(accounts) => {
+                accounts.insert(member_id.clone());
+                Ok(())
+            }
+            _ => Err(()),
+        }
+    }
+
+    pub fn remove_member_from_group(&mut self, member_id: &AccountId) -> Result<(), ()> {
+        match self {
+            RoleKind::Group(accounts) => {
+                accounts.remove(member_id);
+                Ok(())
+            }
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Debug, PartialEq))]
+#[serde(crate = "near_sdk::serde")]
+pub struct RolePermission {
+    /// Name of the role to display to the user.
+    pub name: String,
+    /// Kind of the role: defines which users this permissions apply.
+    pub kind: RoleKind,
+    /// Set of actions on which proposals that this role is allowed to execute.
+    /// <proposal_kind>:<action>
+    pub permissions: HashSet<String>,
+    /// For each proposal kind, defines voting policy.
+    pub vote_policy: HashMap<String, VotePolicy>,
+}
+
+pub struct UserInfo {
+    pub account_id: AccountId,
+    pub amount: Balance,
+}
+
+/// Direct weight or ratio to total weight, used for the voting policy.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Debug, PartialEq))]
+#[serde(crate = "near_sdk::serde")]
+#[serde(untagged)]
+pub enum WeightOrRatio {
+    Weight(U128),
+    Ratio(u64, u64),
+}
+
+impl WeightOrRatio {
+    /// Convert weight or ratio to specific weight given total weight.
+    pub fn to_weight(&self, total_weight: Balance) -> Balance {
+        match self {
+            WeightOrRatio::Weight(weight) => min(weight.0, total_weight),
+            WeightOrRatio::Ratio(num, denom) => min(
+                (*num as u128 * total_weight) / *denom as u128 + 1,
+                total_weight,
+            ),
+        }
+    }
+}
+
+/// How the voting policy votes get weigthed.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Debug, PartialEq))]
+#[serde(crate = "near_sdk::serde")]
+pub enum WeightKind {
+    /// Using token amounts and total delegated at the moment.
+    TokenWeight,
+    /// Weight of the group role. Roles that don't have scoped group are not supported.
+    RoleWeight,
+}
+
+/// Defines configuration of the vote.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Debug, PartialEq))]
+#[serde(crate = "near_sdk::serde")]
+pub struct VotePolicy {
+    /// Kind of weight to use for votes.
+    pub weight_kind: WeightKind,
+    /// Minimum number required for vote to finalize.
+    /// If weight kind is TokenWeight - this is minimum number of tokens required.
+    ///     This allows to avoid situation where the number of staked tokens from total supply is too small.
+    /// If RoleWeight - this is minimum umber of votes.
+    ///     This allows to avoid situation where the role is got too small but policy kept at 1/2, for example.
+    pub quorum: U128,
+    /// How many votes to pass this vote.
+    pub threshold: WeightOrRatio,
+}
+
+impl Default for VotePolicy {
+    fn default() -> Self {
+        VotePolicy {
+            weight_kind: WeightKind::RoleWeight,
+            quorum: U128(0),
+            threshold: WeightOrRatio::Ratio(1, 2),
+        }
+    }
+}
+
+/// Defines voting / decision making policy of this DAO.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Debug, PartialEq))]
+#[serde(crate = "near_sdk::serde")]
+pub struct Policy {
+    /// List of roles and permissions for them in the current policy.
+    pub roles: Vec<RolePermission>,
+    /// Default vote policy. Used when given proposal kind doesn't have special policy.
+    pub default_vote_policy: VotePolicy,
+    /// Proposal bond.
+    pub proposal_bond: U128,
+    /// Expiration period for proposals.
+    pub proposal_period: WrappedDuration,
+    /// Bond for claiming a bounty.
+    pub bounty_bond: U128,
+    /// Period in which giving up on bounty is not punished.
+    pub bounty_forgiveness_period: WrappedDuration,
+}
+
+/// Versioned policy.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Debug, PartialEq))]
+#[serde(crate = "near_sdk::serde", untagged)]
+pub enum VersionedPolicy {
+    /// Default policy with given accounts as council.
+    Default(Vec<AccountId>),
+    Current(Policy),
+}
+
+/// Defines default policy:
+///     - everyone can add proposals
+///     - group consisting of the call can do all actions, consists of caller.
+///     - non token weighted voting, requires 1/2 of the group to vote
+///     - proposal & bounty bond is 1N
+///     - proposal & bounty forgiveness period is 1 day
+fn default_policy(council: Vec<AccountId>) -> Policy {
+    Policy {
+        roles: vec![
+            RolePermission {
+                name: "all".to_string(),
+                kind: RoleKind::Everyone,
+                permissions: vec!["*:AddProposal".to_string()].into_iter().collect(),
+                vote_policy: HashMap::default(),
+            },
+            RolePermission {
+                name: "council".to_string(),
+                kind: RoleKind::Group(council.into_iter().collect()),
+                // All actions except RemoveProposal are allowed by council.
+                permissions: vec![
+                    "*:AddProposal".to_string(),
+                    "*:VoteApprove".to_string(),
+                    "*:VoteReject".to_string(),
+                    "*:VoteRemove".to_string(),
+                    "*:Finalize".to_string(),
+                ]
+                .into_iter()
+                .collect(),
+                vote_policy: HashMap::default(),
+            },
+        ],
+        default_vote_policy: VotePolicy::default(),
+        proposal_bond: U128(10u128.pow(24)),
+        proposal_period: WrappedDuration::from(1_000_000_000 * 60 * 60 * 24 * 7),
+        bounty_bond: U128(10u128.pow(24)),
+        bounty_forgiveness_period: WrappedDuration::from(1_000_000_000 * 60 * 60 * 24),
+    }
+}
+
+impl VersionedPolicy {
+    /// Upgrades either version of policy into the latest.
+    pub fn upgrade(self) -> Self {
+        match self {
+            VersionedPolicy::Default(accounts) => {
+                VersionedPolicy::Current(default_policy(accounts))
+            }
+            VersionedPolicy::Current(policy) => VersionedPolicy::Current(policy),
+        }
+    }
+
+    /// Return recent version of policy.
+    pub fn to_policy(self) -> Policy {
+        match self {
+            VersionedPolicy::Current(policy) => policy,
+            _ => unimplemented!(),
+        }
+    }
+
+    pub fn to_policy_mut(&mut self) -> &mut Policy {
+        match self {
+            VersionedPolicy::Current(policy) => policy,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl Policy {
+    ///
+    /// Doesn't fail, because will be used on the finalization of the proposal.
+    pub fn add_member_to_role(&mut self, role: &String, member_id: &AccountId) {
+        for i in 0..self.roles.len() {
+            if &self.roles[i].name == role {
+                self.roles[i]
+                    .kind
+                    .add_member_to_group(member_id)
+                    .unwrap_or_else(|()| {
+                        env::log(&format!("ERR_ROLE_WRONG_KIND:{}", role).into_bytes());
+                    });
+                return;
+            }
+        }
+        env::log(&format!("ERR_ROLE_NOT_FOUND:{}", role).into_bytes());
+    }
+
+    pub fn remove_member_from_role(&mut self, role: &String, member_id: &AccountId) {
+        for i in 0..self.roles.len() {
+            if &self.roles[i].name == role {
+                self.roles[i]
+                    .kind
+                    .remove_member_from_group(member_id)
+                    .unwrap_or_else(|()| {
+                        env::log(&format!("ERR_ROLE_WRONG_KIND:{}", role).into_bytes());
+                    });
+                return;
+            }
+        }
+        env::log(&format!("ERR_ROLE_NOT_FOUND:{}", role).into_bytes());
+    }
+
+    /// Returns set of roles that this user is memeber of permissions for given user across all the roles it's member of.
+    fn get_user_roles(&self, user: UserInfo) -> HashMap<String, &HashSet<String>> {
+        let mut roles = HashMap::default();
+        for role in self.roles.iter() {
+            if role.kind.match_user(&user) {
+                roles.insert(role.name.clone(), &role.permissions);
+            }
+        }
+        roles
+    }
+
+    /// Can given user execute given action on this proposal.
+    /// Returns all roles that allow this action.
+    pub fn can_execute_action(
+        &self,
+        user: UserInfo,
+        proposal_kind: &ProposalKind,
+        action: &Action,
+    ) -> (Vec<String>, bool) {
+        let roles = self.get_user_roles(user);
+        let mut allowed = false;
+        let allowed_roles = roles
+            .into_iter()
+            .filter_map(|(role, permissions)| {
+                let allowed_role = permissions.contains(&format!(
+                    "{}:{}",
+                    proposal_kind.to_policy_label(),
+                    action.to_policy_label()
+                )) || permissions
+                    .contains(&format!("{}:*", proposal_kind.to_policy_label()))
+                    || permissions.contains(&format!("*:{}", action.to_policy_label()))
+                    || permissions.contains("*:*");
+                allowed = allowed || allowed_role;
+                if allowed_role {
+                    Some(role)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        (allowed_roles, allowed)
+    }
+
+    /// Returns if given proposal kind is token weighted.
+    pub fn is_token_weighted(&self, role: &String, proposal_kind_label: &String) -> bool {
+        let role_info = self.internal_get_role(role).expect("ERR_ROLE_NOT_FOUND");
+        match role_info
+            .vote_policy
+            .get(proposal_kind_label)
+            .unwrap_or(&self.default_vote_policy)
+            .weight_kind
+        {
+            WeightKind::TokenWeight => true,
+            _ => false,
+        }
+    }
+
+    fn internal_get_role(&self, name: &String) -> Option<&RolePermission> {
+        for role in self.roles.iter() {
+            if role.name == *name {
+                return Some(role);
+            }
+        }
+        None
+    }
+
+    /// Get proposal status for given proposal.
+    /// Usually is called after changing it's state.
+    pub fn proposal_status(
+        &self,
+        proposal: &Proposal,
+        roles: Vec<String>,
+        total_supply: Balance,
+    ) -> ProposalStatus {
+        assert_eq!(
+            proposal.status,
+            ProposalStatus::InProgress,
+            "ERR_PROPOSAL_NOT_IN_PROGRESS"
+        );
+        if proposal.submission_time.0 + self.proposal_period.0 < env::block_timestamp() {
+            // Proposal expired.
+            return ProposalStatus::Expired;
+        };
+        for role in roles {
+            let role_info = self.internal_get_role(&role).expect("ERR_MISSING_ROLE");
+            let vote_policy = role_info
+                .vote_policy
+                .get(&proposal.kind.to_policy_label().to_string())
+                .unwrap_or(&self.default_vote_policy);
+            let threshold = std::cmp::max(
+                vote_policy.quorum.0,
+                match &vote_policy.weight_kind {
+                    WeightKind::TokenWeight => vote_policy.threshold.to_weight(total_supply),
+                    WeightKind::RoleWeight => vote_policy.threshold.to_weight(
+                        role_info
+                            .kind
+                            .get_role_size()
+                            .expect("ERR_UNSUPPORTED_ROLE") as Balance,
+                    ),
+                },
+            );
+            // Check if there is anything voted above the threshold specified by policy for given role.
+            let vote_counts = proposal.vote_counts.get(&role).expect("ERR_MISSING_ROLE");
+            if vote_counts[Vote::Approve as usize] >= threshold {
+                return ProposalStatus::Approved;
+            } else if vote_counts[Vote::Reject as usize] >= threshold {
+                return ProposalStatus::Rejected;
+            } else if vote_counts[Vote::Remove as usize] >= threshold {
+                return ProposalStatus::Removed;
+            } else {
+                // continue to next role.
+            }
+        }
+        proposal.status.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_vote_policy() {
+        let r1 = WeightOrRatio::Weight(U128(100));
+        assert_eq!(r1.to_weight(1_000_000), 100);
+        let r2 = WeightOrRatio::Ratio(1, 2);
+        assert_eq!(r2.to_weight(2), 2);
+        let r2 = WeightOrRatio::Ratio(1, 2);
+        assert_eq!(r2.to_weight(5), 3);
+        let r2 = WeightOrRatio::Ratio(1, 1);
+        assert_eq!(r2.to_weight(5), 5);
+    }
+}
+
+'''
+'''--- sputnikdao2/src/proposals.rs ---
+use std::collections::HashMap;
+use std::convert::TryFrom;
+
+use near_contract_standards::fungible_token::core_impl::ext_fungible_token;
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::json_types::{Base64VecU8, WrappedTimestamp, U64};
+use near_sdk::{log, AccountId, Balance, PromiseOrValue};
+
+use crate::policy::UserInfo;
+use crate::types::{
+    upgrade_remote, upgrade_self, Action, Config, BASE_TOKEN, GAS_FOR_FT_TRANSFER, ONE_YOCTO_NEAR,
+};
+use crate::*;
+
+/// Status of a proposal.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub enum ProposalStatus {
+    InProgress,
+    /// If quorum voted yes, this proposal is successfully approved.
+    Approved,
+    /// If quorum voted no, this proposal is rejected. Bond is returned.
+    Rejected,
+    /// If quorum voted to remove (e.g. spam), this proposal is rejected and bond is not returned.
+    /// Interfaces shouldn't show removed proposals.
+    Removed,
+    /// Expired after period of time.
+    Expired,
+    /// If proposal was moved to Hub or somewhere else.
+    Moved,
+}
+
+/// Function call arguments.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Clone, Debug))]
+#[serde(crate = "near_sdk::serde")]
+pub struct ActionCall {
+    method_name: String,
+    args: Base64VecU8,
+    deposit: U128,
+    gas: U64,
+}
+
+/// Kinds of proposals, doing different action.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Clone, Debug))]
+#[serde(crate = "near_sdk::serde")]
+pub enum ProposalKind {
+    /// Change the DAO config.
+    ChangeConfig { config: Config },
+    /// Change the full policy.
+    ChangePolicy { policy: VersionedPolicy },
+    /// Add member to given role in the policy. This is short cut to updating the whole policy.
+    AddMemberToRole {
+        member_id: ValidAccountId,
+        role: String,
+    },
+    /// Remove member to given role in the policy. This is short cut to updating the whole policy.
+    RemoveMemberFromRole {
+        member_id: ValidAccountId,
+        role: String,
+    },
+    /// Calls `receiver_id` with list of method names in a single promise.
+    /// Allows this contract to execute any arbitrary set of actions in other contracts.
+    FunctionCall {
+        receiver_id: ValidAccountId,
+        actions: Vec<ActionCall>,
+    },
+    /// Upgrade this contract with given hash from blob store.
+    UpgradeSelf { hash: Base58CryptoHash },
+    /// Upgrade another contract, by calling method with the code from given hash from blob store.
+    UpgradeRemote {
+        receiver_id: ValidAccountId,
+        method_name: String,
+        hash: Base58CryptoHash,
+    },
+    /// Transfers given amount of `token_id` from this DAO to `receiver_id`.
+    /// If `msg` is not None, calls `ft_transfer_call` with given `msg`. Fails if this base token.
+    /// For `ft_transfer` and `ft_transfer_call` `memo` is the `description` of the proposal.
+    Transfer {
+        /// Can be "" for $NEAR or a valid account id.
+        token_id: AccountId,
+        receiver_id: ValidAccountId,
+        amount: U128,
+        msg: Option<String>,
+    },
+    /// Sets staking contract. Can only be proposed if staking contract is not set yet.
+    SetStakingContract { staking_id: ValidAccountId },
+    /// Add new bounty.
+    AddBounty { bounty: Bounty },
+    /// Indicates that given bounty is done by given user.
+    BountyDone {
+        bounty_id: u64,
+        receiver_id: ValidAccountId,
+    },
+    /// Just a signaling vote, with no execution.
+    Vote,
+}
+
+impl ProposalKind {
+    /// Returns label of policy for given type of proposal.
+    pub fn to_policy_label(&self) -> &str {
+        match self {
+            ProposalKind::ChangeConfig { .. } => "config",
+            ProposalKind::ChangePolicy { .. } => "policy",
+            ProposalKind::AddMemberToRole { .. } => "add_member_to_role",
+            ProposalKind::RemoveMemberFromRole { .. } => "remove_member_from_role",
+            ProposalKind::FunctionCall { .. } => "call",
+            ProposalKind::UpgradeSelf { .. } => "upgrade_self",
+            ProposalKind::UpgradeRemote { .. } => "upgrade_remote",
+            ProposalKind::Transfer { .. } => "transfer",
+            ProposalKind::SetStakingContract { .. } => "set_vote_token",
+            ProposalKind::AddBounty { .. } => "add_bounty",
+            ProposalKind::BountyDone { .. } => "bounty_done",
+            ProposalKind::Vote => "vote",
+        }
+    }
+}
+
+/// Votes recorded in the proposal.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub enum Vote {
+    Approve = 0x0,
+    Reject = 0x1,
+    Remove = 0x2,
+}
+
+impl From<Action> for Vote {
+    fn from(action: Action) -> Self {
+        match action {
+            Action::VoteApprove => Vote::Approve,
+            Action::VoteReject => Vote::Reject,
+            Action::VoteRemove => Vote::Remove,
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// Proposal that are sent to this DAO.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Debug))]
+#[serde(crate = "near_sdk::serde")]
+pub struct Proposal {
+    /// Original proposer.
+    pub proposer: AccountId,
+    /// Description of this proposal.
+    pub description: String,
+    /// Kind of proposal with relevant information.
+    pub kind: ProposalKind,
+    /// Current status of the proposal.
+    pub status: ProposalStatus,
+    /// Count of votes per role per decision: yes / no / spam.
+    pub vote_counts: HashMap<String, [Balance; 3]>,
+    /// Map of who voted and how.
+    pub votes: HashMap<AccountId, Vote>,
+    /// Submission time (for voting period).
+    pub submission_time: WrappedTimestamp,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Debug))]
+#[serde(crate = "near_sdk::serde")]
+pub enum VersionedProposal {
+    Default(Proposal),
+}
+
+impl From<VersionedProposal> for Proposal {
+    fn from(v: VersionedProposal) -> Self {
+        match v {
+            VersionedProposal::Default(p) => p,
+        }
+    }
+}
+
+impl Proposal {
+    /// Adds vote of the given user with given `amount` of weight. If user already voted, fails.
+    pub fn update_votes(
+        &mut self,
+        account_id: &AccountId,
+        roles: &[String],
+        vote: Vote,
+        policy: &Policy,
+        user_weight: Balance,
+    ) {
+        for role in roles {
+            let amount = if policy.is_token_weighted(role, &self.kind.to_policy_label().to_string())
+            {
+                user_weight
+            } else {
+                1
+            };
+            self.vote_counts.entry(role.clone()).or_insert([0u128; 3])[vote.clone() as usize] +=
+                amount;
+        }
+        assert!(
+            self.votes.insert(account_id.clone(), vote).is_none(),
+            "ERR_ALREADY_VOTED"
+        );
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct ProposalInput {
+    /// Description of this proposal.
+    pub description: String,
+    /// Kind of proposal with relevant information.
+    pub kind: ProposalKind,
+}
+
+impl From<ProposalInput> for Proposal {
+    fn from(input: ProposalInput) -> Self {
+        Self {
+            proposer: env::predecessor_account_id(),
+            description: input.description,
+            kind: input.kind,
+            status: ProposalStatus::InProgress,
+            vote_counts: HashMap::default(),
+            votes: HashMap::default(),
+            submission_time: WrappedTimestamp::from(env::block_timestamp()),
+        }
+    }
+}
+
+impl Contract {
+    /// Execute payout of given token to given user.
+    pub(crate) fn internal_payout(
+        &mut self,
+        token_id: &AccountId,
+        receiver_id: &AccountId,
+        amount: Balance,
+        memo: String,
+        msg: Option<String>,
+    ) -> PromiseOrValue<()> {
+        if token_id == BASE_TOKEN {
+            Promise::new(receiver_id.clone()).transfer(amount).into()
+        } else {
+            if let Some(msg) = msg {
+                ext_fungible_token::ft_transfer_call(
+                    receiver_id.clone(),
+                    U128(amount),
+                    Some(memo),
+                    msg,
+                    &token_id,
+                    ONE_YOCTO_NEAR,
+                    GAS_FOR_FT_TRANSFER,
+                )
+                .into()
+            } else {
+                ext_fungible_token::ft_transfer(
+                    receiver_id.clone(),
+                    U128(amount),
+                    Some(memo),
+                    &token_id,
+                    ONE_YOCTO_NEAR,
+                    GAS_FOR_FT_TRANSFER,
+                )
+                .into()
+            }
+        }
+    }
+
+    /// Executes given proposal and updates the contract's state.
+    fn internal_execute_proposal(
+        &mut self,
+        policy: &Policy,
+        proposal: &Proposal,
+    ) -> PromiseOrValue<()> {
+        // Return the proposal bond.
+        Promise::new(proposal.proposer.clone()).transfer(policy.proposal_bond.0);
+        match &proposal.kind {
+            ProposalKind::ChangeConfig { config } => {
+                self.config.set(config);
+                PromiseOrValue::Value(())
+            }
+            ProposalKind::ChangePolicy { policy } => {
+                self.policy.set(policy);
+                PromiseOrValue::Value(())
+            }
+            ProposalKind::AddMemberToRole { member_id, role } => {
+                let mut new_policy = policy.clone();
+                new_policy.add_member_to_role(role, &member_id.clone().into());
+                self.policy.set(&VersionedPolicy::Current(new_policy));
+                PromiseOrValue::Value(())
+            }
+            ProposalKind::RemoveMemberFromRole { member_id, role } => {
+                let mut new_policy = policy.clone();
+                new_policy.remove_member_from_role(role, &member_id.clone().into());
+                self.policy.set(&VersionedPolicy::Current(new_policy));
+                PromiseOrValue::Value(())
+            }
+            ProposalKind::FunctionCall {
+                receiver_id,
+                actions,
+            } => {
+                let mut promise = Promise::new(receiver_id.clone().into());
+                for action in actions {
+                    promise = promise.function_call(
+                        action.method_name.clone().into_bytes(),
+                        action.args.clone().into(),
+                        action.deposit.0,
+                        action.gas.0,
+                    )
+                }
+                promise.into()
+            }
+            ProposalKind::UpgradeSelf { hash } => {
+                upgrade_self(&CryptoHash::from(hash.clone()));
+                PromiseOrValue::Value(())
+            }
+            ProposalKind::UpgradeRemote {
+                receiver_id,
+                method_name,
+                hash,
+            } => {
+                upgrade_remote(
+                    &receiver_id.clone().into(),
+                    method_name,
+                    &CryptoHash::from(hash.clone()),
+                );
+                PromiseOrValue::Value(())
+            }
+            ProposalKind::Transfer {
+                token_id,
+                receiver_id,
+                amount,
+                msg,
+            } => self.internal_payout(
+                token_id,
+                &receiver_id.clone().into(),
+                amount.0,
+                proposal.description.clone(),
+                msg.clone(),
+            ),
+            ProposalKind::SetStakingContract { staking_id } => {
+                assert!(self.staking_id.is_none(), "ERR_INVALID_STAKING_CHANGE");
+                self.staking_id = Some(staking_id.clone().into());
+                PromiseOrValue::Value(())
+            }
+            ProposalKind::AddBounty { bounty } => {
+                self.internal_add_bounty(bounty);
+                PromiseOrValue::Value(())
+            }
+            ProposalKind::BountyDone {
+                bounty_id,
+                receiver_id,
+            } => self.internal_execute_bounty_payout(*bounty_id, &receiver_id.clone().into(), true),
+            ProposalKind::Vote => PromiseOrValue::Value(()),
+        }
+    }
+
+    /// Process rejecting proposal.
+    fn internal_reject_proposal(
+        &mut self,
+        policy: &Policy,
+        proposal: &Proposal,
+        return_bond: bool,
+    ) -> PromiseOrValue<()> {
+        if return_bond {
+            // Return bond to the proposer.
+            Promise::new(proposal.proposer.clone()).transfer(policy.proposal_bond.0);
+        }
+        match &proposal.kind {
+            ProposalKind::BountyDone {
+                bounty_id,
+                receiver_id,
+            } => {
+                self.internal_execute_bounty_payout(*bounty_id, &receiver_id.clone().into(), false)
+            }
+            _ => PromiseOrValue::Value(()),
+        }
+    }
+
+    pub(crate) fn internal_user_info(&self) -> UserInfo {
+        let account_id = env::predecessor_account_id();
+        UserInfo {
+            amount: self.get_user_weight(&account_id),
+            account_id,
+        }
+    }
+}
+
+#[near_bindgen]
+impl Contract {
+    /// Add proposal to this DAO.
+    #[payable]
+    pub fn add_proposal(&mut self, proposal: ProposalInput) -> u64 {
+        // 0. validate bond attached.
+        // TODO: consider bond in the token of this DAO.
+        let policy = self.policy.get().unwrap().to_policy();
+        assert!(
+            env::attached_deposit() >= policy.proposal_bond.0,
+            "ERR_MIN_BOND"
+        );
+
+        // 1. Validate proposal.
+        match &proposal.kind {
+            ProposalKind::ChangePolicy { policy } => match policy {
+                VersionedPolicy::Current(_) => {}
+                _ => panic!("ERR_INVALID_POLICY"),
+            },
+            ProposalKind::Transfer { token_id, msg, .. } => {
+                assert!(
+                    !(token_id == BASE_TOKEN) || msg.is_none(),
+                    "ERR_BASE_TOKEN_NO_MSG"
+                );
+                if token_id != BASE_TOKEN {
+                    assert!(
+                        ValidAccountId::try_from(token_id.clone()).is_ok(),
+                        "ERR_TOKEN_ID_INVALID"
+                    );
+                }
+            }
+            ProposalKind::SetStakingContract { .. } => assert!(
+                self.staking_id.is_none(),
+                "ERR_STAKING_CONTRACT_CANT_CHANGE"
+            ),
+            // TODO: add more verifications.
+            _ => {}
+        };
+
+        // 2. Check permission of caller to add this type of proposal.
+        assert!(
+            policy
+                .can_execute_action(
+                    self.internal_user_info(),
+                    &proposal.kind,
+                    &Action::AddProposal
+                )
+                .1,
+            "ERR_PERMISSION_DENIED"
+        );
+
+        // 3. Actually add proposal to the current list of proposals.
+        let id = self.last_proposal_id;
+        self.proposals
+            .insert(&id, &VersionedProposal::Default(proposal.into()));
+        self.last_proposal_id += 1;
+        id
+    }
+
+    /// Act on given proposal by id, if permissions allow.
+    /// Memo is logged but not stored in the state. Can be used to leave notes or explain the action.
+    pub fn act_proposal(&mut self, id: u64, action: Action, memo: Option<String>) {
+        let mut proposal: Proposal = self.proposals.get(&id).expect("ERR_NO_PROPOSAL").into();
+        let policy = self.policy.get().unwrap().to_policy();
+        // Check permissions for the given action.
+        let (roles, allowed) =
+            policy.can_execute_action(self.internal_user_info(), &proposal.kind, &action);
+        assert!(allowed, "ERR_PERMISSION_DENIED");
+        let sender_id = env::predecessor_account_id();
+        // Update proposal given action. Returns true if should be updated in storage.
+        let update = match action {
+            Action::AddProposal => env::panic(b"ERR_WRONG_ACTION"),
+            Action::RemoveProposal => {
+                self.proposals.remove(&id);
+                false
+            }
+            Action::VoteApprove | Action::VoteReject | Action::VoteRemove => {
+                assert_eq!(
+                    proposal.status,
+                    ProposalStatus::InProgress,
+                    "ERR_PROPOSAL_NOT_IN_PROGRESS"
+                );
+                proposal.update_votes(
+                    &sender_id,
+                    &roles,
+                    Vote::from(action),
+                    &policy,
+                    self.get_user_weight(&sender_id),
+                );
+                // Updates proposal status with new votes using the policy.
+                proposal.status =
+                    policy.proposal_status(&proposal, roles, self.total_delegation_amount);
+                if proposal.status == ProposalStatus::Approved {
+                    self.internal_execute_proposal(&policy, &proposal);
+                    true
+                } else if proposal.status == ProposalStatus::Removed {
+                    self.internal_reject_proposal(&policy, &proposal, false);
+                    self.proposals.remove(&id);
+                    false
+                } else if proposal.status == ProposalStatus::Rejected {
+                    self.internal_reject_proposal(&policy, &proposal, true);
+                    true
+                } else {
+                    // Still in progress or expired.
+                    true
+                }
+            }
+            Action::Finalize => {
+                proposal.status = policy.proposal_status(
+                    &proposal,
+                    policy.roles.iter().map(|r| r.name.clone()).collect(),
+                    self.total_delegation_amount,
+                );
+                assert_eq!(
+                    proposal.status,
+                    ProposalStatus::Expired,
+                    "ERR_PROPOSAL_NOT_EXPIRED"
+                );
+                self.internal_reject_proposal(&policy, &proposal, true);
+                true
+            }
+            Action::MoveToHub => false,
+        };
+        if update {
+            self.proposals
+                .insert(&id, &VersionedProposal::Default(proposal));
+        }
+        if let Some(memo) = memo {
+            log!("Memo: {}", memo);
+        }
+    }
+}
+
+'''
+'''--- sputnikdao2/src/types.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::env::BLOCKCHAIN_INTERFACE;
+use near_sdk::json_types::Base64VecU8;
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{env, AccountId, Balance, Gas};
+
+const BLOCKCHAIN_INTERFACE_NOT_SET_ERR: &str = "Blockchain interface not set.";
+
+/// Account ID used for $NEAR.
+pub const BASE_TOKEN: &str = "";
+
+/// 1 yN to prevent access key fraud.
+pub const ONE_YOCTO_NEAR: Balance = 1;
+
+/// Gas for single ft_transfer call.
+pub const GAS_FOR_FT_TRANSFER: Gas = 10_000_000_000_000;
+
+/// Gas for upgrading this contract on promise creation + deploying new contract.
+pub const GAS_FOR_UPGRADE_SELF_DEPLOY: Gas = 30_000_000_000_000;
+
+pub const GAS_FOR_UPGRADE_REMOTE_DEPLOY: Gas = 10_000_000_000_000;
+
+/// Configuration of the DAO.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Config {
+    /// Name of the DAO.
+    pub name: String,
+    /// Purpose of this DAO.
+    pub purpose: String,
+    /// Generic metadata. Can be used by specific UI to store additional data.
+    /// This is not used by anything in the contract.
+    pub metadata: Base64VecU8,
+}
+
+#[cfg(test)]
+impl Config {
+    pub fn test_config() -> Self {
+        Self {
+            name: "Test".to_string(),
+            purpose: "to test".to_string(),
+            metadata: Base64VecU8(vec![]),
+        }
+    }
+}
+
+/// Set of possible action to take.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub enum Action {
+    /// Action to add proposal. Used internally.
+    AddProposal,
+    /// Action to remove given proposal. Used for immediate deletion in special cases.
+    RemoveProposal,
+    /// Vote to approve given proposal or bounty.
+    VoteApprove,
+    /// Vote to reject given proposal or bounty.
+    VoteReject,
+    /// Vote to remove given proposal or bounty (because it's spam).
+    VoteRemove,
+    /// Finalize proposal, called when it's expired to return the funds
+    /// (or in the future can be used for early proposal closure).
+    Finalize,
+    /// Move a proposal to the hub to shift into another DAO.
+    MoveToHub,
+}
+
+impl Action {
+    pub fn to_policy_label(&self) -> String {
+        format!("{:?}", self)
+    }
+}
+
+/// Self upgrade, optimizes gas by not loading into memory the code.
+pub(crate) fn upgrade_self(hash: &[u8]) {
+    let current_id = env::current_account_id().into_bytes();
+    let method_name = "migrate".as_bytes().to_vec();
+    let attached_gas = env::prepaid_gas() - env::used_gas() - GAS_FOR_UPGRADE_SELF_DEPLOY;
+    unsafe {
+        BLOCKCHAIN_INTERFACE.with(|b| {
+            // Load input (wasm code) into register 0.
+            b.borrow()
+                .as_ref()
+                .expect(BLOCKCHAIN_INTERFACE_NOT_SET_ERR)
+                .storage_read(hash.len() as _, hash.as_ptr() as _, 0);
+            // schedule a Promise tx to this same contract
+            let promise_id = b
+                .borrow()
+                .as_ref()
+                .expect(BLOCKCHAIN_INTERFACE_NOT_SET_ERR)
+                .promise_batch_create(current_id.len() as _, current_id.as_ptr() as _);
+            // 1st item in the Tx: "deploy contract" (code is taken from register 0)
+            b.borrow()
+                .as_ref()
+                .expect(BLOCKCHAIN_INTERFACE_NOT_SET_ERR)
+                .promise_batch_action_deploy_contract(promise_id, u64::MAX as _, 0);
+            // 2nd item in the Tx: call this_contract.migrate() with remaining gas
+            b.borrow()
+                .as_ref()
+                .expect(BLOCKCHAIN_INTERFACE_NOT_SET_ERR)
+                .promise_batch_action_function_call(
+                    promise_id,
+                    method_name.len() as _,
+                    method_name.as_ptr() as _,
+                    0 as _,
+                    0 as _,
+                    0 as _,
+                    attached_gas,
+                );
+        });
+    }
+}
+
+pub(crate) fn upgrade_remote(receiver_id: &AccountId, method_name: &str, hash: &[u8]) {
+    unsafe {
+        BLOCKCHAIN_INTERFACE.with(|b| {
+            // Load input into register 0.
+            b.borrow()
+                .as_ref()
+                .expect(BLOCKCHAIN_INTERFACE_NOT_SET_ERR)
+                .storage_read(hash.len() as _, hash.as_ptr() as _, 0);
+            let promise_id = b
+                .borrow()
+                .as_ref()
+                .expect(BLOCKCHAIN_INTERFACE_NOT_SET_ERR)
+                .promise_batch_create(receiver_id.len() as _, receiver_id.as_ptr() as _);
+            let attached_gas = env::prepaid_gas() - env::used_gas() - GAS_FOR_UPGRADE_REMOTE_DEPLOY;
+            b.borrow()
+                .as_ref()
+                .expect(BLOCKCHAIN_INTERFACE_NOT_SET_ERR)
+                .promise_batch_action_function_call(
+                    promise_id,
+                    method_name.len() as _,
+                    method_name.as_ptr() as _,
+                    u64::MAX as _,
+                    0 as _,
+                    0 as _,
+                    attached_gas,
+                );
+        });
+    }
+}
+
+'''
+'''--- sputnikdao2/src/views.rs ---
+use std::cmp::min;
+
+use crate::*;
+
+/// This is format of output via JSON for the proposal.
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct ProposalOutput {
+    /// Id of the proposal.
+    pub id: u64,
+    #[serde(flatten)]
+    pub proposal: Proposal,
+}
+
+/// This is format of output via JSON for the bounty.
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct BountyOutput {
+    /// Id of the bounty.
+    pub id: u64,
+    #[serde(flatten)]
+    pub bounty: Bounty,
+}
+
+#[near_bindgen]
+impl Contract {
+    /// Returns semver of this contract.
+    pub fn version(&self) -> String {
+        env!("CARGO_PKG_VERSION").to_string()
+    }
+
+    /// Returns config of this contract.
+    pub fn get_config(&self) -> Config {
+        self.config.get().unwrap().clone()
+    }
+
+    /// Returns policy of this contract.
+    pub fn get_policy(&self) -> Policy {
+        self.policy.get().unwrap().to_policy().clone()
+    }
+
+    /// Returns staking contract if available. Otherwise returns empty.
+    pub fn get_staking_contract(&self) -> AccountId {
+        self.staking_id.clone().unwrap_or_default()
+    }
+
+    /// Returns if blob with given hash is stored.
+    pub fn has_blob(&self, hash: Base58CryptoHash) -> bool {
+        env::storage_has_key(&CryptoHash::from(hash))
+    }
+
+    /// Returns available amount of NEAR that can be spent (outside of amount for storage and bonds).
+    pub fn get_available_amount(&self) -> U128 {
+        U128(env::account_balance() - self.locked_amount)
+    }
+
+    /// Returns total delegated stake.
+    pub fn delegation_total_supply(&self) -> U128 {
+        U128(self.total_delegation_amount)
+    }
+
+    /// Returns delegated stake to given account.
+    pub fn delegation_balance_of(&self, account_id: ValidAccountId) -> U128 {
+        U128(
+            self.delegations
+                .get(account_id.as_ref())
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Last proposal's id.
+    pub fn get_last_proposal_id(&self) -> u64 {
+        self.last_proposal_id
+    }
+
+    /// Get proposals in paginated view.
+    pub fn get_proposals(&self, from_index: u64, limit: u64) -> Vec<ProposalOutput> {
+        (from_index..min(self.last_proposal_id, from_index + limit))
+            .filter_map(|id| {
+                self.proposals.get(&id).map(|proposal| ProposalOutput {
+                    id,
+                    proposal: proposal.into(),
+                })
+            })
+            .collect()
+    }
+
+    /// Get specific proposal.
+    pub fn get_proposal(&self, id: u64) -> ProposalOutput {
+        let proposal = self.proposals.get(&id).expect("ERR_NO_PROPOSAL");
+        ProposalOutput {
+            id,
+            proposal: proposal.into(),
+        }
+    }
+
+    /// Get given bounty by id.
+    pub fn get_bounty(&self, id: u64) -> BountyOutput {
+        let bounty = self.bounties.get(&id).expect("ERR_NO_BOUNTY");
+        BountyOutput {
+            id,
+            bounty: bounty.into(),
+        }
+    }
+
+    /// Get number of bounties.
+    pub fn get_last_bounty_id(&self) -> u64 {
+        self.last_bounty_id
+    }
+
+    /// Get `limit` of bounties from given index.
+    pub fn get_bounties(&self, from_index: u64, limit: u64) -> Vec<BountyOutput> {
+        (from_index..std::cmp::min(from_index + limit, self.last_bounty_id))
+            .filter_map(|id| {
+                self.bounties.get(&id).map(|bounty| BountyOutput {
+                    id,
+                    bounty: bounty.into(),
+                })
+            })
+            .collect()
+    }
+
+    /// Get bounty claims for given user.
+    pub fn get_bounty_claims(&self, account_id: ValidAccountId) -> Vec<BountyClaim> {
+        self.bounty_claimers
+            .get(account_id.as_ref())
+            .unwrap_or_default()
+    }
+
+    /// Returns number of claims per given bounty.
+    pub fn get_bounty_number_of_claims(&self, id: u64) -> u32 {
+        self.bounty_claims_count.get(&id).unwrap_or_default()
+    }
+}
+
+'''
+'''--- sputnikdao2/tests/test_general.rs ---
+use std::collections::HashMap;
+
+use near_sdk::json_types::U128;
+use near_sdk::AccountId;
+use near_sdk_sim::{call, to_yocto, view};
+
+use sputnik_staking::User;
+use sputnikdao2::{
+    Action, Policy, Proposal, ProposalInput, ProposalKind, ProposalStatus, RoleKind,
+    RolePermission, VersionedPolicy, VotePolicy,
+};
+
+use crate::utils::*;
+
+mod utils;
+
+fn user(id: u32) -> String {
+    format!("user{}", id)
+}
+
+#[test]
+fn test_multi_council() {
+    let (root, dao) = setup_dao();
+    let user1 = root.create_user(user(1), to_yocto("1000"));
+    let user2 = root.create_user(user(2), to_yocto("1000"));
+    let user3 = root.create_user(user(3), to_yocto("1000"));
+    let new_policy = Policy {
+        roles: vec![
+            RolePermission {
+                name: "all".to_string(),
+                kind: RoleKind::Everyone,
+                permissions: vec!["*:AddProposal".to_string()].into_iter().collect(),
+                vote_policy: HashMap::default(),
+            },
+            RolePermission {
+                name: "council".to_string(),
+                kind: RoleKind::Group(vec![user(1), user(2)].into_iter().collect()),
+                permissions: vec!["*:*".to_string()].into_iter().collect(),
+                vote_policy: HashMap::default(),
+            },
+            RolePermission {
+                name: "community".to_string(),
+                kind: RoleKind::Group(vec![user(1), user(3), user(4)].into_iter().collect()),
+                permissions: vec!["*:*".to_string()].into_iter().collect(),
+                vote_policy: HashMap::default(),
+            },
+        ],
+        default_vote_policy: VotePolicy::default(),
+        proposal_bond: U128(10u128.pow(24)),
+        proposal_period: WrappedDuration::from(1_000_000_000 * 60 * 60 * 24 * 7),
+        bounty_bond: U128(10u128.pow(24)),
+        bounty_forgiveness_period: WrappedDuration::from(1_000_000_000 * 60 * 60 * 24),
+    };
+    add_proposal(
+        &root,
+        &dao,
+        ProposalInput {
+            description: "new policy".to_string(),
+            kind: ProposalKind::ChangePolicy {
+                policy: VersionedPolicy::Current(new_policy.clone()),
+            },
+        },
+    )
+    .assert_success();
+    vote(vec![&root], &dao, 0);
+    assert_eq!(view!(dao.get_policy()).unwrap_json::<Policy>(), new_policy);
+    add_transfer_proposal(&root, &dao, base_token(), user(1), 1_000_000, None).assert_success();
+    vote(vec![&user2], &dao, 1);
+    vote(vec![&user3], &dao, 1);
+    let proposal = view!(dao.get_proposal(1)).unwrap_json::<Proposal>();
+    // Votes from members in different councils.
+    assert_eq!(proposal.status, ProposalStatus::InProgress);
+    // Finish with vote that is in both councils, which approves the proposal.
+    vote(vec![&user1], &dao, 1);
+    let proposal = view!(dao.get_proposal(1)).unwrap_json::<Proposal>();
+    assert_eq!(proposal.status, ProposalStatus::Approved);
+}
+
+#[test]
+fn test_create_dao_and_use_token() {
+    let (root, dao) = setup_dao();
+    let user2 = root.create_user(user(2), to_yocto("1000"));
+    let user3 = root.create_user(user(3), to_yocto("1000"));
+    let test_token = setup_test_token(&root);
+    let staking = setup_staking(&root);
+
+    assert!(view!(dao.get_staking_contract())
+        .unwrap_json::<AccountId>()
+        .is_empty());
+    add_member_proposal(&root, &dao, user2.account_id.clone()).assert_success();
+    assert_eq!(view!(dao.get_last_proposal_id()).unwrap_json::<u64>(), 1);
+    // Voting by user who is not member should fail.
+    should_fail(call!(user2, dao.act_proposal(0, Action::VoteApprove, None)));
+    call!(root, dao.act_proposal(0, Action::VoteApprove, None)).assert_success();
+    // voting second time should fail.
+    should_fail(call!(root, dao.act_proposal(0, Action::VoteApprove, None)));
+    // Add 3rd member.
+    add_member_proposal(&user2, &dao, user3.account_id.clone()).assert_success();
+    vote(vec![&root, &user2], &dao, 1);
+    let policy = view!(dao.get_policy()).unwrap_json::<Policy>();
+    assert_eq!(policy.roles.len(), 2);
+    assert_eq!(
+        policy.roles[1].kind,
+        RoleKind::Group(
+            vec![
+                root.account_id.clone(),
+                user2.account_id.clone(),
+                user3.account_id.clone()
+            ]
+            .into_iter()
+            .collect()
+        )
+    );
+    add_proposal(
+        &user2,
+        &dao,
+        ProposalInput {
+            description: "test".to_string(),
+            kind: ProposalKind::SetStakingContract {
+                staking_id: to_va("staking".to_string()),
+            },
+        },
+    )
+    .assert_success();
+    vote(vec![&user3, &user2], &dao, 2);
+    assert!(!view!(dao.get_staking_contract())
+        .unwrap_json::<AccountId>()
+        .is_empty());
+    assert_eq!(
+        view!(dao.get_proposal(2)).unwrap_json::<Proposal>().status,
+        ProposalStatus::Approved
+    );
+    assert_eq!(
+        view!(staking.ft_total_supply()).unwrap_json::<U128>().0,
+        to_yocto("0")
+    );
+    call!(
+        user2,
+        test_token.mint(to_va(user2.account_id.clone()), U128(to_yocto("100")))
+    )
+    .assert_success();
+    call!(
+        user2,
+        test_token.storage_deposit(Some(to_va(staking.account_id())), None),
+        deposit = to_yocto("1")
+    )
+    .assert_success();
+    call!(
+        user2,
+        staking.storage_deposit(None, None),
+        deposit = to_yocto("1")
+    );
+    call!(
+        user2,
+        test_token.ft_transfer_call(
+            to_va(staking.account_id()),
+            U128(to_yocto("10")),
+            None,
+            "".to_string()
+        ),
+        deposit = 1
+    )
+    .assert_success();
+    assert_eq!(
+        view!(staking.ft_total_supply()).unwrap_json::<U128>().0,
+        to_yocto("10")
+    );
+    let user2_id = to_va(user2.account_id.clone());
+    assert_eq!(
+        view!(staking.ft_balance_of(user2_id.clone()))
+            .unwrap_json::<U128>()
+            .0,
+        to_yocto("10")
+    );
+    assert_eq!(
+        view!(test_token.ft_balance_of(user2_id.clone()))
+            .unwrap_json::<U128>()
+            .0,
+        to_yocto("90")
+    );
+    call!(user2, staking.withdraw(U128(to_yocto("5")))).assert_success();
+    assert_eq!(
+        view!(staking.ft_total_supply()).unwrap_json::<U128>().0,
+        to_yocto("5")
+    );
+    assert_eq!(
+        view!(test_token.ft_balance_of(user2_id.clone()))
+            .unwrap_json::<U128>()
+            .0,
+        to_yocto("95")
+    );
+    call!(
+        user2,
+        staking.delegate(user2_id.clone(), U128(to_yocto("5")))
+    )
+    .assert_success();
+    call!(
+        user2,
+        staking.undelegate(user2_id.clone(), U128(to_yocto("1")))
+    )
+    .assert_success();
+    // should fail right after undelegation as need to wait for voting period before can delegate again.
+    should_fail(call!(
+        user2,
+        staking.delegate(user2_id.clone(), U128(to_yocto("1")))
+    ));
+    let user = view!(staking.get_user(user2_id.clone())).unwrap_json::<User>();
+    assert_eq!(
+        user.delegated_amounts,
+        vec![(user2_id.to_string(), U128(to_yocto("4")))]
+    );
+    assert_eq!(
+        view!(dao.delegation_total_supply()).unwrap_json::<U128>().0,
+        to_yocto("4")
+    );
+    assert_eq!(
+        view!(dao.delegation_balance_of(user2_id))
+            .unwrap_json::<U128>()
+            .0,
+        to_yocto("4")
+    );
+}
+
+/// Test various cases that must fail.
+#[test]
+fn test_failures() {
+    let (root, dao) = setup_dao();
+    should_fail(add_transfer_proposal(
+        &root,
+        &dao,
+        base_token(),
+        user(1),
+        1_000_000,
+        Some("some".to_string()),
+    ));
+    should_fail(add_transfer_proposal(
+        &root,
+        &dao,
+        "not:a^valid.token@".to_string(),
+        user(1),
+        1_000_000,
+        None,
+    ));
+}
+
+'''
+'''--- sputnikdao2/tests/test_upgrade.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::json_types::{Base58CryptoHash, ValidAccountId};
+use near_sdk::serde_json::json;
+use near_sdk_sim::{call, to_yocto, view, DEFAULT_GAS};
+use sputnikdao2::{Action, ProposalInput, ProposalKind};
+
+mod utils;
+use crate::utils::*;
+
+near_sdk_sim::lazy_static_include::lazy_static_include_bytes! {
+    DAO_WASM_BYTES => "res/sputnikdao2.wasm",
+    OTHER_WASM_BYTES => "res/ref_exchange_release.wasm"
+}
+
+#[test]
+fn test_upgrade() {
+    let (root, dao) = setup_dao();
+    let hash = root
+        .call(
+            dao.user_account.account_id.clone(),
+            "store_blob",
+            &DAO_WASM_BYTES,
+            near_sdk_sim::DEFAULT_GAS,
+            to_yocto("200"),
+        )
+        .unwrap_json::<Base58CryptoHash>();
+    call!(
+        root,
+        dao.add_proposal(ProposalInput {
+            description: "test".to_string(),
+            kind: ProposalKind::UpgradeSelf { hash }
+        }),
+        deposit = to_yocto("1")
+    )
+    .assert_success();
+    assert_eq!(view!(dao.get_last_proposal_id()).unwrap_json::<u64>(), 1);
+    call!(root, dao.act_proposal(0, Action::VoteApprove, None)).assert_success();
+    assert_eq!(view!(dao.version()).unwrap_json::<String>(), "2.0.0");
+    call!(root, dao.remove_blob(hash)).assert_success();
+    should_fail(call!(root, dao.remove_blob(hash)));
+}
+
+#[derive(BorshSerialize, BorshDeserialize)]
+struct NewArgs {
+    owner_id: ValidAccountId,
+    exchange_fee: u32,
+    referral_fee: u32,
+}
+
+/// Test that Sputnik can upgrade another contract.
+#[test]
+fn test_upgrade_other() {
+    let (root, dao) = setup_dao();
+    let ref_account_id = "ref-finance".to_string();
+    let _ = root.deploy_and_init(
+        &OTHER_WASM_BYTES,
+        ref_account_id.clone(),
+        "new",
+        &json!({
+            "owner_id": to_va(dao.account_id()),
+            "exchange_fee": 1,
+            "referral_fee": 1,
+        })
+        .to_string()
+        .into_bytes(),
+        to_yocto("1000"),
+        DEFAULT_GAS,
+    );
+    let hash = root
+        .call(
+            dao.user_account.account_id.clone(),
+            "store_blob",
+            &OTHER_WASM_BYTES,
+            near_sdk_sim::DEFAULT_GAS,
+            to_yocto("200"),
+        )
+        .unwrap_json::<Base58CryptoHash>();
+    add_proposal(
+        &root,
+        &dao,
+        ProposalInput {
+            description: "test".to_string(),
+            kind: ProposalKind::UpgradeRemote {
+                receiver_id: to_va(ref_account_id.clone()),
+                method_name: "upgrade".to_string(),
+                hash,
+            },
+        },
+    )
+    .assert_success();
+    call!(root, dao.act_proposal(0, Action::VoteApprove, None)).assert_success();
+}
+
+'''
+'''--- sputnikdao2/tests/utils/mod.rs ---
+#![allow(dead_code)]
+use std::convert::TryFrom;
+
+pub use near_sdk::json_types::{Base64VecU8, ValidAccountId, WrappedDuration, U64};
+use near_sdk::{AccountId, Balance};
+use near_sdk_sim::transaction::ExecutionStatus;
+use near_sdk_sim::{
+    call, deploy, init_simulator, to_yocto, ContractAccount, ExecutionResult, UserAccount,
+};
+
+use near_sdk::json_types::U128;
+use sputnik_staking::ContractContract as StakingContract;
+use sputnikdao2::{
+    Action, Config, ContractContract as DAOContract, ProposalInput, ProposalKind, VersionedPolicy,
+};
+use test_token::ContractContract as TestTokenContract;
+
+near_sdk_sim::lazy_static_include::lazy_static_include_bytes! {
+    DAO_WASM_BYTES => "res/sputnikdao2.wasm",
+    TEST_TOKEN_WASM_BYTES => "../test-token/res/test_token.wasm",
+    STAKING_WASM_BYTES => "../sputnik-staking/res/sputnik_staking.wasm",
+}
+
+type Contract = ContractAccount<DAOContract>;
+
+pub fn base_token() -> String {
+    "".to_string()
+}
+
+pub fn should_fail(r: ExecutionResult) {
+    match r.status() {
+        ExecutionStatus::Failure(_) => {}
+        _ => panic!("Should fail"),
+    }
+}
+
+pub fn setup_dao() -> (UserAccount, Contract) {
+    let root = init_simulator(None);
+    let config = Config {
+        name: "test".to_string(),
+        purpose: "to test".to_string(),
+        metadata: Base64VecU8(vec![]),
+    };
+    let dao = deploy!(
+        contract: DAOContract,
+        contract_id: "dao".to_string(),
+        bytes: &DAO_WASM_BYTES,
+        signer_account: root,
+        deposit: to_yocto("200"),
+        init_method: new(config, VersionedPolicy::Default(vec![root.account_id.clone()]))
+    );
+    (root, dao)
+}
+
+pub fn setup_test_token(root: &UserAccount) -> ContractAccount<TestTokenContract> {
+    deploy!(
+        contract: TestTokenContract,
+        contract_id: "test_token".to_string(),
+        bytes: &TEST_TOKEN_WASM_BYTES,
+        signer_account: root,
+        deposit: to_yocto("200"),
+        init_method: new()
+    )
+}
+
+pub fn setup_staking(root: &UserAccount) -> ContractAccount<StakingContract> {
+    deploy!(
+        contract: StakingContract,
+        contract_id: "staking".to_string(),
+        bytes: &STAKING_WASM_BYTES,
+        signer_account: root,
+        deposit: to_yocto("100"),
+        init_method: new(to_va("dao".to_string()), to_va("test_token".to_string()), U64(100_000_000_000))
+    )
+}
+
+pub fn add_proposal(
+    root: &UserAccount,
+    dao: &Contract,
+    proposal: ProposalInput,
+) -> ExecutionResult {
+    call!(root, dao.add_proposal(proposal), deposit = to_yocto("1"))
+}
+
+pub fn add_member_proposal(
+    root: &UserAccount,
+    dao: &Contract,
+    member_id: AccountId,
+) -> ExecutionResult {
+    add_proposal(
+        root,
+        dao,
+        ProposalInput {
+            description: "test".to_string(),
+            kind: ProposalKind::AddMemberToRole {
+                member_id: to_va(member_id),
+                role: "council".to_string(),
+            },
+        },
+    )
+}
+
+pub fn add_transfer_proposal(
+    root: &UserAccount,
+    dao: &Contract,
+    token_id: AccountId,
+    receiver_id: AccountId,
+    amount: Balance,
+    msg: Option<String>,
+) -> ExecutionResult {
+    add_proposal(
+        root,
+        dao,
+        ProposalInput {
+            description: "test".to_string(),
+            kind: ProposalKind::Transfer {
+                token_id,
+                receiver_id: to_va(receiver_id),
+                amount: U128(amount),
+                msg,
+            },
+        },
+    )
+}
+
+pub fn vote(users: Vec<&UserAccount>, dao: &Contract, proposal_id: u64) {
+    for user in users.into_iter() {
+        call!(
+            user,
+            dao.act_proposal(proposal_id, Action::VoteApprove, None)
+        )
+        .assert_success();
+    }
+}
+
+pub fn to_va(a: AccountId) -> ValidAccountId {
+    ValidAccountId::try_from(a).unwrap()
+}
+
+'''
+'''--- test-token/Cargo.toml ---
+[package]
+name = "test-token"
+version = "0.1.0"
+authors = ["Illia Polosukhin <illia.polosukhin@gmail.com>"]
+edition = "2018"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "3.1.0"
+near-contract-standards = "3.1.0"
+
+'''
+'''--- test-token/build.sh ---
+#!/bin/bash
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo +stable build --target wasm32-unknown-unknown --release
+cp ../target/wasm32-unknown-unknown/release/test_token.wasm res/
+
+'''
+'''--- test-token/src/lib.rs ---
+use near_contract_standards::fungible_token::metadata::{
+    FungibleTokenMetadata, FungibleTokenMetadataProvider,
+};
+use near_contract_standards::fungible_token::FungibleToken;
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::json_types::{ValidAccountId, U128};
+use near_sdk::{near_bindgen, AccountId, PanicOnDefault, PromiseOrValue, env};
+
+near_sdk::setup_alloc!();
+
+#[near_bindgen]
+#[derive(BorshSerialize, BorshDeserialize, PanicOnDefault)]
+pub struct Contract {
+    token: FungibleToken,
+}
+
+#[near_bindgen]
+impl Contract {
+    #[init]
+    pub fn new() -> Self {
+        Self {
+            token: FungibleToken::new(b"t".to_vec()),
+        }
+    }
+
+    pub fn mint(&mut self, account_id: ValidAccountId, amount: U128) {
+        self.token.internal_register_account(account_id.as_ref());
+        self.token
+            .internal_deposit(account_id.as_ref(), amount.into());
+    }
+
+    pub fn burn(&mut self, account_id: ValidAccountId, amount: U128) {
+        self.token
+            .internal_withdraw(account_id.as_ref(), amount.into());
+    }
+}
+
+near_contract_standards::impl_fungible_token_core!(Contract, token);
+near_contract_standards::impl_fungible_token_storage!(Contract, token);
+
+#[near_bindgen]
+impl FungibleTokenMetadataProvider for Contract {
+    fn ft_metadata(&self) -> FungibleTokenMetadata {
+        unimplemented!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::{env, testing_env, MockedBlockchain};
+
+    use super::*;
+
+    #[test]
+    fn test_basics() {
+        let mut context = VMContextBuilder::new();
+        testing_env!(context.build());
+        let mut contract = Contract::new();
+        testing_env!(context
+            .attached_deposit(125 * env::storage_byte_cost())
+            .build());
+        contract.mint(accounts(0), 1_000_000.into());
+        assert_eq!(contract.ft_balance_of(accounts(0)), 1_000_000.into());
+
+        testing_env!(context
+            .attached_deposit(125 * env::storage_byte_cost())
+            .build());
+        contract.storage_deposit(Some(accounts(1)), None);
+        testing_env!(context
+            .attached_deposit(1)
+            .predecessor_account_id(accounts(0))
+            .build());
+        contract.ft_transfer(accounts(1), 1_000.into(), None);
+        assert_eq!(contract.ft_balance_of(accounts(1)), 1_000.into());
+
+        contract.burn(accounts(1), 500.into());
+        assert_eq!(contract.ft_balance_of(accounts(1)), 500.into());
+    }
+}
+
+'''

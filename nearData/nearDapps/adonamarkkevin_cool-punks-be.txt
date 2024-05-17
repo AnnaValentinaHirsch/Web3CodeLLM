@@ -1,0 +1,1016 @@
+*GitHub Repository "adonamarkkevin/cool-punks-be"*
+
+'''--- api.js ---
+const CONFIG_PATH = './near-api-server.config.json';
+
+module.exports = {
+    CONFIG_PATH,
+
+    reject: (err) => {
+        return {error: typeof err === "string" ? err : JSON.stringify(err)};
+    },
+    notify: (message) => {
+        return {text: message};
+    },
+    getNetworkFromRpcNode(rpc_node){
+        return rpc_node.replace("https://rpc.", "").replace(".near.org", "");
+    }
+}
+
+'''
+'''--- app.js ---
+#!/usr/bin/env node
+
+'use strict';
+const user = require('./user');
+const token = require('./token');
+const blockchain = require('./blockchain');
+const api = require('./api');
+const faker = require('faker');
+const crypto = require('crypto');
+const CatboxMemory = require('@hapi/catbox-memory');
+const Hapi = require('@hapi/hapi');
+const fs = require('fs');
+const {Client} = require('pg');
+Client.poolSize = 100;
+
+const settings = JSON.parse(fs.readFileSync(api.CONFIG_PATH, 'utf8'));
+const ViewCacheExpirationInSeconds = 10;
+const ViewGenerateTimeoutInSeconds = 30;
+
+const init = async () => {
+    const server = Hapi.server({
+        port: settings.server_port,
+        host: settings.server_host,
+        cache: [
+            {
+                name: 'near-api-cache',
+                provider: {
+                    constructor: CatboxMemory
+                }
+            }
+        ]
+    });
+
+    function processRequest(request) {
+        Object.keys(request.payload).map((key) => {
+            switch (request.payload[key]) {
+                case '{username}':
+                    request.payload[key] = faker.internet
+                        .userName()
+                        .replace(/[^0-9a-z]/gi, '');
+                    break;
+                case '{color}':
+                    request.payload[key] = faker.internet.color();
+                    break;
+                case '{number}':
+                    request.payload[key] = faker.random.number();
+                    break;
+                case '{word}':
+                    request.payload[key] = faker.random.word();
+                    break;
+                case '{words}':
+                    request.payload[key] = faker.random.words();
+                    break;
+                case '{image}':
+                    request.payload[key] = faker.random.image();
+                    break;
+            }
+        });
+
+        return request;
+    }
+
+    server.route({
+        method: 'GET',
+        path: '/',
+        handler: () => {
+            return api.notify(
+                'Welcome to NEAR REST API SERVER (https://github.com/near-examples/near-api-rest-server)! ' +
+                (!settings.master_account_id
+                    ? 'Please initialize your NEAR account in order to use simple nft mint/transfer methods'
+                    : `Master Account: ${settings.master_account_id}`)
+            );
+        },
+    });
+
+    server.route({
+        method: 'POST',
+        path: '/view',
+        handler: async (request, h) => {
+            request = processRequest(request);
+
+            if (request.payload.disabled_cache) {
+                return blockchain.View(
+                    request.payload.contract,
+                    request.payload.method,
+                    request.payload.params,
+                    request.payload.rpc_node,
+                    request.payload.headers
+                );
+            } else {
+                request.payload.request_name = "view";
+                return replyCachedValue(h, await server.methods.view(request.payload));
+            }
+        }
+    });
+
+    server.method(
+        'view',
+        async (params) => blockchain.View(
+            params.contract,
+            params.method,
+            params.params,
+            params.rpc_node,
+            params.headers
+        ),
+        getServerMethodParams());
+
+    server.route({
+        method: 'POST',
+        path: '/call',
+        handler: async (request) => {
+            request = processRequest(request);
+            let {
+                account_id,
+                private_key,
+                attached_tokens,
+                attached_gas,
+                contract,
+                method,
+                params,
+                network,
+                rpc_node,
+                headers
+            } = request.payload;
+            return await blockchain.Call(
+                account_id,
+                private_key,
+                attached_tokens,
+                attached_gas,
+                contract,
+                method,
+                params,
+                network,
+                rpc_node,
+                headers
+            );
+        },
+    });
+
+    server.route({
+        method: 'POST',
+        path: '/init',
+        handler: async (request) => {
+            if (settings.init_disabled) {
+                return api.reject('Method now allowed');
+            }
+
+            request = processRequest(request);
+            let {
+                master_account_id,
+                seed_phrase,
+                private_key,
+                nft_contract,
+                server_host,
+                server_port,
+                rpc_node,
+            } = request.payload;
+
+            if (seed_phrase)
+                private_key = (await user.GetKeysFromSeedPhrase(seed_phrase)).secretKey;
+
+            let response = await blockchain.Init(
+                master_account_id,
+                private_key,
+                nft_contract,
+                server_host,
+                server_port,
+                rpc_node
+            );
+            if (!response.error) {
+                process.on('SIGINT', function () {
+                    console.log('Stopping server...');
+                    server.stop({timeout: 1000}).then(async function () {
+                        await server.start();
+                    });
+                });
+            }
+
+            return response;
+        },
+    });
+
+    server.route({
+        method: 'POST',
+        path: '/deploy',
+        handler: async (request) => {
+            request = processRequest(request);
+            let {account_id, private_key, seed_phrase, contract} = request.payload;
+
+            if (seed_phrase)
+                private_key = (await user.GetKeysFromSeedPhrase(seed_phrase)).secretKey;
+
+            return await blockchain.DeployContract(account_id, private_key, contract);
+        },
+    });
+
+    server.route({
+        method: 'GET',
+        path: '/view_nft/{token_id}',
+        handler: async (request, h) => {
+            request.params.request_name = "view_nft";
+            return replyCachedValue(h, await server.methods.viewNFT(request.params));
+        },
+    });
+
+    server.method(
+        'viewNFT',
+        async (params) => await token.ViewNFT(params.token_id),
+        getServerMethodParams());
+
+    server.route({
+        method: 'POST',
+        path: '/view_nft',
+        handler: async (request) => {
+            return await token.ViewNFT(
+                request.payload.token_id,
+                request.payload.contract
+            );
+        },
+    });
+
+    server.route({
+        method: 'POST',
+        path: '/create_user',
+        handler: async (request) => {
+            request = processRequest(request);
+
+            const name = (
+                request.payload.name +
+                '.' +
+                settings.master_account_id
+            ).toLowerCase();
+            let account = await user.CreateKeyPair(name);
+
+            let status = await user.CreateAccount(account);
+
+            if (status)
+                return {
+                    text: `Account ${name} created. Public key: ${account.public_key}`,
+                };
+            else return {text: 'Error'};
+        },
+    });
+
+    server.route({
+        method: 'POST',
+        path: '/parse_seed_phrase',
+        handler: async (request) => {
+            request = processRequest(request);
+
+            return await user.GetKeysFromSeedPhrase(request.payload.seed_phrase);
+        },
+    });
+
+    server.route({
+        method: 'GET',
+        path: '/balance/{account_id}',
+        handler: async (request) => {
+            return await blockchain.GetBalance(request.params.account_id);
+        }
+    });
+
+    server.route({
+        method: 'GET',
+        path: '/keypair',
+        handler: async () => {
+            return await user.GenerateKeyPair();
+        }
+    });
+
+    server.route({
+        method: 'POST',
+        path: '/mint_nft',
+        handler: async (request) => {
+            let {min, max} = request.payload;
+
+            if (!min || !max) min = max = 0;
+            let response = [];
+
+            request = processRequest(request);
+            for (let i = min; i <= max; i++) {
+                const tokenId = request.payload.token_id.replace('{inc}', i);
+
+                let {account_id, private_key, metadata, contract} = request.payload;
+
+                const tx = await token.MintNFT(
+                    tokenId,
+                    metadata,
+                    contract,
+                    account_id,
+                    private_key
+                );
+
+                if (tx) {
+                    if (min === max) {
+                        let create_token = await token.ViewNFT(tokenId, contract);
+                        create_token.token_id = tokenId;
+                        response.push({token: create_token, tx: tx});
+                    } else {
+                        response.push({tx: tx});
+                    }
+                } else {
+                    response.push({text: 'Error. Check backend logs.'});
+                }
+            }
+
+            return response;
+        },
+    });
+
+    server.route({
+        method: 'POST',
+        path: '/transfer_nft',
+        handler: async (request) => {
+            request = processRequest(request);
+
+            let {
+                token_id,
+                receiver_id,
+                enforce_owner_id,
+                memo,
+                contract,
+                owner_private_key,
+            } = request.payload;
+
+            const txStatus = await token.TransferNFT(
+                token_id,
+                receiver_id,
+                enforce_owner_id,
+                memo,
+                contract,
+                owner_private_key
+            );
+
+            if (txStatus.error) {
+                return txStatus;
+            } else if (txStatus.status.Failure) {
+                return {
+                    error:
+                        'Because of some reason transaction was not applied as expected',
+                };
+            } else {
+                const new_token = await token.ViewNFT(token_id, contract);
+                if (!new_token) return api.reject('Token not found');
+
+                new_token.tx = txStatus.transaction.hash;
+                return new_token;
+            }
+        },
+    });
+
+    server.route({
+        method: 'GET',
+        path: '/about',
+        handler: async () => {
+            const json = require('./package.json');
+            return "NEAR REST API SERVER Ver. " + json.version;
+        }
+    });
+
+    server.route({
+        method: 'POST',
+        path: '/explorer',
+        handler: async (request) => {
+            let {
+                user,
+                host,
+                database,
+                password,
+                port,
+                query,
+                parameters
+            } = request.payload;
+
+            const client = new Client({
+                user,
+                host,
+                database,
+                password,
+                port,
+            });
+
+            if (["104.199.89.51", "35.184.214.98"].includes(host)) {
+                return api.reject('Please run explorer function only on your own NEAR REST API SERVER instance, https://github.com/near-examples/near-api-rest-server');
+            }
+
+            try {
+                client.connect();
+                let response = await client.query(query, parameters);
+                return response.rows;
+            } catch (ex) {
+                return api.reject('Error. ' + ex.message);
+            }
+        },
+    });
+
+    server.route({
+        method: 'POST',
+        path: '/sign_url',
+        handler: async (request) => {
+            let {
+                account_id,
+                method,
+                params,
+                deposit,
+                gas,
+                receiver_id,
+                meta,
+                callback_url,
+                network
+            } = request.payload;
+
+            return blockchain.GetSignUrl(
+                account_id,
+                method,
+                params,
+                deposit,
+                gas,
+                receiver_id,
+                meta,
+                callback_url,
+                network
+            );
+        },
+    });
+
+    await server.start();
+    console.log('Server running on %s', server.info.uri);
+};
+
+process.on('unhandledRejection', (err) => {
+    console.log(err);
+    process.exit(1);
+});
+
+const getServerMethodParams = () => {
+    return {
+        generateKey: (params) => {
+            let hash = crypto.createHash('sha1');
+            hash.update(JSON.stringify(params));
+            return hash.digest('base64');
+        },
+        cache: {
+            cache: 'near-api-cache',
+            expiresIn: ViewCacheExpirationInSeconds * 1000,
+            generateTimeout: ViewGenerateTimeoutInSeconds * 1000,
+            getDecoratedValue: true
+        }
+    }
+};
+
+const replyCachedValue = (h, {value, cached}) => {
+    const lastModified = cached ? new Date(cached.stored) : new Date();
+    return h.response(value).header('Last-Modified', lastModified.toUTCString());
+};
+
+init();
+
+'''
+'''--- blockchain.js ---
+const nearApi = require('near-api-js');
+const api = require('./api');
+const fs = require('fs');
+const fetch = require('node-fetch');
+const {getNetworkFromRpcNode} = require("./api");
+
+const settings = JSON.parse(fs.readFileSync(api.CONFIG_PATH, 'utf8'));
+
+module.exports = {
+    /**
+     * @return {string}
+     */
+    GetSignUrl: async function (account_id, method, params, deposit, gas, receiver_id, meta, callback_url, network) {
+        try {
+            if(!network)
+                network = "mainnet";
+            const deposit_value = typeof deposit == 'string' ? deposit : nearApi.utils.format.parseNearAmount('' + deposit);
+            const actions = [method === '!transfer' ? nearApi.transactions.transfer(deposit_value) : nearApi.transactions.functionCall(method, Buffer.from(JSON.stringify(params)), gas, deposit_value)];
+            const keypair = nearApi.utils.KeyPair.fromRandom('ed25519');
+            const provider = new nearApi.providers.JsonRpcProvider({url: 'https://rpc.' + network + '.near.org'});
+            const block = await provider.block({finality: 'final'});
+            const txs = [nearApi.transactions.createTransaction(account_id, keypair.publicKey, receiver_id, 1, actions, nearApi.utils.serialize.base_decode(block.header.hash))];
+            const newUrl = new URL('sign', 'https://wallet.' + network + '.near.org/');
+            newUrl.searchParams.set('transactions', txs.map(transaction => nearApi.utils.serialize.serialize(nearApi.transactions.SCHEMA, transaction)).map(serialized => Buffer.from(serialized).toString('base64')).join(','));
+            newUrl.searchParams.set('callbackUrl', callback_url);
+            if (meta)
+                newUrl.searchParams.set('meta', meta);
+            return newUrl.href;
+        } catch (e) {
+            return api.reject(e);
+        }
+    },
+
+    /**
+     * @return {string}
+     */
+    View: async function (recipient, method, params, rpc_node, headers) {
+        try {
+            let rpc = rpc_node || settings.rpc_node;
+            const nearRpc = new nearApi.providers.JsonRpcProvider({url: rpc});
+
+            const account = new nearApi.Account({
+                    provider: nearRpc,
+                    networkId: getNetworkFromRpcNode(rpc),
+                    signer: recipient,
+                    headers: (typeof headers !== undefined) ? headers : {}
+                },
+                recipient);
+            return await account.viewFunction(
+                recipient,
+                method,
+                params
+            );
+        } catch (e) {
+            return api.reject(e);
+        }
+    },
+
+    Init: async function (master_account_id, master_key, nft_contract, server_host, server_port, rpc_node) {
+        try {
+            const new_settings = settings;
+            if (master_account_id) new_settings.master_account_id = master_account_id;
+            if (master_key) new_settings.master_key = master_key;
+            if (nft_contract) new_settings.nft_contract = nft_contract;
+            if (server_host) new_settings.server_host = server_host;
+            if (server_port) new_settings.server_port = server_port;
+            if (rpc_node) new_settings.rpc_node = rpc_node;
+
+            await fs.promises.writeFile(api.CONFIG_PATH, JSON.stringify({
+                ...new_settings
+            }));
+
+            return api.notify("Settings updated.");
+        } catch (e) {
+            return api.reject(e);
+        }
+    },
+
+    GetBalance: async function (account_id) {
+        try {
+            const body = {
+                jsonrpc: '2.0',
+                id: "dontcare",
+                method: "query",
+                params: {
+                    request_type: "view_account",
+                    finality: "final",
+                    account_id: account_id
+                }
+            };
+
+            return fetch(settings.rpc_node, {
+                method: 'post',
+                body: JSON.stringify(body),
+                headers: {'Content-Type': 'application/json'}
+            })
+                .then(res => res.json())
+                .then(json => {
+                    if (json.error)
+                        return api.reject(json.error.data);
+
+                    return json.result.amount
+                });
+        } catch (e) {
+            return api.reject(e);
+        }
+    },
+
+    DeployContract: async function (account_id, private_key, contract_file) {
+        try {
+            const path = `contracts/${contract_file}`;
+            if (!fs.existsSync(path))
+                return api.reject("Contract not found");
+
+            const account = await this.GetAccountByKey(account_id, private_key);
+
+            const data = [...fs.readFileSync(path)];
+            const txs = [nearApi.transactions.deployContract(data)];
+
+            let res = await account.signAndSendTransaction(account_id, txs);
+
+            if (contract_file === "nft_simple.wasm")
+                await this.Call(account_id, private_key, 0, "100000000000000",
+                    account_id, "new", {"owner_id": account_id});
+
+            return res;
+        } catch (e) {
+            return api.reject(e);
+        }
+    },
+
+    Call: async function (account_id, private_key, attached_tokens, attached_gas, recipient, method, params, network, rpc_node, headers) {
+        try {
+            const account = await this.GetAccountByKey(account_id, private_key, network, rpc_node, headers);
+
+            return await account.functionCall({
+                contractId: recipient,
+                methodName: method,
+                args: params,
+                gas: attached_gas,
+                attachedDeposit: attached_tokens
+            });
+        } catch (e) {
+            return api.reject(e);
+        }
+    },
+
+    GetMasterAccount: async function () {
+        try {
+            const keyPair = nearApi.utils.KeyPair.fromString(settings.master_key);
+            const keyStore = new nearApi.keyStores.InMemoryKeyStore();
+            keyStore.setKey("testnet", settings.master_account_id, keyPair);
+
+            const near = await nearApi.connect({
+                networkId: "testnet",
+                deps: {keyStore},
+                masterAccount: settings.master_account_id,
+                nodeUrl: settings.rpc_node
+            });
+
+            return await near.account(settings.master_account_id);
+        } catch (e) {
+            return api.reject(e);
+        }
+    },
+
+    GetUserAccount: async function (accountId) {
+        try {
+            const user = require('./user');
+
+            const account_raw = await user.GetAccount(accountId);
+            const account = JSON.parse(account_raw);
+
+            const keyPair = nearApi.utils.KeyPair.fromString(account.private_key);
+            const keyStore = new nearApi.keyStores.InMemoryKeyStore();
+            keyStore.setKey("testnet", account.account_id, keyPair);
+
+            const near = await nearApi.connect({
+                networkId: "testnet",
+                deps: {keyStore},
+                masterAccount: account.account_id,
+                nodeUrl: settings.rpc_node
+            });
+
+            return await near.account(account.account_id);
+        } catch (e) {
+            return api.reject(e);
+        }
+    },
+
+    GetAccountByKey: async function (account_id, private_key, network, rpc_node, headers) {
+        try {
+            network = network || "testnet";
+            rpc_node = rpc_node || settings.rpc_node;
+
+            private_key = private_key.replace('"', '');
+
+            const keyPair = nearApi.utils.KeyPair.fromString(private_key);
+            const keyStore = new nearApi.keyStores.InMemoryKeyStore();
+            keyStore.setKey(network, account_id, keyPair);
+
+            const near = await nearApi.connect({
+                networkId: network,
+                deps: {keyStore},
+                masterAccount: account_id,
+                nodeUrl: rpc_node,
+                headers: (typeof headers !== undefined) ? headers : {}
+            });
+
+            return await near.account(account_id);
+        } catch (e) {
+            return api.reject(e);
+        }
+    }
+};
+
+'''
+'''--- examples/nft_deploy/deploy_tokens.js ---
+const {data} = require('./token_types.js');
+const homedir = require("os").homedir();
+const path = require("path");
+const fs = require("fs");
+const fetch = require("node-fetch");
+
+const API_SERVER_URL = "https://rest.nearapi.org";
+const CONTRACT_ID = "dev-1621541447792-38210652756946";
+const ACCOUNT_ID = "zavodil.testnet";
+const CREDENTIALS_DIR = ".near-credentials/testnet/";
+
+const run = async () => {
+    const tokens = data.map(({token_type, metadata}, i) => {
+        return {
+            token_type,
+            token_id: token_type + '_1',
+            metadata: {
+                ...metadata,
+                issued_at: Date.now().toString(),
+            },
+            perpetual_royalties: {
+                ['escrow-' + (i + 1) + '.nft.near']: 1000, //10%
+                "account-2.near": 500, // 5%
+                "account-3.near": 100 // 1%
+            }
+        }
+    });
+    
+    // initial add_token_types: 100 tokens of each type
+    const supply_cap_by_type = tokens.map(({token_type}) => ({
+        [token_type]: '100'
+    })).reduce((a, c) => ({...a, ...c}), {});
+
+    let tx = await init(CONTRACT_ID, supply_cap_by_type);
+    console.log(tx);
+
+    // initial mint 1 token of every type
+    for (let i = 0; i < tokens.length; i++) {
+        const token = tokens[i];
+        tx = await mint(CONTRACT_ID, token);
+        console.log(tx)
+    }
+    return "Finish"
+};
+
+const init = async function (contract, supply_cap_by_type) {
+    const body = {
+        method: 'new',
+        contract: contract,
+
+        params: {
+            owner_id: ACCOUNT_ID,
+            metadata: {
+                "spec": "nft-1",
+                "name": "NAME",
+                "symbol": "NFT"
+            },
+            unlocked: true,
+            supply_cap_by_type: supply_cap_by_type,
+        },
+
+        account_id: ACCOUNT_ID,
+        private_key: await getPrivateKey(ACCOUNT_ID),
+        attached_gas: "300000000000000",
+        attached_tokens: ""
+    };
+
+    return await PostResponse("call", body);
+};
+
+const mint = async function (contract, token) {
+    const body = {
+        method: 'nft_mint',
+        contract: contract,
+
+        params: {
+            token_id: token.token_id,
+            metadata: token.metadata,
+            perpetual_royalties: token.perpetual_royalties,
+            token_type: token.token_type,
+        },
+
+        account_id: ACCOUNT_ID,
+        private_key: await getPrivateKey(ACCOUNT_ID),
+        attached_gas: "100000000000000",
+        attached_tokens: "20000000000000000000000"
+    };
+
+    return await PostResponse("call", body);
+};
+
+const PostResponse = async (operation, body, options) => {
+    const response = fetch(`${API_SERVER_URL}/${operation}`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+        headers: {
+            'Content-type': 'application/json; charset=UTF-8'
+        }
+    })
+        .then(res => {
+            return res.text().then(response => {
+                if (options && options.convertToNear) {
+                    return module.exports.RoundFloat(module.exports.ConvertYoctoNear(response, config.FRACTION_DIGITS));
+                } else {
+                    try {
+                        const json = JSON.parse(response);
+                        try {
+                            if (json.error)
+                                return (JSON.parse(json.error));
+                            else {
+                                return (json);
+                            }
+                        } catch (e) {
+                            throw new Error("PostResponse error for " + operation + " request " + JSON.stringify(body) + ". Error: " + e.message);
+                        }
+                    } catch {
+                        return response;
+                    }
+                }
+            });
+
+        });
+    return response;
+};
+
+const getPrivateKey = async (accountId) => {
+    const credentialsPath = path.join(homedir, CREDENTIALS_DIR);
+    const keyPath = credentialsPath + accountId + '.json';
+    try {
+        const credentials = JSON.parse(fs.readFileSync(keyPath));
+        return (credentials.private_key);
+    } catch (e) {
+        throw new Error("Key not found for account " + keyPath + ". Error: " + e.message);
+    }
+};
+
+run().then(r => console.log(r));
+'''
+'''--- examples/nft_deploy/token_types.js ---
+const prefix = "test";
+module.exports = {
+    data: [
+        {
+            token_type: prefix + '_name_1',
+            metadata: {media: 'hash_1'}
+        },
+        {
+            token_type: prefix + '_name_2',
+            metadata: {media: 'hash_2'}
+        },
+        {
+            token_type: prefix + '_name_3',
+            metadata: {media: 'hash_3'}
+        },
+    ]
+};
+'''
+'''--- token.js ---
+const blockchain = require('./blockchain');
+const api = require('./api');
+
+const fs = require('fs');
+const settings = JSON.parse(fs.readFileSync(api.CONFIG_PATH, 'utf8'));
+
+module.exports = {
+
+    /**
+     * @return {string}
+     */
+    ViewNFT: async function (tokenId, contract) {
+        try {
+            const nftContract = contract ? contract : settings.nft_contract;
+            return await blockchain.View(
+                nftContract,
+                "nft_token",
+                {token_id: tokenId}
+            );
+        } catch (e) {
+            return api.reject(e);
+        }
+    },
+
+    /**
+     * @return {string}
+     */
+    MintNFT: async function (tokenId, metadata, contractAccountId, account_id, private_key) {
+        const nftContract = contractAccountId ? contractAccountId : settings.nft_contract;
+
+        let account = !(account_id && private_key)
+            ? await blockchain.GetMasterAccount()
+            : await blockchain.GetAccountByKey(account_id, private_key);
+
+        try {
+            const tx = await account.functionCall(
+                nftContract,
+                "nft_mint",
+                {
+                    "token_id": tokenId,
+                    "metadata": metadata
+                },
+                '100000000000000',
+                '10000000000000000000000');
+
+            if (!tx.status.Failure)
+                return tx.transaction.hash
+        } catch (e) {
+            return api.reject(e);
+        }
+    },
+
+    TransferNFT: async function (tokenId, receiverId, enforceOwnerId, memo, contractAccountId, owner_private_key) {
+        try {
+            const nftContract = contractAccountId ? contractAccountId : settings.nft_contract;
+            let account;
+
+            account = !(enforceOwnerId && owner_private_key)
+                ? ((enforceOwnerId === settings.master_account_id)
+                    ? await blockchain.GetMasterAccount()
+                    : await blockchain.GetUserAccount(enforceOwnerId))
+                : await blockchain.GetAccountByKey(enforceOwnerId, owner_private_key);
+
+            return await account.functionCall(
+                nftContract,
+                "nft_transfer",
+                {
+                    "token_id": tokenId,
+                    "receiver_id": receiverId,
+                    "enforce_owner_id": enforceOwnerId,
+                    "memo": memo
+                },
+                '100000000000000',
+                '1');
+        } catch (e) {
+            return api.reject(e);
+        }
+    }
+};
+
+'''
+'''--- user.js ---
+const nearApi = require('near-api-js');
+const blockchain = require('./blockchain');
+const nearSeedPhrase = require('near-seed-phrase');
+const fs = require('fs');
+
+const storageFolder = "storage";
+
+module.exports = {
+    GenerateKeyPair: async function () {
+        const keypair = nearApi.utils.KeyPair.fromRandom('ed25519');
+
+        return {
+            public_key: keypair.publicKey.toString(),
+            private_key: keypair.secretKey
+        };
+    },
+
+    CreateKeyPair: async function (name) {
+        const keypair = nearApi.utils.KeyPair.fromRandom('ed25519');
+
+        const account =
+            {
+                account_id: name,
+                public_key: keypair.publicKey.toString(),
+                private_key: keypair.secretKey
+            };
+
+        return account;
+    },
+
+    /**
+     * @return {string}
+     */
+    GetFileName: function (account_id) {
+        return `${storageFolder}/${account_id}.json`;
+    },
+
+    SaveKeyPair: async function (account) {
+        if (!fs.existsSync(storageFolder))
+            fs.mkdirSync(storageFolder);
+
+        const filename = this.GetFileName(account.account_id);
+        account.private_key = "ed25519:" + account.private_key;
+
+        await fs.promises.writeFile(filename, JSON.stringify(account));
+    },
+
+    /**
+     * @return {boolean}
+     */
+    CreateAccount: async function (new_account) {
+        const account = await blockchain.GetMasterAccount();
+
+        const res = await account.createAccount(new_account.account_id, new_account.public_key, '200000000000000000000000');
+
+        try {
+            if (res['status'].hasOwnProperty('SuccessValue')) {
+                await this.SaveKeyPair(new_account);
+                return true
+            }
+        } catch (e) {
+            console.log(e);
+        }
+        return false;
+    },
+
+    GetAccount: async function (account_id) {
+        const filename = this.GetFileName(account_id);
+        return await fs.promises.readFile(filename, 'utf8');
+    },
+
+    GetKeysFromSeedPhrase: async function (seedPhrase) {
+        return nearSeedPhrase.parseSeedPhrase(seedPhrase);
+    }
+};
+
+'''

@@ -1,0 +1,3748 @@
+*GitHub Repository "On0n0k1/NCD.L1--Chess"*
+
+'''--- Cargo.toml ---
+[package]
+name = "chess"
+version = "0.1.0"
+authors = ["Lucas Lemos <stiltztinkerstein@gmail.com>"]
+license = "MIT"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "3.1.0"
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+
+'''
+'''--- README.md ---
+# NCD.L1--Chess
+
+A chess game for the NEAR network. The pieces move properly, but I still need to implement some kind of authentication for the players. Also need to properly implement testing/better documentation. But it's still useful as a study material though. 
+
+## Recommendations (How I'm building this project)
+For testing the project, I usually create a subaccount, deploy to it, run my functions and then delete the subaccount.
+
+Call "near login" to enter your main account. Let's say I have a testnet account called "a-test-account.testnet". In that case, I call "near create-account rust-tests.a-test-account.testnet --masterAccount a-test-account.testnet --initialBalance 100" to create a subaccount with name rust-tests and a deposit of 100 NEAR. When I'm done using the deployed project, I would call "near delete rust-tests.a-test-account.testnet a-test-account.testnet", which means the subaccount gets deleted and all the remaining NEAR is transferred back to a-tests-account.testnet.
+
+## Compiling and deploying this chess game.
+
+Bring a terminal to this folder.
+
+cargo +nightly build --target wasm32-unknown-unknown --release
+
+Might need to add wasm32-unknown-unknown before doing the above. A message will show up saying it.
+
+cd ./target/wasm32-unknown-unknown/release
+
+To reach the folder with the compiled wasm.
+
+near deploy --accountId rust-tests.a-test-account.testnet --wasmFile ./chess.wasm
+
+If everything goes well, the subaccount now contains the compiled project. We can run it's functions remotely.
+
+## Functions available
+
+Check lib.rs to see available functions. Functions with &self can be called with view. Functions with &mut self can be called with call.
+
+### Example for view:
+
+near view rust-tests.a-tests-account.testnet get_board '{}'
+
+Will print a very ugly version of the board. It's stored as 64 bytes, so we can't expect much from it. Numbers go from 0 to 12, here's what they mean:
+
+ - 0: Empty piece;
+ - 1: White Pawn;
+ - 2: White Rook;
+ - 3: White Knight;
+ - 4: White Bishop;
+ - 5: White Queen;
+ - 6: White King;
+ - 7: Black Pawn;
+ - 8: Black Rook;
+ - 9: Black Knight;
+ - 10: Black Bishop;
+ - 11: Black Queen;
+ - 12: Black King
+
+### Another example for view:
+
+near view rust-tests.a-tests-account.testnet get_piece_name '{"col": 7, "row": 7}'
+
+Will get the piece in the bottom right corner of the board. A "White Rook". Columns and rows go from 0 to 7, get_piece_name_index does the same thing but you use the index of the entire board instead. For the same position the index would be 63.
+
+### An example for call:
+
+near call rust-tests.a-tests-account.testnet move_to '{"current_col": 0, "current_row": 6, "target_col": 0, "target_row": 4}' --account-id a-tests-account.testnet
+
+Will make the bottom white pawn move forward two steps (If it's the white player's turn).
+
+There's also a function to reset the game and get the game status. Please check them out.
+
+### Costs
+
+I ran the methods from the tests sections in the main lib file. Checking in the explorer, the gas used to deploy the contract was 25TGas. To run each move function the gas cost was 6TGas. To run the last move function that caused the checkmate, the gas cost was 7TGas.
+
+Multiply it by the cost in https://explorer.near.org/ to get the cost in Near for each move function.
+
+At the time of writing this section of the README (jan 6 2022). The cost for each TGas is 0.0001 Ⓝ. The cost for each Ⓝ is U$16.02 . So each function call will cost 0.009612 dollars (TGas used * TGas cost * NearCost(dollars)).
+
+A chess match takes from 40 to 60 moves to end. So a player should play around 2 matches for each dollar spent. In other words, mining near must be very worthwhile right now. I'm not an expert in mining, don't rely too much on my word please.
+
+'''
+'''--- package-lock.json ---
+{
+  "name": "NCD.L1--Chess",
+  "lockfileVersion": 2,
+  "requires": true,
+  "packages": {}
+}
+
+'''
+'''--- src/board.rs ---
+use std::default::Default;
+
+// use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+
+use crate::{
+    // This is just to call Report::col_row_to_index later.
+    movement::report::Report,
+    pieces::{
+        piece::Color,
+        piece::Piece,
+        piece_ext::PieceExt,
+    },
+};
+
+// use crate
+// Need to implement a board struct for computation.
+
+pub struct Board{
+    squares: [u8; 64],
+    built_squares: [Piece; 64],
+    // turn: Player,
+}
+
+// empty:           0
+// white pawn:      1
+// white rook:      2
+// white knight:    3
+// white bishop:    4
+// white queen:     5
+// white king:      6
+// black pawn:      7
+// black rook:      8
+// black knight:    9
+// black bishop:    10
+// black queen:     11
+// black king:      12
+
+// 8 9 A B C A 9 8 
+// 7 7 7 7 7 7 7 7
+// 0 0 0 0 0 0 0 0 
+// 0 0 0 0 0 0 0 0
+// 0 0 0 0 0 0 0 0
+// 0 0 0 0 0 0 0 0
+// 1 1 1 1 1 1 1 1 
+// 2 3 4 5 6 4 3 2
+
+// Board checks if king is in check
+// If not, check if requested move is valid
+// If move is valid, do the move, then check again if king is in check.
+// If king is in check after the move, return false, 
+// else commit the board state and return true.
+
+impl Default for Board{
+    fn default() -> Self{
+        let squares: [u8; 64] = Board::get_default_board();
+
+        let built_squares: [Piece; 64] = Board::new_built_squares(
+            &squares,                           // squares: &[u8; 64]
+        );
+        
+        Board{
+            squares,
+            built_squares,
+        }
+    }
+}
+
+impl Board{
+
+    pub fn get_default_board() -> [u8; 64] {
+        [
+            8, 9, 10, 11, 12, 10, 9, 8,
+            7, 7,  7,  7,  7,  7, 7, 7,
+            0, 0,  0,  0,  0,  0, 0, 0,
+            0, 0,  0,  0,  0,  0, 0, 0,
+            0, 0,  0,  0,  0,  0, 0, 0,
+            0, 0,  0,  0,  0,  0, 0, 0,
+            1, 1,  1,  1,  1,  1, 1, 1,
+            2, 3,  4,  5,  6,  4, 3, 2,
+        ]
+    }
+
+    pub fn new_built_squares(squares: &[u8; 64]) -> [Piece; 64] {
+        let mut built_squares:[Piece; 64] = [Piece::default(); 64];
+        // An array created like this has 64 copies of the same value.
+        // We need each of the EMPTY pieces to hold the correct column/row values.
+        let (mut col, mut row): (u8, u8) = (0, 0);
+
+        for index in 0..squares.len(){
+
+            // built_squares[index].set_row(row);
+            // built_squares[index].set_column(col);
+
+            let empty_replacement: Piece = Piece::new(
+                0,                      // piece_number: u8, 
+                col,                    // column: u8, 
+                row,                    // row: u8,
+            );
+            built_squares[index] = empty_replacement;
+
+            col += 1;
+            if col >= 8 {
+                row += 1;
+                col = 0;
+            }
+        }
+
+        // Put the pieces in the board.
+        Self::build(
+            &squares,                   // squares: &[u8;64], 
+            &mut built_squares,         // built_squares: &mut [Piece; 64],
+        );
+
+        built_squares
+    }
+
+    pub fn new(squares: [u8; 64]) -> Self {
+        let built_squares: [Piece; 64] = Self::new_built_squares(
+            &squares,                   // squares: &[u8; 64]
+        );
+
+        Board{
+            squares,
+            built_squares,
+        }
+    }
+
+    pub fn get_board_array(&self) -> [u8; 64] {
+        return self.squares.clone();
+    }
+
+    // Turn the board into a square of numbers
+    // Instead of an array, we're using a byte slice
+    // We're not checking for length because 
+    // we want it to panic if there's less than 64 elements.
+    // It should never ever have more or less than 64 values.
+    pub fn get_board_string(squares: &[u8]) -> String {
+        fn hex(number: u8) -> String {
+            match number{
+                10 => String::from("A"),
+                11 => String::from("B"),
+                12 => String::from("C"),
+                13 => String::from("D"),
+                14 => String::from("E"),
+                15 => String::from("F"),
+                _ => format!("{}", number),
+            }
+        }
+
+        let mut response: String = String::from("\n");
+
+        for row in 0..8{
+            let index: usize = row * 8;
+            response = format!("{}{} {} {} {} {} {} {} {}\n",
+                response,
+                hex(squares[index]),
+                hex(squares[index + 1]),
+                hex(squares[index + 2]),
+                hex(squares[index + 3]),
+                hex(squares[index + 4]),
+                hex(squares[index + 5]),
+                hex(squares[index + 6]),
+                hex(squares[index + 7]),
+            );
+        }
+
+        response = format!("{}\n", response);
+
+        response
+    }
+
+    /// Checks the board array (squares) and update built_squares with any change that exists between the two.
+    /// This is used in the first step of each move request.
+    fn build(
+        squares: &[u8;64], 
+        built_squares: &mut [Piece; 64],
+    ){
+        for index in 0..squares.len(){
+            let piece_number: u8 = squares[index];
+            if piece_number > 12 {
+                panic!("Invalid piece number on the board ({}).", piece_number);
+            }
+
+            // If piece_number is already the expected Piece type, ignore it.
+            match (piece_number, &built_squares[index]){
+                (0, Piece::EMPTY(_))  
+                | (1, Piece::PAWN(_)  ) | (7,  Piece::PAWN(_)  )
+                | (2, Piece::ROOK(_)  ) | (8,  Piece::ROOK(_)  )
+                | (3, Piece::KNIGHT(_)) | (9,  Piece::KNIGHT(_))
+                | (4, Piece::BISHOP(_)) | (10, Piece::BISHOP(_))
+                | (5, Piece::QUEEN(_) ) | (11, Piece::QUEEN(_) )
+                | (6, Piece::KING(_)  ) | (12, Piece::KING(_)  )   => { continue; },
+                (_, _) => {
+                    let column: u8 = (index % 8) as u8; 
+                    let row: u8 = (index as u8 - column)/8;
+
+                    // The number doesn't refer to the same type of piece.
+                    // Therefore we replace it with the expected value.
+                    built_squares[index] = Piece::new(
+                        piece_number,   // piece_number: u8, 
+                        column,         // column: u8, 
+                        row,            // row: u8,
+                    );
+                }
+            }
+        }
+    }
+
+    pub fn get_piece(&self, col: u8, row: u8) -> Piece{
+        // let piece: Piece = self.built_squares[(row * 8 + col) as usize].clone();
+        let piece: Piece = self.get_piece_index(row * 8 + col);
+        piece
+    }
+
+    pub fn get_piece_index(&self, index: u8) -> Piece{
+        let piece: Piece = self.built_squares[index as usize].clone();
+        piece
+    }
+
+    fn push_pieces(&self, pieces: &mut Vec<Piece>, color: &Color) {
+        for index in 0..self.built_squares.len(){
+            let piece: &Piece = &self.built_squares[index];
+
+            if piece.is_color(
+                color,                  // target_color: &Color,
+            ){
+                pieces.push(piece.clone());
+            }
+        }
+    }
+
+    pub fn push_black_pieces(&self, pieces: &mut Vec<Piece>) {
+        pieces.clear();
+
+        self.push_pieces(
+            pieces,                     // pieces: &mut Vec<Piece>
+            &Color::BLACK,              // color: &Color
+        );
+    }
+
+    pub fn push_white_pieces(&self, pieces: &mut Vec<Piece>) {
+        pieces.clear();
+
+        self.push_pieces(
+            pieces,                     // pieces: &mut Vec<Piece>
+            &Color::WHITE,              // color: &Color
+        )
+    }
+
+    pub fn replace_piece(
+        &mut self,
+        piece_number: u8,
+        col: u8,
+        row: u8,
+    ) {
+        let index: usize = Report::col_row_to_index(
+            col,                        // col: u8, 
+            row,                        // row: u8,
+        ) as usize;
+
+        self.built_squares[index] = Piece::new(
+            piece_number,               // piece_number: u8, 
+            col,                        // column: u8, 
+            row,                        // row: u8,
+        );
+    }
+
+    /// Does the same as replace_piece, but to the final state (squares) of the board.
+    /// Used by step.
+    pub fn finalize_movement(
+        &mut self,
+        piece_number: u8,
+        col: u8,
+        row: u8,
+    ) {
+        let index: usize = Report::col_row_to_index(
+            col,                        // col: u8, 
+            row,                        // row: u8,
+        ) as usize;
+
+        self.squares[index] = piece_number;
+
+    }
+}
+
+'''
+'''--- src/game.rs ---
+
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::{env, near_bindgen};
+
+use near_sdk::serde::{Deserialize, Serialize};
+
+use crate::{
+    log,
+    board::Board,
+    movement::step::Step,
+    player::{
+        errors::ErrorResponse,
+        players::Players,
+        turn::Turn,
+    },
+    pieces::piece::Piece,
+};
+
+// squares represent each position in the board.
+// turn is how many movements the game has completed.
+// player_turn: false: White, true: Black
+// game_over: if game is still running. false means no moves can be done.
+//
+// Later will implement a list of all steps taken.
+// That way we can revert to a previous turn, through player's request.
+
+#[near_bindgen]
+#[derive(Serialize, Deserialize, BorshDeserialize, BorshSerialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Game{
+    squares: Vec<u8>,
+
+    turn: u8,
+    player_turn: bool,
+    game_over: bool,
+
+    black_check: bool,
+    white_check: bool,
+}
+
+impl Default for Game{
+    fn default() -> Self{
+        // let squares: [u8; 64] = Board::get_default_board();
+        let squares: Vec<u8> = Vec::from(Board::get_default_board());
+
+        Game{
+            squares,
+            turn: 0,
+            player_turn: false,
+            game_over: false,
+            black_check: false,
+            white_check: false,
+        }
+    }
+}
+
+#[near_bindgen]
+impl Game{
+
+    #[private]
+    fn update_game_state(&mut self, board: &mut Board, turn: Turn) {
+        // current_player,
+        // value,
+        // black_check: false,
+        // white_check: false,
+        // checkmate: false,
+
+        self.squares.clear();
+        for piece_number in board.get_board_array(){
+            self.squares.push(piece_number);
+        }
+
+        self.turn = turn.get_value();
+        self.player_turn = turn.get_current_player_boolean();
+        // self.game_over = turn.is_game_over();
+        self.black_check = turn.is_black_check();
+        self.white_check = turn.is_white_check();
+        if turn.is_checkmate(){
+            self.game_over = true;
+        }
+    }
+
+    #[private]
+    fn handle_error(&mut self, error: ErrorResponse) -> String {
+        let message: &str = match error{
+            // If movement starts in a position that has no piece.
+            ErrorResponse::NoPiece => {"No piece found in given position. "},
+            // If movement starts in a position owned by a rival player
+            ErrorResponse::RivalPiece => {"A rival player owns this piece. "},
+            // If target position is invalid for given piece
+            ErrorResponse::InvalidMove => {"Invalid move. "},
+            // If the game is already over.
+            ErrorResponse::GameOver => {
+                self.game_over = true;
+                "Game is already over"
+            },
+        };
+
+        String::from(message)
+    }
+
+    #[private]
+    pub fn get_squares(&self) -> Vec<u8> {
+        self.squares.clone()
+    }
+
+    #[private]
+    pub fn get_turn(&self) -> u8 {
+        self.turn.clone()
+    }
+
+    #[private]
+    pub fn get_player_turn(&self) -> bool {
+        self.player_turn.clone()
+    }
+
+    #[private]
+    pub fn is_game_over(&self) -> bool {
+        self.game_over.clone()
+    }
+
+    #[private]
+    pub fn is_black_check(&self) -> bool {
+        self.black_check.clone()
+    }
+
+    #[private]
+    pub fn is_white_check(&self) -> bool {
+        self.white_check.clone()
+    }
+
+    #[private]
+    pub fn reset_game_game(&mut self) -> String{
+        self.squares = Vec::from(Board::get_default_board());
+        self.turn = 0;
+        self.player_turn = false;
+        self.game_over = false;
+
+        String::from("Reset successful.")
+    }
+
+    #[private]
+    pub fn get_game_status_game(&self) -> Self{
+        let game_running: &str = match self.game_over{
+            false => "Running",
+            true => "Game Over",
+        };
+
+        let turn: u8 = self.turn.clone();
+
+        let player: &str = match self.player_turn {
+            false => "White",
+            true => "Black",
+        };
+
+        log(&format!("Game Status: {}\nTurn: {}\nCurrent player: {}\n",
+            game_running,
+            turn,
+            player,
+        ));
+
+        log(
+            &format!("\nBoard:\n{}\n", 
+                Board::get_board_string(
+                    &self.squares[..],              // squares: &[u8; 64]
+                )
+            )
+        );
+
+        // let squares: [u8; 64] = self.squares.clone();
+        let squares: Vec<u8> = self.squares.clone();
+        let turn: u8 = self.turn. clone();
+        let player_turn: bool = self.player_turn.clone();
+        let game_over: bool = self.game_over.clone();
+        let black_check: bool = self.black_check.clone();
+        let white_check: bool = self.white_check.clone();
+
+        Game{
+            squares,
+            turn,
+            player_turn,
+            game_over,
+            black_check,
+            white_check,
+        }
+    }
+
+    #[private]
+    pub fn get_board_game(&self) -> String {
+        format!("\nBoard:\n{}\n",
+            Board::get_board_string(
+                &self.squares,                  // squares: &[u8; 64]
+            )
+        )
+    }
+
+    #[private]
+    pub fn get_piece_name_game(&self, col: u8, row: u8) -> String {
+        let index: u8 = row * 8 + col;
+        
+        self.get_piece_name_index_game(
+            index,                              // index: u8,
+        )
+    }
+
+    #[private]
+    pub fn get_piece_name_index_game(&self, index: u8) -> String {
+        let piece_number: u8 = self.squares[index as usize];
+
+        let name: String = Piece::get_piece_name(
+            piece_number,                       // piece_number: u8,
+        );
+        log(&name);
+
+        name
+    }
+
+    #[private]
+    pub fn move_to_game(
+        &mut self,
+        current: u8,
+        target: u8,
+    ) -> String {
+        if self.game_over{
+            return String::from("Game already over, check status or call reset.");
+        }
+
+        if (current > 63) || (target > 63) {
+            return String::from("Invalid Arguments. Must be lower than 64.");
+        }
+
+        let current_player: bool = self.player_turn;
+        let turn: u8 = self.turn;
+        
+        // let squares: [u8; 64] = self.squares.clone();
+        let mut squares: [u8; 64] = [0; 64];
+        for index in 0..self.squares.len(){
+            squares[index] = self.squares[index];
+        }
+
+        log(&format!("Creating Board"));
+        let mut board: Board = Board::new(
+            squares,                            // squares: [u8; 64]
+        );
+
+        log(&format!("Creating Players"));
+        let mut players: Players = Players::new(
+            &board,                             // board: &Board, 
+            current_player,                     // current_player: bool, 
+            turn,                               // turn: u8,
+        );
+
+        // using env::log here just to clear linter warning
+        env::log(&format!("Creating Step").as_bytes());
+        let step: Step = Step::new_index(
+            current,                            // current: u8,
+            target,                             // target: u8,
+            &board,                             // board: &Board,
+        );
+
+        log(&format!("Calling move"));
+        match players.move_to(
+            &mut board,                         // board: &mut Board, 
+            step,                               // mut target: Step,
+        ) {
+            Result::Err(err) => {
+                return self.handle_error(
+                    err,                        // error: ErrorResponse,
+                );
+            },
+            _ => {
+                // Copy the values from the virtual board to the machine state one.
+                let game_state: Turn = players.get_turn();
+                self.update_game_state(
+                    &mut board,
+                    game_state,
+                );
+
+                // self.squares.clear();
+                // for piece_number in board.get_board_array(){
+                //     self.squares.push(piece_number);
+                // }
+
+                // let (
+                //     player_turn, 
+                //     turn,
+                // ): (bool, u8) = players.get_turn_status();
+
+                // self.player_turn = player_turn;
+                // self.turn = turn;
+
+                // // If the move was successful, then current check state was cleared. Else it wouldn't be valid.
+                // match self.player_turn {
+                //     false => {
+                //         self.white_check = false;
+                //     },
+                //     true => {
+                //         self.black_check = false;
+                //     }
+                // }
+
+                return String::from("Move successful.");
+            }
+        }
+    }
+}
+
+'''
+'''--- src/lib.rs ---
+// pawn: forward 1-step                             
+// rook: straight line                              
+// knight: L shape                                  
+// bishop: diagonal                                 
+// queen: straight line + diagonal max distance     
+// king: straight line + diagonal 1-step can't walk into self-checkmate
+
+// empty:           0
+// white pawn:      1
+// white rook:      2
+// white knight:    3
+// white bishop:    4
+// white queen:     5
+// white king:      6
+// black pawn:      7
+// black rook:      8
+// black knight:    9
+// black bishop:    10
+// black queen:     11
+// black king:      12
+
+// board size 8 x 8 (values in hex)
+// 
+// 8 9 A B C A 9 8 
+// 7 7 7 7 7 7 7 7
+// 0 0 0 0 0 0 0 0 
+// 0 0 0 0 0 0 0 0
+// 0 0 0 0 0 0 0 0
+// 0 0 0 0 0 0 0 0
+// 1 1 1 1 1 1 1 1 
+// 2 3 4 5 6 4 3 2
+
+// algorithm for move order:
+//  - check if game is running
+//  - check if movement is valid for given player
+//  - attempt to move
+//  - check if the player will be under check after move, if true, cancel the move
+//  - after the player move, check if rival is under check,
+//  - if true, check for all possible moves rival can do,
+//  - if there are no moves remaining, checkmate.
+//  - if there are moves remaining, on to the next turn.
+
+// use pieces::piece::PieceActions;
+pub mod pieces;
+pub mod player;
+pub mod board;
+pub mod movement;
+pub mod game;
+
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+#[allow(unused_imports)]
+use near_sdk::{env, near_bindgen};
+use near_sdk::serde::{Deserialize, Serialize};
+
+use game::Game;
+
+near_sdk::setup_alloc!();
+
+#[cfg(not(test))]
+pub fn log(message: &str){
+    env::log(message.as_bytes());
+}
+
+#[cfg(test)]
+pub fn log(message: &str){
+    println!("{}", message);
+}
+
+#[near_bindgen]
+#[derive(Default, Serialize, Deserialize, BorshDeserialize, BorshSerialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Chess {
+    game: Game,
+}
+
+#[near_bindgen]
+impl Chess{
+    // Reset the game to the beginning.
+    pub fn reset_game(&mut self) -> String {
+        self.game.reset_game_game()
+    }
+
+    // Return the state of the game.
+    pub fn get_game_status(&self) -> Game{
+        self.game.get_game_status_game()
+    }
+
+    // Get the name of a piece in given position.
+    pub fn get_piece_name(&self, col: u8, row: u8) -> String{
+        self.game.get_piece_name_game(col, row)
+    }
+
+    // Get the name of a piece in given index.
+    pub fn get_piece_name_index(&self, index: u8) -> String {
+        self.game.get_piece_name_index_game(index)
+    }
+
+    // Get the entire board as a string.
+    pub fn get_board(&self) -> String {
+        self.game.get_board_game()
+    }
+
+    
+    // Move a piece from position "current" to "target" by column and row.
+    pub fn move_to(
+        &mut self,
+        current_col: u8,
+        current_row: u8,
+        target_col: u8,
+        target_row: u8,
+    ) -> String {
+        let current_index: u8 = current_row * 8 + current_col;
+        let target_index: u8 = target_row * 8 + target_col;
+        return self.move_to_index(
+            current_index,              // current: u8,
+            target_index,               // target: u8,
+        );
+    }
+
+    // Move a piece from position "current" to "target" by index.
+    pub fn move_to_index(
+        &mut self,
+        current: u8,
+        target: u8,
+    ) -> String {
+        let response: String = self.game.move_to_game(
+            current,
+            target,
+        );
+
+        log(&response);
+        response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // use near_sdk::test_utils::VMContextBuilder;
+    use near_sdk::{testing_env, VMContext, MockedBlockchain};
+    use crate::board::Board;
+
+    fn get_context(input: Vec<u8>, is_view: bool) -> VMContext {
+        // VMContextBuilder::new()
+        //     .signer_account_id("tester_near".to_string())
+        //     .is_view(is_view)
+        //     .build()
+
+        VMContext {
+            current_account_id: "alice.testnet".to_string(),
+            signer_account_id: "robert.testnet".to_string(),
+            signer_account_pk: vec![0, 1, 2],
+            predecessor_account_id: "jane.testnet".to_string(),
+            input,
+            block_index: 0,
+            block_timestamp: 0,
+            account_balance: 0,
+            account_locked_balance: 0,
+            storage_usage: 0,
+            attached_deposit: 0,
+            prepaid_gas: 10u64.pow(18),
+            random_seed: vec![0, 1, 2],
+            is_view,
+            output_data_receivers: vec![],
+            epoch_height: 19,
+        }
+    }
+
+    fn board_equals(board: Vec<u8>, other: [u8; 64]) -> bool {
+        assert_eq!(board.len(), 64, "Board Length is {}.", board.len());
+        for index in 0..board.len() {
+            if board[index] != other[index] {
+                println!("{}", Board::get_board_string(
+                    &board[..],
+                ));
+
+                return false;
+            }
+        }
+        true
+    }
+
+    fn assert_move(
+        contract: &mut Chess,
+        start_col: u8,
+        start_row: u8,
+        end_col: u8,
+        end_row: u8,
+        counter: u8,
+        squares: [u8; 64]
+    ) {
+        let context = get_context(vec![], false);
+        testing_env!(context);
+
+        println!("Step: {}", counter);
+        println!("{}",
+            &contract
+                .move_to(
+                    start_col, 
+                    start_row, 
+                    end_col,
+                    end_row,
+                )[..]
+        );
+
+        let context = get_context(vec![], true);
+        testing_env!(context);
+
+        let game_status: Game = contract.get_game_status();
+
+        let board: Vec<u8> = game_status
+            .get_squares();
+
+        println!("{}{}\n{}{}\n{}{}\n{}{}\n{}{}\n",
+            "turn: ", game_status.get_turn(),
+            "player_turn: ", game_status.get_player_turn(),
+            "game_over: ", game_status.is_game_over(),
+            "black_check: ", game_status.is_black_check(),
+            "white_check: ", game_status.is_white_check(),
+        );
+        
+        assert!(board_equals(board, squares));
+    }
+
+    fn assert_black_checkmate(
+        contract: &mut Chess,
+    ){
+        let context = get_context(vec![], true);
+        testing_env!(context);
+
+        let game_status: Game = contract.get_game_status();
+        let black_check: bool = game_status.is_black_check();
+        let board: Vec<u8> = game_status.get_squares();
+        println!("{}", Board::get_board_string(
+            &board[..],
+        ));
+        
+        assert!(black_check, "Black was supposed to be under checkmate here");
+    }
+
+    #[test]
+    fn full_game() {
+        let context = get_context(vec![], false);
+        testing_env!(context);
+
+        let mut contract = Chess::default();
+        let game: Game = contract.get_game_status();
+        let board: Vec<u8> =  game.get_game_status_game()
+            .get_squares();
+
+        assert!(board_equals(board, 
+            [
+                8, 9, 10, 11, 12, 10, 9, 8,
+                7, 7,  7,  7,  7,  7, 7, 7,
+                0, 0,  0,  0,  0,  0, 0, 0,
+                0, 0,  0,  0,  0,  0, 0, 0,
+                0, 0,  0,  0,  0,  0, 0, 0,
+                0, 0,  0,  0,  0,  0, 0, 0,
+                1, 1,  1,  1,  1,  1, 1, 1,
+                2, 3,  4,  5,  6,  4, 3, 2,
+            ])
+        );
+
+        assert_move(
+            &mut contract, 
+            1, 
+            6, 
+            1, 
+            4, 
+            1,
+            [
+                8, 9, 10, 11, 12, 10, 9, 8,
+                7, 7,  7,  7,  7,  7, 7, 7,
+                0, 0,  0,  0,  0,  0, 0, 0,
+                0, 0,  0,  0,  0,  0, 0, 0,
+                0, 1,  0,  0,  0,  0, 0, 0,
+                0, 0,  0,  0,  0,  0, 0, 0,
+                1, 0,  1,  1,  1,  1, 1, 1,
+                2, 3,  4,  5,  6,  4, 3, 2,
+            ],
+        );
+
+        assert_move(
+            &mut contract, 
+            1, 
+            1, 
+            1, 
+            3, 
+            2,
+            [
+                8, 9, 10, 11, 12, 10, 9, 8,
+                7, 0,  7,  7,  7,  7, 7, 7,
+                0, 0,  0,  0,  0,  0, 0, 0,
+                0, 7,  0,  0,  0,  0, 0, 0,
+                0, 1,  0,  0,  0,  0, 0, 0,
+                0, 0,  0,  0,  0,  0, 0, 0,
+                1, 0,  1,  1,  1,  1, 1, 1,
+                2, 3,  4,  5,  6,  4, 3, 2,
+            ],
+        );
+
+        assert_move(
+            &mut contract, 
+            1, 
+            7, 
+            2, 
+            5, 
+            3,
+            [
+                8, 9, 10, 11, 12, 10, 9, 8,
+                7, 0,  7,  7,  7,  7, 7, 7,
+                0, 0,  0,  0,  0,  0, 0, 0,
+                0, 7,  0,  0,  0,  0, 0, 0,
+                0, 1,  0,  0,  0,  0, 0, 0,
+                0, 0,  3,  0,  0,  0, 0, 0,
+                1, 0,  1,  1,  1,  1, 1, 1,
+                2, 0,  4,  5,  6,  4, 3, 2,
+            ],
+        );
+
+        assert_move(
+            &mut contract, 
+            3, 
+            1, 
+            3, 
+            2, 
+            4,
+            [
+                8, 9, 10, 11, 12, 10, 9, 8,
+                7, 0,  7,  0,  7,  7, 7, 7,
+                0, 0,  0,  7,  0,  0, 0, 0,
+                0, 7,  0,  0,  0,  0, 0, 0,
+                0, 1,  0,  0,  0,  0, 0, 0,
+                0, 0,  3,  0,  0,  0, 0, 0,
+                1, 0,  1,  1,  1,  1, 1, 1,
+                2, 0,  4,  5,  6,  4, 3, 2,
+            ],
+        );
+
+        assert_move(
+            &mut contract, 
+            0, 
+            6, 
+            0, 
+            5, 
+            5,
+            [
+                8, 9, 10, 11, 12, 10, 9, 8,
+                7, 0,  7,  0,  7,  7, 7, 7,
+                0, 0,  0,  7,  0,  0, 0, 0,
+                0, 7,  0,  0,  0,  0, 0, 0,
+                0, 1,  0,  0,  0,  0, 0, 0,
+                1, 0,  3,  0,  0,  0, 0, 0,
+                0, 0,  1,  1,  1,  1, 1, 1,
+                2, 0,  4,  5,  6,  4, 3, 2,
+            ],
+        );
+
+        assert_move(
+            &mut contract, 
+            2, 
+            0, 
+            0, 
+            2, 
+            6,
+            [
+                8,  9,  0, 11, 12, 10, 9, 8,
+                7,  0,  7,  0,  7,  7, 7, 7,
+                10, 0,  0,  7,  0,  0, 0, 0,
+                0,  7,  0,  0,  0,  0, 0, 0,
+                0,  1,  0,  0,  0,  0, 0, 0,
+                1,  0,  3,  0,  0,  0, 0, 0,
+                0,  0,  1,  1,  1,  1, 1, 1,
+                2,  0,  4,  5,  6,  4, 3, 2,
+            ],
+        );
+
+        assert_move(
+            &mut contract, 
+            7, 
+            6, 
+            7, 
+            4, 
+            7,
+            [
+                8,  9,  0, 11, 12, 10, 9, 8,
+                7,  0,  7,  0,  7,  7, 7, 7,
+                10, 0,  0,  7,  0,  0, 0, 0,
+                0,  7,  0,  0,  0,  0, 0, 0,
+                0,  1,  0,  0,  0,  0, 0, 1,
+                1,  0,  3,  0,  0,  0, 0, 0,
+                0,  0,  1,  1,  1,  1, 1, 0,
+                2,  0,  4,  5,  6,  4, 3, 2,
+            ],
+        );
+
+        assert_move(
+            &mut contract, 
+            6, 
+            1, 
+            6, 
+            2, 
+            8,
+            [
+                8,  9,  0, 11, 12, 10, 9, 8,
+                7,  0,  7,  0,  7,  7, 0, 7,
+                10, 0,  0,  7,  0,  0, 7, 0,
+                0,  7,  0,  0,  0,  0, 0, 0,
+                0,  1,  0,  0,  0,  0, 0, 1,
+                1,  0,  3,  0,  0,  0, 0, 0,
+                0,  0,  1,  1,  1,  1, 1, 0,
+                2,  0,  4,  5,  6,  4, 3, 2,
+            ],
+        );
+
+        assert_move(
+            &mut contract, 
+            7, 
+            7, 
+            7, 
+            5, 
+            9,
+            [
+                8,  9,  0, 11, 12, 10, 9,  8,
+                7,  0,  7,  0,  7,  7, 0,  7,
+                10, 0,  0,  7,  0,  0, 7,  0,
+                0,  7,  0,  0,  0,  0, 0,  0,
+                0,  1,  0,  0,  0,  0, 0,  1,
+                1,  0,  3,  0,  0,  0, 0,  2,
+                0,  0,  1,  1,  1,  1, 1,  0,
+                2,  0,  4,  5,  6,  4, 3,  0,
+            ],
+        );
+
+        assert_move(
+            &mut contract, 
+            5, 
+            0, 
+            7, 
+            2, 
+            10,
+            [
+                8,  9,  0, 11, 12,  0, 9,  8,
+                7,  0,  7,  0,  7,  7, 0,  7,
+                10, 0,  0,  7,  0,  0, 7, 10,
+                0,  7,  0,  0,  0,  0, 0,  0,
+                0,  1,  0,  0,  0,  0, 0,  1,
+                1,  0,  3,  0,  0,  0, 0,  2,
+                0,  0,  1,  1,  1,  1, 1,  0,
+                2,  0,  4,  5,  6,  4, 3,  0,
+            ],
+        );
+
+        // white
+        assert_move(
+            &mut contract, 
+            3, 
+            6, 
+            3, 
+            4, 
+            11,
+            [
+                8,  9,  0, 11, 12,  0, 9,  8,
+                7,  0,  7,  0,  7,  7, 0,  7,
+                10, 0,  0,  7,  0,  0, 7, 10,
+                0,  7,  0,  0,  0,  0, 0,  0,
+                0,  1,  0,  1,  0,  0, 0,  1,
+                1,  0,  3,  0,  0,  0, 0,  2,
+                0,  0,  1,  0,  1,  1, 1,  0,
+                2,  0,  4,  5,  6,  4, 3,  0,
+            ],
+        );
+
+        // black
+        assert_move(
+            &mut contract, 
+            3, 
+            0, 
+            3, 
+            1, 
+            12,
+            [
+                8,  9,  0,  0, 12,  0, 9,  8,
+                7,  0,  7, 11,  7,  7, 0,  7,
+                10, 0,  0,  7,  0,  0, 7, 10,
+                0,  7,  0,  0,  0,  0, 0,  0,
+                0,  1,  0,  1,  0,  0, 0,  1,
+                1,  0,  3,  0,  0,  0, 0,  2,
+                0,  0,  1,  0,  1,  1, 1,  0,
+                2,  0,  4,  5,  6,  4, 3,  0,
+            ],
+        );
+
+        // white
+        assert_move(
+            &mut contract, 
+            2, 
+            5, 
+            1, 
+            3, 
+            13,
+            [
+                8,  9,  0,  0, 12,  0, 9,  8,
+                7,  0,  7, 11,  7,  7, 0,  7,
+                10, 0,  0,  7,  0,  0, 7, 10,
+                0,  3,  0,  0,  0,  0, 0,  0,
+                0,  1,  0,  1,  0,  0, 0,  1,
+                1,  0,  0,  0,  0,  0, 0,  2,
+                0,  0,  1,  0,  1,  1, 1,  0,
+                2,  0,  4,  5,  6,  4, 3,  0,
+            ],
+        );
+
+        // black
+        assert_move(
+            &mut contract, 
+            0, 
+            2, 
+            1, 
+            3, 
+            14,
+            [
+                8,  9,  0,  0, 12,  0, 9,  8,
+                7,  0,  7, 11,  7,  7, 0,  7,
+                0,  0,  0,  7,  0,  0, 7, 10,
+                0, 10,  0,  0,  0,  0, 0,  0,
+                0,  1,  0,  1,  0,  0, 0,  1,
+                1,  0,  0,  0,  0,  0, 0,  2,
+                0,  0,  1,  0,  1,  1, 1,  0,
+                2,  0,  4,  5,  6,  4, 3,  0,
+            ],
+        );
+
+        // white
+        assert_move(
+            &mut contract, 
+            3, 
+            7, 
+            3, 
+            5, 
+            15,
+            [
+                8,  9,  0,  0, 12,  0, 9,  8,
+                7,  0,  7, 11,  7,  7, 0,  7,
+                0,  0,  0,  7,  0,  0, 7, 10,
+                0, 10,  0,  0,  0,  0, 0,  0,
+                0,  1,  0,  1,  0,  0, 0,  1,
+                1,  0,  0,  5,  0,  0, 0,  2,
+                0,  0,  1,  0,  1,  1, 1,  0,
+                2,  0,  4,  0,  6,  4, 3,  0,
+            ],
+        );
+
+        // black
+        assert_move(
+            &mut contract, 
+            1, 
+            3, 
+            3, 
+            5, 
+            16,
+            [
+                8,  9,  0,  0, 12,  0, 9,  8,
+                7,  0,  7, 11,  7,  7, 0,  7,
+                0,  0,  0,  7,  0,  0, 7, 10,
+                0,  0,  0,  0,  0,  0, 0,  0,
+                0,  1,  0,  1,  0,  0, 0,  1,
+                1,  0,  0, 10,  0,  0, 0,  2,
+                0,  0,  1,  0,  1,  1, 1,  0,
+                2,  0,  4,  0,  6,  4, 3,  0,
+            ],
+        );
+
+        // white
+        assert_move(
+            &mut contract, 
+            4, 
+            6, 
+            3, 
+            5, 
+            17,
+            [
+                8,  9,  0,  0, 12,  0, 9,  8,
+                7,  0,  7, 11,  7,  7, 0,  7,
+                0,  0,  0,  7,  0,  0, 7, 10,
+                0,  0,  0,  0,  0,  0, 0,  0,
+                0,  1,  0,  1,  0,  0, 0,  1,
+                1,  0,  0,  1,  0,  0, 0,  2,
+                0,  0,  1,  0,  0,  1, 1,  0,
+                2,  0,  4,  0,  6,  4, 3,  0,
+            ],
+        );
+
+        // black
+        assert_move(
+            &mut contract, 
+            3, 
+            1, 
+            7, 
+            5, 
+            18,
+            [
+                8,  9,  0,  0, 12,  0,  9,  8,
+                7,  0,  7,  0,  7,  7,  0,  7,
+                0,  0,  0,  7,  0,  0,  7, 10,
+                0,  0,  0,  0,  0,  0,  0,  0,
+                0,  1,  0,  1,  0,  0,  0,  1,
+                1,  0,  0,  1,  0,  0,  0, 11,
+                0,  0,  1,  0,  0,  1,  1,  0,
+                2,  0,  4,  0,  6,  4,  3,  0,
+            ],
+        );
+
+        // white
+        assert_move(
+            &mut contract, 
+            6, 
+            6, 
+            7, 
+            5, 
+            19,
+            [
+                8,  9,  0,  0, 12,  0,  9,  8,
+                7,  0,  7,  0,  7,  7,  0,  7,
+                0,  0,  0,  7,  0,  0,  7, 10,
+                0,  0,  0,  0,  0,  0,  0,  0,
+                0,  1,  0,  1,  0,  0,  0,  1,
+                1,  0,  0,  1,  0,  0,  0,  1,
+                0,  0,  1,  0,  0,  1,  0,  0,
+                2,  0,  4,  0,  6,  4,  3,  0,
+            ],
+        );
+
+        // black
+        assert_move(
+            &mut contract, 
+            7, 
+            2, 
+            2, 
+            7, 
+            20,
+            [
+                8,  9,  0,  0, 12,  0,  9,  8,
+                7,  0,  7,  0,  7,  7,  0,  7,
+                0,  0,  0,  7,  0,  0,  7,  0,
+                0,  0,  0,  0,  0,  0,  0,  0,
+                0,  1,  0,  1,  0,  0,  0,  1,
+                1,  0,  0,  1,  0,  0,  0,  1,
+                0,  0,  1,  0,  0,  1,  0,  0,
+                2,  0, 10,  0,  6,  4,  3,  0,
+            ],
+        );
+
+        // white
+        assert_move(
+            &mut contract, 
+            0, 
+            7, 
+            2, 
+            7, 
+            21,
+            [
+                8,  9,  0,  0, 12,  0,  9,  8,
+                7,  0,  7,  0,  7,  7,  0,  7,
+                0,  0,  0,  7,  0,  0,  7,  0,
+                0,  0,  0,  0,  0,  0,  0,  0,
+                0,  1,  0,  1,  0,  0,  0,  1,
+                1,  0,  0,  1,  0,  0,  0,  1,
+                0,  0,  1,  0,  0,  1,  0,  0,
+                0,  0,  2,  0,  6,  4,  3,  0,
+            ],
+        );
+
+        // black
+        assert_move(
+            &mut contract, 
+            1, 
+            0, 
+            2, 
+            2, 
+            22,
+            [
+                8,  0,  0,  0, 12,  0,  9,  8,
+                7,  0,  7,  0,  7,  7,  0,  7,
+                0,  0,  9,  7,  0,  0,  7,  0,
+                0,  0,  0,  0,  0,  0,  0,  0,
+                0,  1,  0,  1,  0,  0,  0,  1,
+                1,  0,  0,  1,  0,  0,  0,  1,
+                0,  0,  1,  0,  0,  1,  0,  0,
+                0,  0,  2,  0,  6,  4,  3,  0,
+            ],
+        );
+
+        // white
+        assert_move(
+            &mut contract, 
+            2, 
+            7, 
+            1, 
+            7, 
+            23,
+            [
+                8,  0,  0,  0, 12,  0,  9,  8,
+                7,  0,  7,  0,  7,  7,  0,  7,
+                0,  0,  9,  7,  0,  0,  7,  0,
+                0,  0,  0,  0,  0,  0,  0,  0,
+                0,  1,  0,  1,  0,  0,  0,  1,
+                1,  0,  0,  1,  0,  0,  0,  1,
+                0,  0,  1,  0,  0,  1,  0,  0,
+                0,  2,  0,  0,  6,  4,  3,  0,
+            ],
+        );
+
+        // black
+        assert_move(
+            &mut contract, 
+            6, 
+            2, 
+            6, 
+            3, 
+            24,
+            [
+                8,  0,  0,  0, 12,  0,  9,  8,
+                7,  0,  7,  0,  7,  7,  0,  7,
+                0,  0,  9,  7,  0,  0,  0,  0,
+                0,  0,  0,  0,  0,  0,  7,  0,
+                0,  1,  0,  1,  0,  0,  0,  1,
+                1,  0,  0,  1,  0,  0,  0,  1,
+                0,  0,  1,  0,  0,  1,  0,  0,
+                0,  2,  0,  0,  6,  4,  3,  0,
+            ],
+        );
+
+        // white
+        assert_move(
+            &mut contract, 
+            6, 
+            7, 
+            5, 
+            5, 
+            25,
+            [
+                8,  0,  0,  0, 12,  0,  9,  8,
+                7,  0,  7,  0,  7,  7,  0,  7,
+                0,  0,  9,  7,  0,  0,  0,  0,
+                0,  0,  0,  0,  0,  0,  7,  0,
+                0,  1,  0,  1,  0,  0,  0,  1,
+                1,  0,  0,  1,  0,  3,  0,  1,
+                0,  0,  1,  0,  0,  1,  0,  0,
+                0,  2,  0,  0,  6,  4,  0,  0,
+            ],
+        );
+
+        // black
+        assert_move(
+            &mut contract, 
+            0, 
+            1, 
+            0, 
+            3, 
+            26,
+            [
+                8,  0,  0,  0, 12,  0,  9,  8,
+                0,  0,  7,  0,  7,  7,  0,  7,
+                0,  0,  9,  7,  0,  0,  0,  0,
+                7,  0,  0,  0,  0,  0,  7,  0,
+                0,  1,  0,  1,  0,  0,  0,  1,
+                1,  0,  0,  1,  0,  3,  0,  1,
+                0,  0,  1,  0,  0,  1,  0,  0,
+                0,  2,  0,  0,  6,  4,  0,  0,
+            ],
+        );
+
+        // white
+        assert_move(
+            &mut contract, 
+            1, 
+            4, 
+            0, 
+            3, 
+            27,
+            [
+                8,  0,  0,  0, 12,  0,  9,  8,
+                0,  0,  7,  0,  7,  7,  0,  7,
+                0,  0,  9,  7,  0,  0,  0,  0,
+                1,  0,  0,  0,  0,  0,  7,  0,
+                0,  0,  0,  1,  0,  0,  0,  1,
+                1,  0,  0,  1,  0,  3,  0,  1,
+                0,  0,  1,  0,  0,  1,  0,  0,
+                0,  2,  0,  0,  6,  4,  0,  0,
+            ],
+        );
+
+        // black
+        assert_move(
+            &mut contract, 
+            6, 
+            0, 
+            7, 
+            2, 
+            28,
+            [
+                8,  0,  0,  0, 12,  0,  0,  8,
+                0,  0,  7,  0,  7,  7,  0,  7,
+                0,  0,  9,  7,  0,  0,  0,  9,
+                1,  0,  0,  0,  0,  0,  7,  0,
+                0,  0,  0,  1,  0,  0,  0,  1,
+                1,  0,  0,  1,  0,  3,  0,  1,
+                0,  0,  1,  0,  0,  1,  0,  0,
+                0,  2,  0,  0,  6,  4,  0,  0,
+            ],
+        );
+
+        // white
+        assert_move(
+            &mut contract, 
+            5, 
+            5, 
+            4, 
+            3, 
+            29,
+            [
+                8,  0,  0,  0, 12,  0,  0,  8,
+                0,  0,  7,  0,  7,  7,  0,  7,
+                0,  0,  9,  7,  0,  0,  0,  9,
+                1,  0,  0,  0,  3,  0,  7,  0,
+                0,  0,  0,  1,  0,  0,  0,  1,
+                1,  0,  0,  1,  0,  0,  0,  1,
+                0,  0,  1,  0,  0,  1,  0,  0,
+                0,  2,  0,  0,  6,  4,  0,  0,
+            ],
+        );
+
+        // black
+        assert_move(
+            &mut contract, 
+            6, 
+            3, 
+            6, 
+            4, 
+            30,
+            [
+                8,  0,  0,  0, 12,  0,  0,  8,
+                0,  0,  7,  0,  7,  7,  0,  7,
+                0,  0,  9,  7,  0,  0,  0,  9,
+                1,  0,  0,  0,  3,  0,  0,  0,
+                0,  0,  0,  1,  0,  0,  7,  1,
+                1,  0,  0,  1,  0,  0,  0,  1,
+                0,  0,  1,  0,  0,  1,  0,  0,
+                0,  2,  0,  0,  6,  4,  0,  0,
+            ],
+        );
+
+        // white
+        assert_move(
+            &mut contract, 
+            7, 
+            5, 
+            6, 
+            4, 
+            31,
+            [
+                8,  0,  0,  0, 12,  0,  0,  8,
+                0,  0,  7,  0,  7,  7,  0,  7,
+                0,  0,  9,  7,  0,  0,  0,  9,
+                1,  0,  0,  0,  3,  0,  0,  0,
+                0,  0,  0,  1,  0,  0,  1,  1,
+                1,  0,  0,  1,  0,  0,  0,  0,
+                0,  0,  1,  0,  0,  1,  0,  0,
+                0,  2,  0,  0,  6,  4,  0,  0,
+            ],
+        );
+
+        // black
+        assert_move(
+            &mut contract, 
+            7, 
+            2, 
+            6, 
+            4, 
+            32,
+            [
+                8,  0,  0,  0, 12,  0,  0,  8,
+                0,  0,  7,  0,  7,  7,  0,  7,
+                0,  0,  9,  7,  0,  0,  0,  0,
+                1,  0,  0,  0,  3,  0,  0,  0,
+                0,  0,  0,  1,  0,  0,  9,  1,
+                1,  0,  0,  1,  0,  0,  0,  0,
+                0,  0,  1,  0,  0,  1,  0,  0,
+                0,  2,  0,  0,  6,  4,  0,  0,
+            ],
+        );
+
+        // white
+        assert_move(
+            &mut contract, 
+            5, 
+            7, 
+            7, 
+            5, 
+            33,
+            [
+                8,  0,  0,  0, 12,  0,  0,  8,
+                0,  0,  7,  0,  7,  7,  0,  7,
+                0,  0,  9,  7,  0,  0,  0,  0,
+                1,  0,  0,  0,  3,  0,  0,  0,
+                0,  0,  0,  1,  0,  0,  9,  1,
+                1,  0,  0,  1,  0,  0,  0,  4,
+                0,  0,  1,  0,  0,  1,  0,  0,
+                0,  2,  0,  0,  6,  0,  0,  0,
+            ],
+        );
+
+        // black
+        assert_move(
+            &mut contract, 
+            2, 
+            2, 
+            3, 
+            4, 
+            34,
+            [
+                8,  0,  0,  0, 12,  0,  0,  8,
+                0,  0,  7,  0,  7,  7,  0,  7,
+                0,  0,  0,  7,  0,  0,  0,  0,
+                1,  0,  0,  0,  3,  0,  0,  0,
+                0,  0,  0,  9,  0,  0,  9,  1,
+                1,  0,  0,  1,  0,  0,  0,  4,
+                0,  0,  1,  0,  0,  1,  0,  0,
+                0,  2,  0,  0,  6,  0,  0,  0,
+            ],
+        );
+
+        // white
+        assert_move(
+            &mut contract, 
+            7, 
+            5, 
+            6, 
+            4, 
+            35,
+            [
+                8,  0,  0,  0, 12,  0,  0,  8,
+                0,  0,  7,  0,  7,  7,  0,  7,
+                0,  0,  0,  7,  0,  0,  0,  0,
+                1,  0,  0,  0,  3,  0,  0,  0,
+                0,  0,  0,  9,  0,  0,  4,  1,
+                1,  0,  0,  1,  0,  0,  0,  0,
+                0,  0,  1,  0,  0,  1,  0,  0,
+                0,  2,  0,  0,  6,  0,  0,  0,
+            ],
+        );
+
+        // black
+        assert_move(
+            &mut contract, 
+            0, 
+            0, 
+            0, 
+            3, 
+            36,
+            [
+                0,  0,  0,  0, 12,  0,  0,  8,
+                0,  0,  7,  0,  7,  7,  0,  7,
+                0,  0,  0,  7,  0,  0,  0,  0,
+                8,  0,  0,  0,  3,  0,  0,  0,
+                0,  0,  0,  9,  0,  0,  4,  1,
+                1,  0,  0,  1,  0,  0,  0,  0,
+                0,  0,  1,  0,  0,  1,  0,  0,
+                0,  2,  0,  0,  6,  0,  0,  0,
+            ],
+        );
+
+        // white
+        // checkmate
+        assert_move(
+            &mut contract, 
+            1, 
+            7, 
+            1, 
+            0, 
+            36,
+            [
+                0,  2,  0,  0, 12,  0,  0,  8,
+                0,  0,  7,  0,  7,  7,  0,  7,
+                0,  0,  0,  7,  0,  0,  0,  0,
+                8,  0,  0,  0,  3,  0,  0,  0,
+                0,  0,  0,  9,  0,  0,  4,  1,
+                1,  0,  0,  1,  0,  0,  0,  0,
+                0,  0,  1,  0,  0,  1,  0,  0,
+                0,  0,  0,  0,  6,  0,  0,  0,
+            ],
+        );
+
+        assert_black_checkmate(&mut contract);
+
+        
+    }
+}
+'''
+'''--- src/movement.rs ---
+pub mod report;
+pub mod step;
+
+'''
+'''--- src/movement/report.rs ---
+use crate::{
+    board::Board,
+    pieces::{
+        piece::{
+            Color,
+            Piece,
+        },
+        piece_ext::PieceExt,
+    },
+    movement::step::Step,
+};
+
+/// Represents the movement report of a single piece.
+#[derive(Clone)]
+pub struct Report{
+    piece: Piece,
+    check: bool,
+    steps: Vec<Step>,
+    search_checkmate: bool,
+}
+
+impl Report{
+    
+    pub fn new(
+        piece: Piece,
+        search_checkmate: bool,
+    ) -> Self {
+
+        Report {
+            piece: piece,
+            check: false,
+            steps: Vec::new(),
+            search_checkmate,
+        }
+    }
+
+    // pub fn new_search_checkmate(
+    //     piece: Piece,
+    // ) -> Self{
+
+    //     Report {
+    //         piece: piece,
+    //         check: false,
+    //         steps: Vec::new(),
+    //         search_checkmate: true,
+    //     }
+    // }
+
+    pub fn is_check(&self) -> bool{
+        self.check.clone()
+    }
+
+    pub fn set_check(&mut self) {
+        self.check = true;
+    }
+
+    // returns false if target is occupied by a rival or ally.
+    pub fn include_step(
+        &mut self, 
+        board: &Board,
+        target_column: i8,
+        target_row: i8,
+        // used by pawn. If true, it will not include empty positions.
+        no_empty: bool,
+        // used by pawn. If true, it will not include rival positions.
+        no_rival: bool,
+    ) -> bool {
+        let current_color: Color = self.piece.get_color();
+
+        if(target_column < 0) || (target_row < 0) || (target_column > 7) || (target_row > 7){
+            // target_column or target_row is outside board's boundaries.
+            return false;
+        }
+
+        let target_piece: Piece = board.get_piece(
+            target_column as u8,                // col: u8,
+            target_row as u8,                   // row: u8,
+        );
+
+        let target_color: Color = target_piece.get_color();
+
+        match (current_color, target_color) {
+            (Color::EMPTY, _) => { panic!("Error when calling report.include_step. Own color is empty."); },
+            (Color::BLACK, Color::WHITE) | (Color::WHITE, Color::BLACK) => {
+                // Rival position, returns false.
+                if !no_rival {
+                    // If above is true (used by pawn), ignores rival positions.
+                    if target_piece.is_king() {
+                        self.set_check();
+                    }
+
+                    if !self.search_checkmate{
+                        // If this is true, we're only checking for checkmate. We won't use steps.
+                        let step: Step = Step::new(
+                            self.piece.clone(),     // current: Piece,
+                            target_piece,           // target: Piece,
+                        );
+    
+                        self.steps.push(step);
+                    }
+                }
+
+                return false
+            },
+            (Color::BLACK, Color::BLACK) | (Color::WHITE, Color::WHITE) => {
+                // Ally position, doesn't include anything and returns false.
+                return false;
+            }
+            (_, Color::EMPTY) => {
+                // Empty position, returns true.
+                if !no_empty {
+                    // If this is true (used by pawn), ignores empty spots.
+                    if !self.search_checkmate{
+                        // If this is true, we're only checking for checkmate. We won't allocate steps.
+                    
+                        let step: Step = Step::new(
+                            self.piece.clone(),// current: Piece, 
+                            target_piece,// target: Piece,
+                        );
+
+                        self.steps.push(step);
+                    }
+                }
+
+                return true;
+            }
+        }
+    }
+
+    pub fn is_step_here(&self, step: &Step) -> bool {
+        // Will not even count if the player is not the same.
+        if self.piece != step.current_piece{ 
+            return false;
+        }
+
+        for value in &self.steps{
+            if value == step {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    pub fn can_avoid_checkmate(
+        &mut self,
+        board: &mut Board,
+    ) -> bool {
+        // If any of the possible moves can clear out check status, then it isn't checkmate.
+        for step in &mut self.steps{
+            if step.can_avoid_checkmate(
+                board,                              // board: &mut Board,
+            ){
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Use the row and column value to return the index in the board.
+    /// This equation is simple, but if I miss something in it, the compiler will not notice.
+    /// Which is why I turned into a stateless method. Less risky.
+    pub fn col_row_to_index(col: u8, row: u8) -> u8 {
+        return row * 8 + col
+    }
+
+    /// Check for the positions in a straight line according to go_right and go_down.
+    /// Count up to max_steps and stops when it finds an ally or is outside the board.
+    pub fn count_steps(
+        &mut self,
+        go_right: i8, 
+        go_down: i8,
+        max_steps: i8,
+        board: &Board,
+    ) {
+        let start_col: u8 = self.piece.get_column();
+        let start_row: u8 = self.piece.get_row();
+        // let color: Color = self.piece.get_color();
+
+        // Using i8 to reduce type casting in each computation.
+        // Without this panic, a bug like this could be hard to find.
+        if max_steps < 0 {
+            panic!("Error in count_steps. Max_steps is negative: {}\n", max_steps);
+        }
+    
+        // let mut col: i8;
+        // let mut row: i8;
+        for counter in 1..(max_steps + 1){
+            let col: i8 = start_col as i8 + go_right * counter;
+            let row: i8 = start_row as i8 + go_down * counter;
+
+            if !self.include_step(
+                board,                              // board: &Board, 
+                col,                                // target_column: i8, 
+                row,                                // target_row: i8, 
+                false,                              // no_empty: bool, 
+                false,                              // no_rival: bool,
+            ){
+                // Function above returns true only as it meets empty positions.
+                // So if false, stop counting.
+                break;
+            }
+        }
+    }
+
+    // Rook, Queen and King use this. Saves a lot of lines.
+    pub fn apply_valid_ortogonal_positions(
+        &mut self,
+        max_steps: i8,
+        board: &Board,
+    ){
+        // Count all steps available to the right of the piece.
+        self.count_steps(
+            1,                 // go_right: i8,
+            0,                 // go_down: i8,
+            max_steps,         // max_steps: i8,
+            &board,            // board: &Board,
+        );
+
+        // Count all steps available to the left of the piece.
+        self.count_steps(
+            -1,                // go_right: i8,
+            0,                 // go_down: i8,
+            max_steps,         // max_steps: i8,
+            &board,            // board: &Board,
+        );
+
+        // Count all steps available below the piece.
+        self.count_steps(
+            0,                 // go_right: i8,
+            1,                 // go_down: i8,
+            max_steps,         // max_steps: i8,
+            &board,            // board: &Board,
+        );
+
+        // Count all the steps available above the piece.
+        self.count_steps(
+            0,                 // go_right: i8,
+            -1,                // go_down: i8,
+            max_steps,         // max_steps: i8,
+            &board,            // board: &Board,
+        );
+    }
+
+    // Bishop, Queen and King use this. Saves a lot of lines.
+    pub fn apply_valid_diagonal_positions(
+        &mut self, 
+        max_steps: i8,
+        board: &Board,
+    ){
+        // count steps available down right
+        self.count_steps(
+            1,                  // go_right: i8, 
+            1,                  // go_down: i8, 
+            max_steps,          // max_steps: i8, 
+            board,              // board: &Board
+        );
+
+        // count steps available down left
+        self.count_steps(
+            -1,                 // go_right: i8, 
+            1,                  // go_down: i8, 
+            max_steps,          // max_steps: i8, 
+            board,              // board: &Board
+        );
+
+        // count steps available up right
+        self.count_steps(
+            1,                  // go_right: i8, 
+            -1,                 // go_down: i8, 
+            max_steps,          // max_steps: i8, 
+            board,              // board: &Board
+        );
+
+        // count steps available up left
+        self.count_steps(
+            -1,                 // go_right: i8, 
+            -1,                 // go_down: i8, 
+            max_steps,          // max_steps: i8, 
+            board,              // board: &Board
+        );
+    }
+}
+'''
+'''--- src/movement/step.rs ---
+use crate::{
+    board::Board,
+    pieces::{
+        piece::{
+            Color,
+            Piece,
+        },
+        piece_ext::PieceExt,
+    },
+    player::player::Player,
+};
+
+/// This represents a single possible step for one piece.
+/// We use it for testing for checkmate.
+#[derive(Clone)]
+pub struct Step{
+    pub current_piece: Piece,
+    pub target_piece: Piece,
+    pub moved: bool,
+}
+
+impl PartialEq for Step{
+    fn eq(&self, other: &Self) -> bool {
+        let self_piece: u8 = self.current_piece.get_piece_number();
+        let other_piece: u8 = other.current_piece.get_piece_number();
+
+        let self_current_column: u8 = self.current_piece.get_column();
+        let self_current_row: u8 = self.current_piece.get_row();
+
+        let self_target_column: u8 = self.target_piece.get_column();
+        let self_target_row: u8 = self.target_piece.get_row();
+
+        let other_current_column: u8 = other.current_piece.get_column();
+        let other_current_row: u8 = other.current_piece.get_row();
+
+        let other_target_column: u8 = other.target_piece.get_column();
+        let other_target_row: u8 = other.target_piece.get_row();
+
+        (self_piece == other_piece)
+        && (self_current_column == other_current_column)
+        && (self_current_row == other_current_row)
+        && (self_target_column == other_target_column)
+        && (self_target_row == other_target_row)
+    }
+}
+
+impl std::fmt::Display for Step {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let start_col: u8 = self.current_piece.get_column();
+        let start_row: u8 = self.current_piece.get_row();
+        
+        let end_col: u8 = self.target_piece.get_column();
+        let end_row: u8 = self.target_piece.get_row();
+
+        write!(f, "[({}, {}), ({},{})]", 
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+        )
+    }
+}
+
+impl Step{
+    pub fn new(
+        current: Piece,
+        target: Piece,
+    ) -> Self{
+        Step{
+            current_piece: current,
+            target_piece: target,
+            moved: false,
+        }
+    }
+
+    pub fn new_index(
+        current: u8,
+        target: u8,
+        board: &Board,
+    ) -> Self {
+        let current_piece: Piece = board.get_piece_index(
+            current,// index: u8,
+        );
+        
+        let target_piece: Piece = board.get_piece_index(
+            target,// index: u8,
+        );
+
+        Step{
+            current_piece,
+            target_piece,
+            moved: false,
+        }
+    }
+
+    pub fn commit_move(
+        &mut self,
+        board: &mut Board,
+    ) {
+        let start_col: u8 = self.current_piece.get_column();
+        let start_row: u8 = self.current_piece.get_row();
+        let piece_number: u8 = self.current_piece.get_piece_number();
+        let end_col: u8 = self.target_piece.get_column();
+        let end_row: u8 = self.target_piece.get_row();
+
+        // Replace current position with an empty piece
+        board.replace_piece(
+            0,                              // piece_number: u8, 
+            start_col,                      // col: u8,
+            start_row,                      // row: u8,
+        );
+
+        // Replace target position with starting piece.
+        board.replace_piece(
+            piece_number,                   // piece_number: u8, 
+            end_col,                        // col: u8,
+            end_row,                        // row: u8,
+        );
+
+        // Step has concluded.
+        self.moved = true;
+    }
+
+    pub fn revert_move(
+        &mut self,
+        board: &mut Board,
+    ){
+        let start_piece_number: u8 = self.current_piece.get_piece_number();
+        let start_col: u8 = self.current_piece.get_column();
+        let start_row: u8 = self.current_piece.get_row();
+
+        let end_piece_number: u8 = self.target_piece.get_piece_number();
+        let end_col: u8 = self.target_piece.get_column();
+        let end_row: u8 = self.target_piece.get_row();
+
+        // Replace starting position with starting piece.
+        board.replace_piece(
+            start_piece_number,             // piece_number: u8, 
+            start_col,                      // col: u8,
+            start_row,                      // row: u8,
+        );
+
+        // Replace target position with target piece.
+        board.replace_piece(
+            end_piece_number,               // piece_number: u8, 
+            end_col,                        // col: u8,
+            end_row,                        // row: u8,
+        );
+
+        // Step is still to be concluded.
+        self.moved = false;
+    }
+
+    /// commit_finalize and revert_finalize does the same as commit_move and commit_revert, but to the final state of the board.
+    /// Should be used after the movement is considered valid.
+    pub fn commit_finalize(
+        &mut self,
+        board: &mut Board,
+    ){
+        let start_col: u8 = self.current_piece.get_column();
+        let start_row: u8 = self.current_piece.get_row();
+        let piece_number: u8 = self.current_piece.get_piece_number();
+        let end_col: u8 = self.target_piece.get_column();
+        let end_row: u8 = self.target_piece.get_row();
+
+        board.finalize_movement(
+            0,                              // piece_number: u8,
+            start_col,                      // col: u8, 
+            start_row,                      // row: u8,
+        );
+
+        board.finalize_movement(
+            piece_number,                   // piece_number: u8,
+            end_col,                        // col: u8, 
+            end_row,                        // row: u8,
+        );
+    }
+
+    pub fn revert_finalize(
+        &mut self,
+        board: &mut Board,
+    ){
+        let start_piece_number: u8 = self.current_piece.get_piece_number();
+        let start_col: u8 = self.current_piece.get_column();
+        let start_row: u8 = self.current_piece.get_row();
+
+        let end_piece_number: u8 = self.target_piece.get_piece_number();
+        let end_col: u8 = self.target_piece.get_column();
+        let end_row: u8 = self.target_piece.get_row();
+
+        board.finalize_movement(
+            start_piece_number,             // piece_number: u8,
+            start_col,                      // col: u8, 
+            start_row,                      // row: u8,
+        );
+
+        board.finalize_movement(
+            end_piece_number,               // piece_number: u8,
+            end_col,                        // col: u8, 
+            end_row,                        // row: u8,
+        );
+
+    }
+
+    /// Build a rival player and see if current player is under check after this move.
+    pub fn can_avoid_checkmate(&mut self, board: &mut Board) -> bool {
+        let current_color: Color = self.current_piece.get_color();
+
+        let rival_color: Color = match current_color {
+            Color::EMPTY => panic!("Error in Step.can_avoid_checkmate. Current_color is Empty."),
+            Color::BLACK => Color::WHITE,
+            Color::WHITE => Color::BLACK,
+        };
+
+        self.commit_move(
+            board,                          // board: &mut Board,
+        );
+
+        let mut rival_player: Player = Player::new(
+            rival_color,                    // color: Color,
+            board,                          // board: &Board,
+        );
+
+        // search_checkmate = true means it won't allocate any step
+        // Does rival player has current under check?
+        rival_player.build_reports(
+            board,                          // board: &Board, 
+            true,                           // search_checkmate: bool,
+        );
+
+        self.revert_move(
+            board,                          // board: &mut Board,
+        );
+
+        // if this move (step) really clears out current player's check state, then next instruction will return false.
+        return !rival_player.is_check();
+    }
+}
+
+'''
+'''--- src/pieces.rs ---
+pub mod bishop;
+pub mod empty;
+pub mod king;
+pub mod knight;
+pub mod pawn;
+pub mod piece;
+pub mod piece_ext;
+pub mod queen;
+pub mod rook;
+
+'''
+'''--- src/pieces/bishop.rs ---
+use std::clone::Clone;
+
+use crate::{
+    board::Board,
+    pieces::{
+        piece::{
+            Color,
+            Piece,
+        },
+        piece_ext::PieceExt,
+    },
+    movement::report::Report,
+};
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct Bishop{
+    color: Color,
+    current_column: u8,
+    current_row: u8,
+}
+
+impl PieceExt for Bishop{
+    fn new(
+        piece_number: u8,
+        column: u8, 
+        row: u8,
+    ) -> Self {
+        let color: Color;
+        if piece_number == 4 {
+            color = Color::WHITE;
+        } else if piece_number == 10 {
+            color = Color::BLACK;
+        } else {
+            panic!("Error in Bishop Constructor. Attempted to create piece with invalid number({}).", piece_number);
+        }
+        // assert!((piece_number==4) || (piece_number==10), "Error in Bishop Constructor. Attempted to create piece with invalid number({}).", piece_number);
+        Bishop{
+            color,
+            current_column: column,
+            current_row: row,
+        }
+    }
+
+    fn get_piece_number(&self) -> u8{
+        let name: &str = "bishop";
+        match self.color{
+            Color::WHITE => 4,
+            Color::BLACK => 10,
+            Color::EMPTY => panic!("Invalid color for {}.get_piece_number. Own color is empty.", name),
+        }
+    }
+
+    fn get_column(&self) -> u8 {
+        return self.current_column;
+    }
+
+    fn get_row(&self) -> u8 {
+        return self.current_row;
+    }
+
+    fn get_color(&self) -> Color{
+        let color = self.color.clone();
+        color
+    }
+
+    fn is_king(&self) -> bool {
+        false
+    }
+
+    fn get_movement_report(
+        &self,
+        board: &Board, 
+        search_checkmate: bool,
+    ) -> Report {
+        // log(&format!("Getting Bishop Report"));
+        let mut report: Report = Report::new(
+            Piece::BISHOP(self.clone()),// piece: Piece, 
+            search_checkmate,           // search_checkmate: bool,
+        );
+
+        report.apply_valid_diagonal_positions(
+            7,                 // max_steps: i8, 
+            &board,                     // board: &Board,
+        );
+
+        report
+    }
+}
+
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
+
+//     #[test]
+//     fn
+// }
+
+'''
+'''--- src/pieces/empty.rs ---
+use std::clone::Clone;
+
+use crate::{
+    // log,
+    board::Board,
+    pieces::{
+        piece::{
+            Color,
+            // Piece,
+        },
+        piece_ext::PieceExt,
+    },
+    movement::report::Report,
+};
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct Empty{
+    current_column: u8,
+    current_row: u8,
+}
+
+impl PieceExt for Empty{
+    fn new(
+        piece_number: u8,
+        column: u8, 
+        row: u8,
+    ) -> Self {
+        if piece_number != 0 {
+            panic!("Tried to create Empty Piece with number {} ", piece_number);
+        }
+
+        Empty{
+            current_column: column,
+            current_row: row,
+        }
+    }
+
+    fn get_piece_number(&self) -> u8{
+        0
+    }
+
+    fn get_column(&self) -> u8 {
+        return self.current_column;
+    }
+
+    fn get_row(&self) -> u8 {
+        return self.current_row;
+    }
+
+    fn get_color(&self) -> Color{
+        Color::EMPTY
+    }
+
+    fn is_king(&self) -> bool {
+        false
+    }
+
+    fn get_movement_report(
+        &self,
+        _board: &Board, 
+        _search_checkmate: bool,
+    ) -> Report {           
+
+       panic!("Tried to get Movement Report from an empty Position");
+    }
+
+}
+
+'''
+'''--- src/pieces/king.rs ---
+use std::clone::Clone;
+
+use crate::{
+    board::Board,
+    pieces::{
+        piece::{
+            Color,
+            Piece,
+        },
+        piece_ext::PieceExt,
+    },
+    movement::report::Report,
+};
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct King{
+    color: Color,
+    current_column: u8,
+    current_row: u8,
+}
+
+impl PieceExt for King{
+    fn new(
+        piece_number: u8,
+        column: u8, 
+        row: u8,
+    ) -> Self {
+        let color: Color;
+        if piece_number == 6 {
+            color = Color::WHITE;
+        } else if piece_number == 12 {
+            color = Color::BLACK;
+        } else {
+            panic!("Error in King Constructor. Attempted to create piece with invalid number({}).", piece_number);
+        }
+        
+        King{
+            color,
+            current_column: column,
+            current_row: row,
+        }
+    }
+
+    fn get_piece_number(&self) -> u8{
+        let name: &str = "king";
+        match self.color{
+            Color::WHITE => 6,
+            Color::BLACK => 12,
+            Color::EMPTY => panic!("Invalid color for {}.get_piece_number. Own color is empty.", name),
+        }
+    }
+
+    fn get_column(&self) -> u8 {
+        return self.current_column;
+    }
+
+    fn get_row(&self) -> u8 {
+        return self.current_row;
+    }
+
+    fn get_color(&self) -> Color{
+        let color = self.color.clone();
+        color
+    }
+
+    fn is_king(&self) -> bool {
+        true
+    }
+
+    fn get_movement_report(
+        &self,
+        board: &Board, 
+        search_checkmate: bool,
+    ) -> Report {           
+
+        // log(&format!("Getting King Report"));
+        let mut report: Report = Report::new(
+            Piece::KING(self.clone()),      // piece: Piece,
+            search_checkmate                ,// search_checkmate: bool,
+        );
+
+        report.apply_valid_ortogonal_positions(
+            1,                              // max_steps: i8,
+            board,                          // board: &Board,
+        );
+
+        report.apply_valid_diagonal_positions(
+            1,                              // max_steps: i8,
+            board,                          // board: &Board,
+        );
+
+        if report.is_check() {
+            panic!("Somehow the king managed to enable check. This shouldn't be possible.");
+        }
+
+        report
+    }
+
+}
+
+'''
+'''--- src/pieces/knight.rs ---
+use crate::{
+    board::Board,
+    pieces::{
+        piece::{
+            Color,
+            Piece,
+        },
+        piece_ext::PieceExt,
+    },
+    movement::report::Report,
+};
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct Knight{
+    color: Color,
+    current_column: u8,
+    current_row: u8,
+}
+
+impl PieceExt for Knight{
+    fn new(
+        piece_number: u8,
+        column: u8, 
+        row: u8,
+    ) -> Self {
+        let color: Color;
+        if piece_number == 3 {
+            color = Color::WHITE;
+        } else if piece_number == 9 {
+            color = Color::BLACK;
+        } else {
+            panic!("Error in Knight Constructor. Attempted to create piece with invalid number({}).", piece_number);
+        }
+
+        Knight{
+            color,
+            current_column: column,
+            current_row: row,
+        }
+    }
+
+    fn get_piece_number(&self) -> u8{
+        let name: &str = "knight";
+        match self.color{
+            Color::WHITE => 3,
+            Color::BLACK => 9,
+            Color::EMPTY => panic!("Invalid color for {}.get_piece_number. Own color is empty.", name),
+        }
+    }
+
+    fn get_column(&self) -> u8 {
+        return self.current_column;
+    }
+
+    fn get_row(&self) -> u8 {
+        return self.current_row;
+    }
+
+    fn get_color(&self) -> Color{
+        let color = self.color.clone();
+        color
+    }
+    
+    fn is_king(&self) -> bool {
+        false
+    }
+
+    fn get_movement_report(
+        &self,
+        board: &Board, 
+        search_checkmate: bool,
+    ) -> Report {
+        // let mut valid_positions: Vec<u8> = Vec::with_capacity(8);
+            
+        // log(&format!("Getting Knight report"));
+        let mut report: Report= Report::new(
+            Piece::KNIGHT(self.clone()),    // piece: Piece,
+            search_checkmate,               // search_checkmate: bool,
+        );
+
+        let row: i8 = self.current_row as i8;
+        let col: i8 = self.current_column as i8;
+        
+        // X: Position in the board.
+        // K: Where knight is located.
+        // 1 to 8: All positions where knight can move.
+
+        // - - - - - - - -
+        // - - - - - - - -
+        // - - - 8 - 7 - -
+        // - - 4 - - - 2 -
+        // - - - - K - - -
+        // - - 3 - - - 1 -
+        // - - - 6 - 5 - -
+        // - - - - - - - -
+
+        // This are all the possible positions that the knight can try to occupy.
+        let position_candidates: [(i8, i8); 8] = [
+            (col + 2, row + 1),             // 1
+            (col + 2, row - 1),             // 2
+            (col - 2, row + 1),             // 3
+            (col - 2, row - 1),             // 4
+            (col + 1, row + 2),             // 5
+            (col - 1, row + 2),             // 6
+            (col + 1, row - 2),             // 7
+            (col - 1, row - 2),             // 8
+        ];
+        position_candidates.map(|(col, row)| {
+
+            report.include_step(
+                board,                      // board: &Board, 
+                col,                        // target_column: i8, 
+                row,                        // target_row: i8, 
+                false,                      // no_empty: bool, 
+                false,                      // no_rival: bool,
+            );
+        });
+
+        report
+    }
+}
+'''
+'''--- src/pieces/pawn.rs ---
+use crate::{
+    board::Board,
+    pieces::{
+        piece::{
+            Color,
+            Piece,
+        },
+        piece_ext::PieceExt,
+    },
+    movement::report::Report,
+};
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct Pawn{
+    color: Color,
+    current_column: u8,
+    current_row: u8,
+}
+
+impl Pawn{
+    fn is_first_move(&self) -> bool {
+
+        return match self.color{
+            Color::WHITE => {
+                self.current_row == 6
+            },
+            Color::BLACK => {
+                self.current_row == 1
+            },
+            _ => {
+                panic!("Error in Pawn.is_first_move. Own color is Empty.")
+            }
+        }
+    }
+}
+
+impl PieceExt for Pawn{
+    fn new(
+        piece_number: u8,
+        column: u8, 
+        row: u8,
+    ) -> Self {
+        let color: Color;
+        if piece_number == 1 {
+            color = Color::WHITE;
+        } else if piece_number == 7 {
+            color = Color::BLACK;
+        } else {
+            panic!("Error in Pawn Constructor. Attempted to create piece with invalid number({}).", piece_number);
+        }
+        Pawn{
+            color,
+            current_column: column,
+            current_row: row,
+        }
+    }
+
+    fn get_piece_number(&self) -> u8{
+        let name: &str = "pawn";
+
+        match self.color{
+            Color::WHITE => 1,
+            Color::BLACK => 7,
+            Color::EMPTY => panic!("Invalid color for {}.get_piece_number. Own color is empty.", name),
+        }
+    }
+
+    fn get_column(&self) -> u8 {
+        return self.current_column;
+    }
+
+    fn get_row(&self) -> u8 {
+        return self.current_row;
+    }
+
+    fn get_color(&self) -> Color{
+        let color = self.color.clone();
+        color
+    }
+
+    fn is_king(&self) -> bool {
+        false
+    }
+
+    fn get_movement_report(
+        &self,
+        board: &Board, 
+        search_checkmate: bool,
+    ) -> Report {
+        
+        // log(&format!("Getting Pawn Report"));
+        let mut report: Report = Report::new(
+            Piece::PAWN(self.clone()),          // piece: Piece,
+            search_checkmate,                   // search_checkmate: bool,
+        );
+
+        let color: &Color = &self.color;
+        
+        let col = self.get_column();
+        let row = self.get_row();
+        
+        // Black on top
+        // White bottom
+        let step: i8 = match color{
+            Color::EMPTY => { panic!("Invalid color for pawn in get_valid_positions. Value is EMPTY."); },
+            Color::BLACK => { 1 },
+            Color::WHITE => { -1 },
+        };
+
+        let front_step = row as i8 + step;
+
+        report.include_step(
+            board,                                  // board: &Board, 
+            col as i8,                              // target_column: i8, 
+            front_step,                             // target_row: i8, 
+            false,                                  // no_empty: bool, 
+            true,                                   // no_rival: bool,
+        );
+        
+        if self.is_first_move() {
+            // If the pawn never moved, it can take an extra step forward.
+            report.include_step(
+                board,                              // board: &Board, 
+                col as i8,                          // target_column: i8, 
+                front_step + step,                  // target_row: i8, 
+                false,                              // no_empty: bool, 
+                true,                               // no_rival: bool,
+            );
+        }
+        
+        report.include_step(
+            board,                                  // board: &Board, 
+            col as i8 +1,                           // target_column: i8, 
+            front_step,                             // target_row: i8, 
+            true,                                   // no_empty: bool, 
+            false,                                  // no_rival: bool,
+        );
+
+        report.include_step(
+            board,                                  // board: &Board, 
+            col as i8 - 1,                          // target_column: i8, 
+            front_step,                             // target_row: i8, 
+            true,                                   // no_empty: bool, 
+            false,                                  // no_rival: bool,
+        );
+
+        report
+    }
+}
+
+'''
+'''--- src/pieces/piece.rs ---
+use crate::{
+    board::Board,
+    movement::report::Report,
+    pieces::{
+        piece_ext::PieceExt,
+        bishop::Bishop,
+        empty::Empty,
+        knight::Knight,
+        king::King,
+        pawn::Pawn,
+        queen::Queen,
+        rook::Rook,
+    },
+};
+
+// empty:           0    
+// white pawn:      1    
+// white rook:      2    
+// white knight:    3    
+// white bishop:    4    
+// white queen:     5    
+// white king:      6    
+// black pawn:      7    
+// black rook:      8    
+// black knight:    9    
+// black bishop:    10   
+// black queen:     11   
+// black king:      12   
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Color{
+    EMPTY,
+    WHITE,
+    BLACK,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Piece{
+    BISHOP( Bishop ),
+    EMPTY(  Empty  ),
+    KING(   King   ),
+    KNIGHT( Knight ),
+    PAWN(   Pawn   ),
+    QUEEN(  Queen  ),
+    ROOK(   Rook   ),
+}
+
+impl Default for Piece{
+    fn default() -> Self{
+        Piece::new(
+            0,      // piece_number: u8, 
+            0,      // column: u8, 
+            0,      // row: u8,
+        )
+    }
+}
+
+impl Piece{
+    pub fn get_piece_name(
+        piece_number: u8,
+    ) -> String {
+        let color: &str = {
+            if piece_number == 0 {
+                ""
+            } else if piece_number < 7{
+                "White"
+            } else {
+                "Black"
+            }
+        };
+
+        let name: &str = match piece_number{
+            0 => { "Empty" },
+            1 | 7  => { " Pawn" },
+            2 | 8  => { " Rook" },
+            3 | 9  => { " Knight" },
+            4 | 10 => { " Bishop" },
+            5 | 11 => { " Queen" },
+            6 | 12 => { " King" },
+            _      => { panic!("Invalid argument for piece_number ({}) in Piece constructor.", piece_number);   },
+        };
+
+        format!("{}{}", color, name)
+    }
+}
+
+impl PieceExt for Piece{
+    fn new(
+        piece_number: u8,
+        column: u8, 
+        row: u8,
+    ) -> Self {
+        match piece_number{
+            0      => { return Piece::EMPTY(Empty::new(piece_number, column, row));                             },
+            1 | 7  => {
+                // if pawn reaches the last position of the board, replace the piece with a queen.
+                if (piece_number == 1) && (row == 0) || (piece_number == 7) && (row == 7){
+                    return Piece::QUEEN(
+                        Queen::new(
+                            piece_number + 4,           // piece_number: u8, 
+                            column,                     // column: u8, 
+                            row,                        // row: u8,
+                        )
+                    )
+                }
+
+                return Piece::PAWN(Pawn::new(piece_number, column, row));
+            },
+            2 | 8  => { return Piece::ROOK(Rook::new(piece_number, column, row));                               },
+            3 | 9  => { return Piece::KNIGHT(Knight::new(piece_number, column, row));                           },
+            4 | 10 => { return Piece::BISHOP(Bishop::new(piece_number, column, row));                           },
+            5 | 11 => { return Piece::QUEEN(Queen::new(piece_number, column, row));                             },
+            6 | 12 => { return Piece::KING(King::new(piece_number, column, row));                               },
+            _      => { panic!("Invalid argument for piece_number ({}) in Piece constructor.", piece_number);   },
+        }
+    }
+
+    fn get_piece_number(&self) -> u8{                
+        match &self{
+            Piece::EMPTY(value)  => { return value.get_piece_number(); },
+            Piece::PAWN(value)   => { return value.get_piece_number(); },
+            Piece::ROOK(value)   => { return value.get_piece_number(); },
+            Piece::KNIGHT(value) => { return value.get_piece_number(); },
+            Piece::BISHOP(value) => { return value.get_piece_number(); },
+            Piece::QUEEN(value)  => { return value.get_piece_number(); },
+            Piece::KING(value)   => { return value.get_piece_number(); },
+        }
+    }
+
+    fn get_column(&self) -> u8 {
+        match &self{
+            Piece::EMPTY(value)  => { return value.get_column(); },
+            Piece::PAWN(value)   => { return value.get_column(); },
+            Piece::ROOK(value)   => { return value.get_column(); },
+            Piece::KNIGHT(value) => { return value.get_column(); },
+            Piece::BISHOP(value) => { return value.get_column(); },
+            Piece::QUEEN(value)  => { return value.get_column(); },
+            Piece::KING(value)   => { return value.get_column(); },
+        }
+    }
+
+    fn get_row(&self) -> u8 {
+        match &self{
+            Piece::EMPTY(value)  => { return value.get_row(); },
+            Piece::PAWN(value)   => { return value.get_row(); },
+            Piece::ROOK(value)   => { return value.get_row(); },
+            Piece::KNIGHT(value) => { return value.get_row(); },
+            Piece::BISHOP(value) => { return value.get_row(); },
+            Piece::QUEEN(value)  => { return value.get_row(); },
+            Piece::KING(value)   => { return value.get_row(); },
+        }
+    }
+
+    fn get_color(&self) -> Color{
+        match &self{
+            Piece::EMPTY(value)  => { return value.get_color(); },
+            Piece::PAWN(value)   => { return value.get_color(); },
+            Piece::ROOK(value)   => { return value.get_color(); },
+            Piece::KNIGHT(value) => { return value.get_color(); },
+            Piece::BISHOP(value) => { return value.get_color(); },
+            Piece::QUEEN(value)  => { return value.get_color(); },
+            Piece::KING(value)   => { return value.get_color(); },
+        }
+    }
+
+    fn is_king(&self) -> bool {
+        match &self{
+            Piece::EMPTY(value)  => { return value.is_king(); },
+            Piece::PAWN(value)   => { return value.is_king(); },
+            Piece::ROOK(value)   => { return value.is_king(); },
+            Piece::KNIGHT(value) => { return value.is_king(); },
+            Piece::BISHOP(value) => { return value.is_king(); },
+            Piece::QUEEN(value)  => { return value.is_king(); },
+            Piece::KING(value)   => { return value.is_king(); },
+        }
+    }
+
+    fn get_movement_report(
+        &self,
+        board: &Board, 
+        search_checkmate: bool,
+    ) -> Report {
+        match &self{
+            Piece::EMPTY(value)  => { return value.get_movement_report(&board, search_checkmate); },
+            Piece::PAWN(value)   => { return value.get_movement_report(&board, search_checkmate); },
+            Piece::ROOK(value)   => { return value.get_movement_report(&board, search_checkmate); },
+            Piece::KNIGHT(value) => { return value.get_movement_report(&board, search_checkmate); },
+            Piece::BISHOP(value) => { return value.get_movement_report(&board, search_checkmate); },
+            Piece::QUEEN(value)  => { return value.get_movement_report(&board, search_checkmate); },
+            Piece::KING(value)   => { return value.get_movement_report(&board, search_checkmate); },
+        }
+    }
+
+}
+
+'''
+'''--- src/pieces/piece_ext.rs ---
+use crate::{
+    board::Board,
+    pieces::{
+        piece::{
+            Color,
+            Piece,
+        }
+    },
+    movement::report::Report,
+};
+
+pub trait PieceExt{
+    /// Create a new instance of this Piece. 
+    fn new(
+        piece_number: u8,
+        target_column: u8,
+        target_row: u8,
+    ) -> Self;
+
+    fn get_piece_number(&self) -> u8;
+
+    fn get_column(&self) -> u8;
+
+    fn get_row(&self) -> u8;
+
+    fn get_color(&self) -> Color;
+
+    fn is_king(&self) -> bool;
+
+    /// Represents all the positions this piece may make.
+    fn get_movement_report(&self, board: &Board, search_checkmate: bool) -> Report;
+
+    fn are_rivals(&self, target: &Piece) -> bool {
+        let target_color: Color = target.get_color();
+        let self_color: Color = self.get_color();
+        
+        match(self_color, target_color) {
+            (Color::BLACK, Color::WHITE) => return true,
+            (Color::WHITE, Color::BLACK) => return true,
+            (Color::EMPTY, _) => panic!("Error in function is_rival. self color is Empty. This shouldn't ever be checked."),
+            (_, Color::EMPTY) => panic!("Error in function is_rival. target color is Empty. This shouldn't ever be checked."),
+            (_, _) => return false,
+        }
+    }
+
+    fn is_color(&self, target_color: &Color) -> bool {
+        let self_color: Color = self.get_color();
+        
+        return self_color == *target_color
+    }
+}
+
+'''
+'''--- src/pieces/queen.rs ---
+use std::clone::Clone;
+
+use crate::{
+    board::Board,
+    movement::report::Report,
+    pieces::{
+        piece::{
+            Color,
+            Piece,
+        },
+        piece_ext::PieceExt,
+    },
+};
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct Queen{
+    color: Color,
+    current_column: u8,
+    current_row: u8,
+}
+
+impl PieceExt for Queen{
+    fn new(
+        piece_number: u8,
+        column: u8, 
+        row: u8,
+    ) -> Self {
+        let color: Color;
+        if piece_number == 5 {
+            color = Color::WHITE;
+        } else if piece_number == 11 {
+            color = Color::BLACK;
+        } else {
+            panic!("Error in Queen Constructor. Attempted to create piece with invalid number({}).", piece_number);
+        }
+        Queen{
+            color,
+            current_column: column,
+            current_row: row,
+        }
+    }
+
+    fn get_piece_number(&self) -> u8{
+        let name: &str = "queen";
+        
+        match self.color{
+            Color::WHITE => 5,
+            Color::BLACK => 11,
+            Color::EMPTY => panic!("Invalid color for {}.get_piece_number. Own color is empty.", name),
+        }
+    }
+
+    fn get_column(&self) -> u8 {
+        return self.current_column;
+    }
+
+    fn get_row(&self) -> u8 {
+        return self.current_row;
+    }
+
+    fn get_color(&self) -> Color{
+        let color = self.color.clone();
+        color
+    }
+
+    fn is_king(&self) -> bool {
+        false
+    }
+
+    fn get_movement_report(
+        &self,
+        board: &Board, 
+        search_checkmate: bool,
+    ) -> Report {            
+        // log(&format!("Getting Queen Report"));
+        let mut report: Report = Report::new(
+            Piece::QUEEN(self.clone()),     // piece: Piece,
+            search_checkmate,               // search_checkmate: bool,
+        );
+        
+        // Queen moves like the rook...
+        report.apply_valid_ortogonal_positions(
+            7,                              // max_steps: i8, 
+            board,                          // board: &Board,
+        );
+
+        // and also like the bishop.
+        report.apply_valid_diagonal_positions(
+            7,                              // max_steps: i8, 
+            board,                          // board: &Board,
+        );
+
+        report
+    }
+}
+
+'''
+'''--- src/pieces/rook.rs ---
+use std::clone::Clone;
+
+use crate::{
+    board::Board,
+    movement::report::Report,
+    pieces::{
+        piece::{
+            Color,
+            Piece,
+        },
+        piece_ext::PieceExt,
+    },
+};
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct Rook{
+    color: Color,
+    current_column: u8,
+    current_row: u8,
+}
+
+impl PieceExt for Rook{
+    fn new(
+        piece_number: u8,
+        column: u8, 
+        row: u8,
+    ) -> Self {
+        let color: Color;
+        if piece_number == 2 {
+            color = Color::WHITE;
+        } else if piece_number == 8 {
+            color = Color::BLACK;
+        } else {
+            panic!("Error in Rook Constructor. Attempted to create piece with invalid number({}).", piece_number);
+        }
+        Rook{
+            color,
+            current_column: column,
+            current_row: row,
+        }
+    }
+
+    fn get_piece_number(&self) -> u8{
+        let name: &str = "rook";
+        
+        match self.color{
+            Color::WHITE => 2,
+            Color::BLACK => 8,
+            Color::EMPTY => panic!("Invalid color for {}.get_piece_number. Own color is empty.", name),
+        }
+    }
+
+    fn get_color(&self) -> Color{
+        let color = self.color.clone();
+        color
+    }
+
+    fn get_column(&self) -> u8 {
+        return self.current_column;
+    }
+
+    fn get_row(&self) -> u8 {
+        return self.current_row;
+    }
+
+    fn is_king(&self) -> bool {
+        false
+    }
+
+    fn get_movement_report(
+        &self,
+        board: &Board, 
+        search_checkmate: bool,
+    ) -> Report {
+        // log(&format!("Getting Rook report"));
+        let mut report: Report = Report::new(
+            Piece::ROOK(self.clone()),      // piece: Piece,
+            search_checkmate,               // search_checkmate: bool
+        );
+
+        report.apply_valid_ortogonal_positions(
+            7,                              // max_steps: i8,
+            board,                          // board: &Board,
+        );
+        
+        report
+    }
+}
+
+'''
+'''--- src/player.rs ---
+pub mod player;
+pub mod players;
+pub mod turn;
+pub mod errors;
+
+'''
+'''--- src/player/errors.rs ---
+pub enum ErrorResponse{
+    // If movement starts in a position that has no piece.
+    NoPiece,
+    // If movement starts in a position owned by a rival player
+    RivalPiece,
+    // If target position is invalid for given piece
+    InvalidMove,
+    // If the game is already over.
+    GameOver,
+}
+
+'''
+'''--- src/player/player.rs ---
+use crate::{
+    board::Board,
+    pieces::{
+        piece::{
+            Color,
+            Piece,
+        },
+        piece_ext::PieceExt,
+    },
+    player::errors::ErrorResponse,
+    movement::{
+        step::Step,
+        report::Report,
+    }
+
+};
+
+pub struct Player{
+    color: Color,    
+    pieces: Vec<Piece>,
+    latest_reports: Vec<Report>,
+    check: bool,
+    search_checkmate: bool,
+}
+
+impl Player{
+    pub fn new(
+        color: Color,
+        board: &Board,
+    ) -> Self{
+        let mut player: Player = Player{
+            color,
+            pieces: Vec::with_capacity(16),
+            latest_reports: Vec::new(),
+            check: false,
+            search_checkmate: false,
+        };
+        
+        player.build_pieces(
+            board,                                  // board: &Board,
+        );
+
+        player
+    }
+
+    fn unset_check(&mut self) {
+        self.check = false;
+    }
+
+    pub fn is_check(&mut self) -> bool {
+        self.check.clone()
+    }
+
+    pub fn set_check(&mut self) {
+        self.check = true;
+    }
+
+    pub fn is_step_valid(&self, step: &Step) -> Result<bool, ErrorResponse> {
+        // If search checkmate is true, then it won't store the positions in each report.
+        // If it was a bug, then it would be a nightmare to track. That's why I'm panicking if it's set.
+        if self.search_checkmate{
+            panic!("Error in player.is_step_valid. search_checkmate is enabled, we will not find anything here.");
+        }
+
+        if self.color != step.current_piece.get_color() {
+            return Result::Err(ErrorResponse::RivalPiece);
+        }
+
+        for report in &self.latest_reports{
+            if report.is_step_here(
+                step,                               // step: &Step,
+            ){
+                return Result::Ok(true);
+            }
+        }
+
+        Result::Ok(false)
+    }
+
+    /// Check the board for all pieces of this Player's color.
+    /// I don't like this function, we don't need to allocate this data. We can compute it directly without needing to store it's data.
+    fn build_pieces(&mut self, board: &Board){        
+        // Getting a reference (zero-copy) of color
+        let color: &Color = &self.color;
+        // Getting a mutable reference (zero-copy) of pieces
+        let pieces: &mut Vec<Piece>= &mut self.pieces;
+
+        match color{
+            Color::BLACK => board.push_black_pieces(pieces),
+            Color::WHITE => board.push_white_pieces(pieces),
+            Color::EMPTY => panic!("Invalid color for player.build_pieces. Own color is Empty."),
+        }
+    }
+
+    /// Build reports once (Own),
+    /// If under check, search for a position that clears the check (build rival reports),
+    /// Do the movement and build reports again (build rival reports)
+    pub fn build_reports(
+        &mut self, 
+        board: &Board, 
+        search_checkmate: bool,
+    ){
+        // If search checkmate is true, then it won't store the positions in each report.
+        // If it was a bug, then it would be a nightmare to track. That's why I'm storing it.
+        self.search_checkmate = search_checkmate;
+        self.build_pieces(
+            board,                                  // board: &Board,
+        );
+
+        self.unset_check();
+        let mut check = false;
+        let pieces: &Vec<Piece> = &self.pieces;
+        let reports: &mut Vec<Report> = &mut self.latest_reports;
+
+        for piece in pieces{
+            let report: Report = piece.get_movement_report(
+                board,                              // board: &Board,
+                search_checkmate,                   // search_checkmate: bool,
+            );
+
+            if report.is_check(){
+                // can't do this below due to borrow
+                // self.set_check();
+                // So we do this instead
+                check = true;
+            }
+
+            if !search_checkmate{
+                // Will not alloc any report if we are searching for checkmate
+                reports.push(report);
+            }
+            
+        }
+        // Reference is not used again, so we can use mutable borrow here.
+        if check {
+            self.set_check();
+        }
+    }
+
+    pub fn get_movement_report(&self) -> Vec<Report> {
+        self.latest_reports.clone()
+    }
+
+    pub fn can_avoid_checkmate(
+        &mut self,
+        board: &mut Board,
+    ) -> bool {
+        // If search checkmate is true, then it won't store the positions in each report.
+        // If it was a bug, then it would be a nightmare to track. That's why I'm panicking if it's set.
+        if self.search_checkmate{
+            panic!("Error in player.can_avoid_checkmate. search_checkmate is enabled, we will not find anything here.");
+        }
+
+        for report in &mut self.latest_reports {
+            if report.can_avoid_checkmate(
+                board,                              // board: &mut Board,
+            ) {
+                // This means that there's at least one movement that will save the player from check status.
+                // It's not checkmate yet.
+                return true;
+            }
+        }
+
+        false
+    }
+}
+
+'''
+'''--- src/player/players.rs ---
+use crate::{
+    board::Board,
+    pieces::{
+        piece::{
+            Color,
+            // Piece,
+        },
+        // piece_ext::PieceExt,
+    },
+    movement::{
+        // report::Report,
+        step::Step,
+    },
+    player::{
+        errors::ErrorResponse,
+        turn::Turn,
+        player::Player,
+    },
+};
+
+// use super::player;
+
+pub struct Players{
+    black: Player,
+    white: Player,
+    turn: Turn,
+}
+
+impl Players{
+    pub fn new(board: &Board, current_player: bool, turn: u8) -> Self{
+
+        // log(&format!("Creating Black Pieces"));
+        let mut black: Player = Player::new(
+            Color::BLACK,                   // color: Color, 
+            board,                          // board: &Board,
+        );
+
+        // log(&format!("Building Black Pieces"));
+        black.build_reports(
+            board,                          // board: &Board,
+            false,                          // search_checkmate: bool,
+        );
+
+        // log(&format!("Creating White Pieces"));
+        let mut white: Player = Player::new(
+            Color::WHITE,                   // color: Color,
+            board,                          // board: &Board,
+        );
+
+        // log(&format!("Building White Pieces"));
+        white.build_reports(
+            board,                          // board: &Board,
+            false,                          // search_checkmate: bool
+        );
+
+        // let turn: Turn = Turn::new();
+        let turn: Turn = Turn::new(
+            current_player,                 // current_player: bool,
+            turn,                           // turn: u8,
+        );
+
+        Players{
+            black,
+            white,
+            turn,
+        }
+    }
+    
+
+    pub fn move_to(&mut self, board: &mut Board, mut target: Step) -> Result<(), ErrorResponse> {
+
+        if self.turn.is_checkmate(){
+            return Result::Err(ErrorResponse::GameOver);
+        }
+
+        let player_color: Color = self.turn.get_current_player_color();
+        
+        let (current_player, other_player): (&mut Player, &mut Player) = match player_color{
+            Color::EMPTY => panic!("Error in Players.move_to. Own color is Empty."),
+            Color::BLACK => {
+                let current_player = &mut self.black;
+                let other_player = &mut self.white;
+
+                // log(&format!("Current Player is Black."));
+                (current_player, other_player)
+            },
+            Color::WHITE => {
+                let current_player = &mut self.white;
+                let other_player = &mut self.black;
+
+                // log(&format!("Current Player is White"));
+                (current_player, other_player)
+            }
+        };
+
+        current_player.build_reports(
+            board,                          // board: &Board,
+            false,                          // search_checkmate: bool
+        );
+
+        // ? can be used in Result type enums.
+        // If Result::Ok(value), use the value in the code.
+        // If Result::Err(err), call "return Result::Err(err)".
+        // Can only be used in functions that return the same type of Result::Err.
+        // 
+        // is_step_valid checks every piece for positions it can go to,
+        // if the piece can go there, returns true.
+        if !current_player.is_step_valid(&target)?{
+            return Result::Err(ErrorResponse::InvalidMove);
+        }
+
+        // If the function returns false, then current player will be under check after their move.
+        if !target.can_avoid_checkmate(
+            board,                          // board: &mut Board,
+        ){
+            return Result::Err(ErrorResponse::InvalidMove);
+        };
+
+        // If it reaches here, then the movement is valid and will not trigger a check own itself.
+        // Commit the move so rival can see the change.
+        target.commit_move(
+            board,                          // board: &mut Board,
+        );
+
+        // Finalize the move to update squares (the array of bytes)
+        target.commit_finalize(
+            board,                          // board: &mut Board,
+        );
+
+        // Now we have to check if rival is under check. If he/she is, then we have to see if it's checkmate.
+
+        // Rebuild the new state of current player
+        current_player.build_reports(
+            board,                          // board: &Board, 
+            false,                          // search_checkmate: bool,
+        );
+
+        // Build rival's movement reports.
+        // search_checkmate = false means that it will store the positions available. 
+        other_player.build_reports(
+            board,                          // board: &Board,
+            false,                          // search_checkmate: bool,
+        );
+
+        if current_player.is_check(){
+            match player_color{
+                Color::BLACK => {
+                    // rival player color is opposite
+                    self.turn.set_white_check();
+                },
+                Color::WHITE => {
+                    self.turn.set_black_check();
+                },
+                _ => panic!("Invalid color type for Players.move_to. Own color is Empty."),
+            }
+
+            // Returns true if there's any movement remaining that could save itself from checkmate.
+            if !other_player.can_avoid_checkmate(
+                board,                      // board: &mut Board,
+            ) {
+                // This means that there's no move that the rival player can take for saving themselves from check status
+                // Checkmate
+                // return Result::Err(ErrorResponse::CheckMate);
+                self.turn.set_checkmate();
+            }
+
+            // self.turn.next_turn()?;
+            // return Result::Err(ErrorResponse::RivalIsCheck);
+            
+        }
+        
+        // Move was successful, so we store the step and
+        // go to the next turn.
+        self.turn.next_turn(
+            // step list is not implemented yet
+            // target,                         // next_step: Step,
+        )?;
+
+        // Movement went through without any issue
+        Result::Ok(())
+    }
+
+    // pub fn get_turn_status(&self) -> (bool, u8) {
+    //     // player_turn: bool,
+    //     // turn: u8,
+    //     // squares: [u8; 64],
+    //     let player_turn: bool = self.turn.get_current_player_boolean();
+    //     let turn: u8 = self.turn.get_turn();
+    //     // let squares: [u8; 64] = board.get_board_array();
+        
+
+    //     (player_turn, turn)
+    // }
+
+    pub fn get_turn(&self) -> Turn {
+        self.turn.clone()
+    }
+}
+'''
+'''--- src/player/turn.rs ---
+use crate::{
+    pieces::{
+        piece::{
+            Color,
+        },
+    },
+    player::errors::ErrorResponse,
+};
+
+#[derive(Clone)]
+pub struct Turn{
+    // What player is currently running.
+    current_player: Color,
+    // How many turns this game went. If it reaches 255, calls reset.
+    value: u8,
+    // A list of each step taken since the start of the round.
+    // It's public so we don't have to copy when retrieving value. Just access directly.
+    // pub steps: Vec<Step>,
+    // will implement later
+    black_check: bool,
+    white_check: bool,
+    checkmate: bool,
+}
+
+impl Turn{
+    pub fn new(
+        current_player: bool,
+        value: u8,
+    ) -> Self {
+        let current_player = match current_player{
+            false => Color::WHITE,
+            true => Color::BLACK,
+        };
+
+        Turn{
+            current_player,
+            value,
+            // steps: Vec::new(),
+            black_check: false,
+            white_check: false,
+            checkmate: false,
+        }
+    }
+
+    pub fn get_current_player_color(&self) -> Color {
+        self.current_player.clone()
+    }
+
+    pub fn get_current_player_boolean(&self) -> bool{
+        match self.current_player {
+            Color::WHITE => false,
+            Color::BLACK => true,
+            _ => panic!("Error in turn.get_current_player_boolean. Own color is Empty."),
+        }
+    }
+    
+    pub fn get_value(&self) -> u8 {
+        self.value.clone()
+    }
+
+    pub fn is_black_check(&self) -> bool {
+        self.black_check.clone()
+    }
+
+    pub fn is_white_check(&self) -> bool {
+        self.white_check.clone()
+    }
+
+    pub fn is_checkmate(&self) -> bool {
+        self.checkmate.clone()
+    }
+
+    pub fn set_black_check(&mut self) {
+        self.black_check = true;
+    }
+
+    pub fn unset_black_check(&mut self) {
+        self.black_check = false;
+    }
+
+    pub fn set_white_check(&mut self) {
+        self.white_check = true;
+    }
+
+    pub fn unset_white_check(&mut self) {
+        self.white_check = false;
+    }
+
+    pub fn set_checkmate(&mut self) {
+        self.checkmate = true;
+    }
+
+    pub fn next_turn(&mut self) -> Result<(), ErrorResponse> {
+        let current_player: Color = self.current_player;
+
+        self.current_player = match current_player{
+            Color::EMPTY => panic!("Error in Turn.next_player. Own color is Empty."),
+            Color::BLACK => Color::WHITE,
+            Color::WHITE => Color::BLACK,
+        };
+
+        self.value += 1;
+        
+        // Won't store more than 128 steps, which is two or three times the average length of games.
+        // if self.turn <= 128{
+        //     self.steps.push(next_step);
+        // }
+        
+        // 255 turns is way over the top. 
+        // Probably an AI that doesn't know what to do.
+        if self.value == 255{
+            return Result::Err(ErrorResponse::GameOver)
+        }
+
+        Result::Ok(())
+    }
+
+}
+'''

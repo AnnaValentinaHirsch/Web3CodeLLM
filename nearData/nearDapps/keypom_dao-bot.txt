@@ -1,0 +1,1692 @@
+*GitHub Repository "keypom/dao-bot"*
+
+'''--- Cargo.toml ---
+[package]
+name = "dao-bot"
+version = "1.0.0"
+authors = ["Min Qian Lu"]
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+near-sdk = "4.0.0"
+uint = { version = "0.9.3", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+
+[profile.release]
+codegen-units = 1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+
+[workspace]
+members = []
+
+'''
+'''--- README.md ---
+This is a DAO bot meant to facilitate auto-registration into DAOs by leveraging [Keypom Function Call Drops](https://docs.keypom.xyz/docs/next/Concepts/KeypomProtocol/GithubReadme/TypesOfDrops/fc-drops).
+
+To learn more, visit the [DAO tutorial](https://docs.keypom.xyz/docs/next/Tutorials/Advanced/daos/introduction).
+
+'''
+'''--- __tests__/auto-registration/auto-reg-tests.ava.ts ---
+import anyTest, { TestFn } from "ava";
+import { BN, NEAR, NearAccount, Worker, getNetworkFromEnv } from "near-workspaces";
+import { CONTRACT_METADATA, displayFailureLog, generateKeyPairs, LARGE_GAS, queryAllViewFunctions, WALLET_GAS } from "../utils/general";
+import { DropConfig, FCData } from "../utils/types";
+
+type kind = {
+    Group?: String[];
+}
+
+type role = {
+    name: string;
+    kind: kind;
+};
+
+type policy = {
+    roles: role[];
+}
+
+// Parsing user roles
+function getUserRoles (policyInfo: policy, accountId: string) {
+    let roles: string[] = [];
+    roles.push('All')
+
+    // Loop through each element in res.roles
+    for (const role of policyInfo.roles) {
+        const roleKind = role.kind;
+        console.log('roleKind: ', roleKind)
+        const roleName = role.name;
+        console.log('roleName: ', roleName)
+
+        
+        console.log(roleKind.Group?.toString());
+        if (roleKind.Group?.includes(accountId)){
+            roles.push(roleName)
+        }
+    }
+
+    return roles
+}
+
+const test = anyTest as TestFn<{
+    worker: Worker;
+    accounts: Record<string, NearAccount>;
+    keypomInitialBalance: NEAR;
+    keypomInitialStateStaked: NEAR;
+}>;
+
+test.beforeEach(async (t) => {
+    // Comment this if you want to see console logs
+    //console.log = function() {}
+
+    // Init the worker and start a Sandbox server
+    const worker = await Worker.init();
+
+    // Prepare sandbox for tests, create accounts, deploy contracts, etc.
+    const root = worker.rootAccount;
+
+    // Creating dao member accounts
+    const minqi = await root.createSubAccount('minqi');
+    const member1 = await root.createSubAccount('member1');
+    const maliciousActor = await root.createSubAccount('maliciousactor');
+
+    // Deploy all 3 contracts
+    const keypom = await root.devDeploy(`./__tests__/ext_wasm/keypom.wasm`);
+    const dao = await root.devDeploy(`./__tests__/ext_wasm/sputnikdao2.wasm`);
+    const daoMalicious = await root.devDeploy(`./__tests__/ext_wasm/sputnikdao2.wasm`);
+    const daoBot = await root.devDeploy(`./testing-wasms/dao_bot.wasm`);
+
+    console.log(`KEYPOM: ${keypom.accountId}`);
+    console.log(`DAO: ${dao.accountId}`);
+    console.log(`DAO_BOT: ${daoBot.accountId}`);
+
+    // Init the dao, Keypom, and daobot contracts
+    await dao.call(dao, 'new', 
+    {
+        config: {
+            name: 'keypomtestdao', 
+            purpose: 'to test adding members automatically', 
+            metadata: ''
+        }, 
+        policy: [minqi.accountId]
+    })
+
+    await keypom.call(keypom, 'new', { root_account: 'test.near', owner_id: keypom, contract_metadata: CONTRACT_METADATA });
+
+    // Add daoBot as its own role
+    let daobot_proposal_id = await minqi.call(dao, 'add_proposal', 
+        {   proposal: {
+                description: 'adding daobot', 
+                kind: {
+                    ChangePolicyAddOrUpdateRole: {
+                        role: {
+                            name: 'keypom-daobot', 
+                            kind: { Group: [daoBot.accountId]},
+                            permissions: ['*:*'],
+                            vote_policy: {}
+                        }
+                    }
+                },
+            }
+        },
+        {gas: new BN(30 * 10**12),
+        attachedDeposit: NEAR.parse("0.1").toString()}
+    );
+    
+    await minqi.call(dao, 'act_proposal',
+    {
+        id: daobot_proposal_id,
+        action: 'VoteApprove'
+    })
+
+    // Add new-onboardee-role
+    let onboardee_proposal_id = await minqi.call(dao, 'add_proposal', 
+        {   proposal: {
+                description: 'adding onboardee role', 
+                kind: {
+                    ChangePolicyAddOrUpdateRole: {
+                        role: {
+                            name: 'new-onboardee-role', 
+                            kind: { Group: [minqi.accountId]},
+                            permissions: ['*:AddProposal'],
+                            vote_policy: {}
+                        }
+                    }
+                },
+            }
+        },
+        {gas: new BN(30 * 10**12),
+        attachedDeposit: NEAR.parse("0.1").toString()}
+    );
+    
+    await minqi.call(dao, 'act_proposal',
+    {
+        id: onboardee_proposal_id,
+        action: 'VoteApprove'
+    })
+    
+    let keypomBalance = await keypom.balance();
+    console.log('keypom available INITIAL: ', keypomBalance.available.toString())
+    console.log('keypom staked INITIAL: ', keypomBalance.staked.toString())
+    console.log('keypom stateStaked INITIAL: ', keypomBalance.stateStaked.toString())
+    console.log('keypom total INITIAL: ', keypomBalance.total.toString())
+
+    // Save state for test runs
+    t.context.worker = worker;
+    t.context.accounts = { root, keypom, dao, daoMalicious, daoBot, minqi, member1, maliciousActor };
+});
+
+// If the environment is reused, use test.after to replace test.afterEach
+test.afterEach(async t => {
+    await t.context.worker.tearDown().catch(error => {
+        console.log('Failed to tear down the worker:', error);
+    });
+});
+
+// PURPOSE: Ensure malicious actors with their own daos cannot gain access to someone else's dao
+test('Malicious Actors with their own DAOs', async t => {
+    const { keypom, dao, daoMalicious, daoBot, minqi, member1, maliciousActor } = t.context.accounts;
+
+    // Set up daoMalicious, maliciousActor's mock dao
+    await maliciousActor.call(daoMalicious, 'new', 
+    {
+        config: {
+            name: 'keypomtestdao', 
+            purpose: 'to test adding members automatically', 
+            metadata: ''
+        }, 
+        policy: [maliciousActor.accountId]
+    })
+
+    // Create malicious FC drop attempting to gain access to dao. None of these should work
+    const fcData: FCData = {
+        methods: [
+            // method 1, fake keypom args
+            [
+                {
+                    receiver_id: daoBot.accountId,
+                    method_name: "new_auto_registration",
+                    args: JSON.stringify({
+                        dao_contract: dao.accountId,
+                        proposal: {
+                            description: "mooooooooon",
+                            kind: {
+                                AddMemberToRole:{
+                                    role: "new-onboardee-role",
+                                    member_id: maliciousActor.accountId
+                                }
+                            }
+                        },
+                        funder: minqi.accountId,
+                        keypom_args:{
+                            funder_id_field: "funder",
+                            account_id_field: "proposal.kind.AddMemberToRole.member_id",
+                        }
+                    }),
+                    attached_deposit: NEAR.parse("0.1").toString()
+                }
+            ],
+            // method 2, let keypom populate keypom args but with existing values
+            [
+                {
+                    receiver_id: daoBot.accountId,
+                    method_name: "new_auto_registration",
+                    args: JSON.stringify({
+                        dao_contract: dao.accountId,
+                        proposal: {
+                            description: "mooooooooon",
+                            kind: {
+                                AddMemberToRole:{
+                                    role: "new-onboardee-role",
+                                    member_id: maliciousActor.accountId
+                                }
+                            }
+                        },
+                        funder: minqi.accountId,
+                    }),
+                    funder_id_field: "funder",
+                    account_id_field: "proposal.kind.AddMemberToRole.member_id",
+                    attached_deposit: NEAR.parse("0.1").toString()
+                }
+            ],
+        ]   
+    }   
+
+    const config: DropConfig = { 
+        uses_per_key: 2
+    }
+
+    // This should not work
+    let {keys, publicKeys} = await generateKeyPairs(1);
+    await maliciousActor.call(keypom, 'create_drop', {public_keys: publicKeys, deposit_per_use: NEAR.parse('1').toString(), fc: fcData, config}, {gas: LARGE_GAS, attachedDeposit: NEAR.parse('5.5').toString()});
+    
+    // claim both uses to test both methods
+    await keypom.setKey(keys[0]);
+    await keypom.call(keypom, 'claim', {account_id: member1.accountId}, {gas: WALLET_GAS});
+    await keypom.call(keypom, 'claim', {account_id: member1.accountId}, {gas: WALLET_GAS});
+    
+    // Ensure DAO does not have member1 as an onboardee
+    let pol: policy = await dao.view('get_policy');
+    
+    let member1dao_groups: Array<String> = getUserRoles(pol, member1.accountId);
+    t.is(member1dao_groups.includes('new-onboardee-role'), false);
+    // t.is(1==1, true);
+});
+
+// // PURPOSE: Normal claiming process
+test('Normal Claiming Process', async t => {
+    const { keypom, dao, daoBot, minqi, member1, maliciousActor, member3 } = t.context.accounts;
+
+    const fcData: FCData = {
+        methods: [
+            [
+                {
+                    receiver_id: daoBot.accountId,
+                    method_name: "new_auto_registration",
+                    args: JSON.stringify({
+                        dao_contract: dao.accountId,
+                        proposal: {
+                            description: "mooooooooon",
+                            kind: {
+                                AddMemberToRole:{
+                                    role: "new-onboardee-role",
+                                }
+                            }
+                        },
+                    }),
+                    funder_id_field: "funder",
+                    account_id_field: "proposal.kind.AddMemberToRole.member_id",
+                    attached_deposit: NEAR.parse("0.1").toString()
+                }
+            ],
+        ]   
+    }   
+
+    const config: DropConfig = { 
+        uses_per_key: 1
+    }
+
+    let {keys, publicKeys} = await generateKeyPairs(1);
+    await minqi.call(keypom, 'create_drop', {public_keys: publicKeys, deposit_per_use: NEAR.parse('1').toString(), fc: fcData, config}, {gas: LARGE_GAS, attachedDeposit: NEAR.parse('3').toString()});
+    
+    await keypom.setKey(keys[0]);
+    await keypom.call(keypom, 'claim', {account_id: member1.accountId}, {gas: WALLET_GAS});
+    
+    let pol: policy = await dao.view('get_policy');
+    let member1_groups: Array<String> = getUserRoles(pol, member1.accountId);    
+    t.is(member1_groups.includes('new-onboardee-role'), true);
+    // t.is(1==1, true);
+});
+
+// // PURPOSE: Ensure Keypom contract stored on DAO bot can be changed but only by daoBot
+test('DAO Bot Keypom Contract State Variable Security', async t => {
+    const { daoBot, minqi } = t.context.accounts;
+
+    let keypomContract = await daoBot.view("view_keypom_contract");
+    t.is(keypomContract == "v2.keypom.testnet", true);
+
+    // This should not work, try catch used to catch error and continue testing
+    try{
+        await minqi.call(daoBot, "change_keypom_contract", {new_contract: "abc.testnet"})
+    }
+    catch(err){
+        // verify it has not changed
+        t.is(keypomContract == "v2.keypom.testnet", true);
+    }
+
+    // This should work
+    await daoBot.call(daoBot, "change_keypom_contract", {new_contract: "v1-3.keypom.testnet"})
+    keypomContract = await daoBot.view("view_keypom_contract");
+    t.is(keypomContract == "v1-3.keypom.testnet", true);
+});
+'''
+'''--- __tests__/auto-registration/v1-auto-reg-tests.ava.ts ---
+import anyTest, { TestFn } from "ava";
+import { BN, NEAR, NearAccount, Worker, getNetworkFromEnv } from "near-workspaces";
+import { CONTRACT_METADATA, displayFailureLog, generateKeyPairs, LARGE_GAS, queryAllViewFunctions, WALLET_GAS } from "../utils/general";
+import { DropConfig, FCData } from "../utils/types";
+
+type kind = {
+    Group?: String[];
+}
+
+type role = {
+    name: string;
+    kind: kind;
+};
+
+type policy = {
+    roles: role[];
+}
+
+// Parsing user roles
+function getUserRoles (policyInfo: policy, accountId: string) {
+    let roles: string[] = [];
+    roles.push('All')
+
+    // Loop through each element in res.roles
+    for (const role of policyInfo.roles) {
+        const roleKind = role.kind;
+        console.log('roleKind: ', roleKind)
+        const roleName = role.name;
+        console.log('roleName: ', roleName)
+
+        
+        console.log(roleKind.Group?.toString());
+        if (roleKind.Group?.includes(accountId)){
+            roles.push(roleName)
+        }
+    }
+
+    return roles
+}
+
+const test = anyTest as TestFn<{
+    worker: Worker;
+    accounts: Record<string, NearAccount>;
+    keypomInitialBalance: NEAR;
+    keypomInitialStateStaked: NEAR;
+}>;
+
+test.beforeEach(async (t) => {
+    // Comment this if you want to see console logs
+    //console.log = function() {}
+
+    // Init the worker and start a Sandbox server
+    const worker = await Worker.init();
+
+    // Prepare sandbox for tests, create accounts, deploy contracts, etc.
+    const root = worker.rootAccount;
+
+    // Creating dao member accounts
+    const minqi = await root.createSubAccount('minqi');
+    const member1 = await root.createSubAccount('member1');
+    const maliciousActor = await root.createSubAccount('maliciousactor');
+
+    // Deploy all 3 contracts
+    const keypom = await root.devDeploy(`./__tests__/ext_wasm/keypom.wasm`);
+    const dao = await root.devDeploy(`./__tests__/ext_wasm/sputnikdao2.wasm`);
+    const daoMalicious = await root.devDeploy(`./__tests__/ext_wasm/sputnikdao2.wasm`);
+    const daoBot = await root.devDeploy(`./testing-wasms/dao_bot_v1.wasm`);
+
+    console.log(`KEYPOM: ${keypom.accountId}`);
+    console.log(`DAO: ${dao.accountId}`);
+    console.log(`DAO_BOT: ${daoBot.accountId}`);
+
+    // Init the dao, Keypom, and daobot contracts
+    await dao.call(dao, 'new', 
+    {
+        config: {
+            name: 'keypomtestdao', 
+            purpose: 'to test adding members automatically', 
+            metadata: ''
+        }, 
+        policy: [minqi.accountId]
+    })
+
+    await keypom.call(keypom, 'new', { root_account: 'test.near', owner_id: keypom, contract_metadata: CONTRACT_METADATA });
+
+    // Add daoBot as its own role
+    let daobot_proposal_id = await minqi.call(dao, 'add_proposal', 
+        {   proposal: {
+                description: 'adding daobot', 
+                kind: {
+                    ChangePolicyAddOrUpdateRole: {
+                        role: {
+                            name: 'keypom-daobot', 
+                            kind: { Group: [daoBot.accountId]},
+                            permissions: ['*:*'],
+                            vote_policy: {}
+                        }
+                    }
+                },
+            }
+        },
+        {gas: new BN(30 * 10**12),
+        attachedDeposit: NEAR.parse("0.1").toString()}
+    );
+    
+    await minqi.call(dao, 'act_proposal',
+    {
+        id: daobot_proposal_id,
+        action: 'VoteApprove'
+    })
+
+    // Add new-onboardee-role
+    let onboardee_proposal_id = await minqi.call(dao, 'add_proposal', 
+        {   proposal: {
+                description: 'adding onboardee role', 
+                kind: {
+                    ChangePolicyAddOrUpdateRole: {
+                        role: {
+                            name: 'new-onboardee-role', 
+                            kind: { Group: [minqi.accountId]},
+                            permissions: ['*:AddProposal'],
+                            vote_policy: {}
+                        }
+                    }
+                },
+            }
+        },
+        {gas: new BN(30 * 10**12),
+        attachedDeposit: NEAR.parse("0.1").toString()}
+    );
+    
+    await minqi.call(dao, 'act_proposal',
+    {
+        id: onboardee_proposal_id,
+        action: 'VoteApprove'
+    })
+    
+    let keypomBalance = await keypom.balance();
+    console.log('keypom available INITIAL: ', keypomBalance.available.toString())
+    console.log('keypom staked INITIAL: ', keypomBalance.staked.toString())
+    console.log('keypom stateStaked INITIAL: ', keypomBalance.stateStaked.toString())
+    console.log('keypom total INITIAL: ', keypomBalance.total.toString())
+
+    // Save state for test runs
+    t.context.worker = worker;
+    t.context.accounts = { root, keypom, dao, daoMalicious, daoBot, minqi, member1, maliciousActor };
+});
+
+// If the environment is reused, use test.after to replace test.afterEach
+test.afterEach(async t => {
+    await t.context.worker.tearDown().catch(error => {
+        console.log('Failed to tear down the worker:', error);
+    });
+});
+
+// PURPOSE: Ensure malicious actors with their own daos cannot gain access to someone else's dao
+test('Malicious Actors with their own DAOs', async t => {
+    const { keypom, dao, daoMalicious, daoBot, minqi, member1, maliciousActor } = t.context.accounts;
+
+    // Set up daoMalicious, maliciousActor's mock dao
+    await maliciousActor.call(daoMalicious, 'new', 
+    {
+        config: {
+            name: 'keypomtestdao', 
+            purpose: 'to test adding members automatically', 
+            metadata: ''
+        }, 
+        policy: [maliciousActor.accountId]
+    })
+
+    // Create malicious FC drop attempting to gain access to dao. None of these should work
+    const fcData: FCData = {
+        methods: [
+            // method 1, fake keypom args
+            [
+                {
+                    receiver_id: daoBot.accountId,
+                    method_name: "new_auto_registration",
+                    args: JSON.stringify({
+                        dao_contract: dao.accountId,
+                        proposal: {
+                            description: "mooooooooon",
+                            kind: {
+                                AddMemberToRole:{
+                                    role: "new-onboardee-role",
+                                    member_id: maliciousActor.accountId
+                                }
+                            }
+                        },
+                        funder: minqi.accountId,
+                        keypom_args:{
+                            funder_id_field: "funder",
+                            account_id_field: "proposal.kind.AddMemberToRole.member_id",
+                        }
+                    }),
+                    attached_deposit: NEAR.parse("0.1").toString()
+                }
+            ],
+            // method 2, let keypom populate keypom args but with existing values
+            [
+                {
+                    receiver_id: daoBot.accountId,
+                    method_name: "new_auto_registration",
+                    args: JSON.stringify({
+                        dao_contract: dao.accountId,
+                        proposal: {
+                            description: "mooooooooon",
+                            kind: {
+                                AddMemberToRole:{
+                                    role: "new-onboardee-role",
+                                    member_id: maliciousActor.accountId
+                                }
+                            }
+                        },
+                        funder: minqi.accountId,
+                    }),
+                    funder_id_field: "funder",
+                    account_id_field: "proposal.kind.AddMemberToRole.member_id",
+                    attached_deposit: NEAR.parse("0.1").toString()
+                }
+            ],
+        ]   
+    }   
+
+    const config: DropConfig = { 
+        uses_per_key: 2
+    }
+
+    // This should not work
+    let {keys, publicKeys} = await generateKeyPairs(1);
+    await maliciousActor.call(keypom, 'create_drop', {public_keys: publicKeys, deposit_per_use: NEAR.parse('1').toString(), fc: fcData, config}, {gas: LARGE_GAS, attachedDeposit: NEAR.parse('5.5').toString()});
+    
+    // claim both uses to test both methods
+    await keypom.setKey(keys[0]);
+    await keypom.call(keypom, 'claim', {account_id: member1.accountId}, {gas: WALLET_GAS});
+    await keypom.call(keypom, 'claim', {account_id: member1.accountId}, {gas: WALLET_GAS});
+    
+    // Ensure DAO does not have member1 as an onboardee
+    let pol: policy = await dao.view('get_policy');
+    
+    let member1dao_groups: Array<String> = getUserRoles(pol, member1.accountId);
+    t.is(member1dao_groups.includes('new-onboardee-role'), false);
+    // t.is(1==1, true);
+});
+
+// // PURPOSE: Normal claiming process
+test('Normal Claiming Process', async t => {
+    const { keypom, dao, daoBot, minqi, member1, maliciousActor, member3 } = t.context.accounts;
+
+    const fcData: FCData = {
+        methods: [
+            [
+                {
+                    receiver_id: daoBot.accountId,
+                    method_name: "new_auto_registration",
+                    args: JSON.stringify({
+                        dao_contract: dao.accountId,
+                        proposal: {
+                            description: "mooooooooon",
+                            kind: {
+                                AddMemberToRole:{
+                                    role: "new-onboardee-role",
+                                }
+                            }
+                        },
+                    }),
+                    funder_id_field: "funder",
+                    account_id_field: "proposal.kind.AddMemberToRole.member_id",
+                    attached_deposit: NEAR.parse("0.1").toString()
+                }
+            ],
+        ]   
+    }   
+
+    const config: DropConfig = { 
+        uses_per_key: 1
+    }
+
+    let {keys, publicKeys} = await generateKeyPairs(1);
+    await minqi.call(keypom, 'create_drop', {public_keys: publicKeys, deposit_per_use: NEAR.parse('1').toString(), fc: fcData, config}, {gas: LARGE_GAS, attachedDeposit: NEAR.parse('3').toString()});
+    
+    await keypom.setKey(keys[0]);
+    await keypom.call(keypom, 'claim', {account_id: member1.accountId}, {gas: WALLET_GAS});
+    
+    let pol: policy = await dao.view('get_policy');
+    let member1_groups: Array<String> = getUserRoles(pol, member1.accountId);    
+    t.is(member1_groups.includes('new-onboardee-role'), true);
+    // t.is(1==1, true);
+});
+
+// // PURPOSE: Ensure Keypom contract stored on DAO bot can be changed but only by daoBot
+test('DAO Bot Keypom Contract State Variable Security', async t => {
+    const { daoBot, minqi } = t.context.accounts;
+
+    let keypomContract = await daoBot.view("view_keypom_contract");
+    t.is(keypomContract == "v2.keypom.testnet", true);
+
+    // This should not work, try catch used to catch error and continue testing
+    try{
+        await minqi.call(daoBot, "change_keypom_contract", {new_contract: "abc.testnet"})
+    }
+    catch(err){
+        // verify it has not changed
+        t.is(keypomContract == "v2.keypom.testnet", true);
+    }
+
+    // This should work
+    await daoBot.call(daoBot, "change_keypom_contract", {new_contract: "v1-3.keypom.testnet"})
+    keypomContract = await daoBot.view("view_keypom_contract");
+    t.is(keypomContract == "v1-3.keypom.testnet", true);
+});
+'''
+'''--- __tests__/utils/general.ts ---
+import { BN, KeyPair, NEAR, NearAccount, TransactionResult } from "near-workspaces";
+import { JsonDrop, JsonKeyInfo } from "./types";
+
+export const DEFAULT_GAS: string = "30000000000000";
+export const LARGE_GAS: string = "300000000000000";
+export const WALLET_GAS: string = "100000000000000";
+export const DEFAULT_DEPOSIT: string = "1000000000000000000000000";
+export const GAS_PRICE: BN = new BN("100000000");
+export const DEFAULT_TERRA_IN_NEAR: string = "3000000000000000000000";
+export const CONTRACT_METADATA = {
+  "version": "1.0.0",
+  "link": "https://github.com/mattlockyer/proxy/commit/71a943ea8b7f5a3b7d9e9ac2208940f074f8afba",
+}
+
+export function displayFailureLog(
+  transaction: TransactionResult
+) {
+  // Loop through each receipts_outcome in the transaction's result field
+  transaction.result.receipts_outcome.forEach((receipt) => {
+    const status = (receipt.outcome.status as any);
+    if (status.Failure?.ActionError?.kind?.FunctionCallError) {
+      console.log('Failure: ', status.Failure?.ActionError?.kind?.FunctionCallError)
+    }
+  })
+}
+
+export function displayAllLogs(
+  transaction: TransactionResult
+) {
+  // Loop through each receipts_outcome in the transaction's result field
+  transaction.result.receipts_outcome.forEach((receipt) => {
+    if (receipt.outcome.logs.length > 0) {
+      console.log('Log: ', receipt.outcome.logs)
+    }
+  })
+}
+
+export async function getDropSupplyForOwner(
+  keypom: NearAccount,
+  ownerId: string
+): Promise<number> {
+  const dropSupplyForOwner: number = await keypom.view('get_drop_supply_for_owner', {account_id: ownerId});
+  return dropSupplyForOwner;
+}
+
+export async function getKeySupplyForDrop(
+  keypom: NearAccount,
+  dropId: string
+): Promise<number> {
+  const getKeySupplyForDrop: number = await keypom.view('get_key_supply_for_drop', {drop_id: dropId});
+  return getKeySupplyForDrop;
+}
+
+export async function getKeyInformation(
+  keypom: NearAccount,
+  publicKey: string
+): Promise<JsonKeyInfo> {
+  const keyInformation: JsonKeyInfo = await keypom.view('get_key_information', {key: publicKey});
+  return keyInformation;
+}
+
+export async function getDropInformation(
+  keypom: NearAccount,
+  dropId: string
+): Promise<JsonDrop> {
+  const dropInfo: JsonDrop = await keypom.view('get_drop_information', {drop_id: dropId});
+  return dropInfo;
+}
+
+export async function generateKeyPairs(
+  numKeys: number,
+): Promise<{ keys: KeyPair[]; publicKeys: string[] }> {
+  // Generate NumKeys public keys
+  let kps: KeyPair[] = [];
+  let pks: string[] = [];
+  for (let i = 0; i < numKeys; i++) {
+    let keyPair = await KeyPair.fromRandom('ed25519');
+    kps.push(keyPair);
+    pks.push(keyPair.getPublicKey().toString());
+  }
+  return {
+    keys: kps,
+    publicKeys: pks
+  }
+}
+
+export function defaultCallOptions(
+  gas: string = DEFAULT_GAS,
+  attached_deposit: string = DEFAULT_DEPOSIT
+) {
+  return {
+    gas: new BN(gas),
+    attachedDeposit: new BN(attached_deposit),
+  };
+}
+
+export function assertBalanceChange(b1: NEAR, b2: NEAR, expected_change: NEAR, precision: number) {
+  console.log('expected change: ', expected_change.toString())
+
+  let numToDivide = new BN(Math.ceil(1 / precision));
+  let range = expected_change.abs().div(numToDivide);
+  console.log('range addition: ', range.toString())
+
+  let acceptableRange = {
+    upper: expected_change.abs().add(range), // 1 + .05 = 1.05
+    lower: expected_change.abs().sub(range) // 1 - .05  = .95
+  }
+  let diff = b2.sub(b1).abs();
+  console.log(`diff: ${diff.toString()} range: ${JSON.stringify(acceptableRange)}`)
+  return diff.gte(acceptableRange.lower) && diff.lte(acceptableRange.upper)
+}
+
+export async function queryAllViewFunctions(
+  {
+  contract,
+  drop_id = null,
+  key = null,
+  from_index = '0',
+  limit = 50,
+  account_id = null
+  }: 
+  {
+    contract: NearAccount,
+    drop_id?: string | null,
+    key?: string | null,
+    from_index?: string | null,
+    limit?: number | null,
+    account_id?: string | null
+  }
+): Promise<{
+  keyBalance: string | null,
+  keyInformation: JsonKeyInfo | null,
+  dropInformation: JsonDrop | null,
+  keySupplyForDrop: number | null,
+  keysForDrop: JsonKeyInfo[] | null,
+  tokenIdsForDrop: string[] | null,
+  dropSupplyForOwner: number | null,
+  dropsForOwner: JsonDrop[] | null,
+  gasPrice: number,
+  rootAccount: string,
+  feesCollected: string,
+  nextDropId: number,
+  keyTotalSupply: number,
+  keys: JsonKeyInfo[],
+}> {
+  let getGasPrice: number = await contract.view('get_gas_price', {});
+  let getRootAccount: string = await contract.view('get_root_account', {});
+  let getFeesCollected: string = await contract.view('get_fees_collected', {});
+  let getNextDropId: number = await contract.view('get_next_drop_id', {});
+  let keyTotalSupply: number = await contract.view('get_key_total_supply', {});
+  let getKeys: JsonKeyInfo[] = await contract.view('get_keys', {from_index, limit});
+
+  let getKeyBalance: string | null = null;
+  let getKeyInformation: JsonKeyInfo | null = null;
+  if(key != null) {
+    getKeyBalance = await contract.view('get_key_balance', {key});
+    getKeyInformation = await contract.view('get_key_information', {key});
+  }
+
+  let getDropInformation: JsonDrop | null = null;
+  let getKeySupplyForDrop: number | null = null;
+  let getKeysForDrop: JsonKeyInfo[] | null = null;
+  let tokenIdsForDrop: string[] | null = null;
+  if(drop_id != null) {
+    getDropInformation = await contract.view('get_drop_information', {drop_id});
+    getKeySupplyForDrop = await contract.view('get_key_supply_for_drop', {drop_id});
+    getKeysForDrop = await contract.view('get_keys_for_drop', {drop_id, from_index, limit});
+    tokenIdsForDrop = await contract.view('get_nft_token_ids_for_drop', {drop_id, from_index, limit});
+  }
+
+  let dropSupplyForOwner: number | null = null;
+  let dropsForOwner: JsonDrop[] | null = null;
+  if(account_id != null) {
+    dropSupplyForOwner = await contract.view('get_drop_supply_for_owner', {account_id});
+    dropsForOwner = await contract.view('get_drops_for_owner', {account_id, from_index, limit});
+  }
+
+  return {
+    keyBalance: getKeyBalance,
+    keyInformation: getKeyInformation,
+    dropInformation: getDropInformation,
+    keySupplyForDrop: getKeySupplyForDrop,
+    keysForDrop: getKeysForDrop,
+    tokenIdsForDrop: tokenIdsForDrop,
+    dropSupplyForOwner: dropSupplyForOwner,
+    dropsForOwner: dropsForOwner,
+    gasPrice: getGasPrice,
+    rootAccount: getRootAccount,
+    feesCollected: getFeesCollected,
+    nextDropId: getNextDropId,
+    keyTotalSupply: keyTotalSupply,
+    keys: getKeys,
+  }
+}
+
+export async function createSeries(
+  {
+  account,
+  nftContract,
+  metadatas,
+  ids
+  }:
+  {
+    account: NearAccount,
+    nftContract: NearAccount,
+    metadatas: string[],
+    ids: string[]
+  }
+) {
+  for(let i = 0; i < metadatas.length; i++) {
+    let metadata = metadatas[i];
+    let id = ids[i];
+    
+    await account.call(nftContract, 'create_series', {
+      metadata,
+      mint_id: id,
+    }, {attachedDeposit: DEFAULT_DEPOSIT});
+  }
+}
+'''
+'''--- __tests__/utils/types.ts ---
+export type JsonDrop = {
+    drop_id: string;
+    owner_id: string,
+    deposit_per_use: string;
+    simple?: SimpleData;
+    nft?: JsonNFTData;
+    ft?: FTData;
+    fc?: FCData;
+    config: DropConfig | null;
+    metadata: string | null;
+    registered_uses: number;
+    required_gas: string;
+    next_key_id: number;
+}
+
+export type JsonToken = {
+    series_id: number;
+    token_id: string;
+    owner_id: string;
+    metadata: TokenMetadata;
+    approved_account_ids: Record<string, number>;
+    royalty: Record<string, number> | null;
+}
+
+export type JsonNFTData = {
+    sender_id?: string;
+    contract_id: string;
+}
+
+export type SimpleData = {
+    lazy_register?: boolean
+}
+
+export type FTData = {
+    sender_id?: string;
+    contract_id: string;
+    balance_per_use: string;
+}
+
+export type FCData = {
+    methods: Array<(MethodData | null)[]>
+}
+
+export type FCConfig = {
+    attached_gas?: string
+}
+
+export type MethodData = {
+    receiver_id: string;
+    method_name: string;
+    args: string;
+    attached_deposit: string;
+    attached_gas?: string;
+    account_id_field?: string;
+    drop_id_field?: string;
+    key_id_field?: string;
+    funder_id_field?: string;
+    user_args_rule?: string;
+}
+
+export type JsonKeyInfo = {
+    drop_id: string;
+    pk: string;
+    // How many uses this key has left. Once 0 is reached, the key is deleted
+    remaining_uses: number,
+    // When was the last time the key was used
+    last_used: number,
+    // How much allowance does the key have left. When the key is deleted, this is refunded to the funder's balance.
+    allowance: number,
+    // Nonce for the current key.
+    key_id: number,
+    // Which use is the key currently on?
+    cur_key_use: number
+}
+
+export type KeyInfo = {
+    remaining_uses: number;
+    last_used: number;
+    allowance: number;
+    key_id: number;
+}
+
+export type TimeConfig = {
+    start?: number;
+    end?: number;
+    throttle?: number;
+    interval?: number;
+}
+
+export type JsonPublicSaleConfig = {
+    /// Maximum number of keys that can be added to this drop. If None, there is no max.
+    max_num_keys?: number;
+ 
+    /// Amount of $NEAR that the user needs to attach (if they are not the funder) on top of costs. This amount will be
+    /// Automatically sent to the funder's balance. If None, the keys are free to the public.
+    price_per_key?: string;
+
+    /// Should the revenue generated be sent to the funder's account balance or
+    /// automatically withdrawn and sent to their NEAR wallet?
+    auto_withdraw_funds?: boolean;
+
+    allowlist? : string[];
+    blocklist? : string[];
+
+    /// Minimum block timestamp before the public sale starts. If None, keys can be added immediately
+    /// Measured in number of non-leap-nanoseconds since January 1, 1970 0:00:00 UTC.
+    start?: number;
+
+    /// Block timestamp dictating the end of the public sale. If None, keys can be added indefinitely
+    /// Measured in number of non-leap-nanoseconds since January 1, 1970 0:00:00 UTC.
+    end?: number;
+}
+
+export type UsageConfig = {
+    permissions?: string;
+    refund_deposit?: boolean;
+    auto_delete_drop?: boolean;
+    auto_withdraw?: boolean;
+    account_creation_fields?: {
+        account_id_field?: String,
+        drop_id_field?: String,
+        key_id_field?: String,
+        funder_id_field?: String,
+    }
+}
+
+export type DropConfig = {
+    uses_per_key?: number;
+    time?: TimeConfig;
+    usage?: UsageConfig;
+    sale?: JsonPublicSaleConfig;
+    root_account_id?: string;
+}
+
+export type TokenMetadata = {
+    title: string | null;
+    description: string | null;
+    media: string | null;
+    media_hash: string | null;
+    copies: number | null;
+    issued_at: number | null;
+    expires_at: number | null;
+    starts_at: number | null;
+    updated_at: number | null;
+    extra: string | null;
+    reference: string | null;
+    reference_hash: string | null;
+}
+'''
+'''--- build.sh ---
+#!/bin/sh
+
+echo ">> Building contract"
+
+rustup target add wasm32-unknown-unknown
+cargo build --all --target wasm32-unknown-unknown --release
+cp ./target/wasm32-unknown-unknown/release/dao_bot.wasm ./out/
+
+'''
+'''--- deploy.sh ---
+#!/bin/sh
+
+./build.sh
+
+if [ $? -ne 0 ]; then
+  echo ">> Error building contract"
+  exit 1
+fi
+
+echo ">> Deploying contract"
+
+# https://docs.near.org/tools/near-cli#near-dev-deploy
+near dev-deploy --wasmFile ./target/wasm32-unknown-unknown/release/hello_near.wasm
+
+'''
+'''--- neardev/dev-account.env ---
+CONTRACT_NAME=dev-1682481900002-78543887295736
+'''
+'''--- package.json ---
+{
+  "name": "dao-bot",
+  "version": "1.0.0",
+  "description": "keypom dao bot, meant to only be called by keypom fc call. 1 dao bot per dao",
+  "main": "index.js",
+  "repository": "https://github.com/keypom/dao-bot.git",
+  "author": "Min Qian Lu <59981815+minqianlu@users.noreply.github.com>",
+  "license": "MIT",
+  "scripts": {
+    "test:auto-reg": "ava __tests__/auto-registration/auto-reg-tests.ava.ts",
+    "test:auto-reg-v1": "ava __tests__/auto-registration/v1-auto-reg-tests.ava.ts"
+  },
+  "dependencies": {
+    "crypto": "^1.0.1",
+    "gh-pages": "^4.0.0",
+    "keypom-js": "^1.4.9"
+  },
+  "devDependencies": {
+    "@types/bn.js": "^5.1.0",
+    "ava": "5.0.1",
+    "near-api-js": "^0.44.2",
+    "near-workspaces": "3.2.2",
+    "ts-node": "^10.8.0",
+    "typescript": "^4.6.4"
+  }
+}
+
+'''
+'''--- src-skeleton/ext_traits.rs ---
+use near_sdk::ext_contract;
+
+use crate::*;
+
+#[ext_contract(ext_dao)]
+trait ExtDao{
+
+    fn get_policy(&self) -> Policy;
+
+    fn act_proposal(&mut self, id: u64, action: Action, memo: Option<String>);
+
+    fn add_proposal(&mut self, proposal: ProposalInput);
+}
+
+// #[ext_contract(ext_self)]
+// trait ContractExt{
+//     fn get_roles_callback(&self);
+// }
+
+'''
+'''--- src-skeleton/lib.rs ---
+mod ext_traits;
+
+use ext_traits::ext_dao;
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::{log, near_bindgen, AccountId, Gas, env, Promise, PromiseResult, require, Balance};
+use near_sdk::serde::{Deserialize, Serialize};
+use std::convert::{TryFrom};
+use std::collections::{HashSet};
+use near_sdk::json_types::U128;
+
+pub const XCC_GAS: Gas = Gas(20_000_000_000_000);
+// 0.1 $NEAR
+pub const SPUTNIK_PROPOSAL_DEPOSIT: Balance = 100000000000000000000000;
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ProposalInput {
+    /// Description of this proposal.
+    pub description: String,
+    /// Kind of proposal with relevant information.
+    pub kind: ProposalKind,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum ProposalKind {
+    /// Add member to given role in the policy. This is short cut to updating the whole policy.
+    AddMemberToRole { member_id: AccountId, role: String },
+    /// Remove member to given role in the policy. This is short cut to updating the whole policy.
+    RemoveMemberFromRole { member_id: AccountId, role: String },
+    /// Just a signaling vote, with no execution.
+    Vote,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+pub struct Policy {
+    /// List of roles and permissions for them in the current policy.
+    pub roles: Vec<RolePermission>,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize,)]
+pub struct RolePermission {
+    /// Name of the role to display to the user.
+    pub name: String,
+    /// Kind of the role: defines which users this permissions apply.
+    pub kind: RoleKind
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+pub enum RoleKind {
+    /// Matches everyone, who is not matched by other roles.
+    Everyone,
+    /// Member greater or equal than given balance. Can use `1` as non-zero balance.
+    Member(U128),
+    /// Set of accounts.
+    Group(HashSet<AccountId>),
+}
+
+/// Injected Keypom Args struct to be sent to external contracts
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct KeypomArgs {
+    pub account_id_field: Option<String>,
+    pub drop_id_field: Option<String>,
+    pub key_id_field: Option<String>,
+    pub funder_id_field: Option<String>
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug)]
+pub enum Action {
+    /// Action to add proposal. Used internally.
+    AddProposal,
+    // Action to remove given proposal. Used for immediate deletion in special cases.
+    RemoveProposal,
+    /// Vote to approve given proposal or bounty.
+    VoteApprove,
+    /// Vote to reject given proposal or bounty.
+    VoteReject,
+    /// Vote to remove given proposal or bounty (because it's spam).
+    VoteRemove,
+    /// Finalize proposal, called when it's expired to return the funds
+    /// (or in the future can be used for early proposal closure).
+    Finalize,
+}
+
+// Define the contract structure
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Contract {
+    keypom_contract: AccountId
+}
+
+impl Default for Contract{
+    fn default() -> Self{
+        Self{
+            keypom_contract: AccountId::try_from("v2.keypom.testnet".to_string()).unwrap()
+        }
+    }
+}
+
+// Implement the contract structure
+#[near_bindgen]
+impl Contract {
+
+    // Create new proposal, and call callback to receive proposal ID
+    #[payable]
+    pub fn new_auto_registration(&mut self, dao_contract: AccountId, proposal: ProposalInput) {
+        
+    } 
+
+    // Receive proposal ID, approve proposal
+    #[private]
+    pub fn callback_new_auto_registration(&mut self, dao_contract: AccountId) -> Promise{
+        
+    }
+
+    #[private]
+    pub fn change_keypom_contract(&mut self, new_contract: AccountId){
+        
+    }
+
+    pub fn view_keypom_contract(&self) -> AccountId{
+        
+    }
+}
+
+'''
+'''--- src-v1/ext_traits.rs ---
+use near_sdk::ext_contract;
+
+use crate::*;
+
+#[ext_contract(ext_dao)]
+trait ExtDao{
+
+    fn get_policy(&self) -> Policy;
+
+    fn act_proposal(&mut self, id: u64, action: Action, memo: Option<String>);
+
+    fn add_proposal(&mut self, proposal: ProposalInput);
+}
+
+// #[ext_contract(ext_self)]
+// trait ContractExt{
+//     fn get_roles_callback(&self);
+// }
+
+'''
+'''--- src-v1/lib.rs ---
+mod ext_traits;
+
+use ext_traits::ext_dao;
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::{log, near_bindgen, AccountId, Gas, env, Promise, PromiseResult, require, Balance};
+use near_sdk::serde::{Deserialize, Serialize};
+use std::convert::{TryFrom};
+use std::collections::{HashSet};
+use near_sdk::json_types::U128;
+
+pub const XCC_GAS: Gas = Gas(20_000_000_000_000);
+// 0.1 $NEAR
+pub const SPUTNIK_PROPOSAL_DEPOSIT: Balance = 100000000000000000000000;
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ProposalInput {
+    /// Description of this proposal.
+    pub description: String,
+    /// Kind of proposal with relevant information.
+    pub kind: ProposalKind,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum ProposalKind {
+    /// Add member to given role in the policy. This is short cut to updating the whole policy.
+    AddMemberToRole { member_id: AccountId, role: String },
+    /// Remove member to given role in the policy. This is short cut to updating the whole policy.
+    RemoveMemberFromRole { member_id: AccountId, role: String },
+    /// Just a signaling vote, with no execution.
+    Vote,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+pub struct Policy {
+    /// List of roles and permissions for them in the current policy.
+    pub roles: Vec<RolePermission>,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize,)]
+pub struct RolePermission {
+    /// Name of the role to display to the user.
+    pub name: String,
+    /// Kind of the role: defines which users this permissions apply.
+    pub kind: RoleKind
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+pub enum RoleKind {
+    /// Matches everyone, who is not matched by other roles.
+    Everyone,
+    /// Member greater or equal than given balance. Can use `1` as non-zero balance.
+    Member(U128),
+    /// Set of accounts.
+    Group(HashSet<AccountId>),
+}
+
+/// Injected Keypom Args struct to be sent to external contracts
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct KeypomArgs {
+    pub account_id_field: Option<String>,
+    pub drop_id_field: Option<String>,
+    pub key_id_field: Option<String>,
+    pub funder_id_field: Option<String>
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug)]
+pub enum Action {
+    /// Action to add proposal. Used internally.
+    AddProposal,
+    // Action to remove given proposal. Used for immediate deletion in special cases.
+    RemoveProposal,
+    /// Vote to approve given proposal or bounty.
+    VoteApprove,
+    /// Vote to reject given proposal or bounty.
+    VoteReject,
+    /// Vote to remove given proposal or bounty (because it's spam).
+    VoteRemove,
+    /// Finalize proposal, called when it's expired to return the funds
+    /// (or in the future can be used for early proposal closure).
+    Finalize,
+}
+
+// Define the contract structure
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Contract {
+    keypom_contract: AccountId
+}
+
+impl Default for Contract{
+    fn default() -> Self{
+        Self{
+            keypom_contract: AccountId::try_from("v2.keypom.testnet".to_string()).unwrap()
+        }
+    }
+}
+
+// Implement the contract structure
+#[near_bindgen]
+impl Contract {
+
+    #[payable]
+    pub fn new_auto_registration(&mut self, dao_contract: AccountId, proposal: ProposalInput) {
+        // Ensure Keypom called this function 
+        log!("V1 RUNNING");
+        require!(env::predecessor_account_id() == AccountId::try_from(self.keypom_contract.clone()).unwrap(), "KEYPOM MUST BE PREDECESSOR, CHECK REQUIRED VERSION USING view_keypom_contract");
+        
+        // Ensure enough attached deposit was added to add the proposal
+        require!(env::attached_deposit() >= SPUTNIK_PROPOSAL_DEPOSIT, "ATTACH MORE NEAR, AT LEAST 0.1 $NEAR");
+        
+        // Begin auto-registration
+        ext_dao::ext(dao_contract.clone())
+        .with_attached_deposit(SPUTNIK_PROPOSAL_DEPOSIT)
+        .add_proposal(proposal)
+        .then(
+            Self::ext(env::current_account_id())
+            .callback_new_auto_registration(dao_contract)
+        );
+    } 
+
+    
+    #[private]
+    pub fn callback_new_auto_registration(&mut self, dao_contract: AccountId) -> Promise{
+        // Get proposal ID from add_proposal promise
+        match env::promise_result(0) {
+            PromiseResult::NotReady => {
+                unreachable!();
+            },
+            PromiseResult::Successful(val) => {
+                if let Ok(proposal_id) = near_sdk::serde_json::from_slice::<u64>(&val) {
+                    // Approve proposal that was just added 
+                    ext_dao::ext(dao_contract.clone())
+                   .act_proposal(proposal_id, Action::VoteApprove, Some("Keypom DAO-Bot auto-registration".to_string()))
+                } else {
+                    env::panic_str("ERR_WRONG_VAL_RECEIVED")
+                }
+            },
+            PromiseResult::Failed => {
+                env::panic_str("ERR_CALL_FAILED");
+            }
+        } 
+    }
+
+    #[private]
+    pub fn change_keypom_contract(&mut self, new_contract: AccountId){
+        self.keypom_contract = new_contract
+    }
+
+    pub fn view_keypom_contract(&self) -> AccountId{
+        self.keypom_contract.clone()
+    }
+}
+'''
+'''--- src/ext_traits.rs ---
+use near_sdk::ext_contract;
+
+use crate::*;
+
+#[ext_contract(ext_dao)]
+trait ExtDao{
+
+    fn get_policy(&self) -> Policy;
+
+    fn act_proposal(&mut self, id: u64, action: Action, memo: Option<String>);
+
+    fn add_proposal(&mut self, proposal: ProposalInput);
+}
+
+#[ext_contract(ext_sbt_registry)]
+trait ExtSBTRegistry{
+
+    fn is_human(&self, account: AccountId) -> Vec<(AccountId, Vec<ClassId>)>;
+
+    fn sbt_tokens_by_owner(&self, account: AccountId, issuer: Option<AccountId>, from_class: Option<u64>, limit: Option<u32>, with_expired: Option<bool>) -> Vec<(AccountId, Vec<OwnedToken>)>;
+}
+
+// #[ext_contract(ext_self)]
+// trait ContractExt{
+//     fn get_roles_callback(&self);
+// }
+
+'''
+'''--- src/lib.rs ---
+mod ext_traits;
+
+use ext_traits::{ext_dao, ext_sbt_registry};
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::{log, near_bindgen, AccountId, Gas, env, Promise, PromiseResult, require, Balance};
+use near_sdk::serde::{Deserialize, Serialize};
+use std::convert::TryFrom;
+use std::collections::HashSet;
+use near_sdk::json_types::{U128, Base64VecU8};
+
+pub const XCC_GAS: Gas = Gas(20_000_000_000_000);
+pub const TGAS: u64 = 1_000_000_000_000;
+
+// 0.1 $NEAR
+pub const SPUTNIK_PROPOSAL_DEPOSIT: Balance = 100000000000000000000000;
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ProposalInput {
+    /// Description of this proposal.
+    pub description: String,
+    /// Kind of proposal with relevant information.
+    pub kind: ProposalKind,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum ProposalKind {
+    /// Add member to given role in the policy. This is short cut to updating the whole policy.
+    AddMemberToRole { member_id: AccountId, role: String },
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+pub struct Policy {
+    /// List of roles and permissions for them in the current policy.
+    pub roles: Vec<RolePermission>,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize,)]
+pub struct RolePermission {
+    /// Name of the role to display to the user.
+    pub name: String,
+    /// Kind of the role: defines which users this permissions apply.
+    pub kind: RoleKind
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+pub enum RoleKind {
+    /// Matches everyone, who is not matched by other roles.
+    Everyone,
+    /// Member greater or equal than given balance. Can use `1` as non-zero balance.
+    Member(U128),
+    /// Set of accounts.
+    Group(HashSet<AccountId>),
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+pub struct OwnedToken {
+    pub token: TokenId,
+    pub metadata: TokenMetadata,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+pub struct TokenMetadata {
+    pub class: ClassId,                      // token class
+    pub issued_at: Option<u64>, // When token was issued or minted, Unix epoch in milliseconds
+    pub expires_at: Option<u64>, // When token expires, Unix epoch in milliseconds
+    pub reference: Option<String>, // URL to an off-chain JSON file with more info.
+    pub reference_hash: Option<Base64VecU8>, // Base64-encoded sha256 hash of JSON from reference field. Required if `reference` is included.
+}
+
+pub type ClassId = u64;
+pub type TokenId = u64;
+
+/// Injected Keypom Args struct to be sent to external contracts
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct KeypomArgs {
+    pub account_id_field: Option<String>,
+    pub drop_id_field: Option<String>,
+    pub key_id_field: Option<String>,
+    pub funder_id_field: Option<String>
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug)]
+pub enum Action {
+    /// Action to add proposal. Used internally.
+    AddProposal,
+    // Action to remove given proposal. Used for immediate deletion in special cases.
+    RemoveProposal,
+    /// Vote to approve given proposal or bounty.
+    VoteApprove,
+    /// Vote to reject given proposal or bounty.
+    VoteReject,
+    /// Vote to remove given proposal or bounty (because it's spam).
+    VoteRemove,
+    /// Finalize proposal, called when it's expired to return the funds
+    /// (or in the future can be used for early proposal closure).
+    Finalize,
+}
+
+// Define the contract structure
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Contract {
+    keypom_contract: AccountId
+}
+
+impl Default for Contract{
+    fn default() -> Self{
+        Self{
+            keypom_contract: AccountId::try_from("v2.keypom.near".to_string()).unwrap()
+        }
+    }
+}
+
+// Implement the contract structure
+#[near_bindgen]
+impl Contract {
+
+    #[payable]
+    pub fn new_auto_registration(&mut self, dao_contract: AccountId, keypom_args: KeypomArgs, funder: AccountId, proposal: ProposalInput, human_only: Option<bool>) {
+        // Ensure Keypom called this function 
+        require!(env::predecessor_account_id() == self.keypom_contract.clone(), "KEYPOM MUST BE PREDECESSOR, CHECK REQUIRED VERSION USING view_keypom_contract");
+        
+        // Note since ONLY AddMemberToRole defined from proposal.kind, any other proposal types will result in serialization error!
+        require!(keypom_args.funder_id_field == Some("funder".to_string()) && keypom_args.account_id_field == Some("proposal.kind.AddMemberToRole.member_id".to_string()), "KEYPOM MUST SEND THESE ARGS");
+
+        // Ensure enough attached deposit was added to add the proposal
+        require!(env::attached_deposit() >= SPUTNIK_PROPOSAL_DEPOSIT, "ATTACH MORE NEAR, AT LEAST 0.1 $NEAR");
+
+        // Ensure proposal kind is valid
+        match &proposal.kind{
+            // extract member ID here using match statement
+            ProposalKind::AddMemberToRole { member_id, role: _ } => {
+                // If Proof-of-Humanity required, begin check
+                if human_only.unwrap_or(false) {
+                    ext_sbt_registry::ext(AccountId::try_from("registry.i-am-human.near".to_string()).unwrap())
+                       .is_human(member_id.clone())
+                       .then(
+                            Self::ext(env::current_account_id())
+                            .internal_human_check(funder, proposal, dao_contract)
+                        );
+                }
+                // If no humanity proof required, start check right away.
+                else{
+                    // Begin auto-registration
+                    ext_dao::ext(AccountId::try_from(dao_contract.clone().to_string()).unwrap())
+                    .get_policy()
+                    .then(
+                        Self::ext(env::current_account_id())
+                        .internal_get_roles_callback(funder, proposal, dao_contract)
+                    );
+                }
+            }
+        }
+    } 
+
+    #[private]
+    pub fn internal_human_check(funder: AccountId, proposal: ProposalInput, dao_contract: AccountId) {
+         // Parse Response and Check if Fractal is in owned tokens
+        if let PromiseResult::Successful(val) = env::promise_result(0) {
+            if let Ok(proof) = near_sdk::serde_json::from_slice::<Vec<(AccountId, Vec<ClassId>)>>(&val) {
+                let mut human_tokens = proof.into_iter().peekable();
+                log!("New Human Check");
+                require!(human_tokens.peek().is_none() == false, "CLAIMING ACCOUNT MUST BE HUMAN");
+                
+                // Begin auto-registration
+                ext_dao::ext(AccountId::try_from(dao_contract.clone().to_string()).unwrap())
+                .get_policy()
+                .then(
+                    Self::ext(env::current_account_id())
+                    .internal_get_roles_callback(funder, proposal, dao_contract)
+                );
+            } else {
+             env::panic_str("ERR_WRONG_VAL_RECEIVED")
+            }      
+        }
+        else{
+            env::panic_str("PROBLEM WITH PROMISE")
+        }  
+    }
+
+    
+    // Roles callback, parse and return council role(s)
+    #[private]
+    pub fn internal_get_roles_callback(&mut self, funder: AccountId, proposal: ProposalInput, dao_contract: AccountId){
+        // Receive get_policy promise, parse it and see if funder is on DAO council
+        if let PromiseResult::Successful(val) = env::promise_result(0) {
+                if let Ok(pol) = near_sdk::serde_json::from_slice::<Policy>(&val) {
+                    // Trying to collect all roles with name council from policy
+                    let members = pol.roles.into_iter()
+                    .filter(|role| role.name == "council".to_string())
+                    .collect::<Vec<RolePermission>>()
+                    .into_iter()
+                    .nth(0)
+                    .unwrap().kind;
+
+                    // See if funder is in Council group
+                    match members{
+                        RoleKind::Group(set) => {
+                            if set.contains(&AccountId::try_from(funder.to_string()).unwrap()){
+                                // Add proposal to register member if funder is on council
+                                ext_dao::ext(AccountId::try_from(dao_contract.clone().to_string()).unwrap())
+                                .with_attached_deposit(SPUTNIK_PROPOSAL_DEPOSIT)
+                                .add_proposal(proposal)
+                                .then(
+                                    Self::ext(env::current_account_id())
+                                    .callback_new_auto_registration(dao_contract)
+                                );   
+                            }
+                            else{
+                                log!("Funder is not council!");
+                            }
+                        }
+                        _ => (),
+                    };
+            } else {
+                env::panic_str("ERR_WRONG_VAL_RECEIVED")
+            }
+        } 
+    }
+    
+    #[private]
+    pub fn callback_new_auto_registration(&mut self, dao_contract: AccountId) -> Promise{
+        // Get proposal ID from add_proposal promise
+        if let PromiseResult::Successful(val) = env::promise_result(0) {
+            if let Ok(proposal_id) = near_sdk::serde_json::from_slice::<u64>(&val) {                 
+                // Approve proposal that was just added 
+                ext_dao::ext(AccountId::try_from(dao_contract.clone().to_string()).unwrap())
+               .act_proposal(proposal_id, Action::VoteApprove, Some("Keypom DAO BOT Auto-Registration".to_string()))
+            } else {
+                env::panic_str("ERR_WRONG_VAL_RECEIVED")
+            }
+        } 
+        else{
+            env::panic_str("PROBLEM WITH PROMISE")
+        }  
+    }
+
+    #[private]
+    pub fn change_keypom_contract(&mut self, new_contract: AccountId){
+        self.keypom_contract = new_contract
+    }
+
+    pub fn view_keypom_contract(&self) -> AccountId{
+        self.keypom_contract.clone()
+    }
+}
+
+'''

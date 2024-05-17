@@ -1,0 +1,3834 @@
+*GitHub Repository "etscript/near-idle-game"*
+
+'''--- README.md ---
+# NEAR Place
+
+Draw with pixels. Your pixels earn you more pixels, so better artists get more pixels to draw.
+
+'''
+'''--- contract-rs/pixel-board/Cargo.toml ---
+[package]
+name = "near-place"
+version = "0.1.0"
+authors = ["Near Inc <hello@nearprotocol.com>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "3.1.0"
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "s"
+lto = true
+debug = false
+panic = "abort"
+# Opt into extra safety checks on arithmetic operations https://stackoverflow.com/a/64136471/249801
+overflow-checks = true
+
+[workspace]
+members = []
+
+'''
+'''--- contract-rs/pixel-board/README.md ---
+# NEAR Place
+
+Smart contract to keep track of the board.
+
+## Building
+
+```bash
+./build.sh
+```
+
+## Testing
+
+To test run:
+
+```bash
+cargo test --package near-place -- --nocapture
+```
+
+'''
+'''--- contract-rs/pixel-board/build.sh ---
+#!/bin/bash
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/near_place.wasm ./res/
+
+'''
+'''--- contract-rs/pixel-board/src/account.rs ---
+use crate::*;
+
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::json_types::{ValidAccountId, U128};
+use near_sdk::{env, near_bindgen, AccountId};
+
+pub const PIXEL_COST: Balance = 1_000_000_000_000_000_000;
+pub const DEFAULT_BALANCE: Balance = 100 * PIXEL_COST;
+/// Current reward is 1 pixel per day per pixel.
+pub const REWARD_PER_PIXEL_PER_NANOSEC: Balance = PIXEL_COST / (24 * 60 * 60 * 1_000_000_000);
+
+pub type AccountIndex = u32;
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Account {
+    pub account_id: AccountId,
+    pub account_index: AccountIndex,
+    pub balance: u128,
+    pub num_pixels: u32,
+    pub claim_timestamp: u64,
+}
+
+impl Account {
+    pub fn new(account_id: AccountId, account_index: AccountIndex) -> Self {
+        Self {
+            account_id,
+            account_index,
+            balance: DEFAULT_BALANCE.into(),
+            num_pixels: 0,
+            claim_timestamp: env::block_timestamp(),
+        }
+    }
+
+    pub fn touch(&mut self) {
+        let block_timestamp = env::block_timestamp();
+        let time_diff = block_timestamp - self.claim_timestamp;
+        self.balance += Balance::from(self.num_pixels + 1)
+            * Balance::from(time_diff)
+            * REWARD_PER_PIXEL_PER_NANOSEC;
+        self.claim_timestamp = block_timestamp;
+    }
+
+    pub fn charge(&mut self, num_pixels: u32) {
+        let cost = Balance::from(num_pixels) * PIXEL_COST;
+        assert!(self.balance >= cost, "Not enough balance to draw pixels");
+        self.balance -= cost;
+    }
+}
+
+impl Place {
+    pub fn get_account_by_id(&self, account_id: AccountId) -> Account {
+        let account_index = self
+            .account_indices
+            .get(&account_id)
+            .unwrap_or(self.accounts.len() as u32);
+        self.accounts
+            .get(u64::from(account_index))
+            .map(|mut account| {
+                account.touch();
+                account
+            })
+            .unwrap_or_else(|| Account::new(account_id, account_index))
+    }
+
+    pub fn get_account_by_index(&self, account_index: AccountIndex) -> Option<Account> {
+        self.accounts
+            .get(u64::from(account_index))
+            .map(|mut account| {
+                account.touch();
+                account
+            })
+    }
+
+    pub fn save_account(&mut self, account: &Account) {
+        if u64::from(account.account_index) >= self.accounts.len() {
+            self.account_indices
+                .insert(&account.account_id, &account.account_index);
+            self.accounts.push(account);
+        } else {
+            self.accounts
+                .replace(u64::from(account.account_index), account);
+        }
+    }
+}
+
+#[near_bindgen]
+impl Place {
+    pub fn get_pixel_cost(&self) -> U128 {
+        PIXEL_COST.into()
+    }
+
+    pub fn get_account_balance(&self, account_id: ValidAccountId) -> U128 {
+        self.get_account_by_id(account_id.into()).balance.into()
+    }
+
+    pub fn get_account_num_pixels(&self, account_id: ValidAccountId) -> u32 {
+        self.get_account_by_id(account_id.into()).num_pixels
+    }
+
+    pub fn get_account_id_by_index(&self, account_index: AccountIndex) -> Option<AccountId> {
+        self.accounts
+            .get(u64::from(account_index))
+            .map(|account| account.account_id)
+    }
+}
+
+'''
+'''--- contract-rs/pixel-board/src/board.rs ---
+use crate::*;
+
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::Vector;
+use near_sdk::json_types::Base64VecU8;
+use near_sdk::near_bindgen;
+use near_sdk::serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+pub const BOARD_WIDTH: u32 = 50;
+pub const BOARD_HEIGHT: u32 = 50;
+pub const TOTAL_NUM_PIXELS: u32 = BOARD_WIDTH * BOARD_HEIGHT;
+
+#[derive(BorshDeserialize, BorshSerialize, Copy, Clone)]
+pub struct Pixel {
+    pub color: u32,
+    pub owner_id: AccountIndex,
+}
+
+impl Default for Pixel {
+    fn default() -> Self {
+        Self {
+            color: 0xffffff,
+            owner_id: 0,
+        }
+    }
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct PixelLine(pub Vec<Pixel>);
+
+impl Default for PixelLine {
+    fn default() -> Self {
+        Self(vec![Pixel::default(); BOARD_WIDTH as usize])
+    }
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct PixelBoard {
+    pub lines: Vector<PixelLine>,
+    pub line_versions: Vec<u32>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct SetPixelRequest {
+    pub x: u32,
+    pub y: u32,
+    pub color: u32,
+}
+
+impl SetPixelRequest {
+    pub fn assert_valid(&self) {
+        assert!(self.x < BOARD_WIDTH, "X is out of bounds");
+        assert!(self.x < BOARD_HEIGHT, "Y is out of bounds");
+        assert!(self.color <= 0xffffff, "Color is out of bounds");
+    }
+}
+
+impl PixelBoard {
+    pub fn new() -> Self {
+        let mut board = Self {
+            lines: Vector::new(b"p".to_vec()),
+            line_versions: vec![0; BOARD_HEIGHT as usize],
+        };
+        let default_line = PixelLine::default();
+        for _ in 0..BOARD_HEIGHT {
+            board.lines.push(&default_line);
+        }
+        board
+    }
+
+    pub fn get_line(&self, index: u32) -> PixelLine {
+        self.lines.get(u64::from(index)).unwrap()
+    }
+
+    /// Returns the list of the old owner IDs for the replaced pixels
+    pub fn set_pixels(
+        &mut self,
+        new_owner_id: u32,
+        pixels: &[SetPixelRequest],
+    ) -> HashMap<AccountIndex, u32> {
+        let mut lines = HashMap::new();
+        let mut old_owners = HashMap::new();
+        for request in pixels {
+            request.assert_valid();
+            let line = lines
+                .entry(request.y)
+                .or_insert_with(|| self.lines.get(u64::from(request.y)).unwrap());
+            let old_owner = line.0[request.x as usize].owner_id;
+            line.0[request.x as usize] = Pixel {
+                owner_id: new_owner_id,
+                color: request.color,
+            };
+            *old_owners.entry(old_owner).or_default() += 1;
+        }
+        for (i, line) in lines {
+            self.save_line(i, &line);
+        }
+        old_owners
+    }
+
+    fn save_line(&mut self, index: u32, line: &PixelLine) {
+        self.lines.replace(u64::from(index), line);
+        self.line_versions[index as usize] += 1;
+    }
+}
+
+#[near_bindgen]
+impl Place {
+    pub fn get_lines(&self, lines: Vec<u32>) -> Vec<Base64VecU8> {
+        lines
+            .into_iter()
+            .map(|i| {
+                let line = self.board.get_line(i);
+                line.try_to_vec().unwrap().into()
+            })
+            .collect()
+    }
+
+    pub fn get_line_versions(&self) -> Vec<u32> {
+        self.board.line_versions.clone()
+    }
+}
+
+'''
+'''--- contract-rs/pixel-board/src/lib.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::{UnorderedMap, Vector};
+use near_sdk::{env, near_bindgen, AccountId, Balance, PanicOnDefault};
+
+pub mod account;
+pub use crate::account::*;
+
+pub mod board;
+pub use crate::board::*;
+
+#[global_allocator]
+static ALLOC: near_sdk::wee_alloc::WeeAlloc<'_> = near_sdk::wee_alloc::WeeAlloc::INIT;
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Place {
+    pub account_indices: UnorderedMap<AccountId, u32>,
+    pub board: board::PixelBoard,
+    pub accounts: Vector<Account>,
+}
+
+#[near_bindgen]
+impl Place {
+    #[init]
+    pub fn new() -> Self {
+        assert!(!env::state_exists(), "Already initialized");
+        let mut place = Self {
+            account_indices: UnorderedMap::new(b"i".to_vec()),
+            board: PixelBoard::new(),
+            accounts: Vector::new(b"a".to_vec()),
+        };
+
+        let mut account = place.get_account_by_id(env::current_account_id());
+        account.num_pixels = TOTAL_NUM_PIXELS;
+        place.save_account(&account);
+
+        place
+    }
+
+    #[payable]
+    pub fn buy_tokens(&mut self) {
+        unimplemented!();
+    }
+
+    pub fn draw(&mut self, pixels: Vec<SetPixelRequest>) {
+        let mut account = self.get_account_by_id(env::predecessor_account_id());
+        let new_pixels = pixels.len() as u32;
+        account.charge(new_pixels);
+
+        let mut old_owners = self.board.set_pixels(account.account_index, &pixels);
+        let replaced_pixels = old_owners.remove(&account.account_index).unwrap_or(0);
+        account.num_pixels += new_pixels - replaced_pixels;
+        self.save_account(&account);
+
+        for (account_index, num_pixels) in old_owners {
+            let mut account = self.get_account_by_index(account_index).unwrap();
+            account.num_pixels -= num_pixels;
+            self.save_account(&account);
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use near_sdk::{testing_env, MockedBlockchain, VMContext};
+
+    pub fn get_context(block_timestamp: u64, is_view: bool) -> VMContext {
+        VMContext {
+            current_account_id: "place.meta".to_string(),
+            signer_account_id: "place.meta".to_string(),
+            signer_account_pk: vec![0, 1, 2],
+            predecessor_account_id: "place.meta".to_string(),
+            input: vec![],
+            block_index: 1,
+            block_timestamp,
+            epoch_height: 1,
+            account_balance: 10u128.pow(26),
+            account_locked_balance: 0,
+            storage_usage: 10u64.pow(6),
+            attached_deposit: 0,
+            prepaid_gas: 300 * 10u64.pow(12),
+            random_seed: vec![0, 1, 2],
+            is_view,
+            output_data_receivers: vec![],
+        }
+    }
+
+    #[test]
+    fn test_new() {
+        let mut context = get_context(3_600_000_000_000, false);
+        testing_env!(context.clone());
+        let contract = Place::new();
+
+        context.is_view = true;
+        testing_env!(context.clone());
+        assert_eq!(contract.get_pixel_cost().0, PIXEL_COST);
+        assert_eq!(
+            contract.get_line_versions(),
+            vec![0u32; BOARD_HEIGHT as usize]
+        );
+    }
+}
+
+'''
+'''--- frontend/README.md ---
+This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
+
+## Available Scripts
+
+In the project directory, you can run:
+
+### `yarn start`
+
+Runs the app in the development mode.<br />
+Open [http://localhost:3000](http://localhost:3000) to view it in the browser.
+
+The page will reload if you make edits.<br />
+You will also see any lint errors in the console.
+
+### `yarn test`
+
+Launches the test runner in the interactive watch mode.<br />
+See the section about [running tests](https://facebook.github.io/create-react-app/docs/running-tests) for more information.
+
+### `yarn build`
+
+Builds the app for production to the `build` folder.<br />
+It correctly bundles React in production mode and optimizes the build for the best performance.
+
+The build is minified and the filenames include the hashes.<br />
+Your app is ready to be deployed!
+
+See the section about [deployment](https://facebook.github.io/create-react-app/docs/deployment) for more information.
+
+### `yarn eject`
+
+**Note: this is a one-way operation. Once you `eject`, you can’t go back!**
+
+If you aren’t satisfied with the build tool and configuration choices, you can `eject` at any time. This command will remove the single build dependency from your project.
+
+Instead, it will copy all the configuration files and the transitive dependencies (webpack, Babel, ESLint, etc) right into your project so you have full control over them. All of the commands except `eject` will still work, but they will point to the copied scripts so you can tweak them. At this point you’re on your own.
+
+You don’t have to ever use `eject`. The curated feature set is suitable for small and middle deployments, and you shouldn’t feel obligated to use this feature. However we understand that this tool wouldn’t be useful if you couldn’t customize it when you are ready for it.
+
+## Learn More
+
+You can learn more in the [Create React App documentation](https://facebook.github.io/create-react-app/docs/getting-started).
+
+To learn React, check out the [React documentation](https://reactjs.org/).
+
+### Code Splitting
+
+This section has moved here: https://facebook.github.io/create-react-app/docs/code-splitting
+
+### Analyzing the Bundle Size
+
+This section has moved here: https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size
+
+### Making a Progressive Web App
+
+This section has moved here: https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app
+
+### Advanced Configuration
+
+This section has moved here: https://facebook.github.io/create-react-app/docs/advanced-configuration
+
+### Deployment
+
+This section has moved here: https://facebook.github.io/create-react-app/docs/deployment
+
+### `yarn build` fails to minify
+
+This section has moved here: https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify
+
+'''
+'''--- frontend/package.json ---
+{
+  "name": "frontend",
+  "version": "0.1.0",
+  "homepage": "place",
+  "private": true,
+  "dependencies": {
+    "@testing-library/jest-dom": "^4.2.4",
+    "@testing-library/react": "^9.3.2",
+    "@testing-library/user-event": "^7.1.2",
+    "bn.js": "^5.1.1",
+    "near-api-js": "^0.27.0",
+    "react": "^16.13.1",
+    "react-bootstrap": "^1.0.0",
+    "react-color": "^2.18.1",
+    "react-dom": "^16.13.1",
+    "react-scripts": "3.4.0"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test",
+    "eject": "react-scripts eject",
+    "deploy": "yarn build && gh-pages -d build"
+  },
+  "eslintConfig": {
+    "extends": "react-app"
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  },
+  "devDependencies": {
+    "gh-pages": "^2.2.0"
+  }
+}
+
+'''
+'''--- frontend/public/index.html ---
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.2.1/css/bootstrap.min.css" integrity="sha384-GJzZqFGwb1QTTN6wy59ffF1BuGJpLSa9DkKMp0DgiMDm4iYMj70gZWKYbI706tWS" crossorigin="anonymous">
+    <link rel="icon" href="%PUBLIC_URL%/favicon.ico" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#000000" />
+    <meta
+      name="description"
+      content="NEAR Place - draw with pixels"
+    />
+    <link rel="apple-touch-icon" href="%PUBLIC_URL%/logo192.png" />
+    <!--
+      manifest.json provides metadata used when your web app is installed on a
+      user's mobile device or desktop. See https://developers.google.com/web/fundamentals/web-app-manifest/
+    -->
+    <link rel="manifest" href="%PUBLIC_URL%/manifest.json" />
+    <!--
+      Notice the use of %PUBLIC_URL% in the tags above.
+      It will be replaced with the URL of the `public` folder during the build.
+      Only files inside the `public` folder can be referenced from the HTML.
+
+      Unlike "/favicon.ico" or "favicon.ico", "%PUBLIC_URL%/favicon.ico" will
+      work correctly both with client-side routing and a non-root public URL.
+      Learn how to configure a non-root public URL by running `npm run build`.
+    -->
+    <title>NEAR Place</title>
+  </head>
+  <body>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="root"></div>
+    <!--
+      This HTML file is a template.
+      If you open it directly in the browser, you will see an empty page.
+
+      You can add webfonts, meta tags, or analytics to this file.
+      The build step will place the bundled scripts into the <body> tag.
+
+      To begin the development, run `npm start` or `yarn start`.
+      To create a production bundle, use `npm run build` or `yarn build`.
+    -->
+  </body>
+</html>
+
+'''
+'''--- frontend/public/manifest.json ---
+{
+  "short_name": "React App",
+  "name": "Create React App Sample",
+  "icons": [
+    {
+      "src": "favicon.ico",
+      "sizes": "64x64 32x32 24x24 16x16",
+      "type": "image/x-icon"
+    },
+    {
+      "src": "logo192.png",
+      "type": "image/png",
+      "sizes": "192x192"
+    },
+    {
+      "src": "logo512.png",
+      "type": "image/png",
+      "sizes": "512x512"
+    }
+  ],
+  "start_url": ".",
+  "display": "standalone",
+  "theme_color": "#000000",
+  "background_color": "#ffffff"
+}
+
+'''
+'''--- frontend/public/robots.txt ---
+# https://www.robotstxt.org/robotstxt.html
+User-agent: *
+Disallow:
+
+'''
+'''--- frontend/src/App.css ---
+.pixel-board {
+  display: inline-block;
+  width: 100%;
+  height: 100%;
+  max-width: 800px;
+  max-height: 800px;
+  border: 1px solid #eeeeee;
+}
+
+.color-picker {
+  max-width: 800px;
+  display: inline-block;
+  padding: 6px;
+}
+
+.circle-picker {
+  margin-top: 5px;
+}
+
+@keyframes placeHolderShimmer {
+  0% {
+    background-position: 0px 0;
+  }
+  100% {
+    background-position: 0 800px;
+  }
+}
+
+.c-animated-background {
+  animation-duration: 2s;
+  animation-fill-mode: forwards;
+  animation-iteration-count: infinite;
+  animation-name: placeHolderShimmer;
+  animation-timing-function: linear;
+  background: #333;
+  background: linear-gradient(to bottom, #333 0%, #116611 4%, #55ff55 8%, #116611 12%, #333 16%);
+}
+
+'''
+'''--- frontend/src/App.js ---
+import "./App.css";
+import React from 'react';
+// import BN from 'bn.js';
+import * as nearAPI from 'near-api-js'
+import { HuePicker, GithubPicker } from 'react-color'
+
+// const OneNear = new BN("1000000000000000000000000");
+const ContractName = 'place.meta';
+const BoardHeight = 50;
+const BoardWidth = 50;
+const NumLinesPerFetch = 10;
+const ExpectedLineLength = 4 + 8 * BoardWidth;
+const CellWidth = 16;
+const CellHeight = 16;
+const MaxNumColors = 31;
+const BatchOfPixels = 10;
+// 500 ms
+const BatchTimeout = 500;
+const RefreshBoardTimeout = 1000;
+const MaxWorkTime = 10 * 60 * 1000;
+
+const intToColor = (c) => `#${c.toString(16).padStart(6, '0')}`;
+const transparentColor = (c, a) => `rgba(${(c >> 16) / 1}, ${((c >> 8) & 0xff) / 1}, ${(c & 0xff) / 1}, ${a})`
+const generateGamma = (hue) => {
+  const gammaColors = [];
+  for (let i = 0; i < MaxNumColors; ++i) {
+    gammaColors.push(`hsl(${hue}, 100%, ${100 * i / (MaxNumColors - 1)}%)`);
+  }
+  return gammaColors;
+};
+const decodeLine = (line) => {
+  let buf = Buffer.from(line, 'base64');
+  if (buf.length !== ExpectedLineLength) {
+    throw new Error("Unexpected encoded line length");
+  }
+  let pixels = []
+  for (let i = 4; i < buf.length; i += 8) {
+    let color = buf.readUInt32LE(i);
+    let ownerIndex = buf.readUInt32LE(i + 4);
+    pixels.push({
+      color,
+      ownerIndex,
+    })
+  }
+  return pixels;
+};
+
+class App extends React.Component {
+  constructor(props) {
+    super(props);
+
+    this.state = {
+      connected: false,
+      signedIn: false,
+      accountId: null,
+      balance: 0.0,
+      numPixels: 0,
+      boardLoaded: false,
+      selectedCell: null,
+      currentColor: 0xff0000,
+      pickerColor: '#ff0000',
+      colors: ["#000000", "#666666", "#aaaaaa", "#FFFFFF", "#F44E3B", "#D33115", "#9F0500", "#FE9200", "#E27300", "#C45100", "#FCDC00", "#FCC400", "#FB9E00", "#DBDF00", "#B0BC00", "#808900", "#A4DD00", "#68BC00", "#194D33", "#68CCCA", "#16A5A5", "#0C797D", "#73D8FF", "#009CE0", "#0062B1", "#AEA1FF", "#7B64FF", "#653294", "#FDA1FF", "#FA28FF", "#AB149E"].map((c) => c.toLowerCase()),
+      gammaColors: generateGamma(0),
+      pickingColor: false,
+    };
+
+    this._balanceRefreshTimer = null;
+    this.canvasRef = React.createRef();
+    this._context = false;
+    this._lines = false;
+    this._queue = [];
+    this._pendingPixels = [];
+    this._refreshBoardTimer = null;
+    this._sendQueueTimer = null;
+    this._stopRefreshTime = new Date().getTime() + MaxWorkTime;
+
+    this._initNear().then(() => {
+      this.setState({
+        connected: true,
+        signedIn: !!this._accountId,
+        accountId: this._accountId,
+      });
+    });
+  }
+
+  componentDidMount() {
+    const canvas = this.canvasRef.current;
+    this._context = canvas.getContext('2d');
+
+    canvas.addEventListener('mousemove', (e) => {
+      const x = Math.trunc(e.offsetX / e.target.clientWidth * BoardWidth);
+      const y = Math.trunc(e.offsetY / e.target.clientHeight * BoardWidth);
+      let cell = null;
+      if (x >= 0 && x < BoardWidth && y >= 0 && y < BoardHeight) {
+        cell = { x, y };
+      }
+      if (JSON.stringify(cell) !== JSON.stringify(this.state.selectedCell)) {
+        this.setState({
+          selectedCell: cell,
+        }, () => {
+          this.renderCanvas()
+        })
+      }
+    });
+
+    canvas.addEventListener('click', async (e) => {
+      if (this.state.selectedCell !== null) {
+        if (this.state.pickingColor) {
+          this.pickColor(this.state.selectedCell);
+        } else {
+          this.saveColor();
+          await this.drawPixel(this.state.selectedCell);
+        }
+      }
+    });
+
+    document.addEventListener('keydown', (e) => {
+      e.altKey && this.setState({
+        pickingColor: true,
+      }, () => {
+        this.renderCanvas()
+      });
+    })
+    document.addEventListener('keyup', (e) => {
+      !e.altKey && this.setState({
+        pickingColor: false,
+      }, () => {
+        this.renderCanvas()
+      });
+    })
+  }
+
+  pickColor(cell) {
+    if (!this.state.signedIn || !this._lines || !this._lines[cell.y]) {
+      return;
+    }
+    const color = this._lines[cell.y][cell.x].color;
+
+    this.setState({
+      currentColor: color,
+      pickingColor: false,
+    }, () => {
+      this.renderCanvas()
+    });
+  }
+
+  async _sendQueue() {
+    const pixels = this._queue.slice(0, BatchOfPixels);
+    this._queue = this._queue.slice(BatchOfPixels);
+    this._pendingPixels = pixels;
+
+    try {
+      await this._contract.draw({
+        pixels
+      });
+      await Promise.all([this.refreshBoard(true), this.refreshAccountStats()]);
+    } catch (error) {
+      console.log("Failed to send a transaction", error);
+      this._queue = this._queue.concat(this._pendingPixels);
+    }
+    this._pendingPixels = [];
+  }
+
+  async _pingQueue(ready) {
+    if (this._sendQueueTimer) {
+      clearTimeout(this._sendQueueTimer);
+      this._sendQueueTimer = null;
+    }
+
+    if (this._pendingPixels.length === 0 && (this._queue.length >= BatchOfPixels || ready)) {
+      await this._sendQueue();
+    }
+    if (this._queue.length > 0) {
+      this._sendQueueTimer = setTimeout(async () => {
+        await this._pingQueue(true);
+      }, BatchTimeout);
+    }
+
+  }
+
+  async drawPixel(cell) {
+    if (!this.state.signedIn || !this._lines || !this._lines[cell.y]) {
+      return;
+    }
+
+    this._queue.push({
+      x: cell.x,
+      y: cell.y,
+      color: this.state.currentColor,
+    });
+
+    this._stopRefreshTime = new Date().getTime() + MaxWorkTime;
+    await this._pingQueue(false);
+  }
+
+  async refreshAccountStats() {
+    let balance = parseFloat(await this._contract.get_account_balance({account_id: this._accountId}));
+    let numPixels = await this._contract.get_account_num_pixels({account_id: this._accountId})
+    if (this._balanceRefreshTimer) {
+      clearInterval(this._balanceRefreshTimer);
+      this._balanceRefreshTimer = null;
+    }
+    const startTime = new Date().getTime();
+    const rewardPerMs = (numPixels + 1) * this._pixelCost / (24 * 60 * 60 * 1000);
+
+    this.setState({
+      balance: balance / this._pixelCost,
+      numPixels,
+    });
+
+    this._balanceRefreshTimer = setInterval(() => {
+      const t = new Date().getTime();
+      this.setState({
+        balance: (balance + (t - startTime) * rewardPerMs) / this._pixelCost
+      })
+    }, 100);
+  }
+
+  async _initNear() {
+    const nearConfig = {
+      networkId: 'default',
+      nodeUrl: 'https://rpc.testnet.near.org',
+      contractName: ContractName,
+      walletUrl: 'https://wallet.testnet.near.org',
+    };
+    const keyStore = new nearAPI.keyStores.BrowserLocalStorageKeyStore();
+    const near = await nearAPI.connect(Object.assign({ deps: { keyStore } }, nearConfig));
+    this._keyStore = keyStore;
+    this._nearConfig = nearConfig;
+    this._near = near;
+
+    this._walletConnection = new nearAPI.WalletConnection(near, ContractName);
+    this._accountId = this._walletConnection.getAccountId();
+
+    this._account = this._walletConnection.account();
+    this._contract = new nearAPI.Contract(this._account, ContractName, {
+      viewMethods: ['get_lines', 'get_line_versions', 'get_pixel_cost', 'get_account_balance', 'get_account_num_pixels', 'get_account_id_by_index'],
+      changeMethods: ['draw', 'buy_tokens'],
+    });
+    this._pixelCost = parseFloat(await this._contract.get_pixel_cost());
+    if (this._accountId) {
+      await this.refreshAccountStats();
+    }
+    this._lineVersions = Array(BoardHeight).fill(-1);
+    this._lines = Array(BoardHeight).fill(false);
+    await this.refreshBoard(true);
+  }
+
+  async refreshBoard(forced) {
+    if (this._refreshBoardTimer) {
+      clearTimeout(this._refreshBoardTimer);
+      this._refreshBoardTimer = null;
+    }
+    const t = new Date().getTime();
+    if (t < this._stopRefreshTime) {
+      this._refreshBoardTimer = setTimeout(async () => {
+        await this.refreshBoard(false);
+      }, RefreshBoardTimeout);
+    }
+
+    if (!forced && document.hidden) {
+      return;
+    }
+
+    let lineVersions = await this._contract.get_line_versions();
+    let needLines = [];
+    for (let i = 0; i < BoardHeight; ++i) {
+      if (lineVersions[i] !== this._lineVersions[i]) {
+        needLines.push(i);
+      }
+    }
+    let requestLines = []
+    for (let i = 0; i < needLines.length; i += NumLinesPerFetch) {
+      requestLines.push(needLines.slice(i, i + NumLinesPerFetch));
+    }
+
+    let results = await Promise.all(requestLines.map(lines => this._contract.get_lines({lines})));
+    results = results.flat();
+    requestLines = requestLines.flat();
+    for (let i = 0; i < requestLines.length; ++i) {
+      let lineIndex = requestLines[i];
+      let line = decodeLine(results[i]);
+      this._lines[lineIndex] = line;
+    }
+
+    this._lineVersions = lineVersions;
+    this.renderCanvas();
+  }
+
+  renderCanvas() {
+    if (!this._context || !this._lines) {
+      return;
+    }
+
+    const ctx = this._context;
+
+    for (let i = 0; i < BoardHeight; ++i) {
+      const line = this._lines[i];
+      if (!line) {
+        continue;
+      }
+      for (let j = 0; j < BoardWidth; ++j) {
+        const p = line[j];
+        ctx.fillStyle = intToColor(p.color);
+        ctx.fillRect(j * CellWidth, i * CellHeight, CellWidth, CellHeight);
+      }
+    }
+
+    this._pendingPixels.concat(this._queue).forEach((p) => {
+      ctx.fillStyle = intToColor(p.color);
+      ctx.fillRect(p.x * CellWidth, p.y * CellHeight, CellWidth, CellHeight);
+    })
+
+    if (this.state.selectedCell) {
+      const c = this.state.selectedCell;
+      if (this.state.pickingColor) {
+        const color = this._lines[c.y] ? this._lines[c.y][c.x].color : 0;
+        ctx.beginPath();
+        ctx.strokeStyle = ctx.fillStyle = transparentColor(color, 0.5);
+        ctx.lineWidth = CellWidth * 4;
+        ctx.arc((c.x + 0.5) * CellWidth, (c.y + 0.5) * CellHeight, CellWidth * 4, 0, 2 * Math.PI);
+        ctx.stroke();
+        ctx.closePath();
+
+        ctx.beginPath();
+        ctx.strokeStyle = ctx.fillStyle = transparentColor(color, 1);
+        ctx.lineWidth = CellWidth * 2;
+        ctx.arc((c.x + 0.5) * CellWidth, (c.y + 0.5) * CellHeight, CellWidth * 4, 0, 2 * Math.PI);
+        ctx.stroke();
+        ctx.closePath();
+      } else {
+        ctx.fillStyle = transparentColor(this.state.currentColor, 0.2);
+        ctx.fillRect(c.x * CellWidth, 0, CellWidth, c.y * CellHeight);
+        ctx.fillRect(c.x * CellWidth, (c.y+ 1) * CellHeight, CellWidth, (BoardHeight - c.y - 1) * CellHeight);
+        ctx.fillRect(0, c.y * CellHeight, c.x * CellWidth, CellHeight);
+        ctx.fillRect( (c.x + 1) * CellWidth, c.y * CellHeight, (BoardWidth - c.x - 1) * CellWidth, CellHeight);
+
+        ctx.beginPath();
+        ctx.lineWidth = 3;
+        ctx.fillStyle = intToColor(this.state.currentColor);
+        ctx.strokeStyle = intToColor(this.state.currentColor);
+        ctx.rect(c.x * CellWidth, c.y * CellHeight, CellWidth, CellHeight);
+        ctx.stroke();
+        ctx.closePath();
+      }
+    }
+
+    if (!this.state.boardLoaded) {
+      this.setState({
+        boardLoaded: true
+      })
+    }
+  }
+
+  async requestSignIn() {
+    const appTitle = 'NEAR Place';
+    await this._walletConnection.requestSignIn(
+        ContractName,
+        appTitle
+    )
+  }
+
+  async logOut() {
+    this._walletConnection.signOut();
+    this._accountId = null;
+    this.setState({
+      signedIn: !!this._accountId,
+      accountId: this._accountId,
+    })
+  }
+
+  hueColorChange(c) {
+    this.setState({
+      gammaColors: generateGamma(c.hsl.h)
+    })
+    this.changeColor(c)
+  }
+
+  saveColor() {
+    const newColor = intToColor(this.state.currentColor);
+    const index = this.state.colors.indexOf(newColor);
+    if (index >= 0) {
+      this.state.colors.splice(index, 1);
+    }
+    this.setState({
+      colors: [newColor].concat(this.state.colors).slice(0, MaxNumColors)
+    });
+  }
+
+  changeColor(c) {
+    const currentColor = c.rgb.r * 0x010000 + c.rgb.g * 0x000100 + c.rgb.b;
+    this.setState({
+      pickerColor: c,
+      currentColor,
+    }, () => {
+      this.renderCanvas();
+    })
+  }
+
+  render() {
+    const content = !this.state.connected ? (
+        <div>Connecting... <span className="spinner-grow spinner-grow-sm" role="status" aria-hidden="true"></span></div>
+    ) : (this.state.signedIn ? (
+        <div>
+          <div className="float-right">
+            <button
+              className="btn btn-outline-secondary"
+              onClick={() => this.logOut()}>Log out</button>
+          </div>
+          <h4>Hello, <span className="font-weight-bold">{this.state.accountId}</span>!</h4>
+          <div>
+            PIXEL tokens: {this.state.balance.toFixed(6)}
+          </div>
+          <div>
+            Your pixels: {this.state.numPixels}
+          </div>
+          <div className="color-picker">
+            <HuePicker color={ this.state.pickerColor } width="100%" disableAlpha={true} onChange={(c) => this.hueColorChange(c)}/>
+            <GithubPicker className="circle-picker" colors={this.state.gammaColors} color={ this.state.pickerColor } triangle='hide' width="100%" onChangeComplete={(c) => this.changeColor(c)}/>
+            <GithubPicker className="circle-picker" colors={this.state.colors} color={ this.state.pickerColor } triangle='hide' width="100%" onChangeComplete={(c) => this.hueColorChange(c)}/>
+          </div>
+        </div>
+    ) : (
+        <div style={{marginBottom: "10px"}}>
+          <button
+              className="btn btn-primary"
+              onClick={() => this.requestSignIn()}>Log in with NEAR Wallet</button>
+        </div>
+    ));
+    return (
+      <div className="px-5">
+        <h1>NEAR Place</h1>
+        {content}
+        <div>
+          <canvas ref={this.canvasRef}
+                  width={800}
+                  height={800}
+                  className={this.state.boardLoaded ? "pixel-board" : "pixel-board c-animated-background"}>
+
+          </canvas>
+        </div>
+      </div>
+    );
+  }
+}
+
+export default App;
+
+'''
+'''--- frontend/src/index.css ---
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+code {
+  font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
+    monospace;
+}
+
+'''
+'''--- frontend/src/index.js ---
+import React from 'react';
+import ReactDOM from 'react-dom';
+import './index.css';
+import App from './App';
+
+ReactDOM.render(<App />, document.getElementById('root'));
+
+'''
+'''--- vue-frontend/README.md ---
+# 挂机放置类小游戏
+
+> 一个全随机的刷装备刷词条小游戏,游戏链接：[couy.xyz](http://couy.xyz)
+
+# 游戏截图
+
+![游戏截图1](https://raw.githubusercontent.com/Couy69/assets/master/Snipaste_2020-11-03_13-05-23.png)
+![游戏截图2](https://raw.githubusercontent.com/Couy69/assets/master/Snipaste_2020-11-09_13-01-54.png)
+![游戏截图3](https://raw.githubusercontent.com/Couy69/assets/master/Snipaste_2020-11-09_13-01-30.png)
+
+# 游戏设计
+
+- 通过副本获得装备与金币
+- 装备分为四个等级：破旧、普通、神器、史诗
+- 主角默认每秒回血 2%
+- 默认暴击伤害 150%
+- 完成副本时可能掉落独特级别(5 个词条)的装备（通关后 2.5%掉落率，无尽挑战不会掉落）
+- 通关后开启无尽挑战
+
+# 授权说明
+- 授权TAPTAP【不会社交的二哈】运营，同时也是我在负责更新，感兴趣的可以下载试一下。taptap链接：https://www.taptap.com/app/229315
+
+# 更新内容
+
+## 2021-1-15 更新 (1.3.3)
+
+#### 优化
+
+- 调高了强化的属性增强
+- 商店刷新到独特时新增提示
+- 调高了一点杀怪金币获取
+- 添加了看上去很牛x的+13特效
+
+#### bug 修复
+
+- 已修复：特定情况下无尽挑战成功后并没有回复满血
+
+## 12-11 更新 (1.3.2)
+
+- 界面显示的问题下个版本会解决，作者现在沉迷赛博朋克2077
+
+#### 功能调整
+
+-  商店售出装备等级无上限，跟随人物等级
+-  添加了百分比格挡词条
+
+#### bug 修复
+
+- 已修复：无尽等级与人物等级可能出现负数(感谢天狐，鸡鸡姬的bug提交)
+- 已修复：无尽勾选重复挑战后导致困难与极难副本也可以重复挑战(感谢konoha，游戏玩家的bug提交)
+
+## 12-9 更新 (1.3.1)
+
+- 提交bug时希望准确描述一下😄
+
+#### 功能调整
+
+-  无尽难度：对应层数*10的极难副本 -> 对应层数*5的极难副本
+
+#### 优化
+
+- 稍微调高了一点金币获取
+- 自动强化需要两倍金币修改为不需要额外金币,与手动强化一致
+- 调整了百分比词条的曲线，会在前期低等级时获得更高的属性
+- 调高了部分带护甲词条的装备属性
+
+#### bug 修复
+
+- 已修复：装备强化后格挡值计算低于预期
+
+## 12-8 更新 (1.3.0)
+
+遇到了bug或者平衡性方面的问题希望大家可以反馈一下。
+
+#### 功能调整
+
+-  添加人物转生，转生时会获得转生点数来强化人物基础属性
+-  修改副本刷新规则，现在副本将根据人物等级来刷新，点击菜单栏的刷新按钮来刷新(30S cd)
+-  副本现在为随机生成，并不是以前的固定属性，难度增加，金币获取增加
+-  饰品栏拆分为戒指与项链，添加新的项链装备
+-  无尽挑战现在可以重置当前的挑战等级
+-  添加格挡属性词条
+-  护甲计算公式调整，极限值由100%调整至95%
+
+#### 优化
+
+- 加入了新的字体
+- 重铸时会显示当前词条的品质等级，方便确定当前词条是不是最佳属性
+
+#### bug 修复
+
+- 修复后台挑战副本失败时自动回血失效的bug
+- 自动出售价格低于预期
+
+## 11-30 更新 (1.2.2)
+
+- 这次基本上都是些小优化。
+
+#### 功能调整
+
+-  现在支持自动强化了，可以在强化界面设定目标等级自动强化，不过花费金币为正常值的两倍
+-  点击右下角清除存档可以重新开始游戏，请谨慎操作或者备份原有存档
+-  背包中可以设置自动出售的装备稀有度等级了（感谢执着的bug提交）
+
+#### 优化
+
+- 调整了一下手机端的显示，从后台来看用手机玩的用户好像也不少
+
+#### bug 修复
+
+- 修复手动结束挑战时出现的错误
+
+## 11-26 更新
+
+- 现在可以在更新公告下方直接提意见了，或者是反馈bug。
+
+#### 功能调整
+
+-  商店支持金币刷新了
+-  无尽挑战添加自动挑战
+
+#### 优化
+
+- 现在强化后会保存游戏，同时系统信息最多显示50条
+- 继续加强副本
+- 调整装备的数值
+
+## 11-25 更新
+
+- 时隔半个多月的更新,这次修改的内容比较多
+
+#### 功能调整
+
+-  添加导入导出存档功能：背包装备过多可能导致存档数据比较长，所以建议导出前处理一下背包装备 
+-  添加自动出售：背包栏可以开启自动出售，自动出售会卖出低品质的装备（低于神器）
+-  添加装备强化与词条重铸：需要金币
+-  添加独特级别的防具与饰品
+
+#### 优化
+
+- 加强副本强度（一级副本基本没有加强，100级强度大概增加了五倍，这个强度变化是线性的）
+- 加了一些动画
+- 装备数值调整
+- 独特装备掉率修改为4%,商店有较小概率刷新出独特装备
+- 售出装备获得金币调高了三倍，增加了高级副本金币获取
+
+#### bug 修复
+
+- 修复自动出售可能将背包其余装备卖出的bug
+
+## 11-9 更新
+
+#### 功能调整
+
+- 适配移动端
+
+## 11-6 更新
+
+#### 功能调整
+
+- （功能）添加装备锁定功能
+- （功能）装备新增百分比词条
+- （功能）添加 60~100 级副本
+- （功能）完成副本时可能掉落独特级别的装备（通关后 2.5%掉落率，无尽挑战不会掉落）
+- （功能）通关后开启无尽挑战
+
+#### 优化
+
+- （优化）调整了商店价格（前期更低，后期更高），现在商店等级最高为 110 级
+- （优化）调整并添加了一些新装备
+- （优化）上调了 90 与 100 级副本的难度
+
+#### bug 修复
+
+- （bug）修复了手动结束副本挑战可能导致副本加速的 bug
+
+## 11-4 更新
+
+这次更新优先添加了下面这些比较重要的功能，以及修复了一些奇奇怪怪的 bug，后续的更新将会着重于游戏内容。
+
+#### 功能调整
+
+- （功能）添加自动挑战功能（装备多于 25 件时自动停止）
+- （功能）手动中断副本挑战
+- （功能）五分钟自动保存游戏
+
+#### 优化
+
+- （优化）添加背包容量指示，高于 25 件装备会有提示
+- （优化）再次大幅加强暴击与暴击伤害，与此同时加强了一丢丢 60 级副本
+
+#### bug 修复
+
+- （bug）修复了第一次进游戏不显示装备对比信息的 bug
+- （bug）副本进程中切换至后台将不能回血（非副本状态仍然可以）
+- （bug）某些情况下金币并不是整数
+
+# 本地运行
+
+### 安装依赖
+
+```sh
+  npm install
+```
+
+### 启动项目
+
+```sh
+  npm run serve
+```
+
+### 打包项目
+
+```sh
+  npm run build
+```
+
+'''
+'''--- vue-frontend/babel.config.js ---
+module.exports = {
+  presets: [
+    '@vue/app'
+  ]
+}
+
+'''
+'''--- vue-frontend/package.json ---
+{
+  "name": "COUY-RPG",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "serve": "vue-cli-service serve",
+    "build": "vue-cli-service build"
+  },
+  "dependencies": {
+    "axios": "^0.21.0",
+    "core-js": "^2.6.5",
+    "js-base64": "^3.5.2",
+    "near-api-js": "^0.27.0",
+    "vue": "^2.6.10",
+    "vue-router": "^3.0.3",
+    "vuex": "^3.0.1"
+  },
+  "devDependencies": {
+    "@vue/cli-plugin-babel": "^3.9.0",
+    "@vue/cli-service": "^3.9.0",
+    "compression-webpack-plugin": "^6.1.1",
+    "compressorjs": "^1.0.6",
+    "node-sass": "^4.9.0",
+    "sass-loader": "^7.1.0",
+    "vue-template-compiler": "^2.6.10"
+  },
+  "postcss": {
+    "plugins": {
+      "autoprefixer": {}
+    }
+  },
+  "browserslist": [
+    "> 1%",
+    "last 2 versions"
+  ]
+}
+
+'''
+'''--- vue-frontend/public/index.html ---
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <meta name="viewport" content="width=device-width,initial-scale=1.0">
+  <meta name="Description" content="一个全随机的刷装备小游戏" />
+  <meta name="Keywords" content="游戏,couy,idle,放置游戏,vue,couy.xyz,rougelike" />
+  <!-- <link rel="icon" href="./fi.png"> -->
+  <title>couy-idleGame</title>
+  <script>
+    var _hmt = _hmt || [];
+    (function () {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?559bf4473cdb0f595d39688e01027947";
+      var s = document.getElementsByTagName("script")[0];
+      s.parentNode.insertBefore(hm, s);
+    })();
+  </script>
+</head>
+
+<body>
+  <noscript>
+    <strong>We're sorry but elevato-html doesn't work properly without JavaScript enabled. Please enable it to continue.</strong>
+  </noscript>
+  <div id="app"></div>
+  <!-- built files will be auto injected -->
+</body>
+</html>
+'''
+'''--- vue-frontend/src/assets/config/equiAttributeArmor.js ---
+/**
+ * 护甲属性配置文件
+ * @author couy
+ */
+
+export const equiAttributeArmor = {
+  data(){
+    return{
+      qualityArmor: [{
+        name: '破旧',
+        qualityCoefficient: 0.7,
+        probability: '0.25',
+        color: '#a1a1a1',
+        extraEntryNum: 1,
+      }, {
+        name: '普通',
+        qualityCoefficient: 1,
+        probability: '0.55',
+        color: '#fff', extraEntryNum: 2,
+      }, {
+        name: '神器',
+        qualityCoefficient: 1.5,
+        probability: '0.15',
+        color: '#ff00ff', extraEntryNum: 3,
+      }, {
+        name: '史诗',
+        qualityCoefficient: 2,
+        probability: '0.05',
+        color: '#f78918', extraEntryNum: 4,
+      }, {
+        name: '独特',
+        qualityCoefficient: 2.2,
+        probability: '0',
+        color: '#ff0000', extraEntryNum: 5,
+      }],
+      extraEntryArmor: [{
+        'value': '11',
+        'showVal': '+11',
+        type: 'ATK',
+        'name': '攻击力'
+      }, {
+        type: 'HP',
+        'value': '20',
+        'showVal': '+20',
+        'name': '生命值'
+      }, {
+        type: 'DEF',
+        'value': '8',
+        'showVal': '+8%',
+        'name': '防御力'
+      }, {
+        'value': '11%',
+        'showVal': '+11%',
+        type: 'DEFPERCENT',
+        'name': '防御力'
+      }, {
+        'value': '11%',
+        'showVal': '+11%',
+        type: 'HPPERCENT',
+        'name': '生命值'
+      },],
+      uniqueCategoryArmor: [{
+        name: '红月的夜行衣',
+        des: '',
+        iconSrc: './icons/U_Armor06.png',
+        entry: [{
+          'valCoefficient': 1.2,
+          'value': '11',
+          'showVal': '+11',
+          type: 'DEF',
+          'name': '防御力'
+        }, {
+          type: 'HP',
+          'valCoefficient': 1.5,
+          'value': '8',
+          'showVal': '8',
+          'name': '生命值'
+        }, {
+          'valCoefficient': 1.2,
+          'value': '11',
+          'showVal': '+11',
+          type: 'ATK',
+          'name': '攻击力'
+        }]
+      }, {
+        name: '肃清者戎衣',
+        des: '相传看到这一袭黑衣的人都死了。',
+        iconSrc: './icons/U_Armor05.png',
+        entry: [{
+          type: 'HP',
+          'valCoefficient': 1.6,
+          'value': '8',
+          'showVal': '8',
+          'name': '生命值'
+        }, {
+          'valCoefficient': 2.4,
+          'value': '11',
+          'showVal': '+11',
+          type: 'ATK',
+          'name': '攻击力'
+        },{
+          'valCoefficient': 1.2,
+          'value': '11',
+          'showVal': '+11',
+          type: 'BLOC',
+          'name': '格挡'
+        },]
+      }, {
+        name: '争执连身衣',
+        des: '',
+        iconSrc: './icons/U_Armor01.png',
+        entry: [{
+          'valCoefficient': 1.0,
+          'value': '11',
+          'showVal': '+11',
+          type: 'DEF',
+          'name': '防御力'
+        }, {
+          type: 'HP',
+          'valCoefficient': 1.4,
+          'value': '8',
+          'showVal': '8',
+          'name': '生命值'
+        }, {
+          'valCoefficient': 1.4,
+          'value': '11',
+          'showVal': '+11',
+          type: 'ATK',
+          'name': '攻击力'
+        }]
+      }, {
+        name: '剑豪盔甲',
+        des: '',
+        iconSrc: './icons/U_Armor02.png',
+        entry: [{
+          'valCoefficient': 2.1,
+          'value': '11',
+          'showVal': '+11',
+          type: 'DEF',
+          'name': '防御力'
+        }, {
+          type: 'HP',
+          'valCoefficient': 2.6,
+          'value': '8',
+          'showVal': '8',
+          'name': '生命值'
+        }]
+      }, {
+        name: '隐武士铠甲',
+        des: '',
+        iconSrc: './icons/U_Armor03.png',
+        entry: [{
+          'valCoefficient': 1.3,
+          'value': '11',
+          'showVal': '+11',
+          type: 'DEF',
+          'name': '防御力'
+        }, {
+          type: 'HP',
+          'valCoefficient': 1.7,
+          'value': '8',
+          'showVal': '8',
+          'name': '生命值'
+        }, {
+          'valCoefficient': 0.9,
+          'value': '11',
+          'showVal': '+11',
+          type: 'ATK',
+          'name': '攻击力'
+        }]
+      }, {
+        name: '芬撒里尔追踪者',
+        des: '',
+        iconSrc: './icons/U_Armor04.png',
+        entry: [{
+          'valCoefficient': 0.9,
+          'value': '11',
+          'showVal': '+11',
+          type: 'DEF',
+          'name': '防御力'
+        }, {
+          'valCoefficient': 1.7,
+          'value': '11',
+          'showVal': '+11',
+          type: 'CRITDMG',
+          'name': '暴击伤害'
+        }, {
+          'valCoefficient': 1.7,
+          'value': '11',
+          'showVal': '+11',
+          type: 'ATK',
+          'name': '攻击力'
+        }]
+      },{
+        name: '先代狂龙战士盔甲',
+        des: '',
+        iconSrc: './icons/U_Armor07.png',
+        entry: [{
+          'valCoefficient': 1.5,
+          'value': '11',
+          'showVal': '+11',
+          type: 'DEF',
+          'name': '防御力'
+        }, {
+          'valCoefficient': 1.2,
+          'value': '11',
+          'showVal': '+11',
+          type: 'BLOC',
+          'name': '格挡'
+        },{
+          type: 'HP',
+          'valCoefficient': 1.4,
+          'value': '8',
+          'showVal': '8',
+          'name': '生命值'
+        },]
+      },],
+      categoryArmor: [
+        {
+          name: '紫金守护胸甲',
+          des: '够肉才能输出',
+          iconSrc: './icons/A_A2.png',
+          entry: [{
+            'valCoefficient': 2,
+            'value': '11',
+            'showVal': '+11',
+            type: 'DEF',
+            'name': '防御力'
+          }, {
+            type: 'HP',
+            'valCoefficient': 0.6,
+            'value': '8',
+            'showVal': '8',
+            'name': '生命值'
+          }]
+        },
+        {
+          name: '战士重铠',
+          des: '六级战士使用的重型铠甲',
+          iconSrc: './icons/A_A5.png',
+          entry: [{
+            'valCoefficient': 1.1,
+            'value': '11',
+            'showVal': '+11',
+            type: 'DEF',
+            'name': '防御力'
+          }, {
+            type: 'HP',
+            'valCoefficient': 0.8,
+            'value': '8',
+            'showVal': '8',
+            'name': '生命值'
+          }]
+        },
+        {
+          name: '天权轻甲',
+          des: '舍弃了防御性能的轻甲，因为更加轻便，攻击性能更加突出',
+          iconSrc: './icons/A_A7.png',
+          entry: [{
+            'valCoefficient': 0.7,
+            'value': '11',
+            'showVal': '+11',
+            type: 'DEF',
+            'name': '防御力'
+          }, {
+            type: 'HP',
+            'valCoefficient': 0.5,
+            'value': '8',
+            'showVal': '8',
+            'name': '生命值'
+          }, {
+            'valCoefficient': 0.5,
+            'value': '11',
+            'showVal': '+11',
+            type: 'ATK',
+            'name': '攻击力'
+          }]
+        },
+        {
+          name: '赤柳血铠',
+          des: '似乎会给使用者提供生命气息',
+          iconSrc: './icons/A_A3.png',
+          entry: [{
+            'valCoefficient': 0.9,
+            'value': '11',
+            'showVal': '+11',
+            type: 'DEF',
+            'name': '防御力'
+          }, {
+            type: 'HP',
+            'valCoefficient': 1.2,
+            'value': '8',
+            'showVal': '8',
+            'name': '生命值'
+          }]
+        },
+        {
+          name: '哈皮毛毛连身衣',
+          des: '哈皮毛毛',
+          iconSrc: './icons/A_A9.png',
+          entry: [{
+            'valCoefficient': 0.8,
+            'value': '11',
+            'showVal': '+11',
+            type: 'DEF',
+            'name': '防御力'
+          }, {
+            type: 'HP',
+            'valCoefficient': 0.8,
+            'value': '8',
+            'showVal': '8',
+            'name': '生命值'
+          }, {
+            'valCoefficient': 0.4,
+            'value': '11',
+            'showVal': '+11',
+            type: 'ATK',
+            'name': '攻击力'
+          }]
+        }
+      ],
+    }
+  },
+  methods: {
+  }
+};
+'''
+'''--- vue-frontend/src/assets/config/equiAttributeNeck.js ---
+/**
+ * 项链属性配置文件
+ * @author couy
+ */
+
+export const equiAttributeNeck = {
+  data(){
+    return{
+      qualityNeck: [{
+        name: '破旧',
+        qualityCoefficient: 0.6,
+        probability: '0.25',
+        color: '#a1a1a1',
+        extraEntryNum: 1,
+      }, {
+        name: '普通',
+        qualityCoefficient: 0.9,
+        probability: '0.55',
+        color: '#fff', extraEntryNum: 2,
+      }, {
+        name: '神器',
+        qualityCoefficient: 1.3,
+        probability: '0.15',
+        color: '#ff00ff', extraEntryNum: 3,
+      }, {
+        name: '史诗',
+        qualityCoefficient: 1.6,
+        probability: '0.05',
+        color: '#f78918', extraEntryNum: 4,
+      }, {
+        name: '独特',
+        qualityCoefficient: 2,
+        probability: '0',
+        color: '#ff0000', extraEntryNum: 5,
+      }],
+      extraEntryNeck: [{
+        'value': '11',
+        'showVal': '+11',
+        type: 'ATK',
+        'name': '攻击力'
+      }, {
+        type: 'HP',
+        'value': '20',
+        'showVal': '+20',
+        'name': '生命值'
+      }, {
+        type: 'DEF',
+        'value': '8',
+        'showVal': '+8%',
+        'name': '防御力'
+      }, {
+        'value': '11%',
+        'showVal': '+11%',
+        type: 'DEFPERCENT',
+        'name': '防御力'
+      }, {
+        'value': '11%',
+        'showVal': '+11%',
+        type: 'HPPERCENT',
+        'name': '生命值'
+      },],
+      uniqueCategoryNeck: [{
+        name: '十字旅团降魔项链',
+        des: '',
+        iconSrc: './icons/U_neck01.png',
+        entry: [{
+          'valCoefficient': 0.7,
+          'value': '11',
+          'showVal': '+11',
+          type: 'ATK',
+          'name': '攻击力'
+        }, {
+          'valCoefficient': 0.8,
+          'value': '11',
+          'showVal': '+11',
+          type: 'HP',
+          'name': '生命值'
+        }, {
+          'valCoefficient': 0.9,
+          'value': '11',
+          'showVal': '+11',
+          type: 'DEF',
+          'name': '防御力'
+        }]
+      }, {
+        name: '进阶黑暗龙王项链',
+        des: '',
+        iconSrc: './icons/U_neck02.png',
+        entry: [{
+          'valCoefficient': 1.0,
+          'value': '11',
+          'showVal': '+11',
+          type: 'CRITDMG',
+          'name': '暴击伤害'
+        }, {
+          'valCoefficient': 0.5,
+          'value': '11',
+          'showVal': '+11',
+          type: 'CRIT',
+          'name': '暴击率'
+        }, {
+          'valCoefficient': 0.8,
+          'value': '11',
+          'showVal': '+11',
+          type: 'HP',
+          'name': '生命值'
+        }]
+      }, {
+        name: '伟大单身成员的项链',
+        des: '真棒，真帅。有了这条帅气的项链，一辈子单身都不会孤独',
+        iconSrc: './icons/U_neck03.png',
+        entry: [{
+          'valCoefficient': 1.0,
+          'value': '11',
+          'showVal': '+11',
+          type: 'CRITDMG',
+          'name': '暴击伤害'
+        }, {
+          'valCoefficient': 1.2,
+          'value': '11',
+          'showVal': '+11',
+          type: 'BLOC',
+          'name': '格挡'
+        }, {
+          'valCoefficient': 0.7,
+          'value': '11',
+          'showVal': '+11',
+          type: 'HP',
+          'name': '生命值'
+        }]
+      }, {
+        name: '魔族之翼展',
+        des: '你能看到什么呢',
+        iconSrc: './icons/U_neck04.png',
+        entry: [{
+          'valCoefficient': 1.6,
+          'value': '11',
+          'showVal': '+11',
+          type: 'CRITDMG',
+          'name': '暴击伤害'
+        }, {
+          'valCoefficient': 1.6,
+          'value': '11',
+          'showVal': '+11',
+          type: 'ATK',
+          'name': '攻击力'
+        },]
+      }, {
+        name: '伊帕娅之项链',
+        des: '',
+        iconSrc: './icons/U_neck05.png',
+        entry: [{
+          'valCoefficient': 0.9,
+          'value': '11',
+          'showVal': '+11',
+          type: 'BLOC',
+          'name': '格挡'
+        }, {
+          'valCoefficient': 0.9,
+          'value': '11',
+          'showVal': '+11',
+          type: 'DEF',
+          'name': '防御力'
+        }, {
+          'valCoefficient': 1.3,
+          'value': '11',
+          'showVal': '+11',
+          type: 'HP',
+          'name': '生命值'
+        }]
+      }],
+      categoryNeck: [
+        {
+          name: '十字军项链',
+          des: '十字军佩戴的项链',
+          iconSrc: './icons/Ac_1.png',
+          entry: [{
+            'valCoefficient': 0.9,
+            'value': '11',
+            'showVal': '+11',
+            type: 'DEF',
+            'name': '防御力'
+          }, {
+            'valCoefficient': 0.5,
+            'value': '11',
+            'showVal': '+11',
+            type: 'HP',
+            'name': '生命值'
+          },{
+          'valCoefficient': 0.6,
+          'value': '11',
+          'showVal': '+11',
+          type: 'BLOC',
+          'name': '格挡'
+        }]
+        },
+        {
+          name: '冰龙凝雪',
+          des: '冰龙凝雪',
+          iconSrc: './icons/Ac_7.png',
+          entry: [{
+            'valCoefficient': 0.75,
+            'value': '11',
+            'showVal': '+11',
+            type: 'CRITDMG',
+            'name': '暴击伤害'
+          }, {
+            'valCoefficient': 0.5,
+            'value': '11',
+            'showVal': '+11',
+            type: 'CRIT',
+            'name': '暴击率'
+          }, {
+            'valCoefficient': 0.5,
+            'value': '11',
+            'showVal': '+11',
+            type: 'HP',
+            'name': '生命值'
+          }]
+        },
+        {
+          name: '银魂之眼',
+          des: '银魂之眼',
+          iconSrc: './icons/Ac_5.png',
+          entry: [{
+            'valCoefficient': 1.1,
+            'value': '11',
+            'showVal': '+11',
+            type: 'CRIT',
+            'name': '暴击率'
+          }, {
+            'valCoefficient': 0.5,
+            'value': '11',
+            'showVal': '+11',
+            type: 'HP',
+            'name': '生命值'
+          }, {
+          'valCoefficient': 0.6,
+          'value': '11',
+          'showVal': '+11',
+          type: 'ATK',
+          'name': '攻击力'
+        }]
+        }
+      ],
+      extraEntryNeck: [{
+        'value': '11',
+        'showVal': '+11',
+        type: 'ATK',
+        'name': '攻击力'
+      }, {
+        type: 'CRIT',
+        'value': '8',
+        'showVal': '+8%',
+        'name': '暴击率'
+      }, {
+        type: 'CRITDMG',
+        'value': '20',
+        'showVal': '+20%',
+        'name': '暴击伤害'
+      }, {
+        type: 'HP',
+        'value': '20',
+        'showVal': '+20',
+        'name': '生命值'
+      }, {
+        type: 'DEF',
+        'value': '8',
+        'showVal': '+8%',
+        'name': '防御力'
+      }, {
+        'value': '11%',
+        'showVal': '+11%',
+        type: 'BLOC',
+        'name': '格挡'
+      }]
+    }
+  },
+  methods: {
+  }
+};
+'''
+'''--- vue-frontend/src/assets/config/equiAttributeRing.js ---
+/**
+ * 戒指属性配置文件
+ * @author couy
+ */
+
+export const equiAttributeRing = {
+  data(){
+    return{
+      quality: [{
+        name: '破旧',
+        qualityCoefficient: 0.6,
+        probability: '0.25',
+        color: '#a1a1a1',
+        extraEntryNum: 1,
+      }, {
+        name: '普通',
+        qualityCoefficient: 0.9,
+        probability: '0.55',
+        color: '#fff', extraEntryNum: 2,
+      }, {
+        name: '神器',
+        qualityCoefficient: 1.3,
+        probability: '0.15',
+        color: '#ff00ff', extraEntryNum: 3,
+      }, {
+        name: '史诗',
+        qualityCoefficient: 1.6,
+        probability: '0.05',
+        color: '#f78918', extraEntryNum: 4,
+      }, {
+        name: '独特',
+        qualityCoefficient: 2,
+        probability: '0',
+        color: '#ff0000', extraEntryNum: 5,
+      }],
+      uniqueCategory: [{
+        name: '真·毛毛指环',
+        des: '',
+        iconSrc: './icons/U_ring02.png',
+        entry: [{
+            'valCoefficient': 1.2,
+            'value': '11',
+            'showVal': '+11',
+            type: 'CRITDMG',
+            'name': '暴击伤害'
+          },{
+            'valCoefficient': 0.5,
+            'value': '11',
+            'showVal': '+11',
+            type: 'CRIT',
+            'name': '暴击率'
+          },{
+            'valCoefficient': 0.7,
+            'value': '11',
+            'showVal': '+11',
+            type: 'ATK',
+            'name': '攻击力'
+          },]
+      },{
+        name: '死神名片戒指',
+        des: '',
+        iconSrc: './icons/U_ring01.png',
+        entry: [{
+            'valCoefficient': 1.0,
+            'value': '11',
+            'showVal': '+11',
+            type: 'CRITDMG',
+            'name': '暴击伤害'
+          },{
+            'valCoefficient': 0.5,
+            'value': '11',
+            'showVal': '+11',
+            type: 'CRIT',
+            'name': '暴击率'
+          },{
+            'valCoefficient': 0.8,
+            'value': '11',
+            'showVal': '+11',
+            type: 'HP',
+            'name': '生命值'
+          }]
+      },{
+        name: '先驱者戒指',
+        des: '',
+        iconSrc: './icons/U_ring03.png',
+        entry: [{
+            'valCoefficient': 1.0,
+            'value': '11',
+            'showVal': '+11',
+            type: 'CRITDMG',
+            'name': '暴击伤害'
+          },{
+            'valCoefficient': 0.5,
+            'value': '11',
+            'showVal': '+11',
+            type: 'CRIT',
+            'name': '暴击率'
+          },{
+            'valCoefficient': 0.7,
+            'value': '11',
+            'showVal': '+11',
+            type: 'HP',
+            'name': '生命值'
+          }]
+      },{
+        name: '素盏呜尊的意志',
+        des: '',
+        iconSrc: './icons/U_ring04.png',
+        entry: [{
+            'valCoefficient': 1.6,
+            'value': '11',
+            'showVal': '+11',
+            type: 'CRITDMG',
+            'name': '暴击伤害'
+          },{
+            'valCoefficient': 1.1,
+            'value': '11',
+            'showVal': '+11',
+            type: 'ATK',
+            'name': '攻击力'
+          },]
+      },{
+        name: '月夜见尊的意志',
+        des: '',
+        iconSrc: './icons/U_ring05.png',
+        entry: [{
+            'valCoefficient': 1.5,
+            'value': '11',
+            'showVal': '+11',
+            type: 'CRITDMG',
+            'name': '暴击伤害'
+          },{
+            'valCoefficient': 1.2,
+            'value': '11',
+            'showVal': '+11',
+            type: 'HP',
+            'name': '生命值'
+          }]
+      },],
+      category: [
+        {
+          name: '生命指环',
+          des: '据说拥有增强佩戴者体质的神秘功效',
+          iconSrc: './icons/Ac_9.png',
+          entry: [{
+            'valCoefficient': 1.1,
+            'value': '11',
+            'showVal': '+11',
+            type: 'HP',
+            'name': '生命值'
+          }]
+        },
+        {
+          name: '毛毛指环',
+          des: '喵喵戒指，上面有没有摸到毛毛jio的怨念',
+          iconSrc: './icons/Ac_11.png',
+          entry: [{
+            'valCoefficient': 0.9,
+            'value': '11',
+            'showVal': '+11',
+            type: 'HP',
+            'name': '生命值'
+          },{
+            'valCoefficient': 0.3,
+            'value': '11',
+            'showVal': '+11',
+            type: 'ATK',
+            'name': '攻击力'
+          },{
+            'valCoefficient': 0.8,
+            'value': '11',
+            'showVal': '+11',
+            type: 'CRIT',
+            'name': '暴击率'
+          },]
+        },
+        {
+          name: '御魂之戒',
+          des: '出来吧，卡赞！吸纳所有彷徨的灵魂！   ——鬼剑士约翰',
+          iconSrc: './icons/Ac_10.png',
+          entry: [{
+            'valCoefficient': 0.7,
+            'value': '11',
+            'showVal': '+11',
+            type: 'HP',
+            'name': '生命值'
+          },{
+            'valCoefficient': 0.5,
+            'value': '11',
+            'showVal': '+11',
+            type: 'ATK',
+            'name': '攻击力'
+          },]
+        },
+      ],
+      extraEntry: [{
+        'value': '11',
+        'showVal': '+11',
+        type: 'ATK',
+        'name': '攻击力'
+      }, {
+        type: 'CRIT',
+        'value': '8',
+        'showVal': '+8%',
+        'name': '暴击率'
+      }, {
+        type: 'CRITDMG',
+        'value': '20',
+        'showVal': '+20%',
+        'name': '暴击伤害'
+      }, {
+        type: 'HP',
+        'value': '20',
+        'showVal': '+20',
+        'name': '生命值'
+      }, {
+        type: 'DEF',
+        'value': '8',
+        'showVal': '+8%',
+        'name': '防御力'
+      }]
+    }
+  },
+  methods: {
+  }
+};
+'''
+'''--- vue-frontend/src/assets/config/equiAttributeWeapon.js ---
+/**
+ * 武器属性配置文件
+ * @author couy
+ */
+
+export const equiAttributeWeapon = {
+  data(){
+    return {
+      quality: [{
+        name: '破旧',
+        qualityCoefficient: 0.7,
+        probability: '0.25',
+        color: '#a1a1a1',
+        extraEntryNum: 1,
+      }, {
+        name: '普通',
+        qualityCoefficient: 1,
+        probability: '0.55',
+        color: '#fff', extraEntryNum: 2,
+      }, {
+        name: '神器',
+        qualityCoefficient: 1.5,
+        probability: '0.15',
+        color: '#ff00ff', extraEntryNum: 3,
+      }, {
+        name: '史诗',
+        qualityCoefficient: 2,
+        probability: '0.05',
+        color: '#f78918', extraEntryNum: 4,
+      }, {
+        name: '独特',
+        qualityCoefficient: 2.2,
+        probability: '0',
+        color: '#ff0000', extraEntryNum: 5,
+      }],
+      uniqueCategory: [{
+        name: '创世亡命剑',
+        des: '只有被选中的勇士才能唤醒它真正的力量。',
+        iconSrc: './icons/U_Sword01.png',
+        entry: [{
+          'valCoefficient': 1.8,
+          'value': '11',
+          'showVal': '+11',
+          type: 'ATK',
+          'name': '攻击力'
+        }, {
+          type: 'CRIT',
+          'valCoefficient': 1.5,
+          'value': '8',
+          'showVal': '+8%',
+          'name': '暴击率'
+        }, {
+          'valCoefficient': 1.3,
+          'value': '11',
+          'showVal': '+11',
+          type: 'CRITDMG',
+          'name': '暴击伤害'
+        }]
+      }, {
+        name: '无名剑',
+        des: '没有人知道它的来历。',
+        iconSrc: './icons/U_Sword02.png',
+        entry: [{
+          'valCoefficient': 2.7,
+          'value': '11',
+          'showVal': '+11',
+          type: 'ATK',
+          'name': '攻击力'
+        }, {
+          type: 'CRIT',
+          'valCoefficient': 2.5,
+          'value': '8',
+          'showVal': '+8%',
+          'name': '暴击率'
+        }]
+      }, {
+        name: '死亡之刃',
+        des: '万物生自守恒，源力破则失。',
+        iconSrc: './icons/U_Sword04.png',
+        entry: [{
+          'valCoefficient': 1.8,
+          'value': '11',
+          'showVal': '+11',
+          type: 'ATK',
+          'name': '攻击力'
+        }, {
+          type: 'CRIT',
+          'valCoefficient': 1.5,
+          'value': '8',
+          'showVal': '+8%',
+          'name': '暴击率'
+        }, {
+          'valCoefficient': 1.3,
+          'value': '11',
+          'showVal': '+11',
+          type: 'CRITDMG',
+          'name': '暴击伤害'
+        }]
+      }, {
+        name: '霜龙利刃',
+        des: '傲雪冷心绝，万念化冰华。',
+        iconSrc: './icons/U_Sword05.png',
+        entry: [{
+          'valCoefficient': 1.8,
+          'value': '11',
+          'showVal': '+11',
+          type: 'ATK',
+          'name': '攻击力'
+        }, {
+          type: 'CRIT',
+          'valCoefficient': 1.5,
+          'value': '8',
+          'showVal': '+8%',
+          'name': '暴击率'
+        }, {
+          'valCoefficient': 1.3,
+          'value': '11',
+          'showVal': '+11',
+          type: 'CRITDMG',
+          'name': '暴击伤害'
+        }]
+      }, {
+        name: '阿加雷斯血色巨剑',
+        des: '诚既勇兮又以武，终刚强兮不可凌。身既死兮神以灵，子魂魄兮为鬼雄。',
+        iconSrc: './icons/U_Sword03.png',
+        entry: [{
+          'valCoefficient': 1.8,
+          'value': '11',
+          'showVal': '+11',
+          type: 'ATK',
+          'name': '攻击力'
+        }, {
+          type: 'CRIT',
+          'valCoefficient': 1.5,
+          'value': '8',
+          'showVal': '+8%',
+          'name': '暴击率'
+        }, {
+          'valCoefficient': 1.3,
+          'value': '11',
+          'showVal': '+11',
+          type: 'CRITDMG',
+          'name': '暴击伤害'
+        }]
+      }, {
+        name: '神龙纳格林之刃',
+        des: '神龙纳格林的爪子锻造的利刃',
+        iconSrc: './icons/U_Sword06.png',
+        entry: [{
+          'valCoefficient': 2.8,
+          'value': '11',
+          'showVal': '+11',
+          type: 'ATK',
+          'name': '攻击力'
+        }, {
+          'valCoefficient': 2.2,
+          'value': '11',
+          'showVal': '+11',
+          type: 'CRITDMG',
+          'name': '暴击伤害'
+        }]
+      }, {
+        name: '大师大冒险家之剑',
+        des: '大师大冒险家之剑',
+        iconSrc: './icons/U_Sword07.png',
+        entry: [{
+          'valCoefficient': 2.4,
+          'value': '11',
+          'showVal': '+11',
+          type: 'ATK',
+          'name': '攻击力'
+        }, {
+          type: 'HP',
+          'valCoefficient': 1.8,
+          'value': '8',
+          'showVal': '8',
+          'name': '生命值'
+        }]
+      }, {
+        name: '六翼天使武刃',
+        des: '六翼天使武刃',
+        iconSrc: './icons/U_Sword08.png',
+        entry: [{
+          'valCoefficient': 2.6,
+          'value': '11',
+          'showVal': '+11',
+          type: 'ATK',
+          'name': '攻击力'
+        }, {
+          type: 'DEF',
+          'valCoefficient': 1.8,
+          'value': '8',
+          'showVal': '8',
+          'name': '防御力'
+        }]
+      }, {
+        name: '数珠丸恒次',
+        des: '具体情况不明，传说为日莲上人所有',
+        iconSrc: './icons/U_Sword09.png',
+        entry: [{
+          'valCoefficient': 3.9,
+          'value': '11',
+          'showVal': '+11',
+          type: 'ATK',
+          'name': '攻击力'
+        }]
+      }, {
+        name: '埃苏莱布斯军刀',
+        des: '',
+        iconSrc: './icons/U_Sword10.png',
+        entry: [{
+          'valCoefficient': 1.9,
+          'value': '11',
+          'showVal': '+11',
+          type: 'ATK',
+          'name': '攻击力'
+        }, {
+          type: 'DEF',
+          'valCoefficient': 1.2,
+          'value': '8',
+          'showVal': '8',
+          'name': '防御力'
+        }, {
+          type: 'BLOC',
+          'valCoefficient': 1.2,
+          'value': '8',
+          'showVal': '8',
+          'name': '格挡'
+        }]
+      },],
+      category: [{
+        name: '狱岩石太刀',
+        des: '用狱岩石制作的太刀，据说拥有让使用者潜力爆发的神秘力量',
+        iconSrc: './icons/W_Sword016.png',
+        entry: [{
+          'valCoefficient': 1.2,
+          'value': '11',
+          'showVal': '+11',
+          type: 'ATK',
+          'name': '攻击力'
+        }, {
+          type: 'CRIT',
+          'valCoefficient': 1.3,
+          'value': '8',
+          'showVal': '+8%',
+          'name': '暴击率'
+        }]
+      },
+      {
+        name: '战士长剑',
+        des: '六级战士使用的长剑',
+        iconSrc: './icons/W_Sword007.png',
+        entry: [{
+          'valCoefficient': 1.2,
+          'value': '11',
+          'showVal': '+11',
+          type: 'ATK',
+          'name': '攻击力'
+        }, {
+          type: 'DEF',
+          'valCoefficient': 0.5,
+          'value': '8',
+          'showVal': '8',
+          'name': '防御力'
+        }]
+      },
+      {
+        name: '赤柳血刃',
+        des: '似乎会给使用者提供生命气息',
+        iconSrc: './icons/W_Sword019.png',
+        entry: [{
+          'valCoefficient': 1.3,
+          'value': '11',
+          'showVal': '+11',
+          type: 'ATK',
+          'name': '攻击力'
+        }, {
+          type: 'HP',
+          'valCoefficient': 1.1,
+          'value': '8',
+          'showVal': '8',
+          'name': '生命值'
+        }]
+      },
+      {
+        name: '普通长剑',
+        des: '朴实无华普通长剑，有的只有强力的攻击力',
+        iconSrc: './icons/W_Sword001.png',
+        entry: [{
+          'valCoefficient': 1.7,
+          'value': '11',
+          'showVal': '+11',
+          type: 'ATK',
+          'name': '攻击力'
+        }]
+      }
+        ,
+      {
+        name: '紫炎波刃剑',
+        des: '传说中的狂战士最喜爱的剑。',
+        iconSrc: './icons/W_Sword021.png',
+        entry: [{
+          'valCoefficient': 1.7,
+          'value': '11',
+          'showVal': '+11',
+          type: 'ATK',
+          'name': '攻击力'
+        }]
+      },
+      {
+        name: '毛毛的爪子',
+        des: '这？这也是武器？',
+        iconSrc: './icons/W_Fist003.png',
+        entry: [{
+          'valCoefficient': 2,
+          'value': '11',
+          'showVal': '+11',
+          type: 'ATK',
+          'name': '攻击力'
+        }, {
+          type: 'CRIT',
+          'valCoefficient': 0.7,
+          'value': '8',
+          'showVal': '+8%',
+          'name': '暴击率'
+        }]
+      },
+      {
+        name: '冰晶之刃',
+        des: '剑锋覆盖着冰晶，碰到的敌人都会被冻住。',
+        iconSrc: './icons/W_Sword018.png',
+        entry: [{
+          'valCoefficient': 1.4,
+          'value': '11',
+          'showVal': '+11',
+          type: 'ATK',
+          'name': '攻击力'
+        }, {
+          'valCoefficient': 1.3,
+          'value': '11',
+          'showVal': '+11',
+          type: 'CRITDMG',
+          'name': '暴击伤害'
+        }]
+      }
+      ],
+      extraEntry: [{
+        'value': '11',
+        'showVal': '+11',
+        type: 'ATK',
+        'name': '攻击力'
+      }, {
+        type: 'CRIT',
+        'value': '8',
+        'showVal': '+8%',
+        'name': '暴击率'
+      }, {
+        type: 'CRITDMG',
+        'value': '20',
+        'showVal': '+20%',
+        'name': '暴击伤害'
+      }, {
+        type: 'HP',
+        'value': '20',
+        'showVal': '+20',
+        'name': '生命值'
+      }, {
+        type: 'DEF',
+        'value': '8',
+        'showVal': '+8%',
+        'name': '防御力'
+      }, {
+        'value': '11%',
+        'showVal': '+11%',
+        type: 'ATKPERCENT',
+        'name': '攻击力'
+      }, {
+        'value': '11%',
+        'showVal': '+11%',
+        type: 'DEFPERCENT',
+        'name': '防御力'
+      }, {
+        'value': '11%',
+        'showVal': '+11%',
+        type: 'HPPERCENT',
+        'name': '生命值'
+      },]
+    }
+  },
+  methods: {
+  }
+};
+'''
+'''--- vue-frontend/src/assets/icons/github.svg ---
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Generator: Adobe Illustrator 18.1.1, SVG Export Plug-In . SVG Version: 6.00 Build 0)  -->
+<svg version="1.1" id="Layer_1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" x="0px" y="0px"
+	 viewBox="0 0 36 36" enable-background="new 0 0 36 36" xml:space="preserve">
+<path fill-rule="evenodd" clip-rule="evenodd" fill="#191717" d="M18,1.4C9,1.4,1.7,8.7,1.7,17.7c0,7.2,4.7,13.3,11.1,15.5
+	c0.8,0.1,1.1-0.4,1.1-0.8c0-0.4,0-1.4,0-2.8c-4.5,1-5.5-2.2-5.5-2.2c-0.7-1.9-1.8-2.4-1.8-2.4c-1.5-1,0.1-1,0.1-1
+	c1.6,0.1,2.5,1.7,2.5,1.7c1.5,2.5,3.8,1.8,4.7,1.4c0.1-1.1,0.6-1.8,1-2.2c-3.6-0.4-7.4-1.8-7.4-8.1c0-1.8,0.6-3.2,1.7-4.4
+	c-0.2-0.4-0.7-2.1,0.2-4.3c0,0,1.4-0.4,4.5,1.7c1.3-0.4,2.7-0.5,4.1-0.5c1.4,0,2.8,0.2,4.1,0.5c3.1-2.1,4.5-1.7,4.5-1.7
+	c0.9,2.2,0.3,3.9,0.2,4.3c1,1.1,1.7,2.6,1.7,4.4c0,6.3-3.8,7.6-7.4,8c0.6,0.5,1.1,1.5,1.1,3c0,2.2,0,3.9,0,4.5
+	c0,0.4,0.3,0.9,1.1,0.8c6.5-2.2,11.1-8.3,11.1-15.5C34.3,8.7,27,1.4,18,1.4z"/>
+</svg>
+
+'''
+'''--- vue-frontend/src/assets/js/api.js ---
+/**
+ * axios封装
+ * 请求拦截、响应拦截、错误统一处理
+ */
+import axios from 'axios';
+import router from '../../router';
+import vue from '../../main'
+
+export async function getAxiosInstance() {
+  var baseURL, instance
+
+  baseURL = 'http://couy.xyz:3001/';
+
+  /** 
+   * 请求失败后的错误统一处理 
+   * @param {Number} status 请求失败的状态码
+   */
+  const errorHandle = (status, response) => {
+    // 状态码判断
+    switch (status) {
+      // 401: 未登录状态，跳转登录页
+      case 401:
+        vue.$store.commit("set_sys_info", {
+          msg: `
+          😭${response.data.msg|| '服务器有点问题，请稍后重试'}
+          `,
+          type: 'warning'
+        });
+        break;
+      case 403:
+        vue.$store.commit("set_sys_info", {
+          msg: `
+          😭${response.data.msg|| '服务器有点问题，请稍后重试'}
+          `,
+          type: 'warning'
+        });
+        break;
+      case 404:
+        vue.$store.commit("set_sys_info", {
+          msg: `
+          😭${response.data.msg|| '服务器有点问题，请稍后重试'}
+          `,
+          type: 'warning'
+        });
+        break;
+      default:
+        vue.$store.commit("set_sys_info", {
+          msg: `
+          😭${response.data.msg|| '服务器有点问题，请稍后重试'}
+          `,
+          type: 'warning'
+        });
+    }
+  }
+
+  // 创建axios实例 
+  instance = axios.create({
+    timeout: 1000 * 12 // 设置十二秒钟的请求超时限制
+    // transformRequest: data => qs.stringify(data)
+  });
+  if (process.env.NODE_ENV == 'development') {
+    //开发环境
+    instance.defaults.baseURL = baseURL;
+  } else if (process.env.NODE_ENV == 'debug') {
+    //debug
+    instance.defaults.baseURL = baseURL;
+  } else if (process.env.NODE_ENV == 'production') {
+    //生产环境
+    instance.defaults.baseURL = baseURL;
+  }
+  // 设置post请求头
+  instance.defaults.headers.post['Content-Type'] = 'application/json;charset=UTF-8';
+
+  // 响应拦截器
+  instance.interceptors.response.use(
+    // 请求成功
+    res => res.status === 200 ? Promise.resolve(res) : Promise.reject(res),
+    // 请求失败
+    error => {
+      const {
+        response
+      } = error;
+      if (response) {
+        // 请求已发出，但是不在2xx的范围 
+        errorHandle(response.status, response);
+
+        return Promise.reject(response);
+      } else {
+        vue.$store.commit("set_sys_info", {
+          msg: `
+          😭${response.data.msg|| '服务器有点问题，请稍后重试'}
+          `,
+          type: 'warning'
+        });
+      }
+    });
+
+  return instance
+}
+'''
+'''--- vue-frontend/src/assets/js/assist.js ---
+/**
+ * vue组件通信
+ * @author couy
+ * @param context 当前上下文环境（一般传this）
+ * @param componentName  需要查找的组件的组件名（特别注意需要该组件定义了name属性）
+ */
+
+export const assist = {
+  methods: {
+    // 由一个组件，向上找到最近的指定组件
+    findComponentUpward(context, componentName) {
+      let parent = context.$parent;
+      let name = parent.$options.name;
+
+      while (parent && (!name || [componentName].indexOf(name) < 0)) {
+        parent = parent.$parent;
+        if (parent) name = parent.$options.name;
+      }
+      return parent;
+    },
+    // 由一个组件，向上找到所有的指定组件
+    findComponentsUpward(context, componentName) {
+      let parents = [];
+      const parent = context.$parent;
+
+      if (parent) {
+        if (parent.$options.name === componentName) parents.push(parent);
+        return parents.concat(this.findComponentsUpward(parent, componentName));
+      } else {
+        return [];
+      }
+    },
+    // 由一个组件，向下找到最近的指定组件
+    findComponentDownward(context, componentName) {
+      const childrens = context.$children;
+      let children = null;
+
+      if (childrens.length) {
+        for (const child of childrens) {
+          const name = child.$options.name;
+
+          if (name === componentName) {
+            children = child;
+            break;
+          } else {
+            children = this.findComponentDownward(child, componentName);
+            if (children) break;
+          }
+        }
+      }
+      return children;
+    },
+    // 由一个组件，向下找到所有指定的组件
+    findComponentsDownward(context, componentName) {
+      return context.$children.reduce((components, child) => {
+        if (child.$options.name === componentName) components.push(child);
+        const foundChilds = this.findComponentsDownward(child, componentName);
+        return components.concat(foundChilds);
+      }, []);
+    },
+
+    // 由一个组件，找到指定组件的兄弟组件
+    findBrothersComponents(context, componentName, exceptMe = true) {
+      let res = context.$parent.$children.filter(item => {
+        return item.$options.name === componentName;
+      });
+      let index = res.findIndex(item => item._uid === context._uid);
+      if (exceptMe) res.splice(index, 1);
+      return res;
+    }
+  }
+};
+'''
+'''--- vue-frontend/src/assets/js/handle.js ---
+function deepCopy(data) {
+  return JSON.parse(JSON.stringify(data))
+}
+
+/**
+ * 根据强化等级计算强化后属性
+ * @param {obj} entry 装备基础属性
+ * @param {number} lv  装备强化等级
+ */
+function CalculateStrAttr(entry, lv) {
+  var a = 1
+  // 确定强化系数
+  a = (1.055 ** lv ** 1.1)
+  entry.map((item) => {
+    let value
+    switch (item.type) {
+      case 'ATK':
+        value = Math.round(a * item.value)
+        item.value = value
+        item.showValue = '+' + value
+        break;
+      case 'DEF':
+        value = Math.round(a * item.value)
+        item.value = value
+        item.showValue = '+' + value
+        break;
+      case 'HP':
+        value = Math.round(a * item.value)
+        item.value = value
+        item.showValue = '+' + value
+        break;
+      case 'ATKPERCENT':
+        value = Math.round(a * item.value)
+        item.value = value
+        item.showValue = '+' + value + '%'
+        break;
+      case 'DEFPERCENT':
+        value = Math.round(a * item.value)
+        item.value = value
+        item.showValue = '+' + value + '%'
+        break;
+      case 'HPPERCENT':
+        value = Math.round(a * item.value)
+        item.value = value
+        item.showValue = '+' + value + '%'
+        break;
+      case 'CRIT':
+        value = Math.round(a * item.value)
+        item.value = value
+        item.showValue = '+' + value + '%'
+        break;
+      case 'CRITDMG':
+        value = Math.round(a * item.value)
+        item.value = value
+        item.showValue = '+' + value + '%'
+        break;
+      case 'BLOC':
+          value = Math.round(a * item.value)
+          item.value = value
+          item.showValue = '+' + value
+          break;
+      default:
+        break;
+    }
+
+  })
+  return entry
+}
+
+/**
+ * 随机化生成副本
+ * @param {number} lv  副本等级
+ * @param {number} difficulty(1:普通 2:困难 3:极难) 副本难度
+ */
+function createRandomDungeons(lv, difficulty) {
+  lv = lv||1,difficulty = difficulty||1;
+  var df = difficulty==1?1:difficulty==2?1.15:1.4
+  var dungeonsConfig = {
+    id:lv+''+difficulty,
+    battleTime: 2000,
+    name: 'Lv'+lv+'_'+(difficulty==1?'普通':difficulty==2?'困难':'极难'),
+    eventNum: '5',
+    lv: lv,
+    needDPS: parseInt(lv*lv**1.3*2*difficulty),
+    difficulty:difficulty,
+    difficultyName:difficulty==1?'普通':difficulty==2?'困难':'极难',
+    top:Math.random()*70+15+'%',
+    left:Math.random()*70+10+'%',
+    eventType: [{
+      name: 'monster',
+      type: 'monster',
+      eventType: 'battle',
+      attribute: {
+        HP: parseInt(lv*lv**1.1*(Math.random()*5+16)*df),
+        ATK: parseInt(lv*lv**1.1*(Math.random()*1+2)*df),
+      },
+      trophy: {
+        gold: parseInt(lv**1.16*(Math.random()*5+11)*df),
+        equip: [
+          0.2*df, 0.08*df, 0.03*df, 0*df
+        ],
+      }
+    }, {
+      name: 'monster',
+      type: 'monster',
+      eventType: 'battle',
+      attribute: {
+        HP: parseInt(lv*lv**1.1*(Math.random()*5+16)*df),
+        ATK: parseInt(lv*lv**1.1*(Math.random()*1+2)*df),
+      },
+      trophy: {
+        gold: parseInt(lv**1.16*(Math.random()*5+11)*df),
+        equip: [
+          0.2*df, 0.08*df, 0.03*df, 0*df
+        ],
+      }
+    }, {
+      name: 'monster',
+      type: 'monster',
+      eventType: 'battle',
+      attribute: {
+        HP: parseInt(lv*lv**1.1*(Math.random()*5+16)*df),
+        ATK: parseInt(lv*lv**1.1*(Math.random()*1+2)*df),
+      },
+      trophy: {
+        gold: parseInt(lv**1.16*(Math.random()*5+11)*df),
+        equip: [
+          0.2*df, 0.08*df, 0.03*df, 0*df
+        ],
+      }
+    }, {
+      name: 'monster',
+      type: 'monster',
+      eventType: 'battle',
+      attribute: {
+        HP: parseInt(lv*lv**1.1*(Math.random()*5+16)*df),
+        ATK: parseInt(lv*lv**1.1*(Math.random()*1+2)*df),
+      },
+      trophy: {
+        gold: parseInt(lv**1.16*(Math.random()*5+11)*df),
+        equip: [
+          0.2*df, 0.08*df, 0.03*df, 0*df
+        ],
+      }
+    }, {
+      name: 'boss',
+      type: 'boss',
+      eventType: 'battle',
+      attribute: {
+        HP: parseInt(lv*lv**1.1*(Math.random()*5+30)*df),
+        ATK: parseInt(lv*lv**1.1*(Math.random()*1+3)*df),
+      },
+      trophy: {
+        gold: parseInt(lv**1.16*(Math.random()*10+28)*df),
+        equip: [
+          0.25-0.05*df, 0.55-0.15*df, 0.15+0.15*df, 0.05+0.05*df
+        ],
+      }
+    }, ]
+  }
+  return dungeonsConfig
+}
+
+/**
+ *  返回一条随机属性
+ * @param {number} lv  装备强化等级
+ */
+function createRandomEntry(lv, qualityCoefficient) {
+
+  let extraEntry = [{
+      'value': '11',
+      'showVal': '+11',
+      type: 'ATK',
+      'name': '攻击力'
+    }, {
+      type: 'CRIT',
+      'value': '8',
+      'showVal': '+8%',
+      'name': '暴击率'
+    }, {
+      type: 'CRITDMG',
+      'value': '20',
+      'showVal': '+20%',
+      'name': '暴击伤害'
+    }, {
+      type: 'HP',
+      'value': '20',
+      'showVal': '+20',
+      'name': '生命值'
+    }, {
+      type: 'DEF',
+      'value': '8',
+      'showVal': '+8%',
+      'name': '防御力'
+    }, {
+      'value': '11%',
+      'showVal': '+11%',
+      type: 'ATKPERCENT',
+      'name': '攻击力'
+    }, {
+      'value': '11%',
+      'showVal': '+11%',
+      type: 'DEFPERCENT',
+      'name': '防御力'
+    }, {
+      'value': '11%',
+      'showVal': '+11%',
+      type: 'HPPERCENT',
+      'name': '生命值'
+    },
+    {
+      'value': '11%',
+      'showVal': '+11%',
+      type: 'BLOCPERCENT',
+      'name': '格挡'
+    },
+    {
+      'value': '11%',
+      'showVal': '+11%',
+      type: 'BLOC',
+      'name': '格挡'
+    },
+    // {
+    //   'value': '11%',
+    //   'showVal': '+11%',
+    //   type: 'EVA',
+    //   'name': '闪避'
+    // },
+  ]
+
+  let randomCoefficient = Math.random() ,EntryLevel = Math.floor(randomCoefficient*100)+'%'
+  let entry = {}
+  let index = Math.floor((Math.random()  * extraEntry.length));
+  entry = extraEntry[index]
+  entry.EntryLevel = EntryLevel
+  switch (entry.type) {
+    case 'ATK':
+      var random = parseInt(lv * 1 + (randomCoefficient  * lv / 2 + 1))
+      random = parseInt(random * qualityCoefficient)
+      random = random || 1
+      entry.value = random
+      entry.showVal = '+' + random
+      break;
+    case 'DEF':
+      var random = parseInt((lv * 0.4 + (randomCoefficient  * lv / 2 + 1)))
+      random = parseInt(random * qualityCoefficient)
+      random = random || 1
+      entry.value = random
+      entry.showVal = '+' + random
+      break;
+    case 'HP':
+      var random = parseInt((lv * 0.2 * 15 + (randomCoefficient  * lv / 2 + 1)))
+      random = parseInt(random * qualityCoefficient)
+      random = random || 1
+      entry.value = random
+      entry.showVal = '+' + random
+      break;
+    case 'ATKPERCENT':
+      var random = parseFloat(lv * 0.11 + (randomCoefficient  * lv / 10 + 4)).toFixed(2)
+      random = parseFloat(random * qualityCoefficient).toFixed(2)
+      random = random || 1
+      entry.value = random
+      entry.showVal = '+' + random + '%'
+      break;
+    case 'DEFPERCENT':
+      var random = parseFloat(lv * 0.1 + (randomCoefficient  * lv / 10 + 4)).toFixed(2)
+      random = parseFloat(random * qualityCoefficient).toFixed(2)
+      random = random || 1
+      entry.value = random
+      entry.showVal = '+' + random + '%'
+      break;
+    case 'HPPERCENT':
+      var random = parseFloat(lv * 0.13 + (randomCoefficient  * lv / 10 + 4)).toFixed(2)
+      random = parseFloat(random * qualityCoefficient).toFixed(2)
+      random = random || 1
+      entry.value = random
+      entry.showVal = '+' + random + '%'
+      break;
+    case 'BLOCPERCENT':
+        var random = parseFloat(lv * 0.1 + (randomCoefficient  * lv / 10 + 4)).toFixed(2)
+        random = parseFloat(random * qualityCoefficient).toFixed(2)
+        random = random || 1
+        entry.value = random
+        entry.showVal = '+' + random + '%'
+        break;
+    case 'CRIT':
+      var random = parseInt(randomCoefficient  * 5 + 5)
+      random = parseInt(random * qualityCoefficient)
+      entry.value = random
+      entry.showVal = '+' + random + '%'
+      break;
+    case 'CRITDMG':
+      var random = parseInt(randomCoefficient  * 12 + 20)
+      random = parseInt(random * qualityCoefficient)
+      entry.value = random
+      entry.showVal = '+' + random + '%'
+      break;
+    case 'BLOC':
+      var random = parseInt((lv * 0.6 + (randomCoefficient  * lv / 2 + 1)))
+      random = parseInt(random * qualityCoefficient)
+      random = random || 1
+      entry.value = random
+      entry.showVal = '+' + random
+      break;
+      // case 'EVA':
+      //     var random = parseInt(randomCoefficient  * 12 + 3)
+      //     random = parseInt(random * qualityCoefficient)
+      //     entry.value = random
+      //     entry.showVal = '+' + random + '%'
+      //     break;
+    default:
+      break;
+  }
+  return entry
+}
+
+export default {
+  deepCopy,
+  CalculateStrAttr,
+  createRandomEntry,
+  createRandomDungeons
+}
+'''
+'''--- vue-frontend/src/main.js ---
+import Vue from 'vue'
+import App from './App.vue'
+import router from './router'
+import store from './store'
+import '@/assets/css/base.scss'
+
+import {
+  getAxiosInstance
+} from '@/assets/js/api' // 导入api接口
+getAxiosInstance().then(v => {
+  Vue.prototype.$api = v
+}).catch(e => {
+  console.log(e)
+});
+
+const vue = new Vue({
+  router,
+  store,
+  render: h => h(App)
+}).$mount('#app')
+
+import Message from './views/uiComponent/message/index'
+Vue.prototype.$message = Message
+
+Vue.prototype.$deepCopy = function(data){
+  data = JSON.stringify(data).length>1?data:{}
+  return JSON.parse(JSON.stringify(data))
+}
+
+export default vue;
+'''
+'''--- vue-frontend/src/router.js ---
+import Vue from 'vue'
+import Router from 'vue-router'
+
+Vue.use(Router)
+
+export default new Router({
+  mode: 'hash',
+  base: process.env.BASE_URL,
+  routes: [{
+      path: '/',
+      name: 'index',
+      component: () => import('./views/index.vue')
+    }
+  ]
+})
+
+/**
+ * 重写路由的push方法
+ */
+const routerPush = Router.prototype.push
+Router.prototype.push = function push(location) {
+  return routerPush.call(this, location).catch(error=> error)
+}
+'''
+'''--- vue-frontend/src/store.js ---
+import Vue from 'vue'
+import Vuex from 'vuex'
+import vueInstance from './main'
+import handle from './assets/js/handle'
+Vue.use(Vuex)
+
+var initial_weapon = {
+    "lv": 1,
+    itemType: 'weapon',
+    "quality": {
+      name: '破旧',
+      qualityCoefficient: 0.7,
+      probability: '0.25',
+      color: '#a1a1a1',
+      extraEntryNum: 1,
+    },
+    "type": {
+      "name": "新手短剑",
+      "des": "新手菜鸡使用的短剑",
+      "iconSrc": "./icons/W_Sword001.png",
+      "entry": [{
+        "valCoefficient": 0.9,
+        "value": 1,
+        "showVal": "+1",
+        "type": "ATK",
+        "name": "攻击力"
+      }]
+    },
+    "extraEntry": [{
+      "value": 1,
+      "showVal": "+1",
+      "type": "ATK",
+      "name": "攻击力"
+    }]
+  },
+  initial_armor = {
+    "lv": 1,
+    itemType: 'armor',
+    "quality": {
+      name: '破旧',
+      qualityCoefficient: 0.7,
+      probability: '0.25',
+      color: '#a1a1a1',
+      extraEntryNum: 1,
+    },
+    "type": {
+      "name": "新手布衣",
+      "des": "新手菜鸡穿的普通衣物",
+      "iconSrc": "./icons/A_A3.png",
+      "entry": [{
+        "valCoefficient": 0.9,
+        "value": 1,
+        "showVal": "+1",
+        "type": "DEF",
+        "name": "防御力"
+      }]
+    },
+    "extraEntry": [{
+      "type": "HP",
+      "value": 10,
+      "showVal": "+10",
+      "name": "生命值"
+    }, ]
+  },
+  initial_neck = {
+    "lv": 1,
+    itemType: 'neck',
+    "quality": {
+      name: '破旧',
+      qualityCoefficient: 0.7,
+      probability: '0.25',
+      color: '#a1a1a1',
+      extraEntryNum: 1,
+    },
+    "type": {
+      "name": "新手项坠",
+      "des": "一个普通的指环",
+      "iconSrc": "./icons/Ac_3.png",
+      "entry": [{
+        "valCoefficient": 0.9,
+        "value": 20,
+        "showVal": "+20",
+        "type": "HP",
+        "name": "生命值"
+      }]
+    },
+    "extraEntry": [{
+      "type": "CRIT",
+      "value": 10,
+      "showVal": "+10%",
+      "name": "暴击率"
+    }]
+  },
+  initial_ring = {
+    "lv": 1,
+    itemType: 'ring',
+    "quality": {
+      name: '破旧',
+      qualityCoefficient: 0.7,
+      probability: '0.25',
+      color: '#a1a1a1',
+      extraEntryNum: 1,
+    },
+    "type": {
+      "name": "新手指环",
+      "des": "一个普通的指环",
+      "iconSrc": "./icons/Ac_10.png",
+      "entry": [{
+        "valCoefficient": 0.9,
+        "value": 20,
+        "showVal": "+20",
+        "type": "HP",
+        "name": "生命值"
+      }]
+    },
+    "extraEntry": [{
+      "type": "CRIT",
+      "value": 10,
+      "showVal": "+10%",
+      "name": "暴击率"
+    }]
+  };
+
+export default new Vuex.Store({
+  state: {
+    needStrengthenEquipment: {}, //设定当前需要强化的装备
+    sysInfo: [{
+      type: '',
+      msg: "欢迎你勇士，点击地图上的副本开始战斗。"
+    }, {
+      type: '',
+      msg: "菜单栏可以刷新当前世界副本。"
+    }],
+    reincarnationAttribute: {
+      'HP': 0,
+      'ATK': 0,
+      'CRIT': 0,
+      'CRITDMG': 0,
+      'DEF': 0,
+      'BLOC': 0,
+      'MOVESPEED': 0,
+      'BATTLESPEED': 0,
+    },
+    reincarnation: {
+      count: 0,
+      point: 0,
+    },
+    playerAttribute: {
+      lv: 1,
+      GOLD: 0,
+      healthRecoverySpeed: 1,
+      endlessLv: 0,
+      attribute: {
+        CURHP: {
+          value: 0,
+          showValue: '',
+        },
+        MAXHP: {
+          value: 0,
+          showValue: '',
+        },
+        ATK: {
+          value: 0,
+          showValue: '',
+        },
+        DEF: {
+          value: 0,
+          showValue: '',
+        },
+        REDUCDMG: { //根据护甲计算的减伤比例
+          value: 0,
+          showValue: '',
+        },
+        CRIT: {
+          value: 0,
+          showValue: '',
+        },
+        CRITDMG: {
+          value: 0,
+          showValue: '',
+        },
+        BLOC: {
+          value: 0,
+          showValue: '0',
+        },
+        EVA: {
+          value: 0,
+          showValue: '',
+        },
+      },
+      weapon: initial_weapon,
+      armor: initial_armor,
+      ring: initial_ring,
+      neck: initial_neck,
+    }
+  },
+  mutations: {
+    set_player_weapon(state, data) {
+      this.state.playerAttribute.weapon = data
+      vueInstance.$store.commit('set_player_attribute')
+    },
+    set_player_armor(state, data) {
+      this.state.playerAttribute.armor = data
+      vueInstance.$store.commit('set_player_attribute')
+    },
+    set_player_ring(state, data) {
+      this.state.playerAttribute.ring = data
+      vueInstance.$store.commit('set_player_attribute')
+    },
+    set_player_neck(state, data) {
+      this.state.playerAttribute.neck = data || initial_neck
+      vueInstance.$store.commit('set_player_attribute')
+    },
+    set_player_rein_attribute(state, data) {
+      this.state.reincarnationAttribute = data
+      vueInstance.$store.commit('set_player_attribute')
+    },
+    set_player_rein(state, data) {
+      this.state.reincarnation = data
+    },
+    set_player_attribute(state, data) {
+      var p = state.playerAttribute
+      var warpon = p.weapon,
+        armor = p.armor,
+        ring = p.ring,
+        neck = p.neck,
+        entry = [],
+        chp = state.playerAttribute.attribute.CURHP.value,
+        mhp = state.playerAttribute.attribute.MAXHP.value,
+        rA = state.reincarnationAttribute,
+        hpP;
+      if (chp && mhp) {
+        hpP = chp / mhp
+      }
+
+      var attribute = {
+        CURHP: {
+          value: 0,
+          showValue: '',
+        },
+        MAXHP: {
+          value: 0 + rA.HP,
+          showValue: '',
+        },
+        ATK: {
+          value: 0 + rA.ATK,
+          showValue: 0 + rA.ATK,
+        },
+        DEF: {
+          value: 0 + rA.DEF,
+          showValue: 0 + rA.DEF,
+        },
+        CRIT: {
+          value: 0 + rA.CRIT,
+          showValue: '+' + 0 + rA.CRIT + '%',
+        },
+        CRITDMG: {
+          value: 0 + rA.CRITDMG,
+          showValue: '+' + 0 + rA.CRITDMG + '%',
+        },
+        EVA: {
+          value: 0,
+          showValue: '',
+        },
+        BLOC: {
+          value: 0 + rA.BLOC,
+          showValue: 0 + rA.BLOC,
+        },
+      }
+
+      let warponStrEntry = vueInstance.$deepCopy(warpon.type.entry)
+      let armorStrEntry = vueInstance.$deepCopy(armor.type.entry)
+      let ringStrEntry = vueInstance.$deepCopy(ring.type.entry)
+      let neckStrEntry = vueInstance.$deepCopy(neck.type.entry)
+      handle.CalculateStrAttr(warponStrEntry, warpon.enchantlvl || 0)
+      handle.CalculateStrAttr(armorStrEntry, armor.enchantlvl || 0)
+      handle.CalculateStrAttr(ringStrEntry, ring.enchantlvl || 0)
+      handle.CalculateStrAttr(neckStrEntry, neck.enchantlvl || 0)
+
+      entry = [].concat(warponStrEntry).concat(warpon.extraEntry).concat(armorStrEntry).concat(armor.extraEntry).concat(ringStrEntry).concat(ring.extraEntry).concat(neckStrEntry).concat(neck.extraEntry)
+
+      // 命中几率初始为100%，用来计算最终的闪避几率
+      let HitChance = 1
+      entry.map(item => {
+        switch (item.type) {
+          case 'ATK':
+            attribute.ATK.value += Number(item.value)
+            attribute.ATK.showValue = '+' + (attribute.ATK.value)
+            break;
+          case 'DEF':
+            attribute.DEF.value += Number(item.value)
+            attribute.DEF.showValue = '+' + (attribute.DEF.value)
+            break;
+          case 'HP':
+            attribute.MAXHP.value += Number(item.value)
+            attribute.MAXHP.showValue = '+' + (attribute.MAXHP.value)
+            break;
+          case 'CRIT':
+            attribute.CRIT.value += Number(item.value)
+            attribute.CRIT.showValue = '+' + attribute.CRIT.value + '%'
+            break;
+          case 'CRITDMG':
+            attribute.CRITDMG.value += Number(item.value)
+            attribute.CRITDMG.showValue = '+' + attribute.CRITDMG.value + '%'
+            break;
+          case 'EVA':
+            HitChance = HitChance * (1 - item.value / 100)
+            break;
+          case 'BLOC':
+            attribute.BLOC.value += Number(item.value)
+            attribute.BLOC.showValue = (attribute.BLOC.value)
+            break;
+          default:
+            break;
+        }
+      })
+      var ATKPERCENT = 0,
+        DEFPERCENT = 0,
+        HPPERCENT = 0,
+      BLOCPERCENT = 0
+      entry.map(item => {
+        switch (item.type) {
+          case 'ATKPERCENT':
+            ATKPERCENT += Number(item.value)
+            break;
+          case 'DEFPERCENT':
+            DEFPERCENT += Number(item.value)
+            break;
+          case 'HPPERCENT':
+            HPPERCENT += Number(item.value)
+            break;
+          case 'BLOCPERCENT':
+            BLOCPERCENT += Number(item.value)
+            break;
+          default:
+            break;
+        }
+      })
+      attribute.ATK.value = parseInt(attribute.ATK.value * (100 + ATKPERCENT) / 100)
+      attribute.ATK.showValue = '+' + (attribute.ATK.value)
+      attribute.DEF.value = parseInt(attribute.DEF.value * (100 + DEFPERCENT) / 100)
+      attribute.DEF.showValue = '+' + (attribute.DEF.value)
+      attribute.MAXHP.value = parseInt(attribute.MAXHP.value * (100 + HPPERCENT) / 100)
+      attribute.MAXHP.showValue = '+' + (attribute.MAXHP.value)
+      attribute.BLOC.value = parseInt(attribute.BLOC.value * (100 + BLOCPERCENT) / 100)
+      attribute.BLOC.showValue = '+' + (attribute.BLOC.value)
+      attribute.EVA.value = ((1 - HitChance) * 100).toFixed(1)
+      attribute.EVA.showValue = ((1 - HitChance) * 100).toFixed(1) + '%'
+
+      // console.log(vueInstance.$store.state)
+      attribute.MAXHP.value += 200
+      if (hpP) {
+
+        attribute.CURHP.value = parseInt(attribute.MAXHP.value * hpP)
+        attribute.CURHP.showValue = '+' + (attribute.CURHP.value)
+      } else {
+        attribute.CURHP = vueInstance.$deepCopy(attribute.MAXHP)
+      }
+
+      // 初始暴击伤害150%
+      attribute.CRITDMG.value += 150
+
+      var atk = attribute.ATK.value,
+        crit = attribute.CRIT.value,
+        critdmg = attribute.CRITDMG.value
+      // 暴击率最多100%
+      if (crit > 100) {
+        crit = 100
+      }
+      attribute.DPS = parseFloat((1 - crit / 100) * atk * 1 + crit / 100 * (critdmg) / 100 * atk * 1)
+      var armor = attribute.DEF.value
+
+      //承受伤害比例
+      // attribute.REDUCDMG = 1 - 0.06 * armor / (1 + (0.06 * armor))
+      attribute.REDUCDMG = 1 - 0.05 * armor / (1 + (0.0525 * armor))
+
+      // state.playerAttribute.attribute=attribute
+      // vueInstance.$store.commit("set_player_attribute", attribute);
+      this.state.playerAttribute.attribute = attribute
+    },
+    set_sys_info(state, data) {
+      this.state.sysInfo.push(data);
+      var time = +new Date()
+      var date = new Date(time + 8 * 3600 * 1000); // 增加8小时
+      this.state.sysInfo[this.state.sysInfo.length - 1].time = date.toJSON().substr(11, 8).replace('T', ' ')
+      if (this.state.sysInfo.length > 50) {
+        this.state.sysInfo.shift()
+      }
+    },
+    clear_sys_info(state, data) {
+      this.state.sysInfo.splice(1, this.state.sysInfo.length)
+    },
+    set_player_gold(state, data) {
+      this.state.playerAttribute.GOLD += parseInt(data);
+    },
+    reset_player_gold(state, data) {
+      this.state.playerAttribute.GOLD = parseInt(data);
+    },
+    reset_player_equi() {
+      vueInstance.$store.commit('set_player_weapon', initial_weapon)
+      vueInstance.$store.commit('set_player_armor', initial_armor)
+      vueInstance.$store.commit('set_player_ring', initial_ring)
+      vueInstance.$store.commit('set_player_neck', initial_neck)
+      vueInstance.$store.commit('set_player_lv', 1)
+    },
+    set_endless_lv(state, data) {
+      this.state.playerAttribute.endlessLv = parseInt(data) < 1 ? 1 : parseInt(data);
+    },
+    set_player_lv(state, data) {
+      data = data < 1 ? 1 : data
+      this.state.playerAttribute.lv = parseInt(data || 1);
+    },
+    set_operator_schema(state, data) {
+      this.state.operatorSchemaIsMobile = data;
+    },
+    set_need_strengthen_equipment(state, data) {
+      this.state.needStrengthenEquipment = data;
+    },
+    set_player_curhp(state, data) {
+      var CURHP = this.state.playerAttribute.attribute.CURHP,
+        MAXHP = this.state.playerAttribute.attribute.MAXHP
+      if (data == 'dead') {
+        CURHP.value = 1
+      }else if(data == 'full'){
+        CURHP.value = MAXHP.value
+      }
+       else {
+        CURHP.value += Number(data);
+        CURHP.value = parseInt(CURHP.value)
+        if (CURHP.value > MAXHP.value) {
+          CURHP.value = MAXHP.value
+        }
+      }
+
+    }
+  },
+})
+'''
+'''--- vue-frontend/src/views/index.html ---
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Document</title>
+</head>
+<style>
+  @font-face {
+    font-family: 'sarasa';
+    src:
+      url('../assets/fonts/sarasa-ui-cl-regular.ttf') format('truetype');
+    font-weight: normal;
+    font-style: normal;
+  }
+
+  @font-face {
+    font-family: 'JetBrainsMono';
+    src:
+      url('../assets/fonts/JetBrainsMono-Regular.ttf') format('truetype');
+    font-weight: normal;
+    font-style: normal;
+  }
+
+  #app {
+    font-family: 'sarasa' !important;
+  }
+
+  div,
+  button,
+  span,
+  p,
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  b,
+  input {
+    font-family: 'sarasa' !important;
+  }
+  i{
+    font-family:'JetBrainsMono' !important;
+  }
+</style>
+
+<body>
+  字蛛字体文件，使用:在本目录下执行：font-spider ./index.html，具体参照字蛛官网
+  中文字体文件过大，所以我并没有上传源文件，仅仅上传了处理后的，需要源文件的可以联系我
+  <div>
+    尊敬背包装备商店强化装备导出存档复制文本到剪贴板手机用户长按没有粘贴请尝试使用输法剪贴板功能导清先输存档数据已经复制存档了建议到备忘录清先输存档数据存档成功导了糟糕存档坏了游戏进度已经了当前最每秒会回复的最力以及计算后的减伤比例减伤比例采用非线性计算护甲越高收益越低显示为近似值实际上永远不会到达减伤当前的初始为每秒这个只是数据并没有统计属性所以只是作为战斗力评估的一个依据你拥有的金币数量在这里钱就是万能的稀有掉落：独特真·死神名片指先驱者指素盏呜尊的意志月夜见尊的意志据说拥有增强佩戴者体质的神秘功效喵喵指上面有没有摸到的怨念御魂之出来吧卡赞吸纳所有彷徨的灵魂——鬼士约翰十字军项链十字军佩戴的项链力冰龙凝雪冰龙凝雪银魂之眼银魂之眼力红月的夜行衣力肃清者戎衣相传看到这一袭黑衣的人都死了争执连身衣力豪盔甲力隐武士铠甲力芬撒里尔追踪者力紫金守护胸甲够肉才能输出力战士重铠六级战士使用的重型铠甲力天权轻甲舍弃了性能的轻甲因为更加轻便攻性能更加突出力赤柳血铠似乎会给使用者提供气息力哈皮连身衣哈皮力创世亡命只有被选中的勇士才能唤醒它真正的力量无名没有人知道它的来历死亡之万物生自守恒源力破则失霜龙利傲雪冷心绝万念化冰华阿加雷斯血色巨诚既勇兮又以武终刚强兮不可凌身既死兮神以灵子魂魄兮为鬼雄神龙纳格林之神龙纳格林的爪子锻造的利师冒险家之师冒险家之六天使武六天使武力数珠丸恒次具体情况不明传说为日莲上人所有狱岩石太用狱岩石制作的太据说拥有让使用者潜力爆发的神秘力量战士长六级战士使用的长力赤柳血似乎会给使用者提供气息普通长朴实无华普通长有的只有强力的紫炎波传说中的狂战士最喜爱的的爪子这这也是武器冰晶之锋覆盖着冰晶碰到的敌人都会被冻住格挡转生先代狂龙战士盔甲埃苏莱布斯军菜单栏可以刷新当前世界欢迎你勇士点地图上的开始战斗普通困难记极玩家等级现在转生可以获得转生后会失去金币与装备转生会获得转生点数转生点数暴攻力防御刃毛毛刀翼角色值大伤害保存副本指环生命剑入戒击率测试服历史版本
+  </div>
+  <i>，。,.！？、【】@#￥%……&*（）——+{}|\《》，/;:''""；‘’”“：、·~1234567890qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM</i>
+</body>
+
+</html>
+'''
+'''--- vue-frontend/src/views/uiComponent/message/index.js ---
+import Vue from 'vue'
+import MessageComponent from './message.vue'
+
+let seed = 1  // 通过seed++来给每个实例创建不同id
+let instances = []  // 用于存放所有组件实例
+let MessageConstructor = Vue.extend(MessageComponent)
+
+let Message = (options = {}) => {
+  // 当调用直接传入字符串的时候，this.$message('内容')
+  if (typeof options === 'string') {
+    options = {
+      message: options
+    }
+  }
+
+  let id = 'message_' + seed++
+  let userOnClose = options.onClose
+  let userOnCancle = options.onCancle
+  
+  // 组件关闭的时候执行close方法
+  // 主要用来数组中移出实例，并重新计算偏移量
+  options.onClose = function () {
+    Message.close(id, userOnClose)
+  }
+  options.onCancle = function () {
+    Message.cancle(id, userOnCancle)
+  }
+  // 计算每个组件的偏移
+  let verticalOffset = options.offset || 16
+  instances.forEach(item => {
+    verticalOffset += item.$el.offsetHeight + 16
+  })
+  options.verticalOffset = verticalOffset
+
+  // 创建实例
+  let instance = new MessageConstructor({
+    data: options,
+    el: document.createElement('div')
+  })
+  // 实例id赋值
+  instance.id = id
+
+  instances.push(instance)
+  // 插入dom
+  document.body.appendChild(instance.$el)
+  return instance
+}
+
+Message.close = function (id, userOnClose) {
+  let len = instances.length
+  let index = -1
+  index = instances.findIndex(item => {
+    return item.id === id
+  })
+  if (index === -1) return
+  const removedHeight = instances[index].$el.offsetHeight
+  if (typeof userOnClose === 'function') {
+    userOnClose(instances[index])
+  }
+  instances.splice(index, 1)
+  
+  // 重新计算偏移量
+  if (len <= 1 || index > instances.length - 1) return
+  for (let i = index; i < len - 1; i++) {
+    let dom = instances[i].$el
+    dom.style['top'] =
+      parseInt(dom.style['top'], 10) - removedHeight - 16 + 'px'
+  }
+}
+
+Message.cancle = function (id,userOnCancle) {
+  let len = instances.length
+  let index = -1
+  index = instances.findIndex(item => {
+    return item.id === id
+  })
+  if (index === -1) return
+  const removedHeight = instances[index].$el.offsetHeight
+  if (typeof userOnCancle === 'function') {
+    userOnCancle(instances[index])
+  }
+  instances.splice(index, 1)
+  
+  // 重新计算偏移量
+  if (len <= 1 || index > instances.length - 1) return
+  for (let i = index; i < len - 1; i++) {
+    let dom = instances[i].$el
+    dom.style['top'] =
+      parseInt(dom.style['top'], 10) - removedHeight - 16 + 'px'
+  }
+}
+
+export default Message
+'''
+'''--- vue-frontend/vue.config.js ---
+const CompressionPlugin = require("compression-webpack-plugin")
+module.exports = {
+  // 选项...
+  publicPath: '',
+  productionSourceMap: false,
+  configureWebpack: config => {
+    if (process.env.NODE_ENV === 'production') {
+      return {
+        plugins: [
+          new CompressionPlugin({
+            test: /\.js$|\.html$|.\css/, //匹配文件名
+            threshold: 1024, //对超过10k的数据压缩
+            deleteOriginalAssets: false //是否删除源文件
+          })
+        ]
+      }
+    }
+  },
+}
+'''

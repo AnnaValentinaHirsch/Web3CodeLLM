@@ -1,0 +1,130 @@
+ETH-NEAR Rainbow Bridge
+DEVELOPERS
+August 19, 2020
+There are lots of blockchains and scalability solutions, and it is hard to decide which one to use when we are building a product, especially when it means committing with the assets or data. Ideally, we don’t want to commit at all. We want to freely move our assets and data between the blockchains, or even better — run our product on several blockchains at the same time and leverage each of them. For example, we can leverage performance on one blockchain while leveraging community and ecosystem on another blockchain.
+
+At NEAR, we do not want Ethereum developers to choose between NEAR and Ethereum and commit to only one. We want them to have the same asset on both blockchains and even have apps that seamlessly communicate across the boundary. So we built a bridge, called Rainbow Bridge, to connect the Ethereum and NEAR blockchains, and we created the lowest possible trust level one can have for an interoperability solution — you only need to trust what it connects, the NEAR and Ethereum blockchains, and you don’t need to trust the bridge itself. There is no authority outside Ethereum miners and NEAR validators.
+
+Specifically, to trust the bridge, you need to:
+
+Trust that Ethereum blocks are final after X confirmations. Currently, bridge implementation decides X for the app developer, but soon app developers will be able to determine X for themselves. It can be 25 if you are a typical app developer or 500 if you are super cautious;
+Trust that at no time, 2/3 of the validators stake on NEAR blockchain is dishonest. Not only the bridge, but also all other applications on NEAR operate under this assumption;
+Until EIP665 is accepted, you will need to trust that it is not possible to exponentially increase the minimum gas price of Ethereum blocks by more than 2x with every block for more than 4 hours. Assuming the base gas price to be 40gwei and 14bps, you can easily calculate that attempting to increase gas price by 2x will very quickly cause it to exceed any reasonable limits way before the end of 4 hours. We will explain more on where this restriction is coming from below.
+Since the Rainbow Bridge does not require the users to trust anything but the blockchains themselves, we call it trustless.
+
+This trustless model results in the following latency number for interactions across the bridge:
+
+For ETH->NEAR interactions, the latency is the speed of producing X Ethereum blocks, which is about 6 minutes for 25 blocks;
+For NEAR->ETH interactions, the latency is 4 hours, and it will be about 14 seconds once EIP665 is accepted.
+Notice how significantly the latency would drop if only EIP665 was accepted. Given that many scalability solutions require up to 7 days of waiting time for interoperability, we consider our bridge rapid. The speed is only limited by the lack of EIP665 and the number of confirmations for Ethereum blocks, which is the same limitation that applies to any Ethereum-based project.
+
+As we will expand later, our bridge does not require special permission to deploy, maintain, or use. Anyone can deploy a new bridge, use an existing bridge, or join the maintenance of an existing bridge without getting approval from anyone else, not even NEAR Foundation, which makes our bridge decentralized. 
+
+Rainbow Bridge is also generic. Any information that is cryptographically provable on NEAR is usable in Ethereum contracts and the other way around. The following information is cryptographically provable for both blockchains:
+
+Inclusion of a transaction in a block;
+Execution of a transaction with a specific result;
+The state of the contract.
+Additionally, blockchain-specific information is provable, like the content of a specific block header, which in Ethereum would include things like information about the miner, and in NEAR would include information about the validators. Cryptographically-provable information allows us to build a variety of use-cases:
+
+we can bridge fungible tokens, non-fungible tokens, or any kind of asset;
+we can write Ethereum contracts that use the state of a contract or validator from NEAR;
+we can do cross-contract calls across the bridge.
+While the variety of the use cases looks unlimited, we currently only have out-of-box support for transferring ERC20 tokens from Ethereum to NEAR blockchain and back. However, we will add out-of-box support for other use cases based on demand. Additionally, anyone can jump in and add support to their personal use case without waiting for us or working with our codebase.
+
+To understand why this and other properties that we listed above hold, we need to understand its design.
+
+*If you are a developer or designer, join us Sept. 15-30, 2020 for NEAR’s open online Hack The Rainbow 🌈 hackathon.
+
+Design
+Anton Bukov developed a large portion of the Rainbow Bridge design during his work in NEAR. He is now the CTO of 1inch exchange, but he still guides the high-level design of the bridge.
+
+The core idea behind the bridge is that it implements two light clients: 
+
+An Ethereum light client implemented in Rust as a NEAR contract
+A NEAR light client implemented in Solidity as an Ethereum contract
+If you are familiar with the concept of a light client, this short outline already explains the above-listed guarantees. In short, a blockchain light client is a specification or an implementation of this specification that tracks the state of the blockchain without running heavy computation, but which can still verify the state that it tracks in a trustless way. The main focus is to be able to track and verify the state with a small amount of computation. 
+
+We realized that the amount of computation could be so small that it might be possible to run a light client inside a contract. This was the key to making the Rainbow Bridge feasible. 
+
+The Ethereum light client is more resource-intensive since it requires tracking every single header of the Ethereum blockchain, and it requires Ethash verification. The NEAR light client is less resource-intensive since it requires tracking only one block per epoch, where an epoch is approximately 43k blocks (this is a necessary quality since NEAR produces blocks much faster than Ethereum, which makes tracking all NEAR headers in an Ethereum Solidity contract challenging and frankly prohibitively expensive due to gas costs). Fortunately, NEAR gas limits allow more expensive computations than Ethereum. So we can run a more expensive Ethereum light client in the more computationally liberal NEAR blockchain while running a less expensive NEAR light client in the more computationally conservative Ethereum blockchain. What a fantastic coincidence! 🙂 You can find the specification of the NEAR light client here: https://nomicon.io/ChainSpec/LightClient.html
+
+Light clients
+Here is the simplified diagram of the light clients operating in the bridge:
+
+
+Notice, how in addition to smart contracts that implement light clients, we have two services, called relays, that regularly send headers to the light clients. Eth2NearRelay sends every single header to the EthOnNearClient contract, while Near2EthRelay sends one header every 4 hours to the NearOnEthClient contract. For a given pair of EthOnNearClient and NearOnEthClient contracts, there could be several pairs of Eth2NearRelay and Near2EthRelay services. Each bridge maintainer can run its pair of services. These pairs of services can either compete with each other — they would try submitting the same blocks simultaneously, and only one would succeed each time, or back up each other — some services would only submit the blocks if others did not submit blocks in time. Our current implementation of the services runs in the first mode.
+
+EthOnNearClient
+EthOnNearClient as we already said is an implementation of the Ethereum light client in Rust as a NEAR contract. It accepts Ethereum headers and maintains the canonical chain, it assumes that blocks that have finalized_gc_threshold confirmations cannot leave the canonical chain, and it memorizes up to hashes_gc_threshold of the blocks from the canonical chain, where hashes_gc_threshold>=finalized_gc_threshold. By the default finalized_gc_threshold=46k which roughly corresponds to 7 days worth of headers. This is done so that the state of the EthOnNearClient does not grow endlessly. Remember that in NEAR one is required to have a certain amount of locked tokens to be able to use the state (more info), which would require a very large ever-growing number of locked tokens if we were storing the hash of every single Ethereum canonical header in a single contract. Therefore we store a limited number of hashes of Ethereum headers. As a consequence the bridge can only be used to prove events that happened within this time horizon. So if you ever start an ERC20 transfer from Ethereum to NEAR, please make sure to finish it within 7 days if it gets interrupted in the middle.
+
+Another important nuance of EthOnNearClient is how it verifies Ethereum headers. It wouldn’t be possible to verify Ethereum PoW directly inside the contract since it would require storing the Ethereum DAG file, which would require prohibitive memory usage. Fortunately, every Ethereum block uses only a subset of the elements from the DAG file, and there is only one DAG file per Ethereum epoch. Moreover, DAG files can be precomputed for future epochs in advance. We precompute DAG files for about 4 years in advance and merkelize each of them. EthOnNearClient contract then memorizes the merkle roots of the DAG files for the next 4 years upon initialization. EthOnNearClient then only needs to receive the Ethereum header, the DAG elements, and the merkle proofs of these elements, which allows it to verify PoW without having the entire DAG file in memory. We took this approach from the EOS bridge used by Kyber network, and we even reuse some of their code. Fortunately, the Ethereum header’s verification uses only 1/3 of the max transaction gas limit and 1/10 of the block gas limit.
+
+NearOnEthClient
+NearOnEthClient is an implementation of the NEAR light client in Solidity as an Ethereum contract. Unlike EthOnNearClient it does not need to verify every single NEAR header and can skip most of them as long as it verifies at least one header per NEAR epoch, which is about 43k blocks and lasts about half a day. As a result, NearOnEthClient can memorize hashes of all submitted NEAR headers in history, so if you are making a transfer from NEAR to Ethereum and it gets interrupted you don’t need to worry and you can resume it any time, even months later. Another useful property of the NEAR light client is that every NEAR header contains a root of the merkle tree computed from all headers before it. As a result, if you have one NEAR header you can efficiently verify any event that happened in any header before it.
+
+Another useful property of the NEAR light client is that it only accepts final blocks, and final blocks cannot leave the canonical chain in NEAR. This means that NearOnEthClient does not need to worry about forks.
+
+However, unfortunately, NEAR uses Ed25519 to sign messages of the validators who approve the blocks, and this signature is not available as an EVM precompile. It makes verification of all signatures of a single NEAR header prohibitively expensive. So technically, we cannot verify one NEAR header within one contract call to NearOnEthClient. Therefore we adopt the optimistic approach where NearOnEthClient verifies everything in the NEAR header except the signatures. Then anyone can challenge a signature in a submitted header within a 4-hour challenge window. The challenge requires verification of a single Ed25519 signature which would cost about 500k Ethereum gas (expensive, but possible). The user submitting the NEAR header would have to post a bond in Ethereum tokens, and a successful challenge would burn half of the bond and return the other half to the challenger. The bond should be large enough to pay for the gas even if the gas price increases exponentially during the 4 hours. For instance, a 20 ETH bond would cover gas price hikes up to 20000 Gwei. This optimistic approach requires having a watchdog service that monitors submitted NEAR headers and challenges any headers with invalid signatures. For added security, independent users can run several watchdog services.
+
+Once EIP665 is accepted, Ethereum will have the Ed25519 signature available as an EVM precompile. This will make watchdog services and the 4-hour challenge window unnecessary.
+
+At its bare minimum, Rainbow Bridge consists of EthOnNearClient and NearOnEthClient contracts, and three services: Eth2NearRelay, Near2EthRelay, and the Watchdog. We might argue that this already constitutes a bridge since we have established a cryptographic link between two blockchains, but practically speaking it requires a large portion of additional code to make application developers even consider using the Rainbow Bridge for their applications.
+
+Provers
+What would make clients more useful is the ability to prove that something happened on a specific blockchain. For that, we implement EthOnNearProver NEAR contract in Rust and NearOnEthProver Ethereum contract in Solidity. EthOnNearProver can verify Ethereum events, while the NearOnEthProver contract can verify NEAR contract execution results. Both EthOnNearProver and NearOnEthProver contracts are implemented separately from EthOnNearClient and NearOnEthClient for multiple reasons:
+
+Separation of concerns — clients are responsible for keeping track of the most recent blockchain header, while provers are responsible for verifying specific cryptographic information;
+Scalability — since NEAR is a sharded blockchain, if a certain instance of the bridge becomes extremely popular, users will be able to scale the load by deploying multiple copies of a given prover;
+Specificity — in addition to the provers described above, one can implement other kinds of provers. One could verify a contract’s state, the specific content of a header, or the inclusion of a transaction. Additionally, different implementations of provers could use different optimizations.
+Currently, we have implementations only for verifying Ethereum events and NEAR contract execution results, which is sufficient for moving tokens between the blockchains. But anyone is welcome to contribute prover implementations. 
+
+(Caption: One EthOnNearClient can have multiple provers talking to it replicated across multiple shards, while NearOnEthClient will have a single copy of each kind of the prover talking to it).
+
+ERC20 use case
+The provers enable us to build a set of contracts that allow asset transfer or cross-chain communication. However, these contracts will be very different depending on what exactly we want to interoperate across the bridge. For example, ERC20 requires an entirely separate set of contracts from ERC721 or native token transfer. Currently, the Rainbow Bridge has out-of-the-box support for generic ERC20 token transfers, and we will add more use cases in the future. In this post, we focus only on the ERC20 use case.
+
+Suppose there is an existing ERC20 token on Ethereum, e.g., DAI. For us to move it across the bridge, we need to deploy two additional contracts:
+
+TokenLocker Ethereum contract implemented in Solidity;
+MintableFungibleToken NEAR contract implemented in Rust.
+When a user wants to transfer X amount of DAI from Ethereum to NEAR, they first lock this X DAI in the TokenLocker contract, and then mint X nearDAI in the MintableFungibleToken NEAR contract. When they want to transfer some tokens back from NEAR to Ethereum, they first burn Y nearDAI in MintableFungibleToken and then unlock Y DAI in TokenLocker.
+
+Currently, each instance of ERC20 token would require deploying a separate pair of TokenLocker/MintableFungibleToken; however, we are going to lift this restriction in the future and use the same TokenLocker for multiple ERC20 tokens. Note that if someone wants to add support of ERC721 or another type of asset transfer, they would need to implement similar Locker/Asset pair with a different external interface and internal implementation, but the high-level design would remain the same — the Locker would lock/unlock assets while Asset would mint/burn the NEAR version of this asset.
+
+Usage flow
+Users will be able to use either RainbowCLI or any app that integrates with RainbowLib, like NEAR Wallet. In rare cases, someone might choose to work with the bridge manually by calling Ethereum and NEAR contracts from their shell using low-level contract calls. Currently, we only support RainbowCLI, but we are working on RainbowLib and Wallet integrations. 
+
+From the user perspective, the transfer of a token should be straightforward: they provide credentials, choose beneficiary and amount, and initiate the transfer either from RainbowCLI, Wallet, or other applications. After some time, the transfer succeeds, and the user receives visual confirmation. Behind the scenes however, RainbowLib will perform the following complex operations:
+
+Suppose Alice wants to transfer X DAI to Bob on NEAR blockchain and she initiates the transfer from RainbowCLI/RainbowLib;
+RainbowLib first sets an allowance to transfer X DAI from Alice to TokenLocker;
+It then calls TokenLocker to grab those tokens resulting in TokenLocker emitting event “Alice locked X tokens in favor of Bob”;
+RainbowLib then waits until EthOnNearClient receives the Ethereum header than contains this event, plus 25 blocks more for confirmation (see note on Ethereum finality in opening section) 
+Then RainbowLib computes the proof of this event and submits it to the MintableFungibleToken contract;
+MintableFungibleToken contract then verifies that this proof is correct by calling EthOnNearProver;
+EthOnNearProver, in turn, verifies that the header of the proof is on the canonical chain of EthOnNearClient, and it has the required number of confirmations. It also verifies the proof itself;
+MintableFungibleToken then unpacks the Ethereum event and mints X nearDAI for Bob, finishing the transfer.
+Similarly, RainbowLib will be able to perform transfers of non-ERC20 tokens and do contract calls.
+
+Hard forks
+We want existing Rainbow Bridges not to break when NEAR or Ethereum protocol change is happening. And we want to be able to upgrade bridge contracts when serious performance upgrades become available, e.g., if EIP665 is accepted. However, we don’t want it to become less trustless or decentralized by introducing a centralized way of initiating the upgrade.
+
+There is a large variety of proxy patterns developed by the Ethereum community that allow contract updates. However, we think the safest upgrade pattern is when the upgrade decision is delegated to the users themselves. An equivalent of this user-controlled upgrade for the bridge is the following:
+
+Suppose the user is using the bridge to transfer DAI between Ethereum and NEAR. Suppose they have X DAI locked in TokenLocker and X nearDAI available on the NEAR side;
+Suppose one day they receive an announcement that NEAR or Ethereum are making a protocol change and they need to migrate to bridge V2 within a week;
+They transfer nearDAI back to DAI using the old bridge, then transfer DAI into nearDAI V2 using bridge V2.
+This approach, however, has downsides:
+
+Unlike regular contracts, the bridge is a more complex system that requires maintenance — someone needs to run the relays constantly, otherwise the light clients will go out of sync with the blockchains and become useless. That means we cannot ask users to manually migrate from bridge V1 to bridge V2 at their convenience. If we shut down the relays of the V1 bridge before literally everyone migrates their assets out, their assets might be permanently locked without the ability to move to V2. If we run relays for too long and wait until every user migrates we will be spending gas on the fees daily, approximately 40 USD per day at 40gwei price;
+Applications that integrate with our bridge would need to be aware of the migration as they would need to switch from an old MintableFungibleToken contract to a new MintableFungibleToken contract. Some of them might need to perform this migration themselves or guide the user through it with the UI.
+Given the above downsides, we have decided to implement the following upgradability option into our bridge. We will be using one of the proxy patterns to allow EthOnNearClient, EthOnNearProver, NearOnEthClient, and NearOnEthProver to automatically switch to new contract versions when they have received a proof that 2/3 of NEAR stake has voted for a new set of contracts. TokenLocker and MintableFungibleToken would not need to change, in most if not all cases, and so the upgrade will be transparent to the users and the application developers. This will not affect the bridge’s trust model since we need to trust 2/3 of the NEAR stake anyway. We will be using the same voting contract as for other governance mechanisms at NEAR. We will also try to minimize the chance of this mechanism used as a backdoor by creating a 7-day delay on the upgrade so that users can observe it, verify it, and if they don’t like it, liquidate their tokens or move them manually to a different bridge. We will, however, leave a possibility for the NEAR validators to vote for an emergency upgrade, but we do not expect to exercise it.
+
+Incentives
+The current Rainbow Bridge does not implement incentives for the maintainers who pay for the gas by relaying the headers. Major users of the bridge are expected to run their own relays, and at least one pair of relays will be run by the NEAR collective. Future versions of the bridge will have an option to charge users of the bridge who perform the transfers would have to pay for its usage in gas, native tokens, or some other means. Designing a sound incentive system is, however, tricky. The most naive approach would accumulate the tax from users of the bridge and distribute it among the maintainers who run relays. Unfortunately, such a system does not protect from death spiral scenarios, e.g. when the bridge experiences a hiccup which causes users to stop using it for some time and consequently makes maintainers lose interest in paying for gas. Our organization is taking time to develop a well-thought-through incentive system for the bridge, and meanwhile, we will maintain it at our own cost.
+
+Trying it out and getting involved
+We’ve been running Rainbow Bridge between Ropsten and NEAR TestNet for several weeks now, but we haven’t opened it to the public yet. However, you can experiment with bridge transfers by running a local NEAR node and Ganache. Please make sure to install all dependencies first, as their number is quite extensive: Rust+Wasm, Golang, pm2, node <=13. We are working on removing some of these dependencies.
+
+If you are a developer or designer, sign up for NEAR’s open online Hack The Rainbow 🌈 hackathon. You can also get involved in our Bridge Guild where we will be discussing various integrations, new use cases, and building projects that use the bridge. Please also follow our blog as we are going to have a series of posts on bridge use cases and integrations.

@@ -1,0 +1,1800 @@
+*GitHub Repository "juno-labs/mars-minter-contract"*
+
+'''--- .cargo/config.toml ---
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=-s"]
+
+'''
+'''--- .github/workflows/tests.yml ---
+name: Automatic Tests
+on: push
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: "stable with rustfmt, and wasm32"
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          target: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v1
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+      - name: install node
+        uses: actions/setup-node@v2
+        with:
+          node-version: "16"
+      - name: Run tests
+        run: yarn && yarn test:ci
+
+'''
+'''--- .vscode/settings.json ---
+{
+    "editor.formatOnSave": true
+}
+'''
+'''--- Cargo.toml ---
+[workspace]
+members = [
+  "contracts/*"
+]
+
+[profile.release]
+codegen-units = 1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+
+'''
+'''--- README.md ---
+# Mars Minter Contract
+
+# Setup
+
+```sh
+# Install dependencies
+yarn
+# Run tests
+yarn test
+```
+
+'''
+'''--- __test__/marketplace.ava.ts ---
+import { Gas, NEAR } from "near-units";
+import { NearAccount, ONE_NEAR, Workspace } from "near-workspaces-ava";
+import {
+  BalanceDelta,
+  deploy,
+  mint,
+  nftTokensForOwner,
+  printBalance,
+  totalCost,
+} from "./marsMinterUtils";
+
+function getRoyalties({ root, person_b, person_c }) {
+  return {
+    accounts: {
+      [root.accountId]: 10,
+      [person_b.accountId]: 20,
+      [person_c.accountId]: 70,
+    },
+    percent: 20,
+  };
+}
+
+function delpoyParas(
+  root: NearAccount,
+  owner_id: NearAccount,
+  treasury_id: NearAccount,
+  approved_nft_contract_ids: NearAccount[]
+): Promise<NearAccount> {
+  return root.createAndDeploy("paras-market", `${__dirname}/paras.wasm`, {
+    method: "new",
+    args: {
+      owner_id,
+      treasury_id,
+
+      approved_nft_contract_ids,
+    },
+  });
+}
+
+const runner = Workspace.init(
+  { initialBalance: NEAR.parse("15 N").toString() },
+  async ({ root }) => {
+    const owner_id = root;
+    await printBalance(console, root);
+    const person_b = await root.createAccount("person_b");
+    const person_a = await root.createAccount("person_a");
+    const person_c = await root.createAccount("person_c");
+    const royalties = getRoyalties({ root, person_b, person_c });
+    const marsMinter = await deploy(root, "mars_minter", { royalties });
+    const token_id = await mint(
+      marsMinter,
+      person_a,
+      await totalCost(marsMinter, 1)
+    );
+
+    const paras = await delpoyParas(root, root, root, [marsMinter]);
+
+    await person_a.call(
+      paras,
+      "storage_deposit",
+      {},
+      {
+        attachedDeposit: ONE_NEAR,
+      }
+    );
+    const msg = JSON.stringify({
+      market_type: "sale",
+      price: ONE_NEAR.toString(),
+      ft_token_ids: "near",
+    });
+    await person_a.call(
+      marsMinter,
+      "nft_approve",
+      {
+        token_id,
+        account_id: paras,
+        msg,
+      },
+      {
+        attachedDeposit: ONE_NEAR,
+      }
+    );
+    return { marsMinter, paras, person_c, person_a, person_b };
+  }
+);
+
+runner.test(
+  "buy one",
+  async (t, { root, marsMinter, paras, person_a, person_c, person_b }) => {
+    const person_a2 = await root.createAccount("person_a2");
+    const ids = await nftTokensForOwner(person_a, marsMinter);
+    t.is(ids.length, 1);
+    const token_id = ids[0].token_id;
+    t.log(
+      await paras.view("get_market_data", {
+        nft_contract_id: marsMinter.accountId,
+        token_id,
+      })
+    );
+
+    const balance = await root.availableBalance();
+    const PersonCBalance = await person_c.availableBalance();
+    const person_aDelta = await BalanceDelta.create(person_a, t);
+    const person_a2Delta = await BalanceDelta.create(person_a2, t);
+
+    t.log("Before person_a2 buys from person_a");
+    await printBalance(t, person_a);
+    await printBalance(t, person_a2);
+    await printBalance(t, person_c);
+    await printBalance(t, person_b);
+    await printBalance(t, root);
+
+    const res = await person_a2.call_raw(
+      paras,
+      "buy",
+      {
+        nft_contract_id: marsMinter,
+        token_id,
+      },
+      {
+        gas: Gas.parse("100 Tgas"),
+        attachedDeposit: ONE_NEAR,
+      }
+    );
+
+    t.log("After person_a2 buys from person_a");
+    await printBalance(t, person_a);
+    await printBalance(t, person_a2);
+    await printBalance(t, person_c);
+    await printBalance(t, person_b);
+    await printBalance(t, root);
+
+    await person_a2Delta.isLessOrEqual(NEAR.from(ONE_NEAR.neg()));
+    await person_aDelta.isGreaterOrEqual(NEAR.parse("750 mN"));
+
+    t.assert(
+      res.logsContain("EVENT_JSON"),
+      `Expected EVENT_JSON got ${res.logs}`
+    );
+    t.log(res.logs);
+    t.log(await nftTokensForOwner(person_a2, marsMinter));
+    const newBalance = await root.availableBalance();
+    t.assert(newBalance.gt(balance));
+    t.log(newBalance.sub(balance).toHuman());
+    const newEveBalance = await person_c.availableBalance();
+    t.assert(newEveBalance.gt(PersonCBalance));
+    t.log(newEveBalance.sub(PersonCBalance).toHuman());
+  }
+);
+
+'''
+'''--- __test__/marsMinter.ava.ts ---
+import { NEAR } from "near-units";
+import { NearAccount, Workspace } from "near-workspaces-ava";
+import {
+  costPerToken,
+  createNewAccount,
+  deploy,
+  MINT_ONE_GAS,
+  nftTokensForOwner,
+  printBalance,
+  tokenStorageCost,
+  totalCost,
+  userMintsNFTs,
+} from "./marsMinterUtils";
+
+const base_cost = NEAR.parse("5 N");
+
+function createRoyalties({ root, person_b, person_a, person_c }) {
+  return {
+    accounts: {
+      [root.accountId]: 10,
+      [person_b.accountId]: 10,
+      [person_a.accountId]: 10,
+      [person_c.accountId]: 70,
+    },
+    percent: 20,
+  };
+}
+
+function subaccounts(root: NearAccount): Promise<NearAccount[]> {
+  return Promise.all(
+    ["person_a", "person_b", "person_c"].map((n) =>
+      root.createAccount(n, {
+        initialBalance: NEAR.parse("200 N").toString(),
+      })
+    )
+  );
+}
+
+const runner = Workspace.init(
+  { initialBalance: NEAR.parse("50 N").toString() },
+  async ({ root }) => {
+    console.log(`Is testnet? ${Workspace.networkIsTestnet()}`);
+
+    await printBalance(console, root);
+
+    const [person_a, person_b, person_c] = await subaccounts(root);
+    const royalties = createRoyalties({ root, person_a, person_b, person_c });
+
+    await printBalance(console, root);
+
+    const ndnDefaultMetaArgs = {
+      name: "Near Dragon Nation",
+      symbol: "NFN",
+      uri: "https://bafybeidq7nu5pxsiy2cext6qtxxygpifhunxco25mtrabfge2rf6lxdax4.ipfs.dweb.link/",
+      size: 100,
+      mint_start_epoch: 1642264405,
+      base_cost,
+      royalties,
+    };
+
+    await printBalance(console, person_c);
+    const marsMinter = await deploy(
+      person_c,
+      "mars_minter",
+      ndnDefaultMetaArgs
+    );
+    await printBalance(console, person_c);
+    return { marsMinter, person_b, person_a, person_c };
+  }
+);
+
+runner.test("can get cost per token", async (t, { marsMinter }) => {
+  const cost = await costPerToken(marsMinter, 1);
+  const storageCost = await tokenStorageCost(marsMinter);
+  t.log(
+    "One token costs " +
+      cost.toHuman() +
+      "to buy and " +
+      storageCost.toHuman() +
+      " to store"
+  );
+
+  t.log(
+    `Const per token for 24 is: ${await (
+      await costPerToken(marsMinter, 24)
+    ).toHuman()}`
+  );
+
+  t.deepEqual(cost.toBigInt(), base_cost.add(storageCost).toBigInt());
+  if (cost.toBigInt() > 0) {
+    t.assert(cost.gte(await costPerToken(marsMinter, 24)));
+  }
+});
+
+async function assertXTokens(t, root: NearAccount, marsMinter, num) {
+  const method = num == 1 ? "nft_mint_one" : "nft_mint_many";
+  let args = num == 1 ? {} : { num };
+  const cost = await totalCost(marsMinter, num);
+
+  t.log(`${num} token costs ` + cost.toHuman());
+  const res = await root.call_raw(marsMinter, method, args, {
+    attachedDeposit: cost,
+    gas: MINT_ONE_GAS,
+  });
+  t.true(res.succeeded, [res.Failure, ...res.promiseErrorMessages].join("\n"));
+  t.is(num, (await nftTokensForOwner(root, marsMinter)).length);
+}
+
+[
+  ["one", 1],
+  ["two", 2],
+  ["five", 5],
+  ["ten", 10],
+].forEach(async ([num, x]) => {
+  runner.test("mint " + num, async (t, { root, marsMinter }) => {
+    await assertXTokens(t, root, marsMinter, x);
+  });
+});
+
+[
+  ["one", 1],
+  ["two", 2],
+  ["ten", 10],
+].forEach(async ([num, x]) => {
+  runner.test("person_b mints " + num, async (t, { person_b, marsMinter }) => {
+    await userMintsNFTs(t, person_b, marsMinter, x);
+  });
+});
+
+async function getDetailedViewOfNFT(t, user: NearAccount, marsMinter) {
+  await userMintsNFTs(t, user, marsMinter, 1);
+  const nftList = await nftTokensForOwner(user, marsMinter);
+  const singleNFTMetadata = nftList[0];
+  t.log({ singleNFTMetadata });
+  const collectionMetadata = await marsMinter.view("nft_metadata");
+  t.log({ collectionMetadata });
+}
+
+runner.test("detailed view of NFT ", async (t, { person_a, marsMinter }) => {
+  await getDetailedViewOfNFT(t, person_a, marsMinter);
+});
+
+async function mintingAllNFTs(
+  t,
+  root: NearAccount,
+  deployer: NearAccount,
+  marsMinter
+) {
+  const whale = await createNewAccount(t, root, "whale", "2000 N");
+  for (let i = 0; i < 10; i++) {
+    await userMintsNFTs(t, whale, marsMinter, 10);
+    const tokens_left = await marsMinter.view("tokens_left");
+    t.log(`Number of tokens left: ${tokens_left}`);
+    await printBalance(t, deployer);
+  }
+
+  t.log(
+    `Number of Holdings: ${(await nftTokensForOwner(whale, marsMinter)).length}`
+  );
+
+  const method = "nft_mint_one";
+  const cost = await totalCost(marsMinter, 1);
+
+  try {
+    await whale.call_raw(
+      marsMinter,
+      method,
+      {},
+      {
+        attachedDeposit: cost,
+        gas: MINT_ONE_GAS,
+      }
+    );
+    t.assert(false);
+  } catch (error) {
+    t.assert(true);
+  }
+
+  t.is(100, (await nftTokensForOwner(whale, marsMinter)).length);
+
+  const mintedNFTs = await nftTokensForOwner(whale, marsMinter);
+  const tokenIdList = mintedNFTs
+    .map((nft) => nft?.token_id)
+    .sort((a, b) => parseInt(a) - parseInt(b));
+  t.log({ tokenIdList });
+}
+
+runner.test(
+  "Try minting all NFTs",
+  async (t, { root, person_c, marsMinter }) => {
+    await mintingAllNFTs(t, root, person_c, marsMinter);
+  }
+);
+
+'''
+'''--- __test__/marsMinterUtils.ts ---
+import { Gas, NEAR } from "near-units";
+import { NearAccount, ONE_NEAR } from "near-workspaces-ava";
+import { join } from "path";
+
+const RUST_BIN_FOLDER = ["target", "wasm32-unknown-unknown", "release"];
+
+export const createNewAccount = async (
+  t: any,
+  root: NearAccount,
+  accountName: string,
+  initialBalance: string = "15 N"
+) => {
+  const account = await root.createAccount(accountName, {
+    initialBalance: NEAR.parse(initialBalance).toString(),
+  });
+  const accountAddress = account.accountId;
+  const accountBalance = await account.balance();
+  const accountBalanceHuman = accountBalance.available.toHuman();
+  t.log(`${accountAddress} created with balance ${accountBalanceHuman}`);
+  return account;
+};
+
+export const printBalance = async (t, user: NearAccount) => {
+  const userAddress = user.accountId;
+  const userBalance = await user.balance();
+  const userBalanceHuman = userBalance.available.toHuman();
+  t.log(`${userAddress} has ${userBalanceHuman}`);
+};
+
+export async function userMintsNFTs(
+  t,
+  user: NearAccount,
+  marsMinter,
+  num,
+  shouldFail: boolean = false,
+  printRootCost: boolean = false
+) {
+  const numPriorHoldings = (await nftTokensForOwner(user, marsMinter)).length;
+  const method = num == 1 ? "nft_mint_one" : "nft_mint_many";
+  let args = num == 1 ? {} : { num };
+  const cost = await totalCost(marsMinter, num);
+
+  if (printRootCost) {
+    t.log(
+      "Cost for root to mint",
+      (await totalCost(marsMinter, num)).toHuman()
+    );
+  }
+
+  t.log(
+    `${user.accountId} is minting: ${num} tokens costing ` + cost.toHuman()
+  );
+  const userBalanceBefore = (await user.balance()).available.toHuman();
+  t.log(`Balance Before: ${userBalanceBefore}`);
+  try {
+    const res = await user.call_raw(marsMinter, method, args, {
+      attachedDeposit: cost,
+      gas: MINT_ONE_GAS,
+    });
+    t.true(
+      res.succeeded,
+      [res.Failure, ...res.promiseErrorMessages].join("\n")
+    );
+    t.is(
+      num,
+      (await nftTokensForOwner(user, marsMinter)).length - numPriorHoldings
+    );
+  } catch (error) {
+    t.assert(shouldFail);
+    t.is(numPriorHoldings, (await nftTokensForOwner(user, marsMinter)).length);
+  }
+  const userBalanceAfter = (await user.balance()).available.toHuman();
+  t.log(`Balance After: ${userBalanceAfter}`);
+}
+
+export class NEARDelta {
+  static readonly ZERO_NEAR = NEAR.from(0);
+  constructor(public readonly amount: NEAR) {}
+
+  toHuman(): string {
+    if (this.isZero()) {
+      return `0 N`;
+    }
+    const absAmount = this.amount.abs();
+    return `${this.amount.isNeg() ? "-" : ""}${absAmount.toHuman()}`;
+  }
+
+  isZero(): boolean {
+    return this.amount.isZero();
+  }
+
+  gt(by = NEARDelta.ZERO_NEAR): boolean {
+    return this.amount.gt(by);
+  }
+
+  gte(by = NEARDelta.ZERO_NEAR): boolean {
+    return this.amount.gte(by);
+  }
+
+  lt(by = NEARDelta.ZERO_NEAR): boolean {
+    return this.amount.lt(by);
+  }
+
+  lte(by = NEARDelta.ZERO_NEAR): boolean {
+    return this.amount.lte(by);
+  }
+}
+
+export class BalanceDelta {
+  private constructor(
+    public readonly initial: NEAR,
+    public readonly account: NearAccount,
+    private t: any
+  ) {}
+
+  static async create(account: NearAccount, t): Promise<BalanceDelta> {
+    return new BalanceDelta(await account.availableBalance(), account, t);
+  }
+
+  async delta(): Promise<NEARDelta> {
+    const newBalance = await this.account.availableBalance();
+    return new NEARDelta(newBalance.sub(this.initial));
+  }
+
+  async isZero(): Promise<void> {
+    return this.assert((delta) => delta.isZero(), "zero");
+  }
+
+  async isGreater(by?: NEAR): Promise<void> {
+    return this.assert((delta) => delta.gt(by), "greater");
+  }
+  async isGreaterOrEqual(by?: NEAR): Promise<void> {
+    return this.assert((delta) => delta.gte(by), "greater or equal");
+  }
+
+  async isLess(by?: NEAR): Promise<void> {
+    return this.assert((delta) => delta.lt(by), "less");
+  }
+
+  async isLessOrEqual(by?: NEAR): Promise<void> {
+    return this.assert((delta) => delta.lte(by), "less or equal");
+  }
+
+  private async assert(
+    fn: (d: NEARDelta) => boolean,
+    innerString: string
+  ): Promise<void> {
+    const delta = await this.delta();
+    this.t.assert(
+      fn(delta),
+      `Account ${
+        this.account.accountId
+      } expected ${innerString} got: ${delta.toHuman()}`
+    );
+  }
+
+  async toHuman(): Promise<string> {
+    return (await this.delta()).toHuman();
+  }
+
+  async log(): Promise<void> {
+    this.t.log(`${this.account.accountId} has delta ${await this.toHuman()}`);
+  }
+}
+
+export async function getDelta<T>(
+  t,
+  account: NearAccount,
+  txns: () => Promise<T>
+): Promise<[BalanceDelta, T]> {
+  const delta = await BalanceDelta.create(account, t);
+  return [delta, await txns()];
+}
+
+const binPath = (name: string): string => {
+  return join(__dirname, "..", ...RUST_BIN_FOLDER, `${name}.wasm`);
+};
+
+export function deploy(
+  owner: NearAccount,
+  name = "mars_minter",
+  args = {}
+): Promise<NearAccount> {
+  return owner.createAndDeploy(name, binPath(name), {
+    method: "new_default_meta",
+    args: {
+      owner_id: owner,
+      name: "MARS MINTER NFT",
+      symbol: "MMN",
+      uri: "https://bafybeidq7nu5pxsiy2cext6qtxxygpifhunxco25mtrabfge2rf6lxdax4.ipfs.dweb.link/",
+      size: 100,
+      base_cost: NEAR.parse("1 N"),
+      is_premint_over: true,
+      ...args,
+    },
+  });
+}
+
+export async function nftTokensForOwner(
+  root,
+  marsMinter,
+  from_index = null,
+  limit = null
+) {
+  return marsMinter.view("nft_tokens_for_owner", {
+    account_id: root,
+    from_index,
+    limit,
+  });
+}
+
+export async function costPerToken(
+  marsMinter: NearAccount,
+  num: number
+): Promise<NEAR> {
+  return NEAR.from(await marsMinter.view("cost_per_token", { num }));
+}
+
+export async function totalCost(
+  marsMinter: NearAccount,
+  num: number
+): Promise<NEAR> {
+  return NEAR.from(await marsMinter.view("total_cost", { num }));
+}
+
+export async function tokenStorageCost(marsMinter: NearAccount): Promise<NEAR> {
+  return NEAR.from(await marsMinter.view("token_storage_cost"));
+}
+
+export const MINT_ONE_GAS = Gas.parse("300 TGas");
+
+export async function getTokens(
+  contract: NearAccount,
+  account_id: NearAccount
+): Promise<any[]> {
+  return contract.view("nft_tokens_for_owner", { account_id });
+}
+
+export async function mint(
+  marsMinter: NearAccount,
+  root: NearAccount,
+  attachedDeposit = ONE_NEAR
+): Promise<string> {
+  let res = await root.call_raw(
+    marsMinter,
+    "nft_mint_one",
+    {},
+    {
+      attachedDeposit,
+    }
+  );
+  return res.parseResult<any>().token_id;
+}
+
+export function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+'''
+'''--- __test__/payouts.ava.ts ---
+import { NEAR } from "near-units";
+import { NearAccount, Workspace } from "near-workspaces-ava";
+import { deploy, getDelta, mint, totalCost } from "./marsMinterUtils";
+
+if (Workspace.networkIsSandbox()) {
+  function createRoyalties({ root, person_b, person_a, person_c }) {
+    return {
+      accounts: {
+        [root.accountId]: 10,
+        [person_b.accountId]: 10,
+        [person_a.accountId]: 10,
+        [person_c.accountId]: 70,
+      },
+      percent: 20,
+    };
+  }
+
+  function subaccounts(root: NearAccount): Promise<NearAccount[]> {
+    return Promise.all(
+      ["person_a", "person_b", "person_c"].map((n) => root.createAccount(n))
+    );
+  }
+
+  const runner = Workspace.init(
+    { initialBalance: NEAR.parse("20 N").toString() },
+    async ({ root }) => {
+      const [person_a, person_b, person_c] = await subaccounts(root);
+      const royalties = createRoyalties({ root, person_a, person_b, person_c });
+      const marsMinter = await deploy(root, "mars_minter", {
+        royalties,
+        initial_royalties: royalties,
+        base_cost: NEAR.parse("5 N"),
+      });
+      return { marsMinter, person_a, person_b, person_c };
+    }
+  );
+
+  runner.test(
+    "Get Payout",
+    async (t, { root, marsMinter, person_c, person_b, person_a }) => {
+      const balance = NEAR.parse("500 N");
+      const cost = await totalCost(marsMinter, 1);
+      const token_id = await mint(marsMinter, root, cost);
+      const payouts = await marsMinter.view("nft_payout", {
+        token_id,
+        balance,
+        max_len_payout: 10,
+      });
+      let innerPayout = createRoyalties({
+        root,
+        person_a,
+        person_b,
+        person_c,
+      }).accounts;
+      t.log(innerPayout);
+      Object.keys(innerPayout).map(
+        (key) =>
+          (innerPayout[key] = NEAR.parse(`${innerPayout[key]}N`).toString())
+      );
+      innerPayout[root.accountId] = balance
+        .mul(NEAR.from(4))
+        .div(NEAR.from(5))
+        .add(NEAR.from(innerPayout[root.accountId]))
+        .toString();
+      const payout = { payout: innerPayout };
+      t.deepEqual(payouts, payout);
+    }
+  );
+
+  runner.test("Initial Payout", async (t, { root, marsMinter, person_c }) => {
+    let charlie = await root.createAccount("charlie");
+    const cost = await totalCost(marsMinter, 1);
+    let [delta, token_id] = await getDelta(t, person_c, async () =>
+      mint(marsMinter, charlie, cost)
+    );
+    t.log(
+      cost.toHuman(),
+      await delta.toHuman(),
+      cost.mul(NEAR.from(1)).div(NEAR.from(5)).toHuman()
+    );
+  });
+}
+
+'''
+'''--- __test__/whitelist.ava.ts ---
+import dayjs from "dayjs";
+import { NEAR } from "near-units";
+import { Workspace } from "near-workspaces-ava";
+import {
+  createNewAccount,
+  deploy,
+  getTokens,
+  sleep,
+  userMintsNFTs,
+} from "./marsMinterUtils";
+
+const sale_price = NEAR.parse("5 N");
+
+const runner = Workspace.init(
+  { initialBalance: NEAR.parse("100 N").toString() },
+  async ({ root }) => {
+    console.log({ rootId: root.accountId });
+    const person_b = await createNewAccount(console, root, "person_b", "50 N");
+    const epochNext20sec = dayjs().unix() + 20;
+    const epochNext60sec = dayjs().unix() + 60;
+    const marsMinter = await deploy(root, "mars_minter", {
+      is_premint_over: false,
+      base_cost: sale_price,
+      premint_start_epoch: epochNext20sec,
+      mint_start_epoch: epochNext60sec,
+    });
+    return { marsMinter, person_b };
+  }
+);
+
+runner.test("premint", async (t, { root, marsMinter, person_b }) => {
+  // Owner mints one before presale
+  await userMintsNFTs(t, root, marsMinter, 1);
+  // PersonB's mint fails before presale
+  await userMintsNFTs(t, person_b, marsMinter, 1, true);
+  // Wait for presale to start
+  const presaleTimer = await sleep(1000 * 20);
+  await presaleTimer;
+  // PersonB's mint fails during presale since she isn't whitelisted
+  await userMintsNFTs(t, person_b, marsMinter, 1, true);
+  // Whitelist person_b to mint 2 NFTs
+  await root.call(marsMinter, "add_whitelist_account", {
+    account_id: person_b,
+    allowance: 2,
+  });
+  // PersonB mint 2 NFTs successfully and mint of 3rd one fails
+  await userMintsNFTs(t, person_b, marsMinter, 2, false);
+  await userMintsNFTs(t, person_b, marsMinter, 1, true);
+  // PersonB waits for the sale to start
+  const saleTimer = await sleep(1000 * 40);
+  await saleTimer;
+  // PersonB mints 3rd NFT successfully
+  await userMintsNFTs(t, person_b, marsMinter, 1, false);
+
+  // PersonB finally has 3 NFTs
+  const tokens = await getTokens(marsMinter, person_b);
+  t.assert(tokens.length == 3);
+});
+
+'''
+'''--- contracts/mars_minter/Cargo.toml ---
+[package]
+name = "mars_minter"
+version = "0.1.0"
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+near-sdk = { git = "https://github.com/willemneal/near-sdk-rs", branch = "release"}
+near-contract-standards = { git = "https://github.com/willemneal/near-sdk-rs", branch = "release" }
+serde = "1.0.0"
+near-units = "0.2.0"
+serde_with = "1.0.0"
+
+[dev-dependencies]
+rand = "0.7.2"
+rand_xorshift = "0.2.0"
+
+[features]
+default = []
+
+'''
+'''--- contracts/mars_minter/src/lib.rs ---
+use near_contract_standards::non_fungible_token::{
+    metadata::{NFTContractMetadata, TokenMetadata, NFT_METADATA_SPEC},
+    refund_deposit_to_account, NearEvent, NonFungibleToken, Token, TokenId,
+};
+use near_sdk::{
+    assert_one_yocto,
+    borsh::{self, BorshDeserialize, BorshSerialize},
+    collections::{LazyOption, LookupMap},
+    env,
+    json_types::Base64VecU8,
+    near_bindgen, require, AccountId, Balance, BorshStorageKey, PanicOnDefault, Promise,
+    PromiseOrValue,
+};
+
+pub mod payout;
+mod raffle;
+
+use payout::*;
+use raffle::Raffle;
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Contract {
+    pub(crate) tokens: NonFungibleToken,
+    metadata: LazyOption<NFTContractMetadata>,
+    raffle: Raffle,
+    pending_tokens: u32,
+    mint_start_epoch: u64,
+    premint_start_epoch: u64,
+    pub base_cost: Balance,
+    royalties: LazyOption<Royalties>,
+    initial_royalties: LazyOption<Royalties>,
+    whitelist: LookupMap<AccountId, u32>,
+    token_id_to_media: LookupMap<String, String>,
+    token_id_to_reference: LookupMap<String, String>,
+}
+
+#[derive(BorshSerialize, BorshStorageKey)]
+enum StorageKey {
+    NonFungibleToken,
+    Metadata,
+    TokenMetadata,
+    Enumeration,
+    Approval,
+    Ids,
+    Royalties,
+    InitialRoyalties,
+    Whitelist,
+    TokenIdToMedia,
+    TokenIdToReference,
+}
+
+#[near_bindgen]
+impl Contract {
+    #[init]
+    pub fn new_default_meta(
+        owner_id: AccountId,
+        name: String,
+        symbol: String,
+        uri: String,
+        size: u32,
+        base_cost: U128,
+        mint_start_epoch: Option<u64>,
+        premint_start_epoch: Option<u64>,
+        icon: Option<String>,
+        spec: Option<String>,
+        reference: Option<String>,
+        reference_hash: Option<Base64VecU8>,
+        royalties: Option<Royalties>,
+        initial_royalties: Option<Royalties>,
+    ) -> Self {
+        royalties.as_ref().map(|r| r.validate());
+        initial_royalties.as_ref().map(|r| r.validate());
+        Self::new(
+            owner_id.clone(),
+            NFTContractMetadata {
+                spec: spec.unwrap_or(NFT_METADATA_SPEC.to_string()),
+                name,
+                symbol,
+                icon,
+                base_uri: Some(uri),
+                reference,
+                reference_hash,
+            },
+            size,
+            base_cost,
+            mint_start_epoch.unwrap_or(0),
+            premint_start_epoch.unwrap_or(0),
+            royalties,
+            initial_royalties,
+        )
+    }
+
+    #[init]
+    pub fn new(
+        owner_id: AccountId,
+        metadata: NFTContractMetadata,
+        size: u32,
+        base_cost: U128,
+        mint_start_epoch: u64,
+        premint_start_epoch: u64,
+        royalties: Option<Royalties>,
+        initial_royalties: Option<Royalties>,
+    ) -> Self {
+        metadata.assert_valid();
+        Self {
+            tokens: NonFungibleToken::new(
+                StorageKey::NonFungibleToken,
+                owner_id,
+                Some(StorageKey::TokenMetadata),
+                Some(StorageKey::Enumeration),
+                Some(StorageKey::Approval),
+            ),
+            metadata: LazyOption::new(StorageKey::Metadata, Some(&metadata)),
+            raffle: Raffle::new(StorageKey::Ids, size as u64),
+            pending_tokens: 0,
+            mint_start_epoch: mint_start_epoch,
+            premint_start_epoch: premint_start_epoch,
+            base_cost: base_cost.0,
+            royalties: LazyOption::new(StorageKey::Royalties, royalties.as_ref()),
+            initial_royalties: LazyOption::new(
+                StorageKey::InitialRoyalties,
+                initial_royalties.as_ref(),
+            ),
+            whitelist: LookupMap::new(StorageKey::Whitelist),
+            token_id_to_media: LookupMap::new(StorageKey::TokenIdToMedia),
+            token_id_to_reference: LookupMap::new(StorageKey::TokenIdToReference),
+        }
+    }
+
+    pub fn add_whitelist_account(&mut self, account_id: AccountId, allowance: u32) {
+        self.assert_owner();
+        self.whitelist.insert(&account_id, &allowance);
+    }
+
+    pub fn whitelisted(&self, account_id: AccountId) -> bool {
+        self.whitelist.contains_key(&account_id)
+    }
+
+    pub fn get_wl_allowance(&self, account_id: AccountId) -> u32 {
+        self.get_whitelist_allowance(&account_id)
+    }
+
+    // Functions to add and remove media and reference URIs
+    /// Edit functions
+    #[payable]
+    pub fn add_media_uri(&mut self, token_id: TokenId, uri: String) {
+        self.assert_owner();
+        assert_one_yocto();
+        self.token_id_to_media.insert(&token_id, &uri);
+    }
+
+    #[payable]
+    pub fn add_reference_uri(&mut self, token_id: TokenId, uri: String) {
+        self.assert_owner();
+        assert_one_yocto();
+        self.token_id_to_reference.insert(&token_id, &uri);
+    }
+
+    #[payable]
+    pub fn remove_media_uri(&mut self, token_id: TokenId) {
+        self.assert_owner();
+        assert_one_yocto();
+        self.token_id_to_media.remove(&token_id);
+    }
+
+    #[payable]
+    pub fn remove_reference_uri(&mut self, token_id: TokenId) {
+        self.assert_owner();
+        assert_one_yocto();
+        self.token_id_to_reference.remove(&token_id);
+    }
+
+    /// Get functions
+    pub fn get_token_media(&self, token_id: &TokenId) -> String {
+        self.token_id_to_media
+            .get(token_id)
+            .unwrap_or_else(|| panic!("Media not found for token {}", token_id))
+    }
+
+    pub fn get_token_reference(&self, token_id: &TokenId) -> String {
+        self.token_id_to_reference
+            .get(token_id)
+            .unwrap_or_else(|| panic!("Reference not found for token {}", token_id))
+    }
+
+    // Update the URIs of existing tokens
+    #[payable]
+    pub fn update_one_token(
+        &mut self,
+        token_id: TokenId,
+        media_uri: String,
+        reference_uri: String,
+    ) {
+        self.assert_owner();
+        assert_one_yocto();
+        let mut current_token_metadata = self
+            .tokens
+            .token_metadata_by_id
+            .as_ref()
+            .unwrap()
+            .get(&token_id)
+            .expect("Token not found");
+
+        current_token_metadata.media = Some(media_uri);
+        current_token_metadata.media_hash = None;
+        current_token_metadata.reference = Some(reference_uri);
+        current_token_metadata.reference_hash = None;
+        self.tokens
+            .token_metadata_by_id
+            .as_mut()
+            .and_then(|by_id| by_id.insert(&token_id, &current_token_metadata));
+    }
+
+    #[payable]
+    pub fn nft_mint(
+        &mut self,
+        _token_id: TokenId,
+        _token_owner_id: AccountId,
+        _token_metadata: TokenMetadata,
+    ) -> Token {
+        self.nft_mint_one()
+    }
+
+    #[payable]
+    pub fn nft_mint_one(&mut self) -> Token {
+        self.nft_mint_many(1)[0].clone()
+    }
+
+    #[payable]
+    pub fn nft_mint_many(&mut self, num: u32) -> Vec<Token> {
+        let owner_id = &env::signer_account_id();
+        let num = self.assert_can_mint(owner_id, num);
+        let tokens = self.nft_mint_many_unguarded(num, owner_id);
+        if self.is_premint() {
+            self.use_whitelist_allowance(owner_id, num);
+        }
+        tokens
+    }
+
+    fn nft_mint_many_unguarded(&mut self, num: u32, owner_id: &AccountId) -> Vec<Token> {
+        let initial_storage_usage = env::storage_usage();
+
+        let tokens: Vec<Token> = (0..num)
+            .map(|_| self.draw_and_mint(owner_id.clone(), None))
+            .collect();
+
+        let storage_used = env::storage_usage() - initial_storage_usage;
+        if let Some(royalties) = self.initial_royalties.get() {
+            let storage_cost = env::storage_byte_cost() * storage_used as Balance;
+            let left_over_funds = env::attached_deposit() - storage_cost;
+            royalties.send_funds(left_over_funds, &self.tokens.owner_id);
+        } else {
+            refund_deposit_to_account(storage_used, self.tokens.owner_id.clone());
+        }
+        log_mint(
+            owner_id.as_str(),
+            tokens.iter().map(|t| t.token_id.to_string()).collect(),
+        );
+        tokens
+    }
+
+    pub fn total_cost(&self, num: u32) -> U128 {
+        (num as Balance * self.cost_per_token().0).into()
+    }
+
+    pub fn cost_per_token(&self) -> U128 {
+        (self.base_cost + self.token_storage_cost().0).into()
+    }
+
+    pub fn token_storage_cost(&self) -> U128 {
+        (env::storage_byte_cost() * self.tokens.extra_storage_in_bytes_per_token as Balance).into()
+    }
+    pub fn tokens_left(&self) -> u32 {
+        self.raffle.len() as u32 - self.pending_tokens
+    }
+
+    pub fn get_mint_start_epoch(&self) -> u64 {
+        self.mint_start_epoch
+    }
+
+    pub fn nft_metadata(&self) -> NFTContractMetadata {
+        self.metadata.get().unwrap()
+    }
+
+    pub fn transfer_ownership(&mut self, new_owner: AccountId) {
+        self.assert_owner();
+        env::log_str(&format!(
+            "{} transfers ownership to {}",
+            self.tokens.owner_id, new_owner
+        ));
+        self.tokens.owner_id = new_owner;
+    }
+
+    pub fn update_mint_start_epoch(&mut self, mint_start_epoch: u64) {
+        self.assert_owner();
+        env::log_str(&format!(
+            "updating {} to {}",
+            self.mint_start_epoch, mint_start_epoch
+        ));
+        self.mint_start_epoch = mint_start_epoch;
+    }
+
+    pub fn update_premint_start_epoch(&mut self, premint_start_epoch: u64) {
+        self.assert_owner();
+        env::log_str(&format!(
+            "updating {} to {}",
+            self.premint_start_epoch, premint_start_epoch
+        ));
+        self.premint_start_epoch = premint_start_epoch;
+    }
+
+    pub fn update_base_cost(&mut self, base_cost: Balance) {
+        self.assert_owner();
+        env::log_str(&format!("updating {} to {}", self.base_cost, base_cost));
+        self.base_cost = base_cost;
+    }
+
+    pub fn update_royalties(&mut self, royalties: Royalties) -> Option<Royalties> {
+        self.assert_owner();
+        royalties.validate();
+        self.royalties.replace(&royalties)
+    }
+
+    fn assert_deposit(&self, num: u32) {
+        require!(
+            env::attached_deposit() >= self.total_cost(num).0,
+            "Not enough attached deposit to buy"
+        );
+    }
+
+    fn assert_can_mint(&self, account_id: &AccountId, num: u32) -> u32 {
+        if !self.is_owner(account_id) {
+            if self.premint_start_epoch * 1000000000 > env::block_timestamp() {
+                env::panic_str("Mint has not started yet")
+            }
+            if self.mint_start_epoch * 1000000000 > env::block_timestamp() {
+                let allowance = self.get_whitelist_allowance(&account_id);
+                require!(
+                    allowance >= num,
+                    format!("Cannot mint {} when allowance is {}", num, allowance)
+                );
+            }
+        }
+        require!(self.tokens_left() >= num, "No NFTs left to mint");
+        self.assert_deposit(num);
+        num
+    }
+
+    fn assert_owner(&self) {
+        require!(self.signer_is_owner(), "Method is private to owner")
+    }
+
+    fn signer_is_owner(&self) -> bool {
+        self.is_owner(&env::signer_account_id())
+    }
+
+    fn is_owner(&self, minter: &AccountId) -> bool {
+        minter.as_str() == self.tokens.owner_id.as_str()
+    }
+
+    fn is_premint(&self) -> bool {
+        let mut premint: bool = false;
+        if self.premint_start_epoch * 1000000000 <= env::block_timestamp() {
+            if self.mint_start_epoch * 1000000000 > env::block_timestamp() {
+                premint = true;
+            }
+        }
+        premint
+    }
+
+    fn draw_and_mint(&mut self, token_owner_id: AccountId, refund: Option<AccountId>) -> Token {
+        let id = self.raffle.draw();
+        self.internal_mint(id.to_string(), token_owner_id, refund)
+    }
+
+    fn internal_mint(
+        &mut self,
+        token_id: String,
+        token_owner_id: AccountId,
+        refund_id: Option<AccountId>,
+    ) -> Token {
+        let token_metadata = Some(self.create_metadata(&token_id));
+        self.tokens
+            .internal_mint_with_refund(token_id, token_owner_id, token_metadata, refund_id)
+    }
+
+    fn create_metadata(&mut self, token_id: &String) -> TokenMetadata {
+        let media = Some(
+            self.token_id_to_media
+                .get(&token_id)
+                .unwrap_or(format!("{}.png", token_id)),
+        );
+        let reference = Some(
+            self.token_id_to_reference
+                .get(&token_id)
+                .unwrap_or(format!("{}.json", token_id)),
+        );
+        let title = Some(format!("{}", token_id));
+        TokenMetadata {
+            title,
+            description: None,
+            media,
+            media_hash: None,
+            copies: None,
+            issued_at: Some(env::block_timestamp().to_string()),
+            expires_at: None,
+            starts_at: None,
+            updated_at: None,
+            extra: None,
+            reference,
+            reference_hash: None,
+        }
+    }
+
+    fn use_whitelist_allowance(&mut self, account_id: &AccountId, num: u32) {
+        let allowance = self.get_whitelist_allowance(account_id);
+        let new_allowance = allowance - num;
+        self.whitelist.insert(&account_id, &new_allowance);
+    }
+
+    fn get_whitelist_allowance(&self, account_id: &AccountId) -> u32 {
+        self.whitelist
+            .get(account_id)
+            .unwrap_or_else(|| panic!("Account not on whitelist"))
+    }
+}
+
+near_contract_standards::impl_non_fungible_token_core!(Contract, tokens);
+near_contract_standards::impl_non_fungible_token_approval!(Contract, tokens);
+near_contract_standards::impl_non_fungible_token_enumeration!(Contract, tokens);
+
+fn log_mint(owner_id: &str, token_ids: Vec<String>) {
+    NearEvent::log_nft_mint(owner_id.to_string(), token_ids, None);
+}
+
+'''
+'''--- contracts/mars_minter/src/payout.rs ---
+use crate::*;
+use near_sdk::{
+    assert_one_yocto,
+    borsh::{self, BorshDeserialize, BorshSerialize},
+    json_types::U128,
+    near_bindgen,
+    serde::{Deserialize, Serialize},
+    AccountId, Promise,
+};
+
+use std::collections::HashMap;
+
+/// Copied from https://github.com/near/NEPs/blob/6170aba1c6f4cd4804e9ad442caeae9dc47e7d44/specs/Standards/NonFungibleToken/Payout.md#reference-level-explanation
+
+/// A mapping of NEAR accounts to the amount each should be paid out, in
+/// the event of a token-sale. The payout mapping MUST be shorter than the
+/// maximum length specified by the financial contract obtaining this
+/// payout data. Any mapping of length 10 or less MUST be accepted by
+/// financial contracts, so 10 is a safe upper limit.
+
+/// This currently deviates from the standard but is in the process of updating to use this type
+#[derive(Default, BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+pub struct Payout {
+    payout: HashMap<AccountId, U128>,
+}
+
+impl Payout {
+    pub fn send_funds(self) {
+        self.payout.into_iter().for_each(|(account, amount)| {
+            Promise::new(account).transfer(amount.0);
+        });
+    }
+}
+
+pub trait Payouts {
+    fn nft_payout(&self, token_id: String, balance: U128, max_len_payout: Option<u32>) -> Payout;
+    fn nft_transfer_payout(
+        &mut self,
+        receiver_id: AccountId,
+        token_id: String,
+        approval_id: Option<u64>,
+        memo: Option<String>,
+        balance: U128,
+        max_len_payout: Option<u32>,
+    ) -> Payout;
+}
+
+#[near_bindgen]
+impl Payouts for Contract {
+    #[allow(unused_variables)]
+    fn nft_payout(&self, token_id: String, balance: U128, max_len_payout: Option<u32>) -> Payout {
+        let owner_id = self
+            .tokens
+            .owner_by_id
+            .get(&token_id)
+            .expect("No such token_id");
+        self.royalties
+            .get()
+            .map_or(Payout::default(), |r| r.create_payout(balance.0, &owner_id))
+    }
+
+    #[payable]
+    fn nft_transfer_payout(
+        &mut self,
+        receiver_id: AccountId,
+        token_id: String,
+        approval_id: Option<u64>,
+        memo: Option<String>,
+        balance: U128,
+        max_len_payout: Option<u32>,
+    ) -> Payout {
+        assert_one_yocto();
+        let payout = self.nft_payout(token_id.clone(), balance, max_len_payout);
+        self.nft_transfer(
+            receiver_id.clone(),
+            token_id.clone(),
+            approval_id.clone(),
+            memo.clone(),
+        );
+        payout
+    }
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Deserialize, Serialize, Default)]
+pub struct Royalties {
+    pub accounts: HashMap<AccountId, u8>,
+    pub percent: u8,
+}
+
+impl Royalties {
+    pub(crate) fn validate(&self) {
+        require!(
+            self.percent <= 100,
+            "royalty percent must be between 0 - 100"
+        );
+        require!(
+            self.accounts.len() <= 10,
+            "can only have a maximum of 10 accounts spliting royalties"
+        );
+        let mut total: u8 = 0;
+        self.accounts.iter().for_each(|(_, percent)| {
+            require!(*percent <= 100, "each royalty should be less than 100");
+            total += percent;
+        });
+        require!(
+            total <= 100,
+            "total percent of each royalty split  must be less than 100"
+        )
+    }
+    pub(crate) fn create_payout(&self, balance: Balance, owner_id: &AccountId) -> Payout {
+        let royalty_payment = apply_percent(self.percent, balance);
+        let mut payout = Payout {
+            payout: self
+                .accounts
+                .iter()
+                .map(|(account, percent)| {
+                    (
+                        account.clone(),
+                        apply_percent(*percent, royalty_payment).into(),
+                    )
+                })
+                .collect(),
+        };
+        let rest = balance - royalty_payment;
+        let owner_payout: u128 = payout.payout.get(owner_id).map_or(0, |x| x.0) + rest;
+        payout.payout.insert(owner_id.clone(), owner_payout.into());
+        payout
+    }
+
+    pub(crate) fn send_funds(&self, balance: Balance, owner_id: &AccountId) {
+        self.create_payout(balance, owner_id).send_funds();
+    }
+}
+
+fn apply_percent(percent: u8, int: u128) -> u128 {
+    int * percent as u128 / 100u128
+}
+
+'''
+'''--- contracts/mars_minter/src/raffle.rs ---
+use core::convert::TryInto;
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::{env, IntoStorageKey};
+use std::marker::PhantomData;
+
+const ERR_INCONSISTENT_STATE: &str = "The collection is an inconsistent state. Did previous smart contract execution terminate unexpectedly?";
+pub const ERR_INDEX_OUT_OF_BOUNDS: &str = "Index out of bounds";
+
+fn expect_consistent_state<T>(val: Option<T>) -> T {
+    val.unwrap_or_else(|| env::panic_str(ERR_INCONSISTENT_STATE))
+}
+
+pub(crate) fn append_slice(id: &[u8], extra: &[u8]) -> Vec<u8> {
+    [id, extra].concat()
+}
+
+/// This is similar to the raffle collection but doesn't keep track of past winners
+#[derive(BorshSerialize, BorshDeserialize)]
+#[cfg_attr(not(feature = "expensive-debug"), derive(Debug))]
+pub struct Raffle {
+    len: u64,
+    prefix: Vec<u8>,
+    #[borsh_skip]
+    el: PhantomData<u64>,
+}
+
+impl Raffle {
+    /// Returns the number of elements in the vector, also referred to as its size.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Returns `true` if the vector contains no elements.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Create new vector with zero elements. Use `id` as a unique identifier on the trie.
+    pub fn new<S>(prefix: S, len: u64) -> Self
+    where
+        S: IntoStorageKey,
+    {
+        return Self {
+            len,
+            prefix: prefix.into_storage_key(),
+            el: PhantomData,
+        };
+    }
+
+    fn index_to_lookup_key(&self, index: u64) -> Vec<u8> {
+        append_slice(&self.prefix, &index.to_le_bytes()[..])
+    }
+
+    /// # Panics
+    ///
+    /// Panics if `index` is out of bounds.
+    fn swap_remove_raw(&mut self, index: u64) -> Vec<u8> {
+        if index >= self.len {
+            env::panic_str(ERR_INDEX_OUT_OF_BOUNDS)
+        } else if index + 1 == self.len {
+            expect_consistent_state(self.pop_raw())
+        } else {
+            let lookup_key = self.index_to_lookup_key(index);
+            let raw_last_value = self
+                .pop_raw()
+                .expect("checked `index < len` above, so `len > 0`");
+            if env::storage_write(&lookup_key, &raw_last_value) {
+                expect_consistent_state(env::storage_get_evicted())
+            } else {
+                // no value was at location its index is the value
+                index.to_le_bytes().to_vec()
+            }
+        }
+    }
+
+    /// Removes the last element from a vector and returns it without deserializing, or `None` if it is empty.
+    fn pop_raw(&mut self) -> Option<Vec<u8>> {
+        if self.is_empty() {
+            None
+        } else {
+            self.len -= 1;
+            let last_lookup_key = self.index_to_lookup_key(self.len);
+            let raw_last_value = if env::storage_remove(&last_lookup_key) {
+                // if key is en in storage, it's value will be stored as last evicted value
+                expect_consistent_state(env::storage_get_evicted())
+            } else {
+                // otherwise the value is index of the last element
+                self.len.to_le_bytes().to_vec()
+            };
+            Some(raw_last_value)
+        }
+    }
+
+    pub fn draw(&mut self) -> u64 {
+        let seed_num = get_random_number(0) as u64;
+        u64::try_from_slice(&self.swap_remove_raw(seed_num % self.len())).unwrap()
+    }
+}
+
+fn get_random_number(shift_amount: u32) -> u32 {
+    let mut seed = env::random_seed();
+    let seed_len = seed.len();
+    let mut arr: [u8; 4] = Default::default();
+    seed.rotate_left(shift_amount as usize % seed_len);
+    arr.copy_from_slice(&seed[..4]);
+    u32::from_le_bytes(arr).try_into().unwrap()
+}
+
+'''
+'''--- package.json ---
+{
+  "name": "mars_minter_contract",
+  "version": "0.1.0",
+  "license": "MIT",
+  "scripts": {
+    "build": "cargo build --target wasm32-unknown-unknown --release && cp ./target/wasm32-unknown-unknown/release/mars_minter.wasm ./scripts/mars_minter.wasm",
+    "test": "yarn build && ava --timeout=5m",
+    "test:ci": "yarn build && ava --timeout=5m",
+    "test:testnet": "NEAR_WORKSPACES_NETWORK=testnet yarn test"
+  },
+  "devDependencies": {
+    "@typescript-eslint/eslint-plugin": "^5.4.0",
+    "@typescript-eslint/parser": "^5.4.0",
+    "acquit": "^1.2.1",
+    "acquit-markdown": "^0.1.0",
+    "eslint": "^7.29.0",
+    "near-api-js": "^0.44.1",
+    "near-cli": "3.2.0",
+    "near-units": "^0.1.9",
+    "near-workspaces-ava": "1.0.0",
+    "nft.storage": "^5.0.0"
+  },
+  "dependencies": {
+    "commander": "^9.0.0",
+    "dayjs": "^1.10.7"
+  }
+}
+'''
+'''--- scripts/cli.ts ---
+import { program } from "commander";
+import dayjs from "dayjs";
+import assert from "assert";
+import fs from "fs";
+
+const { keyStores, connect, transactions, utils } = require("near-api-js");
+const path = require("path");
+const homedir = require("os").homedir();
+
+const CREDENTIALS_DIR = ".near-credentials";
+
+program.version("0.0.2");
+
+const EMPTY_WASM_PATH = "./scripts/empty.wasm";
+const MARS_MINTER_WASM_PATH = "./scripts/mars_minter.wasm";
+
+const nodeUrlMap = {
+  mainnet: "https://rpc.mainnet.near.org",
+  testnet: "https://rpc.testnet.near.org",
+};
+
+const getAccount = async (env, accountId) => {
+  const credentialsPath = path.join(homedir, CREDENTIALS_DIR);
+  const keyStore = new keyStores.UnencryptedFileSystemKeyStore(credentialsPath);
+
+  const config = {
+    keyStore,
+    networkId: env,
+    nodeUrl: nodeUrlMap[env],
+  };
+
+  const near = await connect(config);
+  const account = await near.account(accountId);
+  return account;
+};
+
+const deployContract = async (env, accountId, wasmPath) => {
+  const credentialsPath = path.join(homedir, CREDENTIALS_DIR);
+  const keyStore = new keyStores.UnencryptedFileSystemKeyStore(credentialsPath);
+
+  const config = {
+    keyStore,
+    networkId: env,
+    nodeUrl: nodeUrlMap[env],
+  };
+
+  const near = await connect(config);
+  const account = await near.account(accountId);
+  const result = await account.deployContract(fs.readFileSync(wasmPath));
+  console.log(result);
+};
+
+const deployAndInitializeContract = async (env, accountId, wasmPath) => {
+  const credentialsPath = path.join(homedir, CREDENTIALS_DIR);
+  const keyStore = new keyStores.UnencryptedFileSystemKeyStore(credentialsPath);
+
+  const config = {
+    keyStore,
+    networkId: env,
+    nodeUrl: nodeUrlMap[env],
+  };
+
+  const near = await connect(config);
+  const account = await near.account(accountId);
+
+  // Prepare variables
+  const royalties = {
+    accounts: {
+      [accountId]: 100,
+    },
+    percent: 20,
+  };
+
+  const initial_royalties = {
+    accounts: {
+      [accountId]: 100,
+    },
+    percent: 100,
+  };
+
+  const epochNext060sec = dayjs().unix() + 60;
+  const epochNext300sec = dayjs().unix() + 300;
+
+  const accountState = await account.state();
+
+  const { code_hash: codeHash } = accountState;
+
+  const emptyCodeHashList = ["11111111111111111111111111111111"];
+
+  const initialData = {
+    owner_id: accountId,
+    name: "NDN Testing",
+    symbol: "NDNT",
+    uri: "https://bafybeidq7nu5pxsiy2cext6qtxxygpifhunxco25mtrabfge2rf6lxdax4.ipfs.dweb.link/",
+    description:
+      "Dragon Nation is an exclusive collection of 3,000 Dragon NFTs on the NEAR blockchain.",
+    size: 3000,
+    base_cost: utils.format.parseNearAmount("0.1"),
+    royalties,
+    initial_royalties,
+    premint_start_epoch: epochNext060sec,
+    mint_start_epoch: epochNext300sec,
+  };
+
+  if (emptyCodeHashList.includes(codeHash)) {
+    const result = await account.signAndSendTransaction({
+      receiverId: accountId,
+      actions: [
+        transactions.deployContract(fs.readFileSync(wasmPath)),
+        transactions.functionCall(
+          "new_default_meta",
+          initialData,
+          "200000000000000"
+        ),
+      ],
+    });
+    console.log("Contract is deployed 🚀");
+  } else {
+    console.log("Contract is already deployed!!");
+  }
+};
+
+const getCurrentWhitelistAllowance = async (
+  adminAccount,
+  contractId,
+  accountId
+) => {
+  let currentAllowance = 0;
+  try {
+    currentAllowance = await adminAccount.viewFunction(
+      contractId,
+      "get_wl_allowance",
+      {
+        account_id: accountId,
+      }
+    );
+  } catch (error) {
+    // Error will be thrown for the accounts which are not whitelisted
+  }
+
+  return currentAllowance;
+};
+
+const whitelistAccount = async (
+  adminAccount,
+  contractId,
+  accountId,
+  allowance
+) => {
+  let currentAllowance = 0;
+
+  currentAllowance = await getCurrentWhitelistAllowance(
+    adminAccount,
+    contractId,
+    accountId
+  );
+
+  if (currentAllowance !== allowance) {
+    await adminAccount.functionCall({
+      contractId,
+      methodName: "add_whitelist_account",
+      args: { account_id: accountId, allowance },
+      gas: "30000000000000",
+    });
+  } else {
+    return;
+  }
+
+  currentAllowance = await getCurrentWhitelistAllowance(
+    adminAccount,
+    contractId,
+    accountId
+  );
+
+  assert.ok(currentAllowance === allowance);
+};
+
+programCommand("deploy_empty_contract").action(async (options) => {
+  const { env, accountId } = options;
+  await deployContract(env, accountId, EMPTY_WASM_PATH);
+  process.exit(0);
+});
+
+programCommand("deploy_mars_minter_contract").action(async (options) => {
+  const { env, accountId } = options;
+  await deployAndInitializeContract(env, accountId, MARS_MINTER_WASM_PATH);
+  process.exit(0);
+});
+
+programCommand("whitelist")
+  .requiredOption(
+    "-wj, --wl-json <string>",
+    "Path of the json file containing addresses with allowance"
+  )
+  .action(async (options) => {
+    const { env, accountId: contractId } = options;
+    const wlJson = JSON.parse(fs.readFileSync(options.wlJson, "utf8"));
+    const adminAccount = await getAccount(env, contractId);
+    const promiseList = Object.keys(wlJson).map(async (nearAddress) => {
+      await whitelistAccount(
+        adminAccount,
+        contractId,
+        nearAddress,
+        wlJson[nearAddress]
+      );
+    });
+    await Promise.all(promiseList);
+    console.log(`Done ✅`);
+    process.exit(0);
+  });
+
+function programCommand(name: string) {
+  return program
+    .command(name)
+    .option(
+      "-e, --env <string>",
+      "NEAR cluster env name. One of: mainnet, testnet",
+      "testnet"
+    )
+    .requiredOption("-a, --account-id <string>", "NEAR account ID");
+}
+
+program.parse(process.argv);
+
+'''
+'''--- scripts/example-whitelist-addresses.json ---
+{
+    "app8.flyingsaucer00.testnet": 50,
+    "app7.flyingsaucer00.testnet": 20,
+    "app6.flyingsaucer00.testnet": 20,
+    "app5.flyingsaucer00.testnet": 10
+}
+'''
+'''--- tsconfig.json ---
+{
+  "extends": "near-workspaces-ava/tsconfig.ava.json"
+}
+
+'''

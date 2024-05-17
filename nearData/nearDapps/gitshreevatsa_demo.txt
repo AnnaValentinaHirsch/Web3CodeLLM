@@ -1,0 +1,797 @@
+*GitHub Repository "gitshreevatsa/demo"*
+
+'''--- ambassadors-dao/Cargo.toml ---
+[package]
+name = "ambassadors-dao"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = {version = "4.0.0-pre.4", features = ["unstable"]}
+near-contract-standards = "4.0.0-pre.4"
+hex = "0.4.2"
+rand = "0.8.5"
+
+[dependencies.serde_with]
+version = "1.4.0"
+
+[dev-dependencies]
+near-sdk-sim = "4.0.0-pre.4"
+ambassadors-dao-factory = { path = "../ambassadors-dao-factory" }
+
+'''
+'''--- ambassadors-dao/src/error.rs ---
+pub const ErrNotPermitted: &str = "ERR_NOT_PERMITTED";
+pub const ErrProposalNotFound: &str = "ERR_PROPOSAL_NOT_FOUND";
+pub const ErrBountyNotFound: &str = "ERR_BOUNTY_NOT_FOUND";
+pub const ErrMiscellaneousNotFound: &str = "ERR_MISCELLANEOUS_NOT_FOUND";
+pub const ErrReferralNotFound: &str = "ERR_REFERRAL_NOT_FOUND";
+
+'''
+'''--- ambassadors-dao/src/lib.rs ---
+//! Contains the Contract struct and its implementation
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::LookupMap;
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{env, near_bindgen};
+use near_sdk::{AccountId, PanicOnDefault, Promise};
+use rand::distributions::{Alphanumeric, DistString};
+// use std::sync::{Arc, Mutex};
+// use std::thread;
+
+use payout::{BountyPayout, MiscellaneousPayout, Payout, ProposalPayout};
+use policy::Policy;
+use types::Config;
+
+mod error;
+mod payout;
+mod policy;
+mod types;
+mod vote;
+
+pub mod views;
+
+// TODO: create a proc_macro for generate meta data about the type of information
+// that each Payout type needs for creation
+
+/// The main contract governing Ambassadors DAO
+#[near_bindgen]
+#[derive(BorshSerialize, BorshDeserialize, PanicOnDefault)]
+pub struct Contract {
+    /// defines the policy of the contract
+    policy: Policy,
+    /// the configuration of the contract
+    config: Config,
+    /// proposal payouts
+    proposals: LookupMap<u64, ProposalPayout>,
+    /// the id of the last proposal
+    last_proposal_id: u64,
+    /// proposal payouts
+    bounties: LookupMap<u64, BountyPayout>,
+    /// the id of the last proposal
+    last_bounty_id: u64,
+    /// proposal payouts
+    miscellaneous: LookupMap<u64, MiscellaneousPayout>,
+    /// the id of the last proposal
+    last_miscellaneous_id: u64,
+    /// store the referral ids as a map of <referral-id, account-id>
+    referral_ids: LookupMap<String, AccountId>,
+    // store the current USD conversion rate, conversion_rate == 1 Near token
+    // conversion_rate: Option<f32>,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Clone, Debug))]
+#[serde(crate = "near_sdk::serde")]
+pub struct CreateContractParams {
+    council: Vec<AccountId>,
+    name: String,
+    purpose: String,
+}
+
+#[near_bindgen]
+impl Contract {
+    #[init]
+    pub fn new(params: CreateContractParams) -> Self {
+        if params.council.len() == 0 {
+            panic!("ERR_COUNCIL_EMPTY");
+        }
+        if params.name.len() == 0 {
+            panic!("ERR_INVALID_NAME");
+        }
+        if params.purpose.len() == 0 {
+            panic!("ERR_PURPOSE_EMPTY");
+        }
+        Self {
+            policy: Policy::from(params.council),
+            config: Config::new(params.name, params.purpose),
+            proposals: LookupMap::<u64, ProposalPayout>::new(b"p".to_vec()),
+            last_proposal_id: 0,
+            bounties: LookupMap::<u64, BountyPayout>::new(b"b".to_vec()),
+            last_bounty_id: 0,
+            miscellaneous: LookupMap::<u64, MiscellaneousPayout>::new(b"m".to_vec()),
+            last_miscellaneous_id: 0,
+            referral_ids: {
+                let map = LookupMap::new(b"t".to_vec());
+                map.extend(
+                    params
+                        .council
+                        .iter()
+                        .map(|id| (Self::internal_generate_referral_id(), id.clone())),
+                );
+                map
+            },
+            // conversion_rate: val,
+        }
+    }
+
+    /// Generate a 16 characters long referral ID.
+    /// It contains [a-zA-Z0-9] mcharacters
+    #[private]
+    pub fn internal_generate_referral_id() -> String {
+        Alphanumeric.sample_string(&mut rand::thread_rng(), 16)
+    }
+
+    /// Perform required actions when an ambassador registers
+    pub fn register_ambassador(&mut self, token: Option<String>) -> String {
+        // create a referral token
+        let ref_token = Self::internal_generate_referral_id();
+        self.referral_ids
+            .insert(&ref_token, &env::signer_account_id());
+
+        // check if there was a token passed
+        if let Some(token) = token {
+            match self.referral_ids.get(&token) {
+                Some(id) => {
+                    // Promise::new(AccountId::new_unchecked(token))
+                    //     .transfer(5 / 10 * types::ONE_NEAR);
+                }
+                None => {}
+            }
+        }
+
+        ref_token
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn generates_contract() {
+        unimplemented!()
+    }
+}
+
+'''
+'''--- ambassadors-dao/src/payout/bounty.rs ---
+use near_sdk::{env, near_bindgen};
+
+use super::*;
+
+pub type BountyPayout = Payout<Bounty>;
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Clone, Debug))]
+#[serde(crate = "near_sdk::serde")]
+pub enum Bounty {
+    HackathonCompletion {
+        num_of_registrations: u64,
+        num_of_submissions: u64,
+        // order of the winners w.r.to their ranks
+        winners_info: Vec<SubmissionInfo>,
+    },
+    MemeContestCompletion {
+        num_of_submissions: u64,
+        // order of the winners w.r.to their ranks
+        winners_info: Vec<SubmissionInfo>,
+    },
+    Webinar {
+        num_of_registrations: u64,
+        num_of_attendees: u64,
+        webinar_link: ResourceLink,
+    },
+    ContentCoordniation {
+        content_links: Vec<ResourceLink>,
+        story: String,
+        tools_used: Vec<String>,
+    },
+}
+
+impl From<PayoutInput<Bounty>> for Payout<Bounty> {
+    fn from(input: PayoutInput<Bounty>) -> Self {
+        Self {
+            proposer: env::predecessor_account_id(),
+            description: input.description,
+            info: input.information,
+            status: PayoutStatus::UnderConsideration,
+            votes_count: VotesCount::new(),
+            votes: HashMap::default(),
+        }
+    }
+}
+
+// proposal related function implementation
+#[near_bindgen]
+impl Contract {
+    /// create a bounty payout
+    pub fn add_payout_bounty(&mut self, bounty: PayoutInput<Bounty>) -> u64 {
+        // validate input, seems like there is nothing to do here
+
+        // anyone can create this, no permission checks needed
+
+        // add the bounty to Contract.bountys
+        let new_id = self.last_bounty_id + 1;
+        self.bounties.insert(&new_id, &Payout::from(bounty));
+        self.last_bounty_id = new_id;
+        new_id
+    }
+    /// act on a bounty payout
+    pub fn act_payout_bounty(&mut self, id: u64, action: types::Action, note: Option<String>) {
+        let mut bounty = match self.bounties.get(&id) {
+            Some(b) => b,
+            None => {
+                panic!("{}", error::ErrBountyNotFound);
+            }
+        };
+        self.internal_act_payout(&mut bounty, action, note);
+    }
+}
+
+'''
+'''--- ambassadors-dao/src/payout/miscellaneous.rs ---
+use near_sdk::{env, near_bindgen};
+
+use super::*;
+
+pub type MiscellaneousPayout = Payout<Miscellaneous>;
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Clone, Debug))]
+#[serde(crate = "near_sdk::serde")]
+pub enum Miscellaneous {
+    ContentCreationBounty { links_to_content: Vec<ResourceLink> },
+    CampusSigningMOU,
+    CampusAmbassadorBonus { links_to_content: Vec<ResourceLink> },
+}
+
+impl From<PayoutInput<Miscellaneous>> for Payout<Miscellaneous> {
+    fn from(input: PayoutInput<Miscellaneous>) -> Self {
+        Self {
+            proposer: env::predecessor_account_id(),
+            description: input.description,
+            info: input.information,
+            status: PayoutStatus::UnderConsideration,
+            votes_count: VotesCount::new(),
+            votes: HashMap::default(),
+        }
+    }
+}
+
+#[near_bindgen]
+impl Contract {
+    /// create a miscellaneous payout
+    pub fn add_payout_miscellaneous(&mut self, miscellaneous: PayoutInput<Miscellaneous>) -> u64 {
+        // validate input, seems like there is nothing to do here
+
+        // anyone can create this, no permission checks needed
+
+        // add the miscellaneous to Contract.miscellaneous
+        let new_id = self.last_miscellaneous_id + 1;
+        self.miscellaneous
+            .insert(&new_id, &Payout::from(miscellaneous));
+        self.last_miscellaneous_id = new_id;
+        new_id
+    }
+    /// act on a miscellaneous payout
+    pub fn act_payout_miscellaneous(
+        &mut self,
+        id: u64,
+        action: types::Action,
+        note: Option<String>,
+    ) {
+        let mut miscellaneous = match self.miscellaneous.get(&id) {
+            Some(m) => m,
+            None => {
+                panic!("{}", error::ErrMiscellaneousNotFound);
+            }
+        };
+        self.internal_act_payout(&mut miscellaneous, action, note);
+    }
+}
+'''
+'''--- ambassadors-dao/src/payout/mod.rs ---
+use std::collections::HashMap;
+
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::AccountId;
+use near_sdk::{env, near_bindgen};
+
+pub use bounty::{Bounty, BountyPayout};
+pub use miscellaneous::{Miscellaneous, MiscellaneousPayout};
+pub use proposal::{Proposal, ProposalPayout};
+
+use crate::*;
+
+mod bounty;
+mod miscellaneous;
+mod proposal;
+
+/// The URL to any resource on the internet
+pub type ResourceLink = String;
+
+/// Represents a submission
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Clone, Debug))]
+#[serde(crate = "near_sdk::serde")]
+pub struct SubmissionInfo {
+    name: String,
+    account_id: AccountId,
+    submission_link: ResourceLink,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub enum PayoutStatus {
+    Approved,
+    Rejected,
+    Finalized,
+    Removed(Option<String>),
+    UnderConsideration,
+}
+
+/// A generic input structure for payouts
+///
+/// Let's say you want to add a proposal payout
+/// ```rust
+/// pub fn add_proposal(&mut self, proposal: PayoutInput<ProposalKind>) {
+///     // do something here
+/// }
+/// ```
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Clone, Debug))]
+#[serde(crate = "near_sdk::serde")]
+pub struct PayoutInput<T> {
+    description: String,
+    information: T,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Clone, Debug))]
+#[serde(crate = "near_sdk::serde")]
+pub struct VotesCount {
+    approve_count: u64,
+    reject_count: u64,
+}
+
+impl VotesCount {
+    pub fn new() -> Self {
+        Self {
+            approve_count: 0,
+            reject_count: 0,
+        }
+    }
+}
+
+/// A Payout is a type of payout. Depeding on the type of the Payout
+/// a set of information is required.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Payout<T> {
+    /// the current status of the Payout
+    pub status: PayoutStatus,
+    /// the id of the account that created the Payout
+    pub proposer: AccountId,
+    /// the information needed to create a Payout depending on it's kind
+    pub info: T,
+    /// a brief description for the Payout
+    pub description: String,
+    /// the of individual votes on the Payout
+    pub votes: HashMap<AccountId, vote::Vote>,
+    /// the total vote count, updated whenever the votes are updated
+    pub votes_count: VotesCount,
+}
+
+// TODO: referral payouts
+// TODO: implementation of adding proposals, acting on proposals, and executing proposals
+
+#[near_bindgen]
+impl Contract {
+    #[private]
+    pub fn internal_act_payout<T>(
+        &self,
+        payout: &mut Payout<T>,
+        action: types::Action,
+        note: Option<String>,
+    ) {
+        let signer = env::signer_account_id();
+        // check if the user is authorized to take the action
+        match action {
+            types::Action::RemovePayout => {
+                if signer != payout.proposer {
+                    panic!("{}", error::ErrNotPermitted);
+                }
+                payout.status = PayoutStatus::Removed(note);
+            }
+            types::Action::VoteReject => {
+                if !self.policy.is_council_member(&signer) {
+                    panic!("{}", error::ErrNotPermitted);
+                }
+                payout.votes.insert(signer, vote::Vote::from(action));
+                payout.votes_count.reject_count += 1;
+            }
+            types::Action::VoteApprove => {
+                if !self.policy.is_council_member(&signer) {
+                    panic!("{}", error::ErrNotPermitted);
+                }
+                payout.votes.insert(signer, vote::Vote::from(action));
+                payout.votes_count.approve_count += 1;
+            }
+        };
+    }
+}
+
+'''
+'''--- ambassadors-dao/src/payout/proposal.rs ---
+use near_sdk::{env, near_bindgen};
+
+use super::*;
+
+pub type ProposalPayout = Payout<Proposal>;
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Clone, Debug))]
+#[serde(crate = "near_sdk::serde")]
+pub enum Proposal {
+    Hackathon {
+        expected_registrations: u64,
+        estimated_budget: u64,
+        supporting_document: ResourceLink,
+    },
+    MemeContest {
+        expected_registrations: u64,
+        estimated_budget: u64,
+        supporting_document: ResourceLink,
+    },
+    Open {
+        supporting_document: ResourceLink,
+    },
+}
+
+impl From<PayoutInput<Proposal>> for Payout<Proposal> {
+    fn from(input: PayoutInput<Proposal>) -> Self {
+        Self {
+            proposer: env::predecessor_account_id(),
+            description: input.description,
+            info: input.information,
+            status: PayoutStatus::UnderConsideration,
+            votes_count: VotesCount::new(),
+            votes: HashMap::default(),
+        }
+    }
+}
+
+// proposal related function implementation
+#[near_bindgen]
+impl Contract {
+    /// create a proposal payout
+    pub fn add_payout_proposal(&mut self, proposal: PayoutInput<Proposal>) -> u64 {
+        // validate input, seems like there is nothing to do here
+
+        // anyone can create this, no permission checks needed
+
+        // 3. add the proposal to Contract.proposals
+        let new_id = self.last_proposal_id + 1;
+        self.proposals.insert(&new_id, &Payout::from(proposal));
+        self.last_proposal_id = new_id;
+        new_id
+    }
+    /// act on a proposal payout
+    pub fn act_payout_proposal(&mut self, id: u64, action: types::Action, note: Option<String>) {
+        // check if proposal with id exists
+        let mut proposal = match self.proposals.get(&id) {
+            Some(p) => p,
+            None => {
+                panic!("{}", error::ErrProposalNotFound);
+            }
+        };
+        self.internal_act_payout(&mut proposal, action, note);
+    }
+}
+
+'''
+'''--- ambassadors-dao/src/payout/referrals.rs ---
+use near_sdk::AccountId;
+use near_sdk::{env, near_bindgen};
+use std::collections::HashMap;
+
+use super::*;
+
+struct Refferal {
+    connect: HashMap<AccountId, String>,
+}
+
+#[near_bindgen]
+impl Contract {
+    pub fn generate_randon_no(&mut self) -> String {}
+
+    pub fn validate_ref_id(&self, ref_id: String) {
+        // check the input ref id is associated with any campus ambassador
+        // if yes, return the id of the campus ambassador
+
+        //then tranfer tokens to the campus ambasador
+    }
+
+    // create a referral
+    // vote on a referral
+    pub fn add_payout_referral(&mut self) {}
+}
+
+'''
+'''--- ambassadors-dao/src/policy.rs ---
+use std::collections::HashSet;
+
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::AccountId;
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Debug, PartialEq))]
+#[serde(crate = "near_sdk::serde")]
+pub struct Policy {
+    pub council: HashSet<AccountId>,
+}
+
+impl Policy {
+    /// create a new empty policy
+    pub fn new() -> Self {
+        Policy {
+            council: HashSet::new(),
+        }
+    }
+    /// if the given account ID is a member of the council
+    pub fn is_council_member(&self, member_id: &AccountId) -> bool {
+        self.council.contains(member_id)
+    }
+    /// get size of council   
+    pub fn get_council_size(&self) -> usize {
+        self.council.len()
+    }
+    /// add member to council
+    /// can only be done by a council member
+    /// NOTE: not adding support for this rn
+    pub fn add_member_to_council(&mut self, member_id: &AccountId) {
+        self.council.insert(member_id.clone());
+    }
+    /// remove member from council
+    /// can only be done by a council member
+    /// NOTE: not adding support for this rn
+    pub fn remove_member_from_council(&mut self, member_id: &AccountId) {
+        self.council.remove(member_id);
+    }
+}
+
+impl From<Vec<AccountId>> for Policy {
+    fn from(input: Vec<AccountId>) -> Self {
+        let mut set = HashSet::with_capacity(input.len());
+        for id in input {
+            set.insert(id);
+        }
+        Policy { council: set }
+    }
+}
+
+'''
+'''--- ambassadors-dao/src/types.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{Balance, Gas};
+
+/// 1 yN to prevent access key fraud.
+pub const ONE_YOCTO_NEAR: Balance = 1;
+
+/// 1 N
+pub const ONE_NEAR: Balance = 1_000_000_000_000_000_000_000_000;
+
+/// Gas for single ft_transfer call.
+pub const GAS_FOR_FT_TRANSFER: Gas = Gas(10_000_000_000_000);
+
+/// Configuration of the DAO.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Config {
+    /// name of DAO
+    pub name: String,
+    /// purpose of DAO
+    pub purpose: String,
+}
+
+impl Config {
+    pub fn new(name: String, purpose: String) -> Self {
+        Self { name, purpose }
+    }
+}
+
+/// The actions that the members of the DAO can perform such as
+/// adding a new prosposal or voting for a proposal, etc...
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub enum Action {
+    /// remove a payout
+    RemovePayout,
+    /// approval vote for a payout
+    VoteApprove,
+    /// rejection vote for a payout
+    VoteReject,
+}
+
+impl Action {
+    pub fn to_policy_label(&self) -> String {
+        format!("{:?}", self)
+    }
+}
+
+'''
+'''--- ambassadors-dao/src/views.rs ---
+// implement multiple proposal based on proposer
+
+use std::cmp::min;
+
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::env;
+use near_sdk::serde::{Deserialize, Serialize};
+
+use payout::{Bounty, Proposal, Miscellaneous};
+
+use crate::*;
+
+/// TODO: Get payout input fields, for that create a derive proc_macro
+/// and put it on each of the enums and required structs
+
+/// This is format of output via JSON for the payout.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct PayoutOutput<T> {
+    /// Id of the payout.
+    pub id: u64,
+    #[serde(flatten)]
+    pub payout: Payout<T>,
+}
+
+#[near_bindgen]
+impl Contract {
+    // paginated view
+    // if env signer is council: then they can have paginated view of payouts
+    // if env signer is not council: then they will have only payouts they have added
+
+    pub fn get_proposals(&self, start_index: u64, limit: u64) -> Vec<PayoutOutput<Proposal>>{
+        let signer = env::signer_account_id();
+        if self.policy.is_council_member(&signer){
+            (start_index..min(self.last_proposal_id, start_index+limit)).filter_map(|id|{
+                self.proposals.get(&id).map(|p| PayoutOutput{id, payout: p})
+            }).collect()
+        }
+        // check
+        else {
+            (start_index..min(self.last_proposal_id, start_index+limit)).filter_map(|id|{
+                self.proposals.get(&id).map(|p| PayoutOutput{id, payout: p})
+            }).collect()
+        }
+    }
+    pub fn get_bounties(&self, start_index: u64, limit: u64) -> Vec<PayoutOutput<Bounty>>{
+        if self.policy.is_council_member(&env::signer_account_id()){
+            (start_index..min(self.last_bounty_id, start_index+limit)).filter_map(|id|{
+                self.bounties.get(&id).map(|b| PayoutOutput{id, payout: b})
+            }).collect()
+        }
+        // check
+        else{
+            (start_index..min(self.last_bounty_id, start_index+limit)).filter_map(|id|{
+                self.bounties.get(&id).map(|b| PayoutOutput{id, payout: b})
+            }).collect()
+        }
+    }
+        pub fn get_miscellaneous(&self, start_index:u64, limit:u64) -> Vec<PayoutOutput<Miscellaneous>>{
+            if self.policy.is_council_member(&env::signer_account_id()){
+            (start_index..min(self.last_miscellaneous_id, start_index+limit)).filter_map(|id|{
+                self.miscellaneous.get(&id).map(|m| PayoutOutput{id, payout: m})
+            }).collect()
+        } 
+        // check
+        else{
+            (start_index..min(self.last_miscellaneous_id, start_index+limit)).filter_map(|id|{
+                self.miscellaneous.get(&id).map(|m| PayoutOutput{id, payout: m})
+            }).collect()
+        }
+    }
+
+    pub fn get_proposal(&self, id: u64) -> PayoutOutput<Proposal>{
+        let proposal = self.proposals.get(&id).expect("ERR_NO_PROPOSAL");
+        let signer = env::signer_account_id();
+        if self.policy.is_council_member(&signer)|| signer == proposal.proposer{
+        PayoutOutput {
+            id,
+            payout: proposal,
+            }
+        } // need check
+        else{
+            PayoutOutput{
+                id,
+                payout: proposal,
+            }
+        }
+    }
+
+    pub fn get_bounty(&self, id: u64) -> PayoutOutput<Bounty>{
+        let bounty = self.bounties.get(&id).expect("NO_BOUNTY_FOUND");
+        let signer = env::signer_account_id();
+        if self.policy.is_council_member(&signer)|| signer == bounty.proposer{
+        PayoutOutput {
+            id,
+            payout: bounty,
+            }
+        } // need check
+        else{
+            PayoutOutput{
+                id,
+                payout : bounty,
+            }
+        }
+    }
+
+    pub fn get_miscellaneous_by_id(&self, id: u64) -> PayoutOutput<Miscellaneous>{
+        let miscellaneous = self.miscellaneous.get(&id).expect("NO_MISC_PAYOUT_FOUND");
+        let signer = env::signer_account_id();
+        if self.policy.is_council_member(&env::signer_account_id()) || signer == miscellaneous.proposer{
+        PayoutOutput {
+            id,
+            payout: miscellaneous,
+            }
+        } // need check
+        else{
+            PayoutOutput {
+                id,
+                payout: miscellaneous,
+                }
+        }
+    }
+
+}
+
+// paginated view
+// if env signer is council: then they can have paginated view of payouts
+// if env signer is not council: then they will have only payouts they have added
+
+// get diff payout by id
+// if env signer is council: can view it if it exists
+// if env signer is campus ambassador: can view only if it is added by him. 
+'''
+'''--- ambassadors-dao/src/vote.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::serde::{Deserialize, Serialize};
+
+use crate::types::Action;
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub enum Vote {
+    Approve = 0x0,
+    Reject = 0x1,
+}
+
+impl From<Action> for Vote {
+    fn from(input: Action) -> Self {
+        match input {
+            Action::VoteApprove => Vote::Approve,
+            Action::VoteReject => Vote::Reject,
+            _ => {
+                panic!("ERR_INVALID_ACTION")
+            }
+        }
+    }
+}
+'''

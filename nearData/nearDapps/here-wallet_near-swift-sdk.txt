@@ -1,0 +1,4483 @@
+*GitHub Repository "here-wallet/near-swift-sdk"*
+
+'''--- Package.swift ---
+// swift-tools-version: 5.5
+// The swift-tools-version declares the minimum version of Swift required to build this package.
+
+import PackageDescription
+
+let package = Package(
+    name: "Near",
+    platforms: [.iOS(.v13)],
+    products: [
+        .library(
+            name: "NearSwift",
+            targets: ["NearSwift"]
+        )
+    ],
+    dependencies: [
+        .package(
+            url: "https://github.com/Flight-School/AnyCodable",
+            .upToNextMinor(from: "0.6.0")
+        ),
+        .package(
+            url: "https://github.com/GigaBitcoin/secp256k1.swift.git",
+            .upToNextMajor(from: "0.5.0")
+        ),
+        .package(
+            url: "https://github.com/bitmark-inc/tweetnacl-swiftwrap.git",
+            .upToNextMajor(from: "1.1.0")
+        ),
+        .package(
+            url: "https://github.com/keefertaylor/Base58Swift.git",
+            from: "2.1.0"
+        )
+    ],
+    targets: [
+        .target(
+            name: "NearSwift",
+            dependencies: [
+                "AnyCodable",
+                .product(name: "TweetNacl", package: "tweetnacl-swiftwrap"),
+                .product(name: "secp256k1", package: "secp256k1.swift"),
+                "Base58Swift"
+            ]
+        )
+    ]
+)
+
+'''
+'''--- README.md ---
+# Near
+
+[![Build Status](https://travis-ci.com/nearprotocol/near-client-ios.svg?branch=master)](https://travis-ci.com/nearprotocol/near-client-ios)
+[![Version](https://img.shields.io/cocoapods/v/nearclientios.svg?style=flat)](https://cocoapods.org/pods/nearclientios)
+[![License MIT](https://img.shields.io/github/license/nearprotocol/near-client-ios)](https://github.com/nearprotocol/near-client-ios/blob/master/LICENSE)
+[![Platform](https://img.shields.io/cocoapods/p/nearclientios.svg?style=flat)](https://cocoapods.org/pods/nearclientios)
+
+## Example
+
+To run the example project, clone the repo, and run `pod install` from the Example directory first.
+
+# Usage
+
+```swift
+import nearclientios
+class ViewController: UIViewController, WalletSignInDelegate {
+  private var walletAccount: WalletAccount?
+  private var near: Near?
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    let keyStore = KeychainKeyStore(keychain: .init(service: "example.keystore"))
+    let config = NearConfig(
+      networkId: "testnet", // "default" for mainnet 
+      nodeUrl: URL(string: "https://rpc.testnet.near.org")!, // "https://rpc.mainnet.near.org" for mainnet
+      masterAccount: nil,
+      keyPath: nil,
+      helperUrl: nil,
+      initialBalance: nil,
+      providerType: .jsonRPC(URL(string: "https://rpc.testnet.near.org")!), // "https://rpc.mainnet.near.org" for mainnet
+      signerType: .inMemory(keyStore),
+      keyStore: keyStore,
+      contractName: nil,
+      walletUrl: "https://wallet.testnet.near.org" // "https://wallet.near.org" for mainnet
+    )
+    near = try! Near(config: config)
+    walletAccount = try! WalletAccount(near: near!, authService: DefaultAuthService.shared)
+    let appName = UIApplication.name ?? "signInTitle"
+    DefaultAuthService.shared.walletSignIn = self
+    try! await walletAccount!.requestSignIn(contractId: nil, title: appName, presentingViewController: self)
+  }
+  func completeSignIn(url: URL) async {
+    try! await walletAccount?.completeSignIn(url: url)
+    MainActor.run {
+      //do any additional UI work on the main thread after sign in is complete
+    }
+  }
+}
+```
+
+## Requirements
+
+nearclientios makes use of Swift's async/await and thus requires iOS 13.
+
+## Installation
+
+## Author
+
+NEAR Inc
+
+## License
+
+nearclientios is available under the MIT license. See the LICENSE file for more info.
+
+'''
+'''--- Sources/NearSwift/Account.swift ---
+//
+//  Account.swift
+//  NearSwift
+//
+//  Created by Dmitry Kurochka on 10/30/19.
+//  Copyright © 2019 NEAR Protocol. All rights reserved.
+//
+
+import Foundation
+
+/// Default amount of gas to be sent with the function calls. Used to pay for the fees
+/// incurred while running the contract execution. The unused amount will be refunded back to
+/// the originator.
+/// Due to protocol changes that charge upfront for the maximum possible gas price inflation due to
+/// full blocks, the price of max_prepaid_gas is decreased to `300 * 10**12`.
+/// For discussion see https://github.com/nearprotocol/NEPs/issues/67
+let DEFAULT_FUNC_CALL_AMOUNT: UInt64 = 30000000000000
+
+/// Default number of retries before giving up on a transactioin.
+let TX_STATUS_RETRY_NUMBER = 10
+
+/// Default wait until next retry in millis.
+let TX_STATUS_RETRY_WAIT: Double = 500
+
+/// Exponential back off for waiting to retry.
+let TX_STATUS_RETRY_WAIT_BACKOFF = 1.5
+
+// Sleep given number of millis.
+public func sleep(millis: Double) async -> Void {
+    let sec = millis / 1000
+    return await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        DispatchQueue.main.asyncAfter(deadline: .now() + sec) {continuation.resume(returning: Void())}
+    }
+}
+
+public struct AccountState: Codable {
+    public let accountId: String?
+    public let staked: String?
+    public let locked: String
+    public let amount: String
+    public let codeHash: String
+    public let storagePaidAt: Number
+    public let storageUsage: Number
+    
+    public static let initial: AccountState = .init(accountId: nil, staked: nil, locked: "0", amount: "0", codeHash: "", storagePaidAt: 0, storageUsage: 0)
+}
+
+public struct KeyBox: Decodable {
+    let accessKey: AccessKey
+    let publicKey: String
+}
+
+public struct KeyBoxes: Decodable {
+    let keys: [KeyBox]
+}
+
+public enum AccountError: Error {
+    case noAccessKey(String)
+    case noResult
+}
+
+public struct AuthorizedApp: Equatable, Codable {
+    let contractId: String
+    let amount: UInt128
+    let publicKey: String
+}
+
+public struct AccountDetails: Equatable, Codable {
+    let authorizedApps: [AuthorizedApp]
+    let transactions: [String]
+}
+
+public struct QueryResult: Equatable, Decodable {
+    let logs: [String]
+    let result: [UInt8]
+}
+
+public final class Account {
+    public let connection: Connection
+    public let accountId: String
+    private var _state: AccountState?
+    private var _accessKey: AccessKey?
+    
+    func ready() async throws -> Void {
+        return try await fetchState()
+    }
+    
+    public init(connection: Connection, accountId: String) {
+        self.connection = connection;
+        self.accountId = accountId;
+    }
+    
+    func fetchState() async throws -> Void {
+        _state = try await connection.provider.query(
+            params: [
+                "request_type": "view_account",
+                "finality": Finality.optimistic.rawValue,
+                "account_id": accountId
+            ]
+        )
+        guard
+            let publicKey = try await connection.signer.getPublicKey(
+                accountId: accountId,
+                networkId: connection.networkId
+            )
+        else {
+            print("Missing public key for \(accountId) in \(connection.networkId)")
+            return
+        }
+        _accessKey = try await connection.provider.query(
+            params: [
+                "request_type": "view_access_key",
+                "finality": Finality.optimistic.rawValue,
+                "account_id": accountId,
+                "public_key": publicKey.toString()
+            ]
+        )
+        guard _accessKey != nil else {
+            throw AccountError.noAccessKey("Failed to fetch access key for '\(accountId)' with public key \(publicKey.toString())")
+        }
+        return
+    }
+    
+    public func state() async throws -> AccountState {
+        try await ready()
+        return _state!
+    }
+    
+    private func printLogs(contractId: String, logs: [String]) {
+        logs.forEach {print("[\(contractId)]: \($0)")}
+    }
+    
+    private func retryTxResult(txHash: [UInt8], accountId: String) async throws -> FinalExecutionOutcome {
+        var waitTime = TX_STATUS_RETRY_WAIT
+        for _ in [0 ..< TX_STATUS_RETRY_NUMBER] {
+            if let result = try? await connection.provider.txStatus(txHash: txHash, accountId: accountId) {
+                return result
+            }
+            await sleep(millis: waitTime)
+            waitTime *= TX_STATUS_RETRY_WAIT_BACKOFF
+        }
+        throw TypedError.error(type: "Exceeded \(TX_STATUS_RETRY_NUMBER) status check attempts for transaction \(txHash.baseEncoded).",
+                               message: "RetriesExceeded")
+    }
+    
+    public func decodeTransaction(message: Data) throws -> CodableTransaction {
+        return try BorshDecoder().decode(CodableTransaction.self, from: message)
+    }
+    
+    public func signAndSendTransaction(receiverId: String, actions: [Action]) async throws -> FinalExecutionOutcome {
+        try await ready()
+        guard _accessKey != nil else {
+            throw TypedError.error(type: "Can not sign transactions, initialize account with available public key in Signer.", message: "KeyNotFound")
+        }
+        
+        let status = try await connection.provider.status()
+        _accessKey!.nonce += 1
+    
+        let blockHash = status.syncInfo.latestBlockHash.baseDecoded
+        let (txHash, signedTx) = try await signTransaction(receiverId: receiverId,
+                                                           nonce: _accessKey!.nonce,
+                                                           actions: actions,
+                                                           blockHash: blockHash,
+                                                           signer: connection.signer,
+                                                           accountId: accountId,
+                                                           networkId: connection.networkId)
+        
+        let outcome: FinalExecutionOutcome?
+        do {
+            outcome = try await connection.provider.sendTransaction(signedTransaction: signedTx)
+        } catch let error {
+            if case TypedError.error(let type, _) = error, type == "TimeoutError" {
+                outcome = try await retryTxResult(txHash: txHash, accountId: accountId)
+            } else {
+                throw error
+            }
+        }
+        
+        guard let result = outcome else {throw AccountError.noResult}
+        let flatLogs = ([result.transactionOutcome] + result.receiptsOutcome).reduce([], {$0 + $1.outcome.logs})
+        printLogs(contractId: signedTx.transaction.receiverId, logs: flatLogs)
+        
+        if case .failure(let error) = result.status {
+            throw TypedError.error(
+                type: "Transaction \(result.transactionOutcome.id) failed. \(error.errorMessage ?? "")",
+                message: error.errorType
+            )
+        }
+
+        // TODO: if Tx is Unknown or Started.
+        // TODO: deal with timeout on node side.
+        return result
+    }
+
+    public func signAndSendTransactionAsync(receiverId: String, actions: [Action]) async throws -> SimpleRPCResult {
+        try await ready()
+        guard _accessKey != nil else {
+            throw TypedError.error(type: "Can not sign transactions, initialize account with available public key in Signer.", message: "KeyNotFound")
+        }
+        
+        let status = try await connection.provider.status()
+        _accessKey!.nonce += 1
+        let blockHash = status.syncInfo.latestBlockHash.baseDecoded
+        let (_, signedTx) = try await signTransaction(receiverId: receiverId,
+                                                      nonce: _accessKey!.nonce,
+                                                      actions: actions,
+                                                      blockHash: blockHash,
+                                                      signer: connection.signer,
+                                                      accountId: accountId,
+                                                      networkId: connection.networkId)
+        
+        let outcome: SimpleRPCResult
+        do {
+            outcome = try await connection.provider.sendTransactionAsync(signedTransaction: signedTx)
+        } catch let error {
+            throw error
+        }
+        return outcome
+    }
+    
+    
+    @discardableResult
+    public func createAndDeployContract(contractId: String, publicKey: PublicKey,
+                                 data: [UInt8], amount: UInt128) async throws -> Account {
+        let accessKey = fullAccessKey()
+        let actions = [NearSwift.createAccount(),
+                       NearSwift.transfer(deposit: amount),
+                       NearSwift.addKey(publicKey: publicKey, accessKey: accessKey),
+                       NearSwift.deployContract(code: data)]
+        let _ = try await signAndSendTransaction(receiverId: contractId, actions: actions)
+        let contractAccount = Account(connection: connection, accountId: contractId)
+        return contractAccount
+    }
+    
+    @discardableResult
+    public func sendMoney(receiverId: String, amount: UInt128) async throws -> FinalExecutionOutcome {
+        return try await signAndSendTransaction(receiverId: receiverId, actions: [NearSwift.transfer(deposit: amount)])
+    }
+    
+    @discardableResult
+    public func createAccount(newAccountId: String, publicKey: PublicKey,
+                       amount: UInt128) async throws -> FinalExecutionOutcome {
+        let accessKey = fullAccessKey()
+        let actions = [NearSwift.createAccount(),
+                       NearSwift.transfer(deposit: amount),
+                       NearSwift.addKey(publicKey: publicKey, accessKey: accessKey)]
+        return try await signAndSendTransaction(receiverId: newAccountId, actions: actions)
+    }
+    
+    @discardableResult
+    public func deleteAccount(beneficiaryId: String) async throws -> FinalExecutionOutcome {
+        return try await signAndSendTransaction(receiverId: accountId,
+                                                actions: [NearSwift.deleteAccount(beneficiaryId: beneficiaryId)])
+    }
+    
+    private func deployContract(data: [UInt8]) async throws -> FinalExecutionOutcome {
+        return try await signAndSendTransaction(receiverId: accountId, actions: [NearSwift.deployContract(code: data)])
+    }
+    
+    public func functionCall(contractId: String, methodName: ChangeMethod, args: [String: Any] = [:],
+                      gas: UInt64?, amount: UInt128) async throws -> FinalExecutionOutcome {
+        let gasValue = gas ?? DEFAULT_FUNC_CALL_AMOUNT
+        let actions = [NearSwift.functionCall(methodName: methodName, args: Data(json: args).bytes,
+                                              gas: gasValue, deposit: amount)]
+        return try await signAndSendTransaction(receiverId: contractId, actions: actions)
+    }
+    
+    public func functionCall(contractId: String, methodName: ChangeMethod, args: Data = .init(),
+                      gas: UInt64?, amount: UInt128) async throws -> FinalExecutionOutcome {
+        let gasValue = gas ?? DEFAULT_FUNC_CALL_AMOUNT
+        let actions = [NearSwift.functionCall(methodName: methodName, args: args.bytes,
+                                              gas: gasValue, deposit: amount)]
+        return try await signAndSendTransaction(receiverId: contractId, actions: actions)
+    }
+    
+    // TODO: expand this API to support more options.
+    @discardableResult
+    public func addKey(
+        publicKey: PublicKey,
+        contractId: String?,
+        methodNames: [String]?,
+        amount: UInt128?
+    ) async throws -> FinalExecutionOutcome {
+        let accessKey: AccessKey
+        if let contractId = contractId, !contractId.isEmpty {
+            accessKey = functionCallAccessKey(receiverId: contractId, methodNames: methodNames ?? [], allowance: amount)
+        } else {
+            accessKey = fullAccessKey()
+        }
+        return try await signAndSendTransaction(receiverId: accountId, actions: [NearSwift.addKey(publicKey: publicKey, accessKey: accessKey)])
+    }
+    
+    @discardableResult
+    public func deleteKey(publicKey: PublicKey) async throws -> FinalExecutionOutcome {
+        return try await signAndSendTransaction(receiverId: accountId, actions: [NearSwift.deleteKey(publicKey: publicKey)])
+    }
+    
+    private func stake(publicKey: PublicKey, amount: UInt128) async throws -> FinalExecutionOutcome {
+        return try await signAndSendTransaction(receiverId: accountId,
+                                                actions: [NearSwift.stake(stake: amount, publicKey: publicKey)])
+    }
+    
+    public func viewFunction<T: Decodable>(contractId: String, methodName: String, args: [String: Any] = [:]) async throws -> T {
+        let data = Data(json: args).base64EncodedString()
+        let result: QueryResult = try await connection.provider.query(params: [
+            "request_type": "call_function",
+            "finality": Finality.optimistic.rawValue,
+            "account_id": contractId,
+            "method_name": methodName,
+            "args_base64": data
+        ])
+        if !result.logs.isEmpty {
+            printLogs(contractId: contractId, logs: result.logs)
+        }
+        var rawData: Data
+        do {
+            let dictionary = try result.result.data.toDictionary()
+            rawData = try dictionary.toData()
+        } catch {
+            rawData = result.result.data
+        }
+        let decodedResult = try JSONDecoder().decode(T.self, from: rawData)
+        return decodedResult
+    }
+    
+    /// Returns array of {access_key: AccessKey, public_key: PublicKey} items.
+    public func getAccessKeys() async throws -> KeyBoxes {
+        let response: KeyBoxes = try await connection.provider.query(params: [
+            "request_type": "view_access_key_list",
+            "finality": Finality.optimistic.rawValue,
+            "account_id": accountId,
+        ])
+        return response
+    }
+    
+    public func getAccountDetails() async throws -> AccountDetails {
+        // TODO: update the response value to return all the different keys, not just app keys.
+        // Also if we need this function, or getAccessKeys is good enough.
+        let accessKeys = try await getAccessKeys()
+        var authorizedApps: [AuthorizedApp] = []
+        accessKeys.keys.forEach { item in
+            if case AccessKeyPermission.functionCall(let permission) = item.accessKey.permission {
+                authorizedApps.append(AuthorizedApp(contractId: permission.receiverId,
+                                                    amount: permission.allowance ?? 0,
+                                                    publicKey: item.publicKey))
+            }
+        }
+        let result = AccountDetails(authorizedApps: authorizedApps, transactions: [])
+        return result
+    }
+}
+
+'''
+'''--- Sources/NearSwift/AccountCreator.swift ---
+//
+//  AccountCreator.swift
+//  nearclientios
+//
+//  Created by Dmitry Kurochka on 10/30/19.
+//  Copyright © 2019 NEAR Protocol. All rights reserved.
+//
+
+import Foundation
+
+public protocol AccountCreator {
+  func createAccount(newAccountId: String, publicKey: PublicKey) async throws -> Void
+}
+
+public struct LocalAccountCreator {
+  let masterAccount: Account
+  let initialBalance: UInt128
+}
+
+extension LocalAccountCreator: AccountCreator {
+  public func createAccount(newAccountId: String, publicKey: PublicKey) async throws -> Void {
+    let _ = try await masterAccount.createAccount(newAccountId: newAccountId, publicKey: publicKey, amount: initialBalance)
+  }
+}
+
+public struct UrlAccountCreator {
+  let connection: Connection
+  let helperConnection: ConnectionInfo
+}
+
+extension UrlAccountCreator {
+  init(connection: Connection, helperUrl: URL) {
+    self.init(connection: connection, helperConnection: ConnectionInfo(url: helperUrl))
+  }
+}
+
+extension UrlAccountCreator: AccountCreator {
+  public func createAccount(newAccountId: String, publicKey: PublicKey) async throws -> Void {
+    // no-op
+  }
+}
+
+'''
+'''--- Sources/NearSwift/Connection.swift ---
+//
+//  Connection.swift
+//  nearclientios
+//
+//  Created by Dmitry Kurochka on 10/30/19.
+//  Copyright © 2019 NEAR Protocol. All rights reserved.
+//
+
+import Foundation
+
+public protocol ConnectionConfigProtocol {
+  var networkId: String {get}
+  var providerType: ProviderType {get}
+  var signerType: SignerType {get}
+}
+
+public struct ConnectionConfig: ConnectionConfigProtocol {
+  public let networkId: String
+  public let providerType: ProviderType
+  public let signerType: SignerType
+}
+
+public extension ConnectionConfigProtocol {
+  func provider() -> Provider {
+    switch providerType {
+    case .jsonRPC(let url): return JSONRPCProvider(url: url)
+    }
+  }
+}
+
+public extension ConnectionConfigProtocol {
+  func signer() -> Signer {
+    switch signerType {
+    case .inMemory(let keyStore): return InMemorySigner(keyStore: keyStore)
+    }
+  }
+}
+
+public struct Connection {
+  public let networkId: String
+  public let provider: Provider
+  public let signer: Signer
+}
+
+public extension Connection {
+  static func fromConfig(config: ConnectionConfigProtocol) throws -> Connection {
+    let provider = config.provider()
+    let signer = config.signer()
+    return Connection(networkId: config.networkId, provider: provider, signer: signer)
+  }
+}
+
+'''
+'''--- Sources/NearSwift/Contract.swift ---
+//
+//  Contract.swift
+//  nearclientios
+//
+//  Created by Dmitry Kurochka on 10/30/19.
+//  Copyright © 2019 NEAR Protocol. All rights reserved.
+//
+
+import Foundation
+
+public protocol ContractOptionsProtocol {
+  var viewMethods: [ViewMethod] {get}
+  var changeMethods: [ChangeMethod] {get}
+  var sender: String? {get}
+}
+
+public typealias MethodName = String
+public typealias ViewMethod = MethodName
+public typealias ChangeMethod = MethodName
+
+public extension ViewMethod {
+  static let getValue = "getValue"
+  static let getLastResult = "getLastResult"
+  static let hello = "hello"
+  static let getAllKeys = "getAllKeys"
+  static let returnHiWithLogs = "returnHiWithLogs"
+}
+
+public extension ChangeMethod {
+  static let setValue = "setValue"
+  static let callPromise = "callPromise"
+  static let generateLogs = "generateLogs"
+  static let triggerAssert = "triggerAssert"
+  static let testSetRemove = "testSetRemove"
+}
+
+public struct ContractOptions: ContractOptionsProtocol {
+  public let viewMethods: [ViewMethod]
+  public let changeMethods: [ChangeMethod]
+  public let sender: String?
+}
+
+public struct Contract {
+  let account: Account
+  let contractId: String
+  let viewMethods: [ViewMethod]
+  let changeMethods: [ChangeMethod]
+  let sender: String?
+}
+
+public extension Contract {
+  init(account: Account, contractId: String, options:  ContractOptionsProtocol) {
+    self.init(account: account, contractId: contractId, viewMethods: options.viewMethods,
+              changeMethods: options.changeMethods, sender: nil)
+  }
+}
+
+public extension Contract {
+  func view<T: Decodable>(methodName: ChangeMethod, args: [String: Any] = [:]) async throws -> T {
+    return try await account.viewFunction(contractId: contractId, methodName: methodName, args: args)
+  }
+}
+
+public extension Contract {
+  @discardableResult
+  func change(methodName: ChangeMethod, args: [String: Any] = [:],
+              gas: UInt64? = nil, amount: UInt128 = 0) async throws -> Any? {
+    let rawResult = try await account.functionCall(contractId: contractId,
+                                                   methodName: methodName,
+                                                   args: args,
+                                                   gas: gas,
+                                                   amount: amount)
+    return getTransactionLastResult(txResult: rawResult)
+  }
+}
+
+'''
+'''--- Sources/NearSwift/DefaultAuthService.swift ---
+//
+//  DefaultAuthService.swift
+//  nearclientios
+//
+//  Created by Kevin McConnaughay on 2/17/22.
+//
+
+import Foundation
+import UIKit
+import WebKit
+
+public class DefaultAuthService: NSObject, ExternalAuthService {
+  public static let shared = DefaultAuthService()
+  
+  var navController: UINavigationController?
+  public weak var walletSignIn: WalletSignInDelegate?
+  
+  public func openURL(_ url: URL, presentingViewController: UIViewController) -> Bool {
+    let viewController = UIViewController()
+    navController = UINavigationController(rootViewController: viewController)
+    let closeButton = UIBarButtonItem(title: "Cancel", style: .plain, target: self, action: #selector(self.dismiss))
+    viewController.navigationItem.rightBarButtonItem = closeButton
+    let webView = WKWebView()
+    webView.navigationDelegate = self
+    webView.translatesAutoresizingMaskIntoConstraints = false
+    viewController.view.addSubview(webView)
+    webView.leadingAnchor.constraint(equalTo: viewController.view.leadingAnchor).isActive = true
+    webView.trailingAnchor.constraint(equalTo: viewController.view.trailingAnchor).isActive = true
+    webView.topAnchor.constraint(equalTo: viewController.view.topAnchor).isActive = true
+    webView.bottomAnchor.constraint(equalTo: viewController.view.bottomAnchor).isActive = true
+    webView.load(URLRequest(url: url))
+    presentingViewController.present(navController!, animated: true, completion: nil)
+    return true
+  }
+  
+  @objc private func dismiss() {
+    navController?.dismiss(animated: true, completion: { [weak self] in
+      self?.navController = nil
+    })
+  }
+}
+
+extension DefaultAuthService: WKNavigationDelegate {
+  public func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+    defer {
+      decisionHandler(.allow)
+    }
+    guard let url = navigationAction.request.url else { return }
+    guard url.scheme == APP_SCHEME else { return }
+    Task {
+      await walletSignIn?.completeSignIn(url: url)
+    }
+    dismiss()
+  }
+}
+
+public protocol WalletSignInDelegate: AnyObject {
+  func completeSignIn(url: URL) async
+}
+
+'''
+'''--- Sources/NearSwift/KeyStores/FileSystemKeyStore.swift ---
+//
+//  AccountInfo.swift
+//  nearclientios
+//
+//  Created by Dmitry Kurochka on 10/30/19.
+//  Copyright © 2019 NEAR Protocol. All rights reserved.
+//
+
+import Foundation
+
+/**
+// Format of the account stored on disk.
+*/
+public protocol AccountInfoProtocol {
+  var account_id: String {get}
+  var private_key: String? {get}
+  var secret_key: String? {get}
+}
+
+public struct AccountInfo: AccountInfoProtocol, Codable {
+  public let account_id: String
+  public let private_key: String?
+  public let secret_key: String?
+}
+
+public struct UnencryptedFileSystemKeyStore {
+  let keyDir: String
+  let manager: FileManager
+
+  public init(keyDir: String, manager: FileManager = .default) {
+    self.keyDir = keyDir
+    self.manager = manager
+  }
+}
+
+public enum UnencryptedFileSystemKeyStoreError: Error {
+  case noPrivateKey
+}
+
+extension UnencryptedFileSystemKeyStore: KeyStore {
+  public func setKey(networkId: String, accountId: String, keyPair: KeyPair) async throws -> Void {
+    let networkPath = "\(keyDir)/\(networkId)"
+    let fullNetworkPath = manager.targetDirectory.appendingPathComponent(networkPath).path
+    try manager.ensureDir(path: fullNetworkPath)
+    let content = AccountInfo(account_id: accountId, private_key: keyPair.toString(), secret_key: nil)
+    let encoded = try JSONEncoder().encode(content)
+    let fileUrl = getKeyFileUrl(networkPath: networkPath, accountId: accountId)
+    try encoded.write(to: fileUrl, options: [.atomic])
+  }
+
+  /// Find key / account id.
+  public func getKey(networkId: String, accountId: String) async throws -> KeyPair? {
+    let networkPath = "\(keyDir)/\(networkId)"
+    let path = getKeyFileUrl(networkPath: networkPath, accountId: accountId).path
+    guard manager.fileExists(atPath: path) else {return nil}
+    let accountKeyPair = try await UnencryptedFileSystemKeyStore.readKeyFile(path: path)
+    return accountKeyPair.1
+  }
+
+  public func removeKey(networkId: String, accountId: String) async throws -> Void {
+    let networkPath = "\(keyDir)/\(networkId)"
+    let path = getKeyFileUrl(networkPath: networkPath, accountId: accountId).path
+    guard manager.fileExists(atPath: path) else {return}
+    try manager.removeItem(atPath: path)
+  }
+
+  public func clear() async throws -> Void {
+    let networksPath = manager.targetDirectory.appendingPathComponent(keyDir).path
+    try manager.removeItem(atPath: networksPath)
+  }
+
+  public func getNetworks() async throws -> [String] {
+    let networksPath = manager.targetDirectory.appendingPathComponent(keyDir).path
+    let files = try manager.contentsOfDirectory(atPath: networksPath)
+    return files
+  }
+
+  public func getAccounts(networkId: String) async throws -> [String] {
+    let networkPath = "\(keyDir)/\(networkId)"
+    let fullNetworkPath = manager.targetDirectory.appendingPathComponent(networkPath).path
+    guard manager.fileExists(atPath: fullNetworkPath) else {return []}
+    let files = try manager.contentsOfDirectory(atPath: fullNetworkPath)
+    return files.filter {$0.hasSuffix(".json")}.map {$0.replacingOccurrences(of: ".json", with: "")}
+  }
+}
+
+extension UnencryptedFileSystemKeyStore {
+  private func getKeyFileUrl(networkPath: String, accountId: String) -> URL {
+    return manager.targetDirectory.appendingPathComponent("\(networkPath)/\(accountId).json")
+  }
+
+  private static func loadJsonFile(path: String) async throws -> AccountInfo {
+    let content = try Data(contentsOf: URL(fileURLWithPath: path), options: [])
+    let accountInfo = try JSONDecoder().decode(AccountInfo.self, from: content)
+    return accountInfo
+  }
+
+  static func readKeyFile(path: String) async throws -> (String, KeyPair) {
+    let accountInfo = try await loadJsonFile(path: path)
+    // The private key might be in private_key or secret_key field.
+    var privateKey = accountInfo.private_key
+    if privateKey == nil, accountInfo.secret_key != nil {
+      privateKey = accountInfo.secret_key
+    }
+    guard privateKey != nil else {throw UnencryptedFileSystemKeyStoreError.noPrivateKey}
+    let keyPair = try keyPairFromString(encodedKey: privateKey!)
+    return (accountInfo.account_id, keyPair)
+  }
+}
+
+'''
+'''--- Sources/NearSwift/KeyStores/InMemoryKeyStore.swift ---
+//
+//  InMemoryKeyStore.swift
+//  nearclientios
+//
+//  Created by Dmitry Kurochka on 10/30/19.
+//  Copyright © 2019 NEAR Protocol. All rights reserved.
+//
+
+import Foundation
+
+/**
+* Simple in-memory keystore for testing purposes.
+*/
+public class InMemoryKeyStore {
+  private var keys: [String: String]
+
+  public init(keys: [String: String] = [:]) {
+    self.keys = keys
+  }
+}
+
+extension InMemoryKeyStore: KeyStore {
+  public func setKey(networkId: String, accountId: String, keyPair: KeyPair) async throws -> Void {
+    keys["\(accountId):\(networkId)"] = keyPair.toString()
+  }
+
+  public func getKey(networkId: String, accountId: String) async throws -> KeyPair? {
+    guard let value = keys["\(accountId):\(networkId)"] else {return nil}
+    return try? keyPairFromString(encodedKey: value)
+  }
+
+  public func removeKey(networkId: String, accountId: String) async throws -> Void {
+    keys.removeValue(forKey: "\(accountId):\(networkId)")
+  }
+
+  public func clear() async throws -> Void {
+    keys = [:]
+  }
+
+  public func getNetworks() async throws -> [String] {
+    var result = Set<String>()
+    keys.keys.forEach {key in
+      let parts = key.split(separator: ":")
+      result.insert(String(parts[1]))
+    }
+    return Array(result)
+  }
+
+  public func getAccounts(networkId: String) async throws -> [String] {
+    var result = [String]()
+    keys.keys.forEach {key in
+      let parts = key.split(separator: ":").map {String($0)}
+      if parts[parts.count - 1] == networkId {
+          result.append(parts.dropLast().joined(separator: ":"))
+      }
+    }
+    return result
+  }
+}
+
+'''
+'''--- Sources/NearSwift/KeyStores/KeyStore.swift ---
+//
+//  KeyStore.swift
+//  nearclientios
+//
+//  Created by Dmitry Kurochka on 10/30/19.
+//  Copyright © 2019 NEAR Protocol. All rights reserved.
+//
+
+import Foundation
+
+/**
+* Key store interface for `InMemorySigner`.
+*/
+public protocol KeyStore {
+  func setKey(networkId: String, accountId: String, keyPair: KeyPair) async throws -> Void
+  func getKey(networkId: String, accountId: String) async throws -> KeyPair?
+  func removeKey(networkId: String, accountId: String) async throws -> Void
+  func clear() async throws -> Void
+  func getNetworks() async throws -> [String]
+  func getAccounts(networkId: String) async throws -> [String]
+}
+
+'''
+'''--- Sources/NearSwift/KeyStores/MergeKeyStore.swift ---
+//
+//  MergeKeyStore.swift
+//  nearclientios
+//
+//  Created by Dmitry Kurochka on 10/30/19.
+//  Copyright © 2019 NEAR Protocol. All rights reserved.
+//
+
+import Foundation
+
+/**
+ * Keystore which can be used to merge multiple key stores into one virtual key store.
+ */
+public struct MergeKeyStore {
+  /// First keystore gets all write calls, read calls are attempted from start to end of array
+  private(set) var keyStores: [KeyStore]
+
+  public init(keyStores: [KeyStore] = []) {
+    self.keyStores = keyStores
+  }
+}
+
+extension MergeKeyStore: KeyStore {
+  public func setKey(networkId: String, accountId: String, keyPair: KeyPair) async throws -> Void {
+    return try await keyStores[0].setKey(networkId: networkId, accountId: accountId, keyPair: keyPair)
+  }
+
+  public func getKey(networkId: String, accountId: String) async throws -> KeyPair? {
+    for keyStore in keyStores {
+      if let keyPair = try await keyStore.getKey(networkId: networkId, accountId: accountId) {
+        return keyPair
+      }
+    }
+    return nil
+  }
+
+  public func removeKey(networkId: String, accountId: String) async throws -> Void {
+    for keyStore in keyStores {
+      try await keyStore.removeKey(networkId: networkId, accountId: accountId)
+    }
+  }
+
+  public func clear() async throws -> Void {
+    for keyStore in keyStores {
+      try await keyStore.clear()
+    }
+  }
+
+  public func getNetworks() async throws -> [String] {
+    var result = Set<String>()
+    for keyStore in keyStores {
+      let networks = try await keyStore.getNetworks()
+      for network in networks {
+        result.insert(network)
+      }
+    }
+    return Array(result)
+  }
+
+  public func getAccounts(networkId: String) async throws -> [String] {
+    var result = Set<String>()
+    for keyStore in keyStores {
+      let accounts = try await keyStore.getAccounts(networkId: networkId)
+      for account in accounts {
+        result.insert(account)
+      }
+    }
+    return Array(result)
+  }
+}
+
+'''
+'''--- Sources/NearSwift/Near.swift ---
+//
+//  Near.swift
+//  nearclientios
+//
+//  Created by Dmitry Kurochka on 10/30/19.
+//  Copyright © 2019 NEAR Protocol. All rights reserved.
+//
+
+import Foundation
+
+public protocol NearConfigProtocol: ConnectionConfigProtocol {
+  var networkId: String {get}
+  var nodeUrl: URL {get}
+  var masterAccount: String? {get set}
+  var keyPath: String? {get}
+  var helperUrl: URL? {get}
+  var initialBalance: UInt128? {get}
+  var keyStore: KeyStore? {get set}
+  var contractName: String? {get}
+  var walletUrl: String {get}
+}
+
+public struct NearConfig: NearConfigProtocol {
+  public let networkId: String
+  public let nodeUrl: URL
+  public var masterAccount: String?
+  public let keyPath: String?
+  public let helperUrl: URL?
+  public let initialBalance: UInt128?
+  public let providerType: ProviderType
+  public let signerType: SignerType
+  public var keyStore: KeyStore?
+  public let contractName: String?
+  public let walletUrl: String
+  
+  public init(networkId: String, nodeUrl: URL, masterAccount: String?, keyPath: String?, helperUrl: URL?, initialBalance: UInt128?, providerType: ProviderType, signerType: SignerType, keyStore: KeyStore?, contractName: String?, walletUrl: String) {
+    self.networkId = networkId
+    self.nodeUrl = nodeUrl
+    self.masterAccount = masterAccount
+    self.keyPath = keyPath
+    self.helperUrl = helperUrl
+    self.initialBalance = initialBalance
+    self.providerType = providerType
+    self.signerType = signerType
+    self.keyStore = keyStore
+    self.contractName = contractName
+    self.walletUrl = walletUrl
+  }
+}
+
+public struct Near {
+  let config: NearConfigProtocol
+  public let connection: Connection
+  private let accountCreator: AccountCreator?
+}
+
+public enum NearError: Error {
+  case noAccountCreator(String)
+  case noAccountId
+}
+
+extension Near {
+  public init(config: NearConfigProtocol) throws {
+    let connection = try Connection.fromConfig(config: config)
+    var accountCreator: AccountCreator?
+    if let masterAccount = config.masterAccount {
+      // TODO: figure out better way of specifiying initial balance.
+      let initialBalance = config.initialBalance ?? UInt128(1000000000000)
+      let masterAccount = Account(connection: connection, accountId: masterAccount)
+      accountCreator = LocalAccountCreator(masterAccount: masterAccount, initialBalance: initialBalance)
+    } else if let url = config.helperUrl {
+      accountCreator = UrlAccountCreator(connection: connection, helperUrl: url)
+    }
+    self.init(config: config, connection: connection, accountCreator: accountCreator)
+  }
+}
+
+public extension Near {
+  func account(accountId: String) async throws -> Account {
+    let account = Account(connection: connection, accountId: accountId)
+    try await account.ready()
+    return account
+  }
+
+  private func createAccount(accountId: String, publicKey: PublicKey) async throws -> Account {
+    guard let accountCreator = accountCreator else {
+      throw NearError.noAccountCreator("Must specify account creator, either via masterAccount or helperUrl configuration settings.")
+    }
+    try await accountCreator.createAccount(newAccountId: accountId, publicKey: publicKey)
+    return Account(connection: connection, accountId: accountId)
+  }
+
+  /**
+   - Parameters:
+      - contractId: contractId
+      - options: options
+   - Returns: promise with contract.
+   */
+  @available(*, deprecated, renamed: "Contract.init", message: "Backwards compatibility method. Use contract constructor instead")
+  private func loadContract(contractId: String, options: ContractOptionsProtocol) async throws -> Contract {
+    print("near.loadContract is deprecated. Use `Contract.init` instead.")
+    guard let accountId = options.sender else { throw NearError.noAccountId }
+    let account = Account(connection: connection, accountId: accountId)
+    let contract = Contract(account: account, contractId: contractId, viewMethods: options.viewMethods,
+                    changeMethods: options.changeMethods, sender: accountId)
+    return contract
+  }
+
+  /**
+   - Parameters:
+      - amount: amount
+      - originator: originator
+      - receiver: receiver
+   */
+  @available(*, deprecated, renamed: "yourAccount.sendMoney", message: "Backwards compatibility method. Use `yourAccount.sendMoney` instead")
+  private func sendTokens(amount: UInt128, originator: String, receiver: String) async throws -> String {
+    print("near.sendTokens is deprecated. Use `yourAccount.sendMoney` instead.")
+    let account = Account(connection: connection, accountId: originator)
+    let result = try await account.sendMoney(receiverId: receiver, amount: amount)
+    return result.transactionOutcome.id
+  }
+}
+
+func connect(config: NearConfigProtocol) async throws -> Near {
+    // Try to find extra key in `KeyPath` if provided.let
+  var configuration = config
+  if let keyPath = configuration.keyPath, let keyStore = configuration.keyStore {
+    do {
+      let (accountId, keyPair) = try await UnencryptedFileSystemKeyStore.readKeyFile(path: keyPath)
+      // TODO: Only load key if network ID matches
+      let keyPathStore = InMemoryKeyStore()
+      try await keyPathStore.setKey(networkId: configuration.networkId, accountId: accountId, keyPair: keyPair)
+      if configuration.masterAccount == nil {
+        configuration.masterAccount = accountId
+      }
+      configuration.keyStore = MergeKeyStore(keyStores: [keyStore, keyPathStore])
+      print("Loaded master account \(accountId) key from \(keyPath) with public key = \(keyPair.getPublicKey())")
+    } catch let error {
+      print("Failed to load master account key from \(keyPath): \(error)")
+    }
+  }
+  let near = try Near(config: configuration)
+  return near
+}
+
+'''
+'''--- Sources/NearSwift/Providers/JSONRPCProvider.swift ---
+//
+//  JSONRPCProvider.swift
+//  nearclientios
+//
+//  Created by Dmitry Kurochka on 10/30/19.
+//  Copyright © 2019 NEAR Protocol. All rights reserved.
+//
+
+import Foundation
+import AnyCodable
+
+public enum TypedError: Error {
+    case error(type: String = "UntypedError", message: String?)
+}
+
+public enum Finality: String, Codable {
+    case final
+    case optimistic
+}
+
+public enum SyncCheckpoint: String, Codable {
+    case genesis = "genesis"
+    case earliestAvailable = "earliest_available"
+}
+
+public final class JSONRPCProvider {
+    /// Keep ids unique across all connections
+    private var _nextId = 123
+    
+    private let connection: ConnectionInfo
+    
+    init(url: URL, network: Network? = nil) {
+        self.connection = ConnectionInfo(url: url)
+    }
+}
+
+extension JSONRPCProvider {
+    private func getId() -> Int {
+        _nextId += 1
+        return _nextId
+    }
+    
+    private func sendJsonRpc<T: Decodable>(method: String, params: [Any?]) async throws -> T {
+        let request: [String: Any] = ["method": method,
+                                      "params": params,
+                                      "id": getId(),
+                                      "jsonrpc": "2.0"]
+        let json = try await fetchJson(connection: connection, json: request)
+        
+        return try await processJsonRpc(request: request, json: json)
+    }
+    
+    private func sendJsonRpc<T: Decodable>(method: String, paramsDict: [String: Any]) async throws -> T {
+        let request: [String: Any] = ["method": method,
+                                      "params": paramsDict,
+                                      "id": getId(),
+                                      "jsonrpc": "2.0"]
+        
+        let json = try await fetchJson(connection: connection, json: request)
+        
+        return try await processJsonRpc(request: request, json: json)
+    }
+    
+    func processJsonRpc<T: Decodable>(request: [String: Any], json: Any) async throws -> T {
+        let data = try JSONSerialization.data(withJSONObject: json, options: .fragmentsAllowed)
+        //    debugPrint("=====================")
+        //    print(T.self)
+        //    print(String(decoding: data, as: UTF8.self))
+        //    debugPrint("=====================")
+        do {
+            let decoder = JSONDecoder()
+            decoder.keyDecodingStrategy = .convertFromSnakeCase
+            let decoded = try decoder.decode(T.self, from: data)
+            return decoded
+        } catch let error {
+            print(error)
+            let json: Data = (try? JSONSerialization.data(withJSONObject: request, options: [.fragmentsAllowed])) ?? .init()
+            print(String(decoding: json, as: UTF8.self))
+            print(T.self)
+            throw error
+        }
+    }
+}
+
+extension JSONRPCProvider: Provider {
+    public func getNetwork() async -> Network {
+        let result: Network = Network(name: "test", chainId: "test")
+        return result
+    }
+    
+    public func status() async throws -> NodeStatusResult {
+        return try await sendJsonRpc(method: "status", params: [])
+    }
+    
+    public func networkInfo() async throws -> NetworkInfoResult {
+        return try await sendJsonRpc(method: "network_info", params: [])
+    }
+    
+    public func sendTransaction(signedTransaction: SignedTransaction) async throws -> FinalExecutionOutcome {
+        let data = try BorshEncoder().encode(signedTransaction)
+        let params = [data.base64EncodedString()]
+        //    debugPrint("params \(params)")
+        return try await sendJsonRpc(method: "broadcast_tx_commit", params: params)
+    }
+    
+    public func sendTransactionAsync(signedTransaction: SignedTransaction) async throws -> SimpleRPCResult {
+        let data = try BorshEncoder().encode(signedTransaction)
+        let params = [data.base64EncodedString()]
+        
+        return try await sendJsonRpc(method: "broadcast_tx_async", params: params)
+    }
+    
+    public func txStatus(txHash: [UInt8], accountId: String) async throws -> FinalExecutionOutcome {
+        let params = [txHash.baseEncoded, accountId]
+        return try await sendJsonRpc(method: "tx", params: params)
+    }
+    
+    public func experimentalTxStatusWithReceipts(txHash: [UInt8], accountId: String) async throws -> FinalExecutionOutcome {
+        let params = [txHash.baseEncoded, accountId]
+        return try await sendJsonRpc(method: "EXPERIMENTAL_tx_status", params: params)
+    }
+    
+    public func query<T: Decodable>(params: [String: Any]) async throws -> T {
+        return try await sendJsonRpc(method: "query", paramsDict: params)
+    }
+    
+    public func block(blockQuery: BlockReference) async throws -> BlockResult {
+        let params: [String: Any] = typeEraseBlockReferenceParams(blockQuery: blockQuery)
+        return try await sendJsonRpc(method: "block", paramsDict: params)
+    }
+    
+    public func blockChanges(blockQuery: BlockReference) async throws -> BlockChangeResult {
+        let params: [String: Any] = typeEraseBlockReferenceParams(blockQuery: blockQuery)
+        return try await sendJsonRpc(method: "EXPERIMENTAL_changes_in_block", paramsDict: params)
+    }
+    
+    public func chunk(chunkId: ChunkId) async throws -> ChunkResult {
+        var params: [String: Any] = [:]
+        switch chunkId {
+        case .chunkHash(let chunkHash):
+            params["chunk_id"] = chunkHash
+        case .blockShardId(let blockShardId):
+            params["block_id"] = typeEraseBlockId(blockId: blockShardId.blockId)
+            params["shard_id"] = blockShardId.shardId
+        }
+        return try await sendJsonRpc(method: "chunk", paramsDict: params)
+    }
+    
+    public func gasPrice(blockId: NullableBlockId) async throws -> GasPrice {
+        let params: Any? = typeEraseNullableBlockId(blockId: blockId)
+        return try await sendJsonRpc(method: "gas_price", params: [params])
+    }
+    
+    public func experimentalGenesisConfig() async throws -> ExperimentalNearProtocolConfig {
+        return try await sendJsonRpc(method: "EXPERIMENTAL_genesis_config", params: [])
+    }
+    
+    public func experimentalProtocolConfig(blockQuery: BlockReference) async throws -> ExperimentalNearProtocolConfig {
+        let params: [String: Any] = typeEraseBlockReferenceParams(blockQuery: blockQuery)
+        return try await sendJsonRpc(method: "EXPERIMENTAL_protocol_config", paramsDict: params)
+    }
+    
+    public func validators(blockId: NullableBlockId) async throws -> EpochValidatorInfo {
+        let params: Any? = typeEraseNullableBlockId(blockId: blockId)
+        return try await sendJsonRpc(method: "validators", params: [params])
+    }
+    
+    public func accessKeyChanges(accountIdArray: [String], blockQuery: BlockReference) async throws -> ChangeResult {
+        var params: [String: Any] = typeEraseBlockReferenceParams(blockQuery: blockQuery)
+        params["changes_type"] = "all_access_key_changes"
+        params["account_ids"] = accountIdArray
+        
+        return try await sendJsonRpc(method: "EXPERIMENTAL_changes", paramsDict: params)
+    }
+    
+    public func singleAccessKeyChanges(accessKeyArray: [AccessKeyWithPublicKey], blockQuery: BlockReference) async throws -> ChangeResult {
+        var params: [String: Any] = typeEraseBlockReferenceParams(blockQuery: blockQuery)
+        params["changes_type"] = "single_access_key_changes"
+        params["keys"] = accessKeyArray.map { value in
+            return [
+                "account_id": value.accountId,
+                "public_key": value.publicKey
+            ]
+        }
+        
+        return try await sendJsonRpc(method: "EXPERIMENTAL_changes", paramsDict: params)
+    }
+    public func accountChanges(accountIdArray: [String], blockQuery: BlockReference) async throws -> ChangeResult {
+        var params: [String: Any] = typeEraseBlockReferenceParams(blockQuery: blockQuery)
+        params["changes_type"] = "account_changes"
+        params["account_ids"] = accountIdArray
+        
+        return try await sendJsonRpc(method: "EXPERIMENTAL_changes", paramsDict: params)
+    }
+    
+    public func contractStateChanges(accountIdArray: [String], blockQuery: BlockReference, keyPrefix: String?) async throws -> ChangeResult {
+        var params: [String: Any] = typeEraseBlockReferenceParams(blockQuery: blockQuery)
+        params["changes_type"] = "data_changes"
+        params["account_ids"] = accountIdArray
+        params["key_prefix_base64"] = keyPrefix ?? ""
+        
+        return try await sendJsonRpc(method: "EXPERIMENTAL_changes", paramsDict: params)
+    }
+    
+    public func contractCodeChanges(accountIdArray: [String], blockQuery: BlockReference) async throws -> ChangeResult {
+        var params: [String: Any] = typeEraseBlockReferenceParams(blockQuery: blockQuery)
+        params["changes_type"] = "contract_code_changes"
+        params["account_ids"] = accountIdArray
+        
+        return try await sendJsonRpc(method: "EXPERIMENTAL_changes", paramsDict: params)
+    }
+}
+
+'''
+'''--- Sources/NearSwift/Providers/Provider.swift ---
+//
+//  Provider.swift
+//  nearclientios
+//
+//  Created by Dmitry Kurochka on 10/30/19.
+//  Copyright © 2019 NEAR Protocol. All rights reserved.
+//
+
+import Foundation
+import AnyCodable
+
+public typealias Number = Int
+
+public struct SyncInfo: Codable {
+  let latestBlockHash: String
+  let latestBlockHeight: Number
+  let latestBlockTime: String
+  let latestStateRoot: String
+  let syncing: Bool
+}
+
+public struct Validator: Codable {}
+
+public struct NodeStatusResult: Codable {
+  let chainId: String
+  let rpcAddr: String
+  let syncInfo: SyncInfo
+  let validators: [Validator]
+}
+
+public struct NetworkInfoResult: Decodable {
+  let peerMaxCount: Number
+}
+
+public struct SimpleRPCResult: Decodable {
+  public let id: String
+  public let jsonrpc: String
+  private let result: String
+  
+  public var hash: String {
+    return result
+  }
+
+}
+
+public typealias BlockHash = String
+public typealias BlockHeight = Number
+public enum BlockId {
+  case blockHash(String)
+  case blockHeight(Int)
+}
+public enum NullableBlockId {
+  case blockHash(String)
+  case blockHeight(Int)
+  case null
+}
+
+public func typeEraseNullableBlockId(blockId: NullableBlockId) -> Any? {
+  switch blockId {
+  case .blockHeight(let height):
+   return height
+  case .blockHash(let hash):
+    return hash
+  case .null:
+    return nil
+  }
+}
+
+public enum BlockReference {
+  case blockId(BlockId)
+  case finality(Finality)
+}
+
+public func typeEraseBlockId(blockId: BlockId) -> Any {
+  switch blockId {
+  case .blockHeight(let height):
+    return height
+  case .blockHash(let hash):
+    return hash
+  }
+}
+
+public func typeEraseBlockReferenceParams(blockQuery: BlockReference) -> [String: Any] {
+  var params: [String: Any] = [:]
+  switch blockQuery {
+  case .blockId(let blockId):
+    params["block_id"] = typeEraseBlockId(blockId: blockId)
+  case .finality(let finality):
+    params["finality"] = finality.rawValue
+  }
+  
+  return params
+}
+
+public struct AccessKeyWithPublicKey: Codable {
+  let accountId: String
+  let publicKey: String
+}
+
+public enum ExecutionStatusBasic: String, Decodable {
+  case unknown = "Unknown"
+  case pending = "Pending"
+  case failure = "Failure"
+}
+
+public enum ExecutionStatus: Decodable, Equatable {
+  case successValue(String)
+  case basic(ExecutionStatusBasic)
+  case successReceiptId(String)
+  case failure(ExecutionError)
+
+  private enum CodingKeys: String, CodingKey {
+    case successValue = "SuccessValue"
+    case failure = "Failure"
+    case successReceiptId = "SuccessReceiptId"
+  }
+
+  public init(from decoder: Decoder) throws {
+    if let container = try? decoder.singleValueContainer(), let status = try? container.decode(ExecutionStatusBasic.self) {
+      self = .basic(status)
+      return
+    }
+    let container = try? decoder.container(keyedBy: CodingKeys.self)
+    if let value = try? container?.decode(String.self, forKey: .successValue) {
+      self = .successValue(value)
+      return
+    }
+    if let value = try? container?.decode(String.self, forKey: .successReceiptId) {
+      self = .successReceiptId(value)
+      return
+    }
+    if let value = try? container?.decode(ExecutionError.self, forKey: .failure) {
+      self = .failure(value)
+      return
+    }
+    throw NEARDecodingError.notExpected
+  }
+}
+
+public enum FinalExecutionStatusBasic: String, Codable {
+  case notStarted = "NotStarted"
+  case started = "Started"
+  case failure = "Failure"
+}
+
+public struct ExecutionError: Codable, Equatable{
+  let errorMessage: String?
+  let errorType: String?
+
+  init(errorMessage: String? = nil, errorType: String? = nil) {
+    self.errorMessage = errorMessage
+    self.errorType = errorType
+  }
+}
+
+public enum FinalExecutionStatus: Decodable, Equatable {
+  case successValue(String)
+  case basic(ExecutionStatusBasic)
+  case failure(ExecutionError)
+
+  private enum CodingKeys: String, CodingKey {
+    case successValue = "SuccessValue"
+    case failure = "Failure"
+  }
+
+  public init(from decoder: Decoder) throws {
+    if let container = try? decoder.singleValueContainer(), let status = try? container.decode(ExecutionStatusBasic.self) {
+      self = .basic(status)
+      return
+    }
+    let container = try? decoder.container(keyedBy: CodingKeys.self)
+    if let value = try? container?.decode(String.self, forKey: .successValue) {
+      self = .successValue(value)
+      return
+    }
+    if let value = try? container?.decode(ExecutionError.self, forKey: .failure) {
+      self = .failure(value)
+      return
+    }
+    throw NEARDecodingError.notExpected
+  }
+}
+
+public struct ExecutionOutcomeWithId: Decodable, Equatable {
+  public let id: String
+  let outcome: ExecutionOutcome
+}
+
+public struct ExecutionOutcome: Decodable, Equatable {
+  let status: ExecutionStatus
+  let logs: [String]
+  let receiptIds: [String]
+  let gasBurnt: Number
+}
+
+public struct FinalExecutionOutcome: Decodable, Equatable {
+  let status: FinalExecutionStatus
+  public let transactionOutcome: ExecutionOutcomeWithId
+  let receiptsOutcome: [ExecutionOutcomeWithId]
+  let receipts: AnyDecodable?
+}
+
+public struct TotalWeight: Codable {
+  let num: Number
+}
+
+public struct BlockHeader: Codable {
+  public let height: Number
+  public let epochId: String
+  public let nextEpochId: String
+  public let hash: String
+  public let prevHash: String
+  public let prevStateRoot: String
+  public let chunkReceiptsRoot: String
+  public let chunkHeadersRoot: String
+  public let chunkTxRoot: String
+  public let outcomeRoot: String
+  public let chunksIncluded: Number
+  public let challengesRoot: String
+  public let timestamp: Number
+  public let timestampNanosec: String
+  public let randomValue: String
+  public let validatorProposals: [ValidatorProposal]
+  public let chunkMask: [Bool]
+  public let gasPrice: String
+  public let rentPaid: String
+  public let validatorReward: String
+  public let totalSupply: String
+  //let challenges_result: [Any]
+  public let lastFinalBlock: String
+  public let lastDsFinalBlock: String
+  public let nextBpHash: String
+  public let blockMerkleRoot: String
+}
+
+public typealias ChunkHash = String
+public typealias ShardId = Number
+public struct BlockShardId {
+  let blockId: BlockId
+  let shardId: ShardId
+}
+
+public enum ChunkId {
+  case chunkHash(ChunkHash)
+  case blockShardId(BlockShardId)
+}
+
+public struct ValidatorProposal: Codable {}
+
+public struct ChunkHeader: Codable {
+  let chunkHash: ChunkHash
+  let prevBlockHash: String
+  let outcomeRoot: String
+  let prevStateRoot: String
+  let encodedMerkleRoot: String
+  let encodedLength: Number
+  let heightCreated: Number
+  let heightIncluded: Number
+  let shardId: ShardId
+  let gasUsed: Number
+  let gasLimit: Number
+  let rentPaid: String
+  let validatorReward: String
+  let balanceBurnt: String
+  let outgoingReceiptsRoot: String
+  let txRoot: String
+  let validatorProposals: [ValidatorProposal]
+  let signature: String
+}
+
+public struct Receipt: Codable {}
+
+public struct ChunkResult: Codable {
+  let header: ChunkHeader
+  let receipts: [Receipt]
+  let transactions: [Transaction]
+}
+
+public struct TransactionBody: Codable {}
+
+public struct Transaction: Codable {
+  public let hash: String
+  public let public_key: String
+  public let signature: String
+  public let body: TransactionBody
+}
+
+public struct BlockResult: Codable {
+  public let header: BlockHeader
+  public let transactions: [Transaction]?
+}
+
+public struct BlockChange: Codable {
+  let type: String
+  let accountId: String
+}
+
+public struct BlockChangeResult: Codable {
+  let blockHash: String
+  let changes: [BlockChange]
+}
+
+public struct ChangeResult: Decodable {
+  let blockHash: String
+  let changes: [AnyDecodable]
+}
+
+public struct ExperimentalNearProtocolConfig: Decodable {
+  let chainId: String
+  let genesisHeight: Number
+  let runtimeConfig: ExperimentalNearProtocolRuntimeConfig?
+}
+
+public struct ExperimentalNearProtocolRuntimeConfig: Decodable {
+  let storageAmountPerByte: String
+}
+
+public struct GasPrice: Codable {
+  let gasPrice: String
+}
+
+public struct EpochValidatorInfo: Decodable {
+  // Validators for the current epoch.
+  let nextValidators: [NextEpochValidatorInfo]
+  // Validators for the next epoch.
+  let currentValidators: [CurrentEpochValidatorInfo]
+  // Fishermen for the current epoch.
+  let nextFishermen: [ValidatorStakeView]
+  // Fishermen for the next epoch.
+  let currentFishermen: [ValidatorStakeView]
+  // Proposals in the current epoch.
+  let currentProposals: [ValidatorStakeView]
+  // Kickout in the previous epoch.
+  let prevEpochKickout: [ValidatorStakeView]
+  // Epoch start height.
+  let epochStartHeight: Number
+}
+
+public struct CurrentEpochValidatorInfo: Decodable {
+  let accountId: String
+  let publicKey: String
+  let isSlashed: Bool
+  let stake: String
+  let shards: [Number]
+  let numProducedBlocks: Number
+  let numExpectedBlocks: Number
+}
+
+public struct NextEpochValidatorInfo: Decodable {
+  let accountId: String
+  let publicKey: String
+  let stake: String
+  let shards: [Number]
+}
+
+public struct ValidatorStakeView: Decodable {
+  let accountId: String
+  let publicKey: String
+  let stake: String
+}
+
+public enum ProviderType {
+  case jsonRPC(URL)
+}
+
+public protocol Provider {
+  func getNetwork() async throws -> Network
+  func status() async throws -> NodeStatusResult
+  func networkInfo() async throws -> NetworkInfoResult
+  func sendTransaction(signedTransaction: SignedTransaction) async throws -> FinalExecutionOutcome
+  func sendTransactionAsync(signedTransaction: SignedTransaction) async throws -> SimpleRPCResult
+  func txStatus(txHash: [UInt8], accountId: String) async throws -> FinalExecutionOutcome
+  func experimentalTxStatusWithReceipts(txHash: [UInt8], accountId: String) async throws -> FinalExecutionOutcome
+  func query<T: Decodable>(params: [String: Any]) async throws -> T
+  func block(blockQuery: BlockReference) async throws -> BlockResult
+  func blockChanges(blockQuery: BlockReference) async throws -> BlockChangeResult
+  func chunk(chunkId: ChunkId) async throws -> ChunkResult
+  func gasPrice(blockId: NullableBlockId) async throws -> GasPrice
+  func experimentalGenesisConfig() async throws -> ExperimentalNearProtocolConfig
+  func experimentalProtocolConfig(blockQuery: BlockReference) async throws -> ExperimentalNearProtocolConfig
+  func validators(blockId: NullableBlockId) async throws -> EpochValidatorInfo
+  func accessKeyChanges(accountIdArray: [String], blockQuery: BlockReference) async throws -> ChangeResult
+  func singleAccessKeyChanges(accessKeyArray: [AccessKeyWithPublicKey], blockQuery: BlockReference) async throws -> ChangeResult
+  func accountChanges(accountIdArray: [String], blockQuery: BlockReference) async throws -> ChangeResult
+  func contractStateChanges(accountIdArray: [String], blockQuery: BlockReference, keyPrefix: String?) async throws -> ChangeResult
+  func contractCodeChanges(accountIdArray: [String], blockQuery: BlockReference) async throws -> ChangeResult
+}
+
+public func getTransactionLastResult(txResult: FinalExecutionOutcome) -> Any? {
+  if case .successValue(let value) = txResult.status, let data = Data(base64Encoded: value) {
+    do {
+      return try JSONSerialization.jsonObject(with: data, options: [])
+    } catch {
+      return String(data: data,
+                    encoding: .utf8)?.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+    }
+  }
+  return nil
+}
+
+'''
+'''--- Sources/NearSwift/Signer.swift ---
+//
+//  Signer.swift
+//  nearclientios
+//
+//  Created by Dmitry Kurochka on 10/30/19.
+//  Copyright © 2019 NEAR Protocol. All rights reserved.
+//
+
+import Foundation
+
+public enum SignerType {
+  case inMemory(KeyStore)
+}
+
+/**
+ General signing interface, can be used for in memory signing, RPC singing, external wallet, HSM, etc.
+ */
+public protocol Signer {
+
+  /**
+   Creates new key and returns public key.
+   - Parameters:
+      - accountId: accountId to retrieve from.
+      - networkId: network for this accountId.
+   */
+  func createKey(accountId: String, networkId: String, curve: KeyType) async throws -> PublicKey
+
+  /**
+   - Parameters:
+      - accountId: accountId to retrieve from.
+      - networkId: network for this accountId.
+    - Returns: public key for given account / network.
+   */
+  func getPublicKey(accountId: String, networkId: String) async throws -> PublicKey?
+
+  /**
+   Signs given hash.
+   - Parameters:
+      - hash: hash to sign.
+      - accountId: accountId to use for signing.
+      - networkId: network for this accontId.
+   */
+  func signHash(hash: [UInt8], accountId: String, networkId: String) async throws -> SignatureProtocol
+
+  /**
+   Signs given message, by first hashing with sha256.
+   - Parameters:
+      - message: message to sign.
+      - accountId: accountId to use for signing.
+      - networkId: network for this accontId.
+   */
+  func signMessage(message: [UInt8], accountId: String, networkId: String) async throws -> SignatureProtocol
+}
+
+extension Signer {
+  public func signMessage(message: [UInt8], accountId: String, networkId: String) async throws -> SignatureProtocol {
+    return try await signHash(hash: message.digest, accountId: accountId, networkId: networkId)
+  }
+}
+
+/**
+ * Signs using in memory key store.
+ */
+public struct InMemorySigner {
+  let keyStore: KeyStore
+
+  public init(keyStore: KeyStore) {
+    self.keyStore = keyStore
+  }
+}
+
+public enum InMemorySignerError: Error {
+  case notFound(String)
+}
+
+extension InMemorySigner: Signer {
+  public func createKey(accountId: String, networkId: String, curve: KeyType = .ED25519) async throws -> PublicKey {
+    let keyPair = try keyPairFromRandom(curve: curve)
+    try await keyStore.setKey(networkId: networkId, accountId: accountId, keyPair: keyPair)
+    return keyPair.getPublicKey()
+  }
+
+  public func getPublicKey(accountId: String, networkId: String) async throws -> PublicKey? {
+    let keyPair = try await keyStore.getKey(networkId: networkId, accountId: accountId)
+    return keyPair?.getPublicKey()
+  }
+
+  public func signHash(hash: [UInt8], accountId: String, networkId: String) async throws -> SignatureProtocol {
+    guard let keyPair = try await keyStore.getKey(networkId: networkId, accountId: accountId) else {
+      throw InMemorySignerError.notFound("Key for \(accountId) not found in \(networkId)")
+    }
+    let signature = try keyPair.sign(message: hash)
+    return signature
+  }
+}
+
+'''
+'''--- Sources/NearSwift/Transaction.swift ---
+//
+//  Transaction.swift
+//  nearclientios
+//
+//  Created by Dmitry Kurochka on 10/30/19.
+//  Copyright © 2019 NEAR Protocol. All rights reserved.
+//
+
+import Foundation
+
+public struct FunctionCallPermission {
+  let allowance: UInt128?
+  let receiverId: String
+  let methodNames: [String]
+}
+
+extension FunctionCallPermission: Decodable {
+  private enum CodingKeys: String, CodingKey {
+    case allowance, receiverId, methodNames
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    allowance = UInt128(stringLiteral: try container.decode(String.self, forKey: .allowance))
+    receiverId = try container.decode(String.self, forKey: .receiverId)
+    methodNames = try container.decode([String].self, forKey: .methodNames)
+  }
+}
+
+extension FunctionCallPermission: BorshCodable {
+  public func serialize(to writer: inout Data) throws {
+    try allowance.serialize(to: &writer)
+    try receiverId.serialize(to: &writer)
+    try methodNames.serialize(to: &writer)
+  }
+
+  public init(from reader: inout BinaryReader) throws {
+    self.allowance = try .init(from: &reader)
+    self.receiverId = try .init(from: &reader)
+    self.methodNames = try .init(from: &reader)
+  }
+}
+
+public struct FullAccessPermission: Equatable {}
+
+extension FullAccessPermission: BorshCodable {
+  public func serialize(to writer: inout Data) throws {}
+
+  public init(from reader: inout BinaryReader) throws {
+    self.init()
+  }
+}
+
+public enum AccessKeyPermission {
+  case functionCall(FunctionCallPermission)
+  case fullAccess(FullAccessPermission)
+
+  var rawValue: UInt8 {
+    switch self {
+    case .functionCall: return 0
+    case .fullAccess: return 1
+    }
+  }
+}
+
+public enum NEARDecodingError: Error {
+  case notExpected
+}
+
+extension AccessKeyPermission: Decodable {
+  private enum CodingKeys: String, CodingKey {
+    case functionCall = "FunctionCall"
+  }
+
+  public init(from decoder: Decoder) throws {
+    if let container = try? decoder.singleValueContainer() {
+      let value = try? container.decode(String.self)
+      if value == "FullAccess" {
+        self = .fullAccess(FullAccessPermission())
+        return
+      }
+    }
+    if let container = try? decoder.container(keyedBy: CodingKeys.self) {
+      let permission = try container.decode(FunctionCallPermission.self, forKey: .functionCall)
+      self = .functionCall(permission)
+    } else {
+      throw NEARDecodingError.notExpected
+    }
+  }
+}
+
+extension AccessKeyPermission: BorshCodable {
+  public func serialize(to writer: inout Data) throws {
+    try rawValue.serialize(to: &writer)
+    switch self {
+    case .functionCall(let permission): try permission.serialize(to: &writer)
+    case .fullAccess(let permission): try permission.serialize(to: &writer)
+    }
+  }
+
+  public init(from reader: inout BinaryReader) throws {
+    let rawValue = try UInt8(from: &reader)
+    switch rawValue {
+    case 0: self = .functionCall(try FunctionCallPermission(from: &reader))
+    case 1: self = .fullAccess(try FullAccessPermission(from: &reader))
+    default: fatalError()
+    }
+  }
+}
+
+public struct AccessKey: Decodable {
+  var nonce: UInt64
+  let permission: AccessKeyPermission
+}
+
+extension AccessKey: BorshCodable {
+  public func serialize(to writer: inout Data) throws {
+    try nonce.serialize(to: &writer)
+    try permission.serialize(to: &writer)
+  }
+
+  public init(from reader: inout BinaryReader) throws {
+    self.nonce = try .init(from: &reader)
+    self.permission = try .init(from: &reader)
+  }
+}
+
+public func fullAccessKey() -> AccessKey {
+  let fullAccess = FullAccessPermission()
+  let permission = AccessKeyPermission.fullAccess(fullAccess)
+  return AccessKey(nonce: 0, permission: permission)
+}
+
+public func functionCallAccessKey(receiverId: String, methodNames: [String], allowance: UInt128?) -> AccessKey {
+  let callPermission = FunctionCallPermission(allowance: allowance, receiverId: receiverId, methodNames: methodNames)
+  let permission = AccessKeyPermission.functionCall(callPermission)
+  return AccessKey(nonce: 0, permission: permission)
+}
+
+public protocol IAction {}
+
+public struct CreateAccount: IAction {}
+
+extension CreateAccount: BorshCodable {
+  public func serialize(to writer: inout Data) throws {}
+
+  public init(from reader: inout BinaryReader) throws {
+    self.init()
+  }
+}
+
+public struct DeployContract: IAction {
+  public let code: [UInt8]
+}
+
+extension DeployContract: BorshCodable {
+  public func serialize(to writer: inout Data) throws {
+    try code.serialize(to: &writer)
+  }
+
+  public init(from reader: inout BinaryReader) throws {
+    let code: [UInt8] = try .init(from: &reader)
+    self.init(code: code)
+  }
+}
+
+public struct FunctionCall: IAction {
+    public let methodName: String
+    public let args: [UInt8]
+    public let gas: UInt64
+    public let deposit: UInt128
+    public init(methodName: String, args: [UInt8], gas: UInt64, deposit: UInt128) {
+        self.methodName = methodName
+        self.args = args
+        self.gas = gas
+        self.deposit = deposit
+    }
+    
+    public init(methodName: String, args: Data, gas: UInt64, deposit: UInt128) {
+        self.methodName = methodName
+        self.args = args.bytes
+        self.gas = gas
+        self.deposit = deposit
+    }
+}
+
+extension FunctionCall: BorshCodable {
+  public func serialize(to writer: inout Data) throws {
+    try methodName.serialize(to: &writer)
+    try args.serialize(to: &writer)
+    try gas.serialize(to: &writer)
+    try deposit.serialize(to: &writer)
+  }
+
+  public init(from reader: inout BinaryReader) throws {
+    self.methodName = try .init(from: &reader)
+    self.args = try .init(from: &reader)
+    self.gas = try .init(from: &reader)
+    self.deposit = try .init(from: &reader)
+  }
+}
+
+public struct Transfer: IAction {
+    public let deposit: UInt128
+}
+
+extension Transfer: BorshCodable {
+  public func serialize(to writer: inout Data) throws {
+    try deposit.serialize(to: &writer)
+  }
+
+  public init(from reader: inout BinaryReader) throws {
+    self.deposit = try .init(from: &reader)
+  }
+}
+
+public struct Stake: IAction {
+    public let stake: UInt128
+    public let publicKey: PublicKey
+}
+
+extension Stake: BorshCodable {
+  public func serialize(to writer: inout Data) throws {
+    try stake.serialize(to: &writer)
+    try publicKey.serialize(to: &writer)
+  }
+
+  public init(from reader: inout BinaryReader) throws {
+    self.stake = try .init(from: &reader)
+    self.publicKey = try .init(from: &reader)
+  }
+}
+
+public struct AddKey: IAction {
+    public let publicKey: PublicKey
+    public let accessKey: AccessKey
+}
+
+extension AddKey: BorshCodable {
+  public func serialize(to writer: inout Data) throws {
+    try publicKey.serialize(to: &writer)
+    try accessKey.serialize(to: &writer)
+  }
+
+  public init(from reader: inout BinaryReader) throws {
+    self.publicKey = try .init(from: &reader)
+    self.accessKey = try .init(from: &reader)
+  }
+}
+
+public struct DeleteKey: IAction {
+    public let publicKey: PublicKey
+}
+
+extension DeleteKey: BorshCodable {
+  public func serialize(to writer: inout Data) throws {
+    try publicKey.serialize(to: &writer)
+  }
+
+  public init(from reader: inout BinaryReader) throws {
+    self.publicKey = try .init(from: &reader)
+  }
+}
+
+public struct DeleteAccount: IAction {
+    public let beneficiaryId: String
+}
+
+extension DeleteAccount: BorshCodable {
+  public func serialize(to writer: inout Data) throws {
+    try beneficiaryId.serialize(to: &writer)
+  }
+
+  public init(from reader: inout BinaryReader) throws {
+    self.beneficiaryId = try .init(from: &reader)
+  }
+}
+
+public func createAccount() -> Action {
+  return .createAccount(CreateAccount())
+}
+
+func deployContract(code: [UInt8]) -> Action {
+  return .deployContract(DeployContract(code: code))
+}
+
+func functionCall(methodName: String, args: [UInt8], gas: UInt64, deposit: UInt128) -> Action {
+  return .functionCall(FunctionCall(methodName: methodName, args: args, gas: gas, deposit: deposit))
+}
+
+func transfer(deposit: UInt128) -> Action {
+  return .transfer(Transfer(deposit: deposit))
+}
+
+func stake(stake: UInt128, publicKey: PublicKey) -> Action {
+  return .stake(Stake(stake: stake, publicKey: publicKey))
+}
+
+func addKey(publicKey: PublicKey, accessKey: AccessKey) -> Action {
+  return .addKey(AddKey(publicKey: publicKey, accessKey: accessKey))
+}
+
+func deleteKey(publicKey: PublicKey) -> Action {
+  return .deleteKey(DeleteKey(publicKey: publicKey))
+}
+
+func deleteAccount(beneficiaryId: String) -> Action {
+  return .deleteAccount(DeleteAccount(beneficiaryId: beneficiaryId))
+}
+
+//public struct SignaturePayload: FixedLengthByteArray, BorshCodable {
+//  public static let fixedLength: UInt32 = 64
+//  public let bytes: [UInt8]
+//  public init(bytes: [UInt8]) {
+//    self.bytes = bytes
+//  }
+//}
+
+public struct CodableSignature {
+  let keyType: KeyType
+  let bytes: [UInt8]
+
+  init(signature: [UInt8], curve: KeyType) {
+    self.keyType = curve
+    self.bytes = signature
+  }
+}
+
+extension CodableSignature: BorshCodable {
+  public func serialize(to writer: inout Data) throws {
+    try keyType.serialize(to: &writer)
+    writer.append(bytes, count: Int(keyType == .ED25519 ? 64 : 65))
+  }
+
+  public init(from reader: inout BinaryReader) throws {
+    self.keyType = try .init(from: &reader)
+    self.bytes = reader.read(count: keyType == .ED25519 ? 64 : 65)
+  }
+}
+
+public struct BlockHashPayload: FixedLengthByteArray, BorshCodable {
+  public static let fixedLength: UInt32 = 32
+  public let bytes: [UInt8]
+  public init(bytes: [UInt8]) {
+    self.bytes = bytes
+  }
+}
+
+public struct CodableTransaction {
+  public let signerId: String
+  public let publicKey: PublicKey
+  public let nonce: UInt64
+  public let receiverId: String
+  public let blockHash: BlockHashPayload
+  public let actions: [Action]
+}
+
+extension CodableTransaction: BorshCodable {
+  public func serialize(to writer: inout Data) throws {
+    try signerId.serialize(to: &writer)
+    try publicKey.serialize(to: &writer)
+    try nonce.serialize(to: &writer)
+    try receiverId.serialize(to: &writer)
+    try blockHash.serialize(to: &writer)
+    try actions.serialize(to: &writer)
+  }
+
+  public init(from reader: inout BinaryReader) throws {
+    self.signerId = try .init(from: &reader)
+    self.publicKey = try .init(from: &reader)
+    self.nonce = try .init(from: &reader)
+    self.receiverId = try .init(from: &reader)
+    self.blockHash = try .init(from: &reader)
+    self.actions = try .init(from: &reader)
+  }
+}
+
+public struct SignedTransaction {
+  let transaction: CodableTransaction
+  let signature: CodableSignature
+}
+
+extension SignedTransaction: BorshCodable {
+  public func serialize(to writer: inout Data) throws {
+    try transaction.serialize(to: &writer)
+    try signature.serialize(to: &writer)
+  }
+
+  public init(from reader: inout BinaryReader) throws {
+    self.transaction = try .init(from: &reader)
+    self.signature = try .init(from: &reader)
+  }
+}
+
+public enum Action {
+  case createAccount(CreateAccount)
+  case deployContract(DeployContract)
+  case functionCall(FunctionCall)
+  case transfer(Transfer)
+  case stake(Stake)
+  case addKey(AddKey)
+  case deleteKey(DeleteKey)
+  case deleteAccount(DeleteAccount)
+
+  var rawValue: UInt8 {
+    switch self {
+    case .createAccount: return 0
+    case .deployContract: return 1
+    case .functionCall: return 2
+    case .transfer: return 3
+    case .stake: return 4
+    case .addKey: return 5
+    case .deleteKey: return 6
+    case .deleteAccount: return 7
+    }
+  }
+}
+
+extension Action: BorshCodable {
+  public func serialize(to writer: inout Data) throws {
+    try rawValue.serialize(to: &writer)
+    switch self {
+    case .createAccount(let payload): try payload.serialize(to: &writer)
+    case .deployContract(let payload): try payload.serialize(to: &writer)
+    case .functionCall(let payload): try payload.serialize(to: &writer)
+    case .transfer(let payload): try payload.serialize(to: &writer)
+    case .stake(let payload): try payload.serialize(to: &writer)
+    case .addKey(let payload): try payload.serialize(to: &writer)
+    case .deleteKey(let payload): try payload.serialize(to: &writer)
+    case .deleteAccount(let payload): try payload.serialize(to: &writer)
+    }
+  }
+
+  public init(from reader: inout BinaryReader) throws {
+    let rawValue = try UInt8.init(from: &reader)
+    switch rawValue {
+    case 0: self = .createAccount(try CreateAccount(from: &reader))
+    case 1: self = .deployContract(try DeployContract(from: &reader))
+    case 2: self = .functionCall(try FunctionCall(from: &reader))
+    case 3: self = .transfer(try Transfer(from: &reader))
+    case 4: self = .stake(try Stake(from: &reader))
+    case 5: self = .addKey(try AddKey(from: &reader))
+    case 6: self = .deleteKey(try DeleteKey(from: &reader))
+    case 7: self = .deleteAccount(try DeleteAccount(from: &reader))
+    default: fatalError()
+    }
+  }
+}
+
+enum SignError: Error {
+  case noPublicKey
+}
+
+func signTransaction(receiverId: String, nonce: UInt64, actions: [Action], blockHash: [UInt8],
+                     signer: Signer, accountId: String, networkId: String) async throws -> ([UInt8], SignedTransaction) {
+  guard let publicKey = try await signer.getPublicKey(accountId: accountId, networkId: networkId) else {
+    throw SignError.noPublicKey
+  }
+  let transaction = CodableTransaction(signerId: accountId,
+                                       publicKey: publicKey,
+                                       nonce: nonce,
+                                       receiverId: receiverId,
+                                       blockHash: BlockHashPayload(bytes: blockHash),
+                                       actions: actions)
+  let message = try BorshEncoder().encode(transaction)
+  let hash = message.digest
+  let signature = try await signer.signMessage(message: message.bytes, accountId: accountId, networkId: networkId)
+  
+  let signedTx = SignedTransaction(transaction: transaction, signature: CodableSignature(signature: signature.signature, curve: publicKey.keyType))
+  return (hash, signedTx)
+}
+
+'''
+'''--- Sources/NearSwift/Utils/AppInfo.swift ---
+//
+//  AppInfo.swift
+//  nearclientios
+//
+//  Created by Dmytro Kurochka on 10.12.2019.
+//
+
+import Foundation
+import UIKit
+
+extension UIApplication {
+  static var urlSchemes: [String]? {
+    return (Bundle.main.object(forInfoDictionaryKey: "CFBundleURLTypes") as? [[String: Any]])?.first?["CFBundleURLSchemes"] as? [String]
+  }
+}
+
+'''
+'''--- Sources/NearSwift/Utils/Borsh/BinaryReader.swift ---
+//
+//  BinaryReader.swift
+//  nearclientios
+//
+//  Created by Dmytro Kurochka on 22.11.2019.
+//
+
+import Foundation
+
+public struct BinaryReader {
+  private var cursor: Int
+  private let bytes: [UInt8]
+
+  init(bytes: [UInt8]) {
+    self.cursor = 0
+    self.bytes = bytes
+  }
+}
+
+extension BinaryReader {
+  mutating func read(count: UInt32) -> [UInt8] {
+    let newPosition = cursor + Int(count)
+    let result = bytes[cursor..<newPosition]
+    cursor = newPosition
+    return Array(result)
+  }
+}
+
+'''
+'''--- Sources/NearSwift/Utils/Borsh/Borsh.swift ---
+//
+//  Borsh.swift
+//  nearclientios
+//
+//  Created by Dmytro Kurochka on 23.11.2019.
+//
+
+import Foundation
+
+public typealias BorshCodable = BorshSerializable & BorshDeserializable
+
+public enum BorshDecodingError: Error {
+  case unknownData
+}
+
+'''
+'''--- Sources/NearSwift/Utils/Borsh/BorshDecoder.swift ---
+//
+//  BorshDecoder.swift
+//  nearclientios
+//
+//  Created by Dmytro Kurochka on 23.11.2019.
+//
+
+import Foundation
+
+struct BorshDecoder {
+  func decode<T>(_ type: T.Type, from data: Data) throws -> T where T : BorshDeserializable {
+    var reader = BinaryReader(bytes: [UInt8](data))
+    return try T.init(from: &reader)
+  }
+}
+
+'''
+'''--- Sources/NearSwift/Utils/Borsh/BorshDeserialize.swift ---
+//
+//  BorshDeserialize.swift
+//  nearclientios
+//
+//  Created by Dmytro Kurochka on 21.11.2019.
+//
+
+import Foundation
+
+public protocol BorshDeserializable {
+  init(from reader: inout BinaryReader) throws
+}
+
+enum DeserializationError: Error {
+  case noData
+}
+
+public extension FixedWidthInteger {
+  init(from reader: inout BinaryReader) throws {
+    var value: Self = .zero
+    let bytes = reader.read(count: UInt32(MemoryLayout<Self>.size))
+    let size = withUnsafeMutableBytes(of: &value, { bytes.copyBytes(to: $0) } )
+    assert(size == MemoryLayout<Self>.size)
+    self = Self(littleEndian: value)
+  }
+}
+
+extension UInt8: BorshDeserializable {}
+extension UInt16: BorshDeserializable {}
+extension UInt32: BorshDeserializable {}
+extension UInt64: BorshDeserializable {}
+extension UInt128: BorshDeserializable {}
+extension Int8: BorshDeserializable {}
+extension Int16: BorshDeserializable {}
+extension Int32: BorshDeserializable {}
+extension Int64: BorshDeserializable {}
+extension Int128: BorshDeserializable {}
+
+extension Float32: BorshDeserializable {
+  public init(from reader: inout BinaryReader) throws {
+    var value: Self = .zero
+    let bytes = reader.read(count: UInt32(MemoryLayout<Self>.size))
+    let size = withUnsafeMutableBytes(of: &value, { bytes.copyBytes(to: $0) } )
+    assert(size == MemoryLayout<Self>.size)
+    assert(!value.isNaN, "For portability reasons we do not allow to deserialize NaNs.")
+    self = value
+  }
+}
+
+extension Float64: BorshDeserializable {
+  public init(from reader: inout BinaryReader) throws {
+    var value: Self = .zero
+    let bytes = reader.read(count: UInt32(MemoryLayout<Self>.size))
+    let size = withUnsafeMutableBytes(of: &value, { bytes.copyBytes(to: $0) } )
+    assert(size == MemoryLayout<Self>.size)
+    assert(!value.isNaN, "For portability reasons we do not allow to deserialize NaNs.")
+    self = value
+  }
+}
+
+extension Bool: BorshDeserializable {
+  public init(from reader: inout BinaryReader) throws {
+    var value: Self = false
+    let bytes = reader.read(count: UInt32(MemoryLayout<Self>.size))
+    let size = withUnsafeMutableBytes(of: &value, { bytes.copyBytes(to: $0) } )
+    assert(size == MemoryLayout<Self>.size)
+    self = value
+  }
+}
+
+extension Optional where Wrapped: BorshDeserializable {
+  init(from reader: inout BinaryReader) throws {
+    let isSomeValue: UInt8 = try .init(from: &reader)
+    switch isSomeValue {
+    case 1: self = try Wrapped.init(from: &reader)
+    default: self = .none
+    }
+  }
+}
+
+extension String: BorshDeserializable {
+  public init(from reader: inout BinaryReader) throws {
+    let count: UInt32 = try .init(from: &reader)
+    let bytes = reader.read(count: count)
+    guard let value = String(bytes: bytes, encoding: .utf8) else {throw DeserializationError.noData}
+    self = value
+  }
+}
+
+extension Array: BorshDeserializable where Element: BorshDeserializable {
+  public init(from reader: inout BinaryReader) throws {
+    let count: UInt32 = try .init(from: &reader)
+    self = try Array<UInt32>(0..<count).map {_ in try Element.init(from: &reader) }
+  }
+}
+
+extension Set: BorshDeserializable where Element: BorshDeserializable & Equatable {
+  public init(from reader: inout BinaryReader) throws {
+    self = try Set(Array<Element>.init(from: &reader))
+  }
+}
+
+extension Dictionary: BorshDeserializable where Key: BorshDeserializable & Equatable, Value: BorshDeserializable {
+  public init(from reader: inout BinaryReader) throws {
+    let count: UInt32 = try .init(from: &reader)
+    let keyValuePairs = try Array<UInt32>(0..<count)
+      .map {_ in (try Key.init(from: &reader), try Value.init(from: &reader)) }
+    self = Dictionary(uniqueKeysWithValues: keyValuePairs)
+  }
+}
+
+'''
+'''--- Sources/NearSwift/Utils/Borsh/BorshEncoder.swift ---
+//
+//  BorshEncoder.swift
+//  nearclientios
+//
+//  Created by Dmytro Kurochka on 23.11.2019.
+//
+
+import Foundation
+
+struct BorshEncoder {
+  func encode<T>(_ value: T) throws -> Data where T : BorshSerializable {
+    var writer = Data()
+    try value.serialize(to: &writer)
+    return writer
+  }
+}
+
+'''
+'''--- Sources/NearSwift/Utils/Borsh/BorshSerialize.swift ---
+//
+//  BorshSerialize.swift
+//  nearclientios
+//
+//  Created by Dmytro Kurochka on 21.11.2019.
+//
+
+import Foundation
+
+public protocol BorshSerializable {
+  func serialize(to writer: inout Data) throws
+}
+
+extension UInt8: BorshSerializable {}
+extension UInt16: BorshSerializable {}
+extension UInt32: BorshSerializable {}
+extension UInt64: BorshSerializable {}
+extension UInt128: BorshSerializable {}
+extension Int8: BorshSerializable {}
+extension Int16: BorshSerializable {}
+extension Int32: BorshSerializable {}
+extension Int64: BorshSerializable {}
+extension Int128: BorshSerializable {}
+
+public extension FixedWidthInteger {
+  func serialize(to writer: inout Data) throws {
+    writer.append(contentsOf: withUnsafeBytes(of: self.littleEndian) { Array($0) })
+  }
+}
+
+extension Float32: BorshSerializable {
+  public func serialize(to writer: inout Data) throws {
+    assert(!self.isNaN, "For portability reasons we do not allow to serialize NaNs.")
+    var start = bitPattern.littleEndian
+    writer.append(Data(buffer: UnsafeBufferPointer(start: &start, count: 1)))
+  }
+}
+
+extension Float64: BorshSerializable {
+  public func serialize(to writer: inout Data) throws {
+    assert(!self.isNaN, "For portability reasons we do not allow to serialize NaNs.")
+    var start = bitPattern.littleEndian
+    writer.append(Data(buffer: UnsafeBufferPointer(start: &start, count: 1)))
+  }
+}
+
+extension Bool: BorshSerializable {
+  public func serialize(to writer: inout Data) throws {
+    let intRepresentation: UInt8 = self ? 1 : 0
+    try intRepresentation.serialize(to: &writer)
+  }
+}
+
+extension Optional where Wrapped: BorshSerializable {
+  func serialize(to writer: inout Data) throws {
+    switch self {
+    case .some(let value):
+      try UInt8(1).serialize(to: &writer)
+      try value.serialize(to: &writer)
+    case .none:
+      try UInt8(0).serialize(to: &writer)
+    }
+  }
+}
+
+extension String: BorshSerializable {
+  public func serialize(to writer: inout Data) throws {
+    let data = Data(utf8)
+    try UInt32(data.count).serialize(to: &writer)
+    writer.append(data)
+  }
+}
+
+extension Array: BorshSerializable where Element: BorshSerializable {
+  public func serialize(to writer: inout Data) throws {
+    try UInt32(count).serialize(to: &writer)
+    try forEach { try $0.serialize(to: &writer) }
+  }
+}
+
+extension Set: BorshSerializable where Element: BorshSerializable & Comparable {
+  public func serialize(to writer: inout Data) throws {
+    try sorted().serialize(to: &writer)
+  }
+}
+
+extension Dictionary: BorshSerializable where Key: BorshSerializable & Comparable, Value: BorshSerializable {
+  public func serialize(to writer: inout Data) throws {
+    let sortedByKeys = sorted(by: {$0.key < $1.key})
+    try UInt32(sortedByKeys.count).serialize(to: &writer)
+    try sortedByKeys.forEach { key, value in
+      try key.serialize(to: &writer)
+      try value.serialize(to: &writer)
+    }
+  }
+}
+
+'''
+'''--- Sources/NearSwift/Utils/FileManager.swift ---
+//
+//  FileManager.swift
+//  nearclientios
+//
+//  Created by Dmytro Kurochka on 08.11.2019.
+//
+
+import Foundation
+
+public extension FileManager {
+  func ensureDir(path: String) throws -> Void {
+    try createDirectory(atPath: path, withIntermediateDirectories: true, attributes: nil)
+  }
+
+  var targetDirectory: URL {
+    let paths = urls(for: .documentDirectory, in: .userDomainMask)
+    return paths[0]
+  }
+}
+
+'''
+'''--- Sources/NearSwift/Utils/FixedLengthByteArray.swift ---
+//
+//  FixedLengthByteArray.swift
+//  nearclientios
+//
+//  Created by Dmytro Kurochka on 25.11.2019.
+//
+
+import Foundation
+
+public protocol FixedLengthByteArray {
+  static var fixedLength: UInt32 {get}
+  var bytes: [UInt8] {get}
+  init(bytes: [UInt8]) throws
+}
+
+extension FixedLengthByteArray {
+  public func serialize(to writer: inout Data) throws {
+    writer.append(bytes, count: Int(Self.fixedLength))
+  }
+
+  public init(from reader: inout BinaryReader) throws {
+    try self.init(bytes: reader.read(count: Self.fixedLength))
+  }
+}
+
+'''
+'''--- Sources/NearSwift/Utils/Int2x/Int2X.swift ---
+import Foundation
+import Accelerate.vecLib
+
+public typealias Int1X = FixedWidthInteger & BinaryInteger & SignedInteger & Codable
+
+public struct Int2X<Word:UInt1X>: Hashable, Codable {
+    public typealias IntegerLiteralType = UInt64
+    public typealias Magnitude = UInt2X<Word>
+    public typealias Words = [Word.Words.Element]
+    public typealias Stride = Int
+    public var rawValue:Magnitude = 0
+    public init(rawValue:Magnitude){ self.rawValue = rawValue }
+    public init(_ source:Int2X) { self.rawValue = source.rawValue }
+    public init() {}
+}
+// Swift bug?
+// auto-generated == fatalError()'s
+// UInt2X(hi:nonzero, lo:0) == 0
+extension Int2X {
+    public static func == (_ lhs: Int2X, _ rhs: Int2X)->Bool {
+        return lhs.rawValue == rhs.rawValue
+    }
+}
+extension Int2X : ExpressibleByIntegerLiteral {
+    public static var isSigned: Bool { return true }
+    public static var bitWidth: Int { return Magnitude.bitWidth }
+    public static var max:Int2X { return Int2X(rawValue:(Magnitude.max >> 1))    }
+    public static var min:Int2X { return Int2X(rawValue:(Magnitude.max >> 1) &+ 1) }
+    public init?<T>(exactly source: T) where T : BinaryInteger {
+        guard source.bitWidth <= Int2X.bitWidth || source.magnitude <= T(Int2X.max.rawValue) else {
+            return nil
+        }
+        if !T.isSigned && source & (1 << (source.bitWidth - 1)) != 0 {
+            return nil
+        }
+        self.init(source)
+    }
+    public init<T>(_ source: T) where T : BinaryInteger {
+        if !T.isSigned && Word.bitWidth * 2 <= source.bitWidth && source & (1 << (source.bitWidth - 1)) != 0 {
+            fatalError("Not enough bits to represent a signed value")
+        }
+        self.rawValue = Magnitude(source.magnitude)
+        if T.isSigned && source & (1 << (source.bitWidth - 1)) != 0 {
+            self.rawValue = -self.rawValue
+        }
+    }
+    public init?<T>(exactly source: T) where T : BinaryFloatingPoint {
+        guard let rv = Magnitude(exactly: source.sign == .minus ? -source : +source) else { return nil }
+        self = Int2X(rawValue:rv)
+        guard !self.isNegative else { return nil }
+        if source.sign == .minus { self = -self }
+    }
+    public init<T>(_ source: T) where T : BinaryFloatingPoint {
+        guard let result = Int2X(exactly: source) else {
+            fatalError("Not enough bits to represent a signed value")
+        }
+        self = result
+    }
+    // alway succeeds
+    public init<T:BinaryInteger>(truncatingIfNeeded source: T) {
+        self.rawValue = Magnitude(truncatingIfNeeded:source.magnitude)
+        if T.isSigned && source < 0 {
+            self.rawValue = -self.rawValue
+        }
+    }
+    // alway succeeds
+    public init<T:BinaryInteger>(clamping source: T) {
+        self = Int2X(exactly: source) ?? Int2X.max
+    }
+    public init(integerLiteral value: IntegerLiteralType) {
+        self.init(value)
+    }
+}
+extension Int2X : Comparable {
+    internal var isNegative:Bool {
+        return Int2X.max.rawValue < self.rawValue
+    }
+    public var magnitude:Magnitude {
+        return isNegative ? rawValue == Int2X.min.rawValue ? rawValue : -rawValue : +rawValue
+    }
+    public static func < (lhs: Int2X, rhs: Int2X) -> Bool {
+        return Int2X.max.rawValue < lhs.rawValue &- rhs.rawValue
+    }
+}
+extension Int2X : Numeric {
+    // unary operators
+    public static prefix func ~(_ value:Int2X)->Int2X {
+        return Int2X(rawValue:~(value.rawValue))
+    }
+    public static prefix func +(_ value:Int2X)->Int2X {
+        return value
+    }
+    public static prefix func -(_ value:Int2X)->Int2X {
+        return Int2X(rawValue:-(value.rawValue))
+    }
+    // additions
+    public func addingReportingOverflow(_ other: Int2X) -> (partialValue: Int2X, overflow: Bool) {
+        let (pv, of) = self.rawValue.addingReportingOverflow(other.rawValue)
+        // For any given int the only possible case that overflows is I.min - I.min
+        // in which case overflow is true and partialValue is 0
+        return (Int2X(rawValue:pv), of && pv == 0)
+        
+    }
+    public static func &+(_ lhs:Int2X, _ rhs:Int2X)->Int2X {
+        return lhs.addingReportingOverflow(rhs).partialValue
+    }
+    public static func +(_ lhs:Int2X, _ rhs:Int2X)->Int2X {
+        let (pv, of) = lhs.addingReportingOverflow(rhs)
+        precondition(!of, "\(lhs) + \(rhs): Addition overflow!")
+        return pv
+    }
+    public static func += (lhs: inout Int2X, rhs: Int2X) {
+        lhs = lhs + rhs
+    }
+    // subtraction
+    public func subtractingReportingOverflow(_ other: Int2X) -> (partialValue: Int2X, overflow: Bool) {
+        let (pv, of) = self.rawValue.subtractingReportingOverflow(other.rawValue)
+        return (Int2X(rawValue:pv), of && pv == 0)
+    }
+    public static func &-(_ lhs:Int2X, _ rhs:Int2X)->Int2X {
+        return lhs.subtractingReportingOverflow(rhs).partialValue
+    }
+    public static func -(_ lhs:Int2X, _ rhs:Int2X)->Int2X {
+        let (pv, of) = lhs.subtractingReportingOverflow(rhs)
+        precondition(!of, "\(lhs) - \(rhs): Subtruction overflow!")
+        return pv
+    }
+    public static func -= (lhs: inout Int2X, rhs: Int2X) {
+        lhs = lhs - rhs
+    }
+    // multiplication
+    public func multipliedFullWidth(by other: Int2X) -> (high: Int2X, low: Magnitude) {
+        let (h, l) = self.rawValue.multipliedFullWidth(by:other.rawValue)
+        return (Int2X(h), l)
+        
+    }
+    public func multipliedReportingOverflow(by other: Int2X) -> (partialValue: Int2X, overflow: Bool) {
+        let hv = self.magnitude.multipliedFullWidth(by: other.magnitude)
+        return (self.isNegative != other.isNegative ? -Int2X(rawValue:hv.low) : +Int2X(rawValue:hv.low), 0 < hv.high)
+    }
+    public static func &*(lhs: Int2X, rhs: Int2X) -> Int2X {
+        return lhs.multipliedReportingOverflow(by: rhs).partialValue
+    }
+    public static func *(lhs: Int2X, rhs: Int2X) -> Int2X {
+        let result = lhs.multipliedReportingOverflow(by: rhs)
+        precondition(!result.overflow, "Multiplication overflow!")
+        return result.partialValue
+    }
+    public static func *= (lhs: inout Int2X, rhs: Int2X) {
+        lhs = lhs * rhs
+    }
+}
+// bitshifts
+extension Int2X {
+    public static func &>>(_ lhs:Int2X, _ rhs:Int2X)->Int2X {
+        if rhs.isNegative { return lhs &<< -rhs }
+        if Int2X.bitWidth <= rhs { return 0 }
+        let rv = lhs.magnitude &>> rhs.magnitude
+        return lhs.isNegative ? -Int2X(rawValue:rv) : +Int2X(rawValue:rv)
+    }
+    public static func &<<(_ lhs:Int2X, _ rhs:Int2X)->Int2X {
+        if rhs.isNegative { return lhs &>> -rhs }
+        if Int2X.bitWidth <= rhs { return 0 }
+        let rv = lhs.magnitude &<< rhs.magnitude
+        return lhs.isNegative ? -Int2X(rawValue:rv) : +Int2X(rawValue:rv)
+    }
+    public static func &>>=(_ lhs:inout Int2X, _ rhs:Int2X) {
+        return lhs = lhs &>> rhs
+    }
+    public static func &<<=(_ lhs:inout Int2X, _ rhs:Int2X) {
+        return lhs = lhs &<< rhs
+    }
+}
+// division
+extension Int2X {
+    public func quotientAndRemainder(dividingBy other: Int2X) -> (quotient: Int2X, remainder: Int2X) {
+        let qv = self.magnitude.quotientAndRemainder(dividingBy:other.magnitude)
+        let q = self.isNegative != other.isNegative ? -qv.quotient : +qv.quotient
+        let r = self.isNegative ? -qv.remainder : +qv.remainder
+        return (Int2X(rawValue:q), Int2X(rawValue:r))
+    }
+    public static func / (_ lhs:Int2X, rhs:Int2X)->Int2X {
+        return lhs.quotientAndRemainder(dividingBy: rhs).quotient
+    }
+    public static func /= (_ lhs:inout Int2X, rhs:Int2X) {
+        lhs = lhs / rhs
+    }
+    public static func % (_ lhs:Int2X, rhs:Int2X)->Int2X {
+        return lhs.quotientAndRemainder(dividingBy: rhs).remainder
+    }
+    public static func %= (_ lhs:inout Int2X, rhs:Int2X) {
+        lhs = lhs % rhs
+    }
+    public func dividedReportingOverflow(by other :Int2X) -> (partialValue: Int2X, overflow:Bool) {
+        return (self / other, false)
+    }
+    public func remainderReportingOverflow(dividingBy other :Int2X) -> (partialValue: Int2X, overflow:Bool) {
+        return (self % other, false)
+    }
+    public func dividingFullWidth(_ dividend: (high: Int2X, low: Magnitude)) -> (quotient: Int2X, remainder: Int2X) {
+        let qv = self.magnitude.dividingFullWidth((high: dividend.high.magnitude, low: dividend.low))
+        let q = self.isNegative != dividend.high.isNegative ? -qv.quotient : +qv.quotient
+        let r = self.isNegative ? -qv.remainder : +qv.remainder
+        return (Int2X(rawValue:q), Int2X(rawValue:r))
+    }
+}
+// UInt2X -> String
+extension Int2X : CustomStringConvertible, CustomDebugStringConvertible {
+    public func toString(radix:Int=10, uppercase:Bool=false) -> String {
+        return (self.isNegative ? "-" : "") + self.magnitude.toString(radix:radix, uppercase:uppercase)
+    }
+    public var description:String {
+        return toString()
+    }
+    public var debugDescription:String {
+        return (self.isNegative ? "-" : "+") + "0x" + self.magnitude.toString(radix:16)
+    }
+}
+extension StringProtocol {
+    public init?<Word>(_ source:Int2X<Word>, radix:Int=10, uppercase:Bool=false) {
+        self.init(source.toString(radix:radix, uppercase:uppercase))
+    }
+}
+// String <- UInt2X
+extension Int2X : ExpressibleByStringLiteral {
+    public init(stringLiteral value: StringLiteralType) {
+        self.init()
+        if let result = Int2X.fromString(value) {
+            self = result
+        }
+    }
+    internal static func fromString(_ value: String) -> Int2X? {
+        var source = value
+        var sign   = "+"
+        if source.first == "-" || source.first == "+" {
+            sign = String(source.first!)
+            source.removeFirst()
+        }
+        guard let magnitude = Magnitude.fromString(source) else { return nil }
+        return sign == "-" ? -Int2X(rawValue: magnitude) : +Int2X(rawValue: magnitude)
+    }
+}
+// Int -> Int2X
+extension Int {
+    public init<Word>(_ source:Int2X<Word>) {
+        let a = Int(bitPattern: UInt(source.magnitude))
+        self.init(source.isNegative ? -a : +a)
+    }
+}
+// Strideable
+extension Int2X: Strideable {
+    public func distance(to other: Int2X) -> Int {
+        return Int(other) - Int(self)
+    }
+    public func advanced(by n: Int) -> Int2X {
+        return self + Int2X(n)
+    }
+}
+// BinaryInteger
+extension Int2X: BinaryInteger {
+    public var bitWidth: Int {
+        return rawValue.bitWidth
+    }
+    public var words: Words {
+        return rawValue.words
+    }
+    public var trailingZeroBitCount: Int {
+        return rawValue.trailingZeroBitCount
+    }
+    public static func &= (lhs: inout Int2X, rhs: Int2X) {
+        lhs.rawValue &= rhs.rawValue
+    }
+    public static func |= (lhs: inout Int2X, rhs: Int2X) {
+        lhs.rawValue |= rhs.rawValue
+    }
+    public static func ^= (lhs: inout Int2X, rhs: Int2X) {
+        lhs.rawValue ^= rhs.rawValue
+    }
+    public static func <<= <RHS>(lhs: inout Int2X, rhs: RHS) where RHS : BinaryInteger {
+        lhs.rawValue <<= rhs
+    }
+    public static func >>= <RHS>(lhs: inout Int2X, rhs: RHS) where RHS : BinaryInteger {
+        lhs.rawValue >>= rhs
+    }
+}
+// FixedWidthInteger
+extension Int2X: FixedWidthInteger {
+    public init(_truncatingBits bits: UInt) {
+        fatalError()
+    }
+    public var nonzeroBitCount: Int {
+        return self.rawValue.nonzeroBitCount
+    }
+    public var leadingZeroBitCount: Int {
+        return self.rawValue.leadingZeroBitCount
+    }
+    public var byteSwapped: Int2X {
+        return Int2X(rawValue:rawValue.byteSwapped)
+    }
+}
+// SignedInteger
+extension Int2X: SignedInteger {}
+
+public typealias Int128    = Int2X<UInt64>
+public typealias Int256    = Int2X<UInt128>
+public typealias Int512    = Int2X<UInt256>
+public typealias Int1024   = Int2X<UInt512>
+
+'''
+'''--- Sources/NearSwift/Utils/Int2x/UInt2X.swift ---
+import Foundation
+import Accelerate.vecLib
+
+public typealias UInt1X = FixedWidthInteger & BinaryInteger & UnsignedInteger & Codable
+
+public struct UInt2X<Word:UInt1X>: Hashable, Codable {
+    public typealias IntegerLiteralType = UInt64
+    public typealias Magnitude = UInt2X
+    public typealias Words = [Word.Words.Element]
+    public typealias Stride = Int
+    // internally it is least significant word first to make Accelerate happy
+    public var lo:Word = 0
+    public var hi:Word = 0
+    public init(hi:Word, lo:Word) { (self.hi, self.lo) = (hi, lo) }
+    public init(_ source:UInt2X){ (hi, lo) = (source.hi, source.lo) }
+}
+// Swift bug?
+// auto-generated == incorrectly reports
+// UInt2X(hi:nonzero, lo:0) == 0 is true
+extension UInt2X {
+    public static func == (_ lhs: UInt2X, _ rhs: UInt2X)->Bool {
+        return lhs.hi == rhs.hi && lhs.lo == rhs.lo
+    }
+}
+extension UInt2X : ExpressibleByIntegerLiteral {
+    public static var isSigned: Bool { return false }
+    public static var bitWidth: Int {
+        return Word.bitWidth * 2
+    }
+    public static var min:UInt2X { return UInt2X(hi:Word.min, lo:Word.min) }
+    public static var max:UInt2X { return UInt2X(hi:Word.max, lo:Word.max) }
+    public init(_ source: Word) {
+        (hi, lo) = (0, source)
+    }
+    public init?<T>(exactly source: T) where T : BinaryInteger {
+        guard source.bitWidth <= UInt2X.bitWidth || source <= T(UInt2X.max) else {
+            return nil
+        }
+        self.init(source)
+    }
+    public init<T>(_ source: T) where T : BinaryInteger  {
+        self.hi = Word(source.magnitude >> Word.bitWidth)
+        self.lo = Word(truncatingIfNeeded:source.magnitude)
+    }
+    public init?<T>(exactly source: T) where T : BinaryFloatingPoint {
+        print("\(#line)", source)
+        guard source.sign != .minus else { return nil }
+        guard source.exponent < UInt2X.bitWidth else { return nil }
+        self = UInt2X(source.significandBitPattern | (1 << T.significandBitCount) )
+        self <<= Int(source.exponent) - T.significandBitCount
+    }
+    public init<T>(_ source: T) where T : BinaryFloatingPoint {
+        guard let result = UInt2X(exactly: source) else {
+            fatalError("Not enough bits to represent a signed value")
+        }
+        self = result
+    }
+    // alway succeeds
+    public init<T:BinaryInteger>(truncatingIfNeeded source: T) {
+        self.hi = Word(truncatingIfNeeded:source.magnitude >> Word.bitWidth)
+        self.lo = Word(truncatingIfNeeded:source.magnitude)
+    }
+    // alway succeeds
+    public init<T:BinaryInteger>(clamping source: T) {
+        self = UInt2X(exactly: source) ?? UInt2X.max
+    }
+    public init(integerLiteral value: IntegerLiteralType) {
+        self.init(value)
+    }
+}
+// Comparable
+extension UInt2X : Comparable {
+    public static func < (lhs: UInt2X, rhs: UInt2X) -> Bool {
+        return lhs.hi < rhs.hi ? true : lhs.hi == rhs.hi && lhs.lo < rhs.lo
+    }
+}
+// Accelerate support
+// careful with the significance order.  Accerelate is least significant first.
+#if os(macOS) || os(iOS)
+import Accelerate
+#endif
+public class Int2XConfig {
+    #if os(macOS) || os(iOS)
+    public static var useAccelerate = true
+    #else
+    public static let useAccelerate = false
+    #endif
+}
+// numeric
+extension UInt2X : Numeric {
+   public var magnitude: UInt2X {
+        return self
+    }
+    // unary operators
+    public static prefix func ~(_ value:UInt2X)->UInt2X {
+        return UInt2X(hi:~value.hi, lo:~value.lo)
+    }
+    public static prefix func +(_ value:UInt2X)->UInt2X {
+        return value
+    }
+    public static prefix func -(_ value:UInt2X)->UInt2X {
+        return ~value &+ 1  // two's complement
+    }
+    // additions
+    public func addingReportingOverflow(_ other: UInt2X) -> (partialValue: UInt2X, overflow: Bool) {
+        guard self  != 0 else { return (other, false) }
+        guard other != 0 else { return (self,  false) }
+        #if os(macOS)
+        if Int2XConfig.useAccelerate {
+            //print("line \(#line):Accelerated! \(UInt2X.self)(\(self)).addingReportingOverflow(\(other))")
+            switch self {
+            case is UInt128:
+                var a = unsafeBitCast((self,  vU128()), to:vU256.self)
+                var b = unsafeBitCast((other, vU128()), to:vU256.self)
+                var ab = vU256()
+                vU256Add(&a, &b, &ab)
+                let (r, o) = unsafeBitCast(ab, to:(UInt2X, UInt2X).self)
+                return (r, o != 0)
+            case is UInt256:
+                var a = unsafeBitCast((self,  vU256()), to:vU512.self)
+                var b = unsafeBitCast((other, vU256()), to:vU512.self)
+                var ab = vU512()
+                vU512Add(&a, &b, &ab)
+                let (r, o) = unsafeBitCast(ab, to:(UInt2X, UInt2X).self)
+                return (r, o != 0)
+            case is UInt512:
+                var a = unsafeBitCast((self,  vU512()), to:vU1024.self)
+                var b = unsafeBitCast((other, vU512()), to:vU1024.self)
+                var ab = vU1024()
+                vU1024Add(&a, &b, &ab)
+                let (r, o) = unsafeBitCast(ab, to:(UInt2X, UInt2X).self)
+                return (r, o != 0)
+            default:
+                break
+            }
+        }
+        #endif
+        var of = false
+        let (lv, lf) = self.lo.addingReportingOverflow(other.lo)
+        var (hv, uo) = self.hi.addingReportingOverflow(other.hi)
+        if lf {
+            (hv, of) = hv.addingReportingOverflow(1)
+        }
+        return (partialValue: UInt2X(hi:hv, lo:lv), overflow: uo || of)
+    }
+    public func addingReportingOverflow(_ other: Word) -> (partialValue: UInt2X, overflow: Bool) {
+        return self.addingReportingOverflow(UInt2X(hi:0, lo:other))
+    }
+    public static func &+(_ lhs:UInt2X, _ rhs:UInt2X)->UInt2X {
+        return lhs.addingReportingOverflow(rhs).partialValue
+    }
+    public static func +(_ lhs:UInt2X, _ rhs:UInt2X)->UInt2X {
+        precondition(~lhs >= rhs, "\(lhs) + \(rhs): Addition overflow!")
+        return lhs &+ rhs
+    }
+    public static func +(_ lhs:UInt2X, _ rhs:Word)->UInt2X {
+        return lhs + UInt2X(hi:0, lo:rhs)
+    }
+    public static func +(_ lhs:Word, _ rhs:UInt2X)->UInt2X {
+        return UInt2X(hi:0, lo:lhs) + rhs
+    }
+    public static func += (lhs: inout UInt2X, rhs: UInt2X) {
+        lhs = lhs + rhs
+    }
+    public static func += (lhs: inout UInt2X, rhs: Word) {
+        lhs = lhs + rhs
+    }
+    // subtraction
+    public func subtractingReportingOverflow(_ other: UInt2X) -> (partialValue: UInt2X, overflow: Bool) {
+        guard self  != other else { return (0,  false) }
+        guard self  != 0 else { return (-other, false) }
+        guard other != 0 else { return (+self,  false) }
+        #if os(macOS)
+        if Int2XConfig.useAccelerate {
+            // print("line \(#line):Accelerated! \(UInt2X.self)(\(self)).subtractingReportingOverflow(\(other))")
+            switch self {
+            case is UInt128:
+                var a = unsafeBitCast((self,  vU128()), to:vU256.self)
+                var b = unsafeBitCast((other, vU128()), to:vU256.self)
+                var ab = vU256()
+                vU256Sub(&a, &b, &ab)
+                let (r, o) = unsafeBitCast(ab, to:(UInt2X, UInt2X).self)
+                return (r, o != 0)
+            case is UInt256:
+                var a = unsafeBitCast((self,  vU256()), to:vU512.self)
+                var b = unsafeBitCast((other, vU256()), to:vU512.self)
+                var ab = vU512()
+                vU512Sub(&a, &b, &ab)
+                let (r, o) = unsafeBitCast(ab, to:(UInt2X, UInt2X).self)
+                return (r, o != 0)
+            case is UInt512:
+                var a = unsafeBitCast((self,  vU512()), to:vU1024.self)
+                var b = unsafeBitCast((other, vU512()), to:vU1024.self)
+                var ab = vU1024()
+                vU1024Sub(&a, &b, &ab)
+                let (r, o) = unsafeBitCast(ab, to:(UInt2X, UInt2X).self)
+                return (r, o != 0)
+            default:
+                break
+            }
+        }
+        #endif
+        return self.addingReportingOverflow(-other)
+    }
+    public func subtractingReportingOverflow(_ other: Word) -> (partialValue: UInt2X, overflow: Bool) {
+        return self.subtractingReportingOverflow(UInt2X(hi:0, lo:other))
+    }
+    public static func &-(_ lhs:UInt2X, _ rhs:UInt2X)->UInt2X {
+        return lhs.subtractingReportingOverflow(rhs).partialValue
+    }
+    public static func -(_ lhs:UInt2X, _ rhs:UInt2X)->UInt2X {
+        precondition(lhs >= rhs, "\(lhs) - \(rhs): Subtraction overflow!")
+        return lhs &- rhs
+    }
+    public static func -(_ lhs:UInt2X, _ rhs:Word)->UInt2X {
+        return lhs - UInt2X(hi:0, lo:rhs)
+    }
+    public static func -(_ lhs:Word, _ rhs:UInt2X)->UInt2X {
+        return UInt2X(hi:0, lo:lhs) - rhs
+    }
+    public static func -= (lhs: inout UInt2X, rhs: UInt2X) {
+        lhs = lhs - rhs
+    }
+    public static func -= (lhs: inout UInt2X, rhs: Word) {
+        lhs = lhs - rhs
+    }
+    // multiplication
+    public func multipliedHalfWidth(by other: Word) -> (high: UInt2X, low: Magnitude) {
+        guard self  != 0 else { return (0, 0) }
+        guard other != 0 else { return (0, 0) }
+        let l = self.lo.multipliedFullWidth(by:other)
+        let h = self.hi.multipliedFullWidth(by:other)
+        let r0          = Word(l.low)
+        let (r1, o1)    = Word(h.low).addingReportingOverflow(Word(l.high))
+        let r2          = Word(h.high) &+ (o1 ? 1 : 0)  // will not overflow
+        return (UInt2X(hi:0, lo:r2), UInt2X(hi:r1, lo:r0))
+    }
+    public func multipliedFullWidth(by other: UInt2X) -> (high: UInt2X, low: Magnitude) {
+        guard self  != 0 else { return (0, 0) }
+        guard other != 0 else { return (0, 0) }
+        #if os(macOS)
+        if Int2XConfig.useAccelerate {
+            // print("line \(#line):Accelerated! \(UInt2X.self)(\(self)).multipliedFullWidth(by:\(other))")
+            switch self {
+            case is UInt128:
+                var a = unsafeBitCast(self,  to:vU128.self)
+                var b = unsafeBitCast(other, to:vU128.self)
+                var ab = vU256()
+                vU128FullMultiply(&a, &b, &ab)
+                let (l, h) = unsafeBitCast(ab, to:(UInt2X, UInt2X).self)
+                return (h, l)
+            case is UInt256:
+                var a = unsafeBitCast(self,  to:vU256.self)
+                var b = unsafeBitCast(other, to:vU256.self)
+                var ab = vU512()
+                vU256FullMultiply(&a, &b, &ab)
+                let (l, h) = unsafeBitCast(ab, to:(UInt2X, UInt2X).self)
+                return (h, l)
+            case is UInt512:
+                var a = unsafeBitCast(self,  to:vU512.self)
+                var b = unsafeBitCast(other, to:vU512.self)
+                var ab = vU1024()
+                vU512FullMultiply(&a, &b, &ab)
+                let (l, h) = unsafeBitCast(ab, to:(UInt2X, UInt2X).self)
+                return (h, l)
+            default:
+                break
+            }
+        }
+        #endif
+        let l  = self.multipliedHalfWidth(by: other.lo)
+        let hs = self.multipliedHalfWidth(by: other.hi)
+        let h  = (high:UInt2X(hi:hs.high.lo, lo:hs.low.hi), low:UInt2X(hi:hs.low.lo, lo:0))
+        let (rl, ol) = h.low.addingReportingOverflow(l.low)
+        let rh       = h.high &+ l.high &+ (ol ? 1 : 0) // will not overflow
+        return (rh, rl)
+    }
+    public func multipliedReportingOverflow(by other: UInt2X) -> (partialValue: UInt2X, overflow: Bool) {
+        guard self  != 0 else { return (0, false) }
+        guard other != 0 else { return (0, false) }
+        let result = self.multipliedFullWidth(by: other)
+        return (result.low, 0 < result.high)
+    }
+    public static func &*(lhs: UInt2X, rhs: UInt2X) -> UInt2X {
+        return lhs.multipliedReportingOverflow(by: rhs).partialValue
+    }
+    public static func &*(lhs: UInt2X, rhs: Word) -> UInt2X {
+        return lhs.multipliedHalfWidth(by: rhs).low
+    }
+    public static func &*(lhs: Word, rhs: UInt2X) -> UInt2X {
+        return rhs.multipliedHalfWidth(by: lhs).low
+    }
+    public static func *(lhs: UInt2X, rhs: UInt2X) -> UInt2X {
+        let result = lhs.multipliedReportingOverflow(by: rhs)
+        precondition(!result.overflow, "Multiplication overflow!")
+        return result.partialValue
+    }
+    public static func *(lhs: UInt2X, rhs: Word) -> UInt2X {
+        let result = lhs.multipliedHalfWidth(by: rhs)
+        precondition(result.high == 0, "Multiplication overflow!")
+        return result.low
+    }
+    public static func *(lhs: Word, rhs: UInt2X) -> UInt2X {
+        let result = rhs.multipliedHalfWidth(by: lhs)
+        precondition(result.high == 0, "Multiplication overflow!")
+        return result.low
+    }
+    public static func *= (lhs: inout UInt2X, rhs: UInt2X) {
+        lhs = lhs * rhs
+    }
+    public static func *= (lhs: inout UInt2X, rhs: Word) {
+        lhs = lhs * rhs
+    }
+}
+// bitshifts
+extension UInt2X {
+    public func rShifted(_ width:Int)->UInt2X {
+        if width <  0 { return self.lShifted(-width) }
+        if width == 0 { return self }
+        if width == Word.bitWidth     { return UInt2X(hi:0, lo:self.hi) }
+        #if os(macOS)
+        if Int2XConfig.useAccelerate {
+            // print("line \(#line):Accelerated! \(UInt2X.self)(\(self)).rShifted(\(other))")
+            switch self {
+            case is UInt128:
+                var a = unsafeBitCast((self,  vU128()), to:vU256.self)
+                var r = vU256()
+                vLR256Shift(&a, UInt32(width), &r)
+                return unsafeBitCast(r, to:(UInt2X, UInt2X).self).0
+            case is UInt256:
+                var a = unsafeBitCast(self, to:vU256.self)
+                var r = vU256()
+                vLR256Shift(&a, UInt32(width), &r)
+                return unsafeBitCast(r, to:UInt2X.self)
+            case is UInt512:
+                var a = unsafeBitCast(self, to:vU512.self)
+                var r = vU512()
+                vLR512Shift(&a, UInt32(width), &r)
+                return unsafeBitCast(r, to:UInt2X.self)
+            case is UInt1024:
+                var a = unsafeBitCast(self, to:vU1024.self)
+                var r = vU1024()
+                vLR1024Shift(&a, UInt32(width), &r)
+                return unsafeBitCast(r, to:UInt2X.self)
+            default:
+                break
+            }
+        }
+        #endif
+        if Word.bitWidth < width {
+            return UInt2X(hi:0, lo:self.hi >> (width - Word.bitWidth))
+        }
+        else {
+            let mask = Word((1 << width) &- 1)
+            let carry = (self.hi & mask) << (Word.bitWidth - width)
+            return UInt2X(hi: self.hi >> width, lo: carry | self.lo >> width)
+        }
+    }
+    public func lShifted(_ width:Int)->UInt2X {
+        if width <  0 { return self.rShifted(-width) }
+        if width == 0 { return self }
+        if width == Word.bitWidth     { return UInt2X(hi:self.lo, lo:0) }
+        #if os(macOS)
+        if Int2XConfig.useAccelerate {
+            // print("line \(#line):Accelerated! \(UInt2X.self)(\(self)).lShifted(\(other))")
+            switch self {
+            case is UInt128:
+                var a = unsafeBitCast((self,  vU128()), to:vU256.self)
+                var r = vU256()
+                vLL256Shift(&a, UInt32(width), &r)
+                return unsafeBitCast(r, to:(UInt2X, UInt2X).self).0
+            case is UInt256:
+                var a = unsafeBitCast(self, to:vU256.self)
+                var r = vU256()
+                vLL256Shift(&a, UInt32(width), &r)
+                return unsafeBitCast(r, to:UInt2X.self)
+            case is UInt512:
+                var a = unsafeBitCast(self, to:vU512.self)
+                var r = vU512()
+                vLL512Shift(&a, UInt32(width), &r)
+                return unsafeBitCast(r, to:UInt2X.self)
+            case is UInt1024:
+                var a = unsafeBitCast(self, to:vU1024.self)
+                var r = vU1024()
+                vLL1024Shift(&a, UInt32(width), &r)
+                return unsafeBitCast(r, to:UInt2X.self)
+            default:
+                break
+            }
+        }
+        #endif
+        if Word.bitWidth < width {
+            return UInt2X(hi:self.lo << (width - Word.bitWidth), lo:0)
+        }
+        else {
+            let carry = self.lo >> (Word.bitWidth - width)
+            return UInt2X(hi: self.hi << width | carry, lo: self.lo << width)
+        }
+    }
+    public static func &>>(_ lhs:UInt2X, _ rhs:UInt2X)->UInt2X {
+        return lhs.rShifted(Int(rhs.lo))
+    }
+    public static func &>>=(_ lhs:inout UInt2X, _ rhs:UInt2X) {
+        return lhs = lhs &>> rhs
+    }
+    public static func &<<(_ lhs:UInt2X, _ rhs:UInt2X)->UInt2X {
+        return lhs.lShifted(Int(rhs.lo))
+    }
+    public static func &<<=(_ lhs:inout UInt2X, _ rhs:UInt2X) {
+        return lhs = lhs &<< rhs
+    }
+}
+// division, which is rather tough
+extension UInt2X {
+    public func quotientAndRemainder(dividingBy other: Word) -> (quotient: UInt2X, remainder: UInt2X) {
+        precondition(other != 0, "division by zero!")
+        let (qh, rh) = self.hi.quotientAndRemainder(dividingBy: other)
+        let (ql, rl) = other.dividingFullWidth((high: rh, low:self.lo.magnitude))
+        return (UInt2X(hi:qh, lo:ql), UInt2X(rl))
+    }
+    public func quotientAndRemainder(dividingBy other: UInt2X) -> (quotient: UInt2X, remainder: UInt2X) {
+        precondition(other != 0, "division by zero!")
+        guard other != self else { return (1, 0) }
+        guard other <  self else { return (0, self) }
+        guard other.hi != 0 else {
+            return self.quotientAndRemainder(dividingBy: other.lo)
+        }
+        #if os(macOS)
+        if Int2XConfig.useAccelerate {
+            // print("line \(#line):Accelerated! \(UInt2X.self)(\(self)).quotientAndRemainder(dividingBy:\(other))")
+            switch self {
+            case is UInt128:
+                var a = unsafeBitCast((self,  vU128()), to:vU256.self)
+                var b = unsafeBitCast((other, vU128()), to:vU256.self)
+                var (q, r) = (vU256(), vU256())
+                vU256Divide(&a, &b, &q, &r)
+                let qq = unsafeBitCast(q, to:(UInt2X, UInt2X).self).0
+                let rr = unsafeBitCast(r, to:(UInt2X, UInt2X).self).0
+                return (qq, rr)
+            case is UInt256:
+                var a = unsafeBitCast(self,  to:vU256.self)
+                var b = unsafeBitCast(other, to:vU256.self)
+                var (q, r) = (vU256(), vU256())
+                vU256Divide(&a, &b, &q, &r)
+                let qq = unsafeBitCast(q, to:UInt2X.self)
+                let rr = unsafeBitCast(r, to:UInt2X.self)
+                return (qq, rr)
+            case is UInt512:
+                var a = unsafeBitCast(self,  to:vU512.self)
+                var b = unsafeBitCast(other, to:vU512.self)
+                var (q, r) = (vU512(), vU512())
+                vU512Divide(&a, &b, &q, &r)
+                let qq = unsafeBitCast(q, to:UInt2X.self)
+                let rr = unsafeBitCast(r, to:UInt2X.self)
+                return (qq, rr)
+            case is UInt1024:
+                var a = unsafeBitCast(self,  to:vU1024.self)
+                var b = unsafeBitCast(other, to:vU1024.self)
+                var (q, r) = (vU1024(), vU1024())
+                vU1024Divide(&a, &b, &q, &r)
+                let qq = unsafeBitCast(q, to:UInt2X.self)
+                let rr = unsafeBitCast(r, to:UInt2X.self)
+                return (qq, rr)
+           default:
+                break
+            }
+        }
+        #endif
+        #if false
+        if Word.bitWidth * 2 <= UInt64.bitWidth { // cheat when we can :-)
+            let divided = (UInt64(self.hi)  << Word.bitWidth) +  UInt64(self.lo)
+            let divider = (UInt64(other.hi) << Word.bitWidth) + UInt64(other.lo)
+            let (q, r) = divided.quotientAndRemainder(dividingBy: divider)
+            return (UInt2X(q), UInt2X(r))
+        }
+        #endif
+        // slow but steady bitwise long division
+        // print("line \(#line): \(UInt2X.self)(\(self)).quotientAndRemainder(dividingBy:\(other))")
+        var (q, r) = (UInt2X(0), UInt2X(0))
+        for i in (0..<UInt2X.bitWidth).reversed() {
+            r <<= 1
+            r |= (self >> i) & 1
+            if other <= r {
+                r -= other
+                q |= (1 << i)
+            }
+        }
+        return (q, r)
+    }
+    public static func / (_ lhs:UInt2X, rhs:UInt2X)->UInt2X {
+        return lhs.quotientAndRemainder(dividingBy: rhs).quotient
+    }
+    public static func /= (_ lhs:inout UInt2X, rhs:UInt2X) {
+        lhs = lhs / rhs
+    }
+    public static func % (_ lhs:UInt2X, rhs:UInt2X)->UInt2X {
+        return lhs.quotientAndRemainder(dividingBy: rhs).remainder
+    }
+    public static func %= (_ lhs:inout UInt2X, rhs:UInt2X) {
+        lhs = lhs % rhs
+    }
+    public func dividedReportingOverflow(by other :UInt2X) -> (partialValue: UInt2X, overflow:Bool) {
+        return (self / other, false)
+    }
+    public func remainderReportingOverflow(dividingBy other :UInt2X) -> (partialValue: UInt2X, overflow:Bool) {
+        return (self % other, false)
+    }
+    public func dividingFullWidth(_ dividend: (high: UInt2X, low: Magnitude)) -> (quotient: UInt2X, remainder: UInt2X) {
+        precondition(self != 0, "division by zero!")
+        guard dividend.high != 0 else { return dividend.low.quotientAndRemainder(dividingBy: self) }
+        #if os(macOS)
+        if Int2XConfig.useAccelerate {
+            // print("line \(#line):Accelerated! \(UInt2X.self)(\(self)).dividingFullWidth(\(dividend))")
+            switch self {
+            case is UInt128:
+                var a = unsafeBitCast((dividend.low, dividend.high), to:vU256.self)
+                var b = unsafeBitCast((self, vU128()), to:vU256.self)
+                var (q, r) = (vU256(), vU256())
+                vU256Divide(&a, &b, &q, &r)
+                let qq = unsafeBitCast(q, to:(UInt2X, UInt2X).self).0
+                let rr = unsafeBitCast(r, to:(UInt2X, UInt2X).self).0
+                return (qq, rr)
+            case is UInt256:
+                var a = unsafeBitCast((dividend.low, dividend.high), to:vU512.self)
+                var b = unsafeBitCast((self, vU256()), to:vU512.self)
+                var (q, r) = (vU512(), vU512())
+                vU512Divide(&a, &b, &q, &r)
+                let qq = unsafeBitCast(q, to:(UInt2X, UInt2X).self).0
+                let rr = unsafeBitCast(r, to:(UInt2X, UInt2X).self).0
+                return (qq, rr)
+            case is UInt512:
+                var a = unsafeBitCast((dividend.low, dividend.high), to:vU1024.self)
+                var b = unsafeBitCast((self, vU512()), to:vU1024.self)
+                var (q, r) = (vU1024(), vU1024())
+                vU1024Divide(&a, &b, &q, &r)
+                let qq = unsafeBitCast(q, to:(UInt2X, UInt2X).self).0
+                let rr = unsafeBitCast(r, to:(UInt2X, UInt2X).self).0
+                return (qq, rr)
+            default:
+                break
+            }
+        }
+        #endif
+        // slow but steady bitwise long division
+        // print("line \(#line): \(UInt2X.self)(\(self)).dividingFullWidth(\(dividend))")
+        var (q, r) = (UInt2X(0), dividend.high % self)
+        for i in (0..<UInt2X.bitWidth).reversed() {
+            r <<= 1
+            r |= (dividend.low >> i) & 1
+            if self <= r {
+                r -= self
+                q |= (1 << i)
+            }
+        }
+        return (q, r)
+    }
+}
+// UInt2X -> String
+extension UInt2X : CustomStringConvertible, CustomDebugStringConvertible {
+    public func toString(radix:Int=10, uppercase:Bool=false) -> String {
+        precondition((2...36) ~= radix, "radix must be within the range of 2-36.")
+        if self == 0 { return "0" }
+        if self.hi == 0 { return String(self.lo, radix:radix, uppercase:uppercase) }
+        if radix == 16 || radix == 4 || radix == 2 { // time-saver
+            let sl = String(self.lo, radix:radix, uppercase:uppercase)
+            let dCount  = Word.bitWidth / (radix == 16 ? 4 : radix == 4 ? 2 : 1)
+            let zeros   = [Character](repeating: "0", count: dCount - sl.count)
+            return String(self.hi, radix:radix, uppercase:uppercase) + String(zeros) + sl
+        }
+        let digits = uppercase
+            ? Array("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+            : Array("0123456789abcdefghijklmnopqrstuvwxyz")
+        #if false // slow but steady digit by digit conversion
+        var result = [Character]()
+        var qr = (quotient: self, remainder: UInt2X(0))
+        repeat {
+            qr = qr.quotient.quotientAndRemainder(dividingBy: Word(radix))
+            result.append(digits[Int(qr.remainder.lo)])
+        } while qr.quotient != UInt2X(0)
+        return String(result.reversed())
+        #else // faster n-digit-at-once conversion
+        let base:UInt64 = [
+            0x0000000000000000, 0x0000000000000000, 0x0000000000000000, 0xa8b8b452291fe800, //  0 ~  3
+            0x0000000000000000, 0x6765c793fa100800, 0x41c21cb8e1000000, 0x3642798750226200, //  4 ~  7
+            0x8000000000000000, 0xa8b8b452291fe800, 0x8ac7230489e80000, 0x4d28cb56c33fa400, //  8 ~ 11
+            0x1eca170c00000000, 0x780c7372621bd800, 0x1e39a5057d810000, 0x5b27ac993df97800, // 11 ~ 15
+            0x0000000000000000, 0x27b95e997e21da00, 0x5da0e1e53c5c8000, 0xd2ae3299c1c4b000, // 16 ~ 19
+            0x16bcc41e90000000, 0x2d04b7fdd9c0f000, 0x5658597bcaa24000, 0xa0e2073737609000, // 20 ~ 23
+            0x0c29e98000000000, 0x14adf4b732033500, 0x226ed36478bfa000, 0x383d9170b85ff800, // 24 ~ 27
+            0x5a3c23e39c000000, 0x8e65137388122800, 0xdd41bb36d259e000, 0x0aee5720ee830680, // 28 ~ 31
+            0x1000000000000000, 0x172588ad4f5f0a00, 0x211e44f7d02c1000, 0x2ee56725f06e5c00, // 32 ~ 35
+            0x41c21cb8e1000000                                                              // 36
+        ][radix]
+        let nlen = base.description.count - 1
+        // print("base=",base)
+        var qr = (quotient: self, remainder: UInt2X(0))
+        var result = [UInt64]()
+        repeat {
+            qr = qr.quotient.quotientAndRemainder(dividingBy: UInt2X(base))
+            result.append(UInt64(qr.remainder))
+        }  while qr.quotient != UInt2X(0)
+        let firstDigit = result.removeLast()
+        return String(firstDigit, radix:radix, uppercase:uppercase) + result.map {
+            let s = String($0, radix:radix, uppercase:uppercase)
+            return String([Character](repeating: "0", count:nlen - s.count)) + s
+        }.reversed().joined()
+        #endif
+    }
+    public var description:String {
+        return toString()
+    }
+    public var debugDescription:String {
+        return "0x" + toString(radix: 16)
+    }
+}
+extension StringProtocol {
+    public init?<Word>(_ source:UInt2X<Word>, radix:Int=10, uppercase:Bool=false) {
+        self.init(source.toString(radix:radix, uppercase:uppercase))
+    }
+}
+// String <- UInt2X
+extension UInt2X : ExpressibleByStringLiteral {
+    public init(stringLiteral value: StringLiteralType) {
+        self.init()
+        if let result = UInt2X.fromString(value) {
+            self = result
+        }
+    }
+    internal static func fromString(_ value: String) -> UInt2X? {
+        let radix = UInt2X.radixFromString(value)
+        let source = radix == 10 ? value : String(value.dropFirst(2))
+        return UInt2X(source, radix:radix)
+    }
+    internal static func radixFromString(_ string: String) -> Int {
+        switch string.prefix(2) {
+        case "0b": return 2
+        case "0o": return 8
+        case "0x": return 16
+        default:   return 10
+        }
+    }
+}
+// Int -> UInt2X
+extension Int {
+    public init<Word>(_ source:UInt2X<Word>) {
+        self.init(bitPattern:UInt(source.hi << Word.bitWidth + source.lo))
+    }
+}
+// Strideable
+extension UInt2X: Strideable {
+    public func distance(to other: UInt2X) -> Int {
+        return Int(other) - Int(self)
+    }
+    public func advanced(by n: Int) -> UInt2X {
+        return self + UInt2X(n)
+    }
+}
+// BinaryInteger
+extension UInt2X: BinaryInteger {
+    public var bitWidth: Int {
+        return Word.bitWidth * 2
+    }
+    public var words: Words {
+        return Array(self.lo.words) + Array(self.hi.words)
+    }
+    public var trailingZeroBitCount: Int {
+        return self.hi == 0 ? self.lo.trailingZeroBitCount : self.hi.trailingZeroBitCount + Word.bitWidth
+    }
+    public static func &= (lhs: inout UInt2X, rhs: UInt2X) {
+        lhs = UInt2X(hi:lhs.hi & rhs.hi, lo:lhs.lo & rhs.lo)
+    }
+    public static func |= (lhs: inout UInt2X, rhs: UInt2X) {
+        lhs = UInt2X(hi:lhs.hi | rhs.hi, lo:lhs.lo | rhs.lo)
+    }
+    public static func ^= (lhs: inout UInt2X<Word>, rhs: UInt2X<Word>) {
+        lhs = UInt2X(hi:lhs.hi ^ rhs.hi, lo:lhs.lo ^ rhs.lo)
+    }
+    public static func <<= <RHS>(lhs: inout UInt2X<Word>, rhs: RHS) where RHS : BinaryInteger {
+        lhs = lhs.lShifted(Int(rhs))
+    }
+    public static func >>= <RHS>(lhs: inout UInt2X, rhs: RHS) where RHS : BinaryInteger {
+        lhs = lhs.rShifted(Int(rhs))
+    }
+}
+// FixedWidthInteger
+extension UInt2X: FixedWidthInteger {
+    public init(_truncatingBits bits: UInt) {
+        fatalError()
+    }
+    public var nonzeroBitCount: Int {
+        return self.hi.nonzeroBitCount + self.lo.nonzeroBitCount
+    }
+    public var leadingZeroBitCount: Int {
+        return self.hi == 0 ? self.lo.leadingZeroBitCount + Word.bitWidth : self.hi.leadingZeroBitCount
+    }
+    public var byteSwapped: UInt2X {
+        return UInt2X(hi:self.lo.byteSwapped, lo:self.hi.byteSwapped)
+    }
+}
+// UnsignedInteger
+extension UInt2X: UnsignedInteger {}
+
+public typealias UInt128    = UInt2X<UInt64>
+public typealias UInt256    = UInt2X<UInt128>
+public typealias UInt512    = UInt2X<UInt256>
+public typealias UInt1024   = UInt2X<UInt512>
+
+'''
+'''--- Sources/NearSwift/Utils/KeyPair.swift ---
+//
+//  KeyPair.swift
+//  nearclientios
+//
+//  Created by Dmitry Kurochka on 10/30/19.
+//  Copyright © 2019 NEAR Protocol. All rights reserved.
+//
+
+import Foundation
+import TweetNacl
+import secp256k1
+
+public protocol SignatureProtocol {
+    var signature: [UInt8] {get}
+    var publicKey: PublicKey {get}
+}
+
+public struct Signature: SignatureProtocol {
+    public let signature: [UInt8]
+    public let publicKey: PublicKey
+}
+
+/** All supported key types */
+public enum KeyType: String, Codable, Equatable, BorshCodable {
+    case ED25519 = "ed25519"
+    case SECP256k1 = "secp256k1"
+    
+    public func serialize(to writer: inout Data) throws {
+        switch self {
+        case .ED25519: return try UInt8(0).serialize(to: &writer)
+        case .SECP256k1: return try UInt8(1).serialize(to: &writer)
+        }
+    }
+    
+    public init(from reader: inout BinaryReader) throws {
+        let value = try UInt8(from: &reader)
+        switch value {
+        case 0: self = .ED25519
+        case 1: self = .SECP256k1
+        default: throw BorshDecodingError.unknownData
+        }
+    }
+}
+
+public enum PublicKeyDecodeError: Error {
+    case invalidKeyFormat(String)
+    case unknowKeyType
+}
+
+/**
+ * PublicKey representation that has type and bytes of the key.
+ */
+public struct PublicKey: Decodable, Equatable {
+    public let keyType: KeyType
+    public let data: [UInt8]
+    
+    public init(keyType: KeyType, data: [UInt8]) {
+        self.keyType = keyType
+        self.data = data
+    }
+    
+    func bytes() -> [UInt8] {
+        switch keyType {
+        case .ED25519:
+            return data
+        case .SECP256k1:
+            // inject the first byte back into the data, it will always be 0x04 since we always use SECP256K1_EC_UNCOMPRESSED
+            var modifiedBytes = data
+            modifiedBytes.insert(0x04, at: 0)
+            return modifiedBytes
+        }
+    }
+    
+    public static func fromString(encodedKey: String) throws -> PublicKey {
+        let parts = encodedKey.split(separator: ":").map {String($0)}
+        if parts.count == 1 {
+            return PublicKey(keyType: .ED25519, data: parts[0].baseDecoded)
+        } else if parts.count == 2 {
+            guard let keyType = KeyType(rawValue: parts[0]) else {throw PublicKeyDecodeError.unknowKeyType}
+            return PublicKey(keyType: keyType, data: parts[1].baseDecoded)
+        } else {
+            throw PublicKeyDecodeError.invalidKeyFormat("Invlaid encoded key format, must be <curve>:<encoded key>")
+        }
+    }
+    
+    public func toString() -> String {
+        return "\(keyType.rawValue):\(data.baseEncoded)"
+    }
+}
+
+extension PublicKey: BorshCodable {
+    
+    public func serialize(to writer: inout Data) throws {
+        try keyType.serialize(to: &writer)
+        writer.append(data, count: Int(keyType == .ED25519 ? 32 : 64))
+    }
+    
+    public init(from reader: inout BinaryReader) throws {
+        self.keyType = try .init(from: &reader)
+        self.data = reader.read(count: keyType == .ED25519 ? 32 : 64)
+    }
+}
+
+public enum KeyPairDecodeError: Error {
+    case invalidKeyFormat(String)
+    case unknowCurve(String)
+}
+
+public protocol KeyPair {
+    func sign(message: [UInt8]) throws -> SignatureProtocol
+    func verify(message: [UInt8], signature: [UInt8]) throws -> Bool
+    func toString() -> String
+    func bytes() throws -> [UInt8]
+    func getPublicKey() -> PublicKey
+}
+
+func keyPairFromRandom(curve: KeyType = .ED25519) throws -> KeyPair{
+    switch curve {
+    case .ED25519: return try KeyPairEd25519.fromRandom()
+    case .SECP256k1: return try KeyPairSecp256k1.fromRandom()
+    }
+}
+
+func keyPairFromString(encodedKey: String) throws -> KeyPair {
+    let parts = encodedKey.split(separator: ":").map {String($0)}
+    if parts.count == 1 {
+        return try KeyPairEd25519(secretKey: parts[0])
+    } else if parts.count == 2 {
+        guard let curve = KeyType(rawValue: parts[0]) else {
+            throw KeyPairDecodeError.unknowCurve("Unknown curve: \(parts[0])")
+        }
+        switch curve {
+        case .ED25519: return try KeyPairEd25519(secretKey: parts[1])
+        case .SECP256k1: return try KeyPairSecp256k1(secretKey: parts[1])
+        }
+    } else {
+        throw KeyPairDecodeError.invalidKeyFormat("Invalid encoded key format, must be <curve>:<encoded key>")
+    }
+}
+
+/**
+ * This struct provides key pair functionality for Ed25519 curve:
+ * generating key pairs, encoding key pairs, signing and verifying.
+ */
+public struct KeyPairEd25519: Equatable {
+    private let publicKey: PublicKey
+    private let secretKey: String
+    
+    /**
+     * Construct an instance of key pair given a secret key.
+     * It's generally assumed that these are encoded in base58.
+     * - Parameter secretKey: SecretKey to be used for KeyPair
+     */
+    public init(secretKey: String) throws {
+        let keyPair = try NaclSign.KeyPair.keyPair(fromSecretKey: secretKey.baseDecoded.data)
+        self.publicKey = PublicKey(keyType: .ED25519, data: keyPair.publicKey.bytes)
+        self.secretKey = secretKey
+    }
+    
+    /**
+     Generate a new random keypair.
+     ```
+     let keyRandom = KeyPair.fromRandom()
+     keyRandom.publicKey
+     - Returns: publicKey
+     ```
+     ```
+     let keyRandom = KeyPair.fromRandom()
+     keyRandom.secretKey
+     - Returns: secretKey
+     ```
+     */
+    public static func fromRandom() throws -> Self {
+        let newKeyPair = try NaclSign.KeyPair.keyPair()
+        return try KeyPairEd25519(secretKey: newKeyPair.secretKey.baseEncoded)
+    }
+    
+    /**
+     Generate new keypair from seed.
+     */
+    public static func fromSeed(seed: Data) throws -> Self {
+        let newKeyPair = try NaclSign.KeyPair.keyPair(fromSeed: seed)
+        return try KeyPairEd25519(secretKey: newKeyPair.secretKey.baseEncoded)
+    }
+}
+
+extension KeyPairEd25519: KeyPair {
+    public func sign(message: [UInt8]) throws -> SignatureProtocol {
+        let signature = try NaclSign.signDetached(message: message.data, secretKey: secretKey.baseDecoded.data)
+        return Signature(signature: signature.bytes, publicKey: publicKey)
+    }
+    
+    public func verify(message: [UInt8], signature: [UInt8]) throws -> Bool {
+        return try NaclSign.signDetachedVerify(message: message.data, sig: signature.data, publicKey: publicKey.bytes().data)
+    }
+    
+    public func toString() -> String {
+        return "ed25519:\(secretKey)"
+    }
+    
+    public func getPublicKey() -> PublicKey {
+        return publicKey
+    }
+    
+    func getSecretKey() -> String {
+        return secretKey
+    }
+    
+    public func bytes() throws -> [UInt8] {
+        try secretKey.bytes
+    }
+}
+
+public enum Secp256k1Error: Error {
+    case badContext(String)
+    case invalidPrivateKey(String)
+    case invalidPublicKey(String)
+    case invalidSignature(String)
+    case signatureFailure(String)
+    case unknownError
+}
+
+/**
+ * This struct provides key pair functionality for secp256k1 curve:
+ * generating key pairs, encoding key pairs, signing and verifying.
+ */
+public struct KeyPairSecp256k1: Equatable {
+    private let publicKey: PublicKey
+    private let secretKey: String
+    
+    /**
+     * Construct an instance of key pair given a secret key.
+     * It's generally assumed that these are encoded in base58.
+     * - Parameter secretKey: SecretKey to be used for KeyPair
+     */
+    public init(secretKey: String) throws {
+        let privateKey = secretKey.baseDecoded.data
+        // this is largely based on the MIT Licensed implementation here — https://github.com/argentlabs/web3.swift/blob/04c10ec83861ee483efabb72850d51573cfa2545/web3swift/src/Utils/KeyUtil.swift
+        
+        guard let context = secp256k1_context_create(UInt32(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY)) else {
+            throw Secp256k1Error.badContext("Unable to generate secp256k1 key, bad context")
+        }
+        
+        defer {
+            secp256k1_context_destroy(context)
+        }
+        
+        let privateKeyPointer = (privateKey as NSData).bytes.assumingMemoryBound(to: UInt8.self)
+        guard secp256k1_ec_seckey_verify(context, privateKeyPointer) == 1 else {
+            throw Secp256k1Error.invalidPrivateKey("Unable to generate secp256k1 key, invalid private key")
+        }
+        
+        let publicKeyPointer = UnsafeMutablePointer<secp256k1_pubkey>.allocate(capacity: 1)
+        defer {
+            publicKeyPointer.deallocate()
+        }
+        
+        guard secp256k1_ec_pubkey_create(context, publicKeyPointer, privateKeyPointer) == 1 else {
+            throw Secp256k1Error.unknownError
+        }
+        
+        var publicKeyLength = 65
+        let outputPointer = UnsafeMutablePointer<UInt8>.allocate(capacity: publicKeyLength)
+        defer {
+            outputPointer.deallocate()
+        }
+        secp256k1_ec_pubkey_serialize(context, outputPointer, &publicKeyLength, publicKeyPointer, UInt32(SECP256K1_EC_UNCOMPRESSED))
+        
+        // drop the first byte of the data, it will always be 0x04 since we always use SECP256K1_EC_UNCOMPRESSED
+        let publicKey = Data(bytes: outputPointer, count: publicKeyLength).subdata(in: 1..<publicKeyLength)
+        
+        self.publicKey = PublicKey(keyType: .SECP256k1, data: publicKey.bytes)
+        self.secretKey = secretKey
+    }
+    
+    /**
+     Generate a new random keypair.
+     ```
+     let keyRandom = KeyPair.fromRandom()
+     keyRandom.publicKey
+     - Returns: publicKey
+     ```
+     ```
+     let keyRandom = KeyPair.fromRandom()
+     keyRandom.secretKey
+     - Returns: secretKey
+     ```
+     */
+    public static func fromRandom() throws -> Self {
+        let newKeyPair = try NaclSign.KeyPair.keyPair()
+        return try KeyPairSecp256k1(secretKey: newKeyPair.secretKey.baseEncoded)
+    }
+}
+
+extension KeyPairSecp256k1: KeyPair {
+    public func bytes() throws -> [UInt8] {
+        try secretKey.bytes
+    }
+    
+    public func sign(message: [UInt8]) throws -> SignatureProtocol {
+        // this is largely based on the MIT Licensed implementation here — https://github.com/argentlabs/web3.swift/blob/04c10ec83861ee483efabb72850d51573cfa2545/web3swift/src/Utils/KeyUtil.swift
+        guard let context = secp256k1_context_create(UInt32(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY)) else {
+            throw Secp256k1Error.badContext("Unable to sign secp256k1 message, bad context")
+        }
+        
+        defer {
+            secp256k1_context_destroy(context)
+        }
+        
+        let messagePointer = (message.data as NSData).bytes.assumingMemoryBound(to: UInt8.self)
+        let privateKeyPointer = (secretKey.baseDecoded.data as NSData).bytes.assumingMemoryBound(to: UInt8.self)
+        let signaturePointer = UnsafeMutablePointer<secp256k1_ecdsa_recoverable_signature>.allocate(capacity: 1)
+        defer {
+            signaturePointer.deallocate()
+        }
+        guard secp256k1_ecdsa_sign_recoverable(context, signaturePointer, messagePointer, privateKeyPointer, nil, nil) == 1 else {
+            throw Secp256k1Error.signatureFailure("Failed to sign message: recoverable ECDSA signature creation failed.")
+        }
+        
+        let outputPointer = UnsafeMutablePointer<UInt8>.allocate(capacity: 64)
+        defer {
+            outputPointer.deallocate()
+        }
+        var recid: Int32 = 0
+        secp256k1_ecdsa_recoverable_signature_serialize_compact(context, outputPointer, &recid, signaturePointer)
+        
+        let outputWithRecidPointer = UnsafeMutablePointer<UInt8>.allocate(capacity: 65)
+        defer {
+            outputWithRecidPointer.deallocate()
+        }
+        outputWithRecidPointer.assign(from: outputPointer, count: 64)
+        outputWithRecidPointer.advanced(by: 64).pointee = UInt8(recid)
+        
+        let signature = Data(bytes: outputWithRecidPointer, count: 65)
+        
+        return Signature(signature: signature.bytes, publicKey: publicKey)
+    }
+    
+    public func verify(message: [UInt8], signature: [UInt8]) throws -> Bool {
+        guard let context = secp256k1_context_create(UInt32(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY)) else {
+            throw Secp256k1Error.badContext("Unable to verify secp256k1 message, bad context")
+        }
+        
+        defer {
+            secp256k1_context_destroy(context)
+        }
+        let messagePointer = (message.data as NSData).bytes.assumingMemoryBound(to: UInt8.self)
+        let signaturePointer = (signature.data as NSData).bytes.assumingMemoryBound(to: UInt8.self)
+        
+        let publicKeyPointer = UnsafeMutablePointer<secp256k1_pubkey>.allocate(capacity: 1)
+        defer {
+            publicKeyPointer.deallocate()
+        }
+        let publicKeyBytes = publicKey.bytes()
+        guard secp256k1_ec_pubkey_parse(context, publicKeyPointer, publicKeyBytes, publicKeyBytes.count) == 1 else {
+            throw Secp256k1Error.invalidPublicKey("Unable to verify secp256k1 message, invalid public key")
+        }
+        var signatureOutput = secp256k1_ecdsa_signature()
+        guard secp256k1_ecdsa_signature_parse_compact(context, &signatureOutput, signaturePointer) == 1 else {
+            throw Secp256k1Error.invalidSignature("Unable to verify secp256k1 message, invalid signature")
+        }
+        
+        return secp256k1_ecdsa_verify(context, &signatureOutput, messagePointer, publicKeyPointer) != 0
+    }
+    
+    public func toString() -> String {
+        return "secp256k1:\(secretKey)"
+    }
+    
+    public func getPublicKey() -> PublicKey {
+        return publicKey
+    }
+    
+    func getSecretKey() -> String {
+        return secretKey
+    }
+}
+
+'''
+'''--- Sources/NearSwift/Utils/Network.swift ---
+//
+//  Network.swift
+//  nearclientios
+//
+//  Created by Dmitry Kurochka on 10/30/19.
+//  Copyright © 2019 NEAR Protocol. All rights reserved.
+//
+
+import Foundation
+
+public protocol NetworkProtocol {
+  var name: String {get}
+  var chainId: String {get}
+  var _defaultProvider: ((_ providers: Any) -> Any)? {get}
+}
+
+public struct Network: NetworkProtocol {
+  public let name: String
+  public let chainId: String
+  public var _defaultProvider: ((_ providers: Any) -> Any)?
+}
+
+'''
+'''--- Sources/NearSwift/Utils/SHA256.swift ---
+//
+//  SHA256.swift
+//  nearclientios
+//
+//  Created by Dmitry Kurochka on 10/30/19.
+//  Copyright © 2019 NEAR Protocol. All rights reserved.
+//
+
+import Foundation
+import CommonCrypto
+
+public extension Collection where Element == UInt8 {
+  var digest: [UInt8] {
+    var result = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+    data.withUnsafeBytes {
+        _ = CC_SHA256($0.baseAddress, CC_LONG(count), &result)
+    }
+    return result
+  }
+}
+
+'''
+'''--- Sources/NearSwift/Utils/Serialize.swift ---
+//
+//  Serialize.swift
+//  nearclientios
+//
+//  Created by Dmitry Kurochka on 10/30/19.
+//  Copyright © 2019 NEAR Protocol. All rights reserved.
+//
+
+import Foundation
+import Base58Swift
+
+public extension String {
+  var baseDecoded: [UInt8] {
+    return Base58.base58Decode(self) ?? []
+  }
+}
+
+public extension Data {
+  var baseEncoded: String {
+    return Base58.base58Encode(bytes)
+  }
+
+  var bytes: [UInt8] {
+    return [UInt8](self)
+  }
+}
+
+public extension Data {
+  var hexString: String {
+      return map { String(format: "%02x", UInt8($0)) }.joined()
+  }
+}
+
+public extension Data {
+  var json: [String: Any]? {
+    return try? toDictionary()
+  }
+
+  init(json: [String: Any]) {
+    let data = try? json.toData()
+    self.init(bytes: data?.bytes ?? [], count: data?.bytes.count ?? 0)
+  }
+}
+
+public extension Sequence where Element == UInt8 {
+  var baseEncoded: String {
+    return data.baseEncoded
+  }
+
+  var data: Data {
+    return Data(self)
+  }
+}
+
+public struct CastingError: Error {
+  let fromType: Any.Type
+  let toType: Any.Type
+  init<FromType, ToType>(fromType: FromType.Type, toType: ToType.Type) {
+    self.fromType = fromType
+    self.toType = toType
+  }
+}
+
+extension CastingError: LocalizedError {
+  var localizedDescription: String { return "Can not cast from \(fromType) to \(toType)" }
+}
+
+extension CastingError: CustomStringConvertible { public var description: String { return localizedDescription } }
+
+public extension Data {
+  func toDictionary(options: JSONSerialization.ReadingOptions = []) throws -> [String: Any] {
+    return try to(type: [String: Any].self, options: options)
+  }
+
+  func to<T>(type: T.Type, options: JSONSerialization.ReadingOptions = []) throws -> T {
+    guard let result = try JSONSerialization.jsonObject(with: self, options: options) as? T else {
+      throw CastingError(fromType: type, toType: T.self)
+    }
+    return result
+  }
+}
+
+public extension String {
+  func asJSON<T>(to type: T.Type, using encoding: String.Encoding = .utf8) throws -> T {
+    guard let data = data(using: encoding) else { throw CastingError(fromType: type, toType: T.self) }
+    return try data.to(type: T.self)
+  }
+
+  func asJSONToDictionary(using encoding: String.Encoding = .utf8) throws -> [String: Any] {
+    return try asJSON(to: [String: Any].self, using: encoding)
+  }
+}
+
+internal extension Dictionary {
+  func toData(options: JSONSerialization.WritingOptions = []) throws -> Data {
+    return try JSONSerialization.data(withJSONObject: self, options: options)
+  }
+}
+
+'''
+'''--- Sources/NearSwift/Utils/URL+Params.swift ---
+//
+//  URL+Params.swift
+//  nearclientios
+//
+//  Created by Dmytro Kurochka on 10.12.2019.
+//
+
+import Foundation
+
+public extension URL {
+  var queryParameters: [String: String]? {
+    guard let components = URLComponents(url: self, resolvingAgainstBaseURL: true),
+      let queryItems = components.queryItems else { return nil }
+    return queryItems.reduce(into: [String: String]()) { result, item in
+      result[item.name] = item.value
+    }
+  }
+}
+
+'''
+'''--- Sources/NearSwift/Utils/Web.swift ---
+//
+//  Web.swift
+//  nearclientios
+//
+//  Created by Dmitry Kurochka on 10/30/19.
+//  Copyright © 2019 NEAR Protocol. All rights reserved.
+//
+
+import Foundation
+
+public struct ConnectionInfo {
+    let url: URL
+    let user: String? = nil
+    let password: String? = nil
+    let allowInsecure: Bool? = nil
+    let timeout: TimeInterval? = nil
+    let headers: [String: Any]? = nil
+}
+
+enum HTTPError: Error {
+    case unknown
+    case error(status: Int, message: String?)
+}
+
+private func fetch(url: URL, params: [String: Any]?) async throws-> Any {
+    let session = URLSession.shared
+    var request = URLRequest(url: url)
+    request.httpMethod = params.flatMap {_ in "POST"} ?? "GET"
+    request.addValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = params.flatMap { try? $0.toData() }
+    return try await withCheckedThrowingContinuation({ (continuation: CheckedContinuation<Any, Error>) in
+        let task = session.dataTask(with: request) { data, response, error in
+            if let error = error { return continuation.resume(throwing: error) }
+            let result = data.flatMap {try? $0.toDictionary()}
+            if let json = result?["result"] {
+                continuation.resume(returning: json)
+            } else if let httpResponse = response as? HTTPURLResponse {
+                let json: Data = (try? JSONSerialization.data(withJSONObject: result, options: [.fragmentsAllowed])) ?? .init()
+                debugPrint("=====================")
+                print(String(decoding: json, as: UTF8.self))
+                debugPrint("=====================")
+                let error = HTTPError.error(status: httpResponse.statusCode,
+                                            message: data.flatMap({ String(data: $0, encoding: .utf8) }))
+                continuation.resume(throwing: error)
+            } else {
+                continuation.resume(throwing: HTTPError.unknown)
+            }
+        }
+        task.resume()
+    })
+}
+
+public func fetchJson(connection: ConnectionInfo, json: [String: Any]?) async throws -> Any {
+    let url = connection.url
+    return try await fetch(url: url, params: json)
+}
+
+func fetchJson(url: URL, json: [String: Any]?) async throws -> Any {
+    return try await fetch(url: url, params: json)
+}
+
+'''
+'''--- Sources/NearSwift/WalletAccount.swift ---
+//
+//  WalletAccount.swift
+//  nearclientios
+//
+//  Created by Dmitry Kurochka on 10/30/19.
+//  Copyright © 2019 NEAR Protocol. All rights reserved.
+//
+
+import Foundation
+import UIKit
+
+public let APP_SCHEME = "x-nearclientios"
+
+let LOGIN_WALLET_URL_SUFFIX = "/login/"
+
+let LOCAL_STORAGE_KEY_SUFFIX = "_wallet_auth_key"
+
+/// storage key for a pending access key (i.e. key has been generated but we are not sure it was added yet)
+let PENDING_ACCESS_KEY_PREFIX = "pending_key"
+
+public protocol AuthDataProtocol {
+    var accountId: String? {get}
+}
+
+public struct AuthData: AuthDataProtocol {
+    public let accountId: String?
+}
+
+public enum WalletAccountError: Error {
+    case noKeyStore
+    case noKeyPair
+    case noRegisteredURLSchemes
+    case successUrlWrongScheme
+    case failureUrlWrongScheme
+    case callbackUrlParamsNotValid
+}
+
+public protocol WalletStorage: AnyObject {
+    func get(for key: String) async throws -> String?
+    func set(_ value: String?, for key: String) async throws
+}
+
+public let WALLET_STORAGE_SERVICE = "nearlib.wallet"
+
+public protocol ExternalAuthService {
+    func openURL(_ url: URL, presentingViewController: UIViewController) -> Bool
+}
+
+public actor WalletAccount {
+    private let _walletBaseUrl: String
+    private let _authDataKey: String
+    private let _keyStore: KeyStore
+    private var _authData: AuthDataProtocol
+    private let _networkId: String
+    private let storage: WalletStorage
+    private let authService: ExternalAuthService
+    
+    public init(
+        near: Near,
+        authService: ExternalAuthService,
+        appKeyPrefix: String? = nil,
+        storage: WalletStorage
+    ) async throws {
+        let keyPrefix = appKeyPrefix ?? (near.config.contractName ?? "default")
+        let authDataKey = keyPrefix + LOCAL_STORAGE_KEY_SUFFIX
+        guard
+            let keyStore = (near.connection.signer as? InMemorySigner)?.keyStore
+        else {
+            throw WalletAccountError.noKeyStore
+        }
+        let value = try await storage.get(for: authDataKey)
+        let authData = AuthData(accountId: value)
+        _walletBaseUrl = near.config.walletUrl
+        _authDataKey = authDataKey
+        _keyStore = keyStore
+        _authData = authData
+        _networkId = near.config.networkId
+        self.storage = storage
+        self.authService = authService
+    }
+}
+
+extension WalletAccount {
+    /**
+     - Example:
+     walletAccount.isSignedIn()
+     - Returns: Returns true, if this WalletAccount is authorized with the wallet.
+     */
+    public func isSignedIn() -> Bool {
+        return _authData.accountId != nil
+    }
+    
+    /**
+     - Example:
+     walletAccount.getAccountId()
+     - Returns: Authorized Account ID.
+     */
+    public func getAccountId() -> String {
+        return _authData.accountId ?? ""
+    }
+    
+    /**
+     Redirects current page to the wallet authentication page.
+     - Parameters:
+     - contractId: contractId contract ID of the application
+     - accountId: title name of the application
+     - networkId: successUrl url to redirect on success
+     - failureUrl: failureUrl url to redirect on failure
+     */
+    @discardableResult
+    public func requestSignIn(
+        contractId: String?,
+        title: String,
+        presentingViewController: UIViewController,
+        successUrl: URL = URL(string: APP_SCHEME + "://success")!,
+        failureUrl: URL = URL(string: APP_SCHEME + "://fail")!,
+        appUrl: URL = URL(string: APP_SCHEME + "://")!,
+        curve: KeyType = .ED25519
+    ) async throws -> Bool {
+        guard getAccountId().isEmpty else {return true}
+        guard try await _keyStore.getKey(networkId: _networkId, accountId: getAccountId()) == nil else {return true}
+        
+        var newUrlComponents = URLComponents(string: _walletBaseUrl + LOGIN_WALLET_URL_SUFFIX)
+        let title = URLQueryItem(name: "referrer", value: title)
+        let contract_id = URLQueryItem(name: "contract_id", value: contractId)
+        let success_url = URLQueryItem(name: "success_url", value: successUrl.absoluteString)
+        let failure_url = URLQueryItem(name: "failure_url", value: failureUrl.absoluteString)
+        let app_url = URLQueryItem(name: "app_url", value: appUrl.absoluteString)
+        let accessKey = try keyPairFromRandom(curve: curve)
+        let public_key = URLQueryItem(name: "public_key", value: accessKey.getPublicKey().toString())
+        
+        newUrlComponents?.queryItems = [title, contract_id, success_url, failure_url, app_url, public_key]
+        let accountId = PENDING_ACCESS_KEY_PREFIX + accessKey.getPublicKey().toString()
+        try await _keyStore.setKey(networkId: _networkId, accountId: accountId, keyPair: accessKey)
+        if let openUrl = newUrlComponents?.url {
+            return await MainActor.run {
+                authService.openURL(openUrl, presentingViewController: presentingViewController)
+            }
+        }
+        return false
+    }
+    
+    /**
+     Complete sign in for a given account id and public key. To be invoked by the app when getting a callback from the wallet.
+     */
+    public func completeSignIn(url: URL) async throws -> Void {
+        guard let params = url.queryParameters else {throw WalletAccountError.callbackUrlParamsNotValid}
+        if let publicKey = params["public_key"], let accountId = params["account_id"] {
+            _authData = AuthData(accountId: accountId)
+            try await storage.set(accountId, for: _authDataKey)
+            try await _moveKeyFromTempToPermanent(accountId: accountId, publicKey: publicKey)
+        }
+    }
+    
+    private func _moveKeyFromTempToPermanent(accountId: String, publicKey: String) async throws -> Void {
+        let pendingAccountId = PENDING_ACCESS_KEY_PREFIX + publicKey
+        guard let keyPair = try await (_keyStore.getKey(networkId: _networkId,
+                                                        accountId: pendingAccountId)) else {throw WalletAccountError.noKeyPair}
+        try await _keyStore.setKey(networkId: _networkId, accountId: accountId, keyPair: keyPair)
+        try await _keyStore.removeKey(networkId: _networkId, accountId: PENDING_ACCESS_KEY_PREFIX + publicKey)
+    }
+    
+    /**
+     Sign out from the current account
+     */
+    public func signOut() {
+        _authData = AuthData(accountId: nil)
+        Task {
+            _ = try? await storage.set(nil, for: _authDataKey)
+        }
+    }
+}
+
+'''

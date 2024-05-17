@@ -1,0 +1,1053 @@
+*GitHub Repository "monocrowd/near-ft-transfer"*
+
+'''--- .gitpod.yml ---
+tasks:
+  - init: yarn
+    command: yarn dev
+ports:
+  - port: 1234
+    onOpen: open-browser
+
+'''
+'''--- README.md ---
+near-ft-transfer
+==================
+
+This [React] app was initialized with [create-near-app]
+
+Quick Start
+===========
+- dev
+   - dev-1637682800749-94703729978601
+- testnet
+   - ft.happybits.testnet
+
+- setup
+   - export ID=dev-1637682800749-94703729978601
+   - near call $ID new '{"owner_id": "'$ID'", "total_supply": "1000000000000000", "metadata": { "spec": "ft-1.0.0", "name": "MEME Token", "symbol": "MEME", "decimals": 8 }}' --accountId $ID
+   - near view $ID ft_metadata
+   - near view $ID ft_balance_of '{"account_id": "'$ID'"}'
+   - near call $ID storage_deposit '{}' --accountId $ID
+
+'''
+'''--- babel.config.js ---
+module.exports = {
+  presets: ['@babel/preset-env', '@babel/preset-react'],
+}
+
+'''
+'''--- contract/Cargo.toml ---
+[package]
+name = "nft"
+version = "0.1.0"
+authors = ["Near Inc <hello@near.org>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "3.1.0"
+near-contract-standards = "3.1.1"
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+# Opt into extra safety checks on arithmetic operations https://stackoverflow.com/a/64136471/249801
+overflow-checks = true
+
+[workspace]
+members = []
+
+'''
+'''--- contract/README.md ---
+near-ft-transfer Smart Contract
+==================
+
+A [smart contract] written in [Rust] for an app initialized with [create-near-app]
+
+Quick Start
+===========
+
+Before you compile this code, you will need to install Rust with [correct target]
+
+Exploring The Code
+==================
+
+1. The main smart contract code lives in `src/lib.rs`. You can compile it with
+   the `./compile` script.
+2. Tests: You can run smart contract tests with the `./test` script. This runs
+   standard Rust tests using [cargo] with a `--nocapture` flag so that you
+   can see any debug info you print to the console.
+
+  [smart contract]: https://docs.near.org/docs/develop/contracts/overview
+  [Rust]: https://www.rust-lang.org/
+  [create-near-app]: https://github.com/near/create-near-app
+  [correct target]: https://github.com/near/near-sdk-rs#pre-requisites
+  [cargo]: https://doc.rust-lang.org/book/ch01-03-hello-cargo.html
+
+'''
+'''--- contract/compile.js ---
+// This file does two things:
+//
+// 1. Compile the Rust contract using cargo (see buildCmd below). This will
+//    create a wasm file in the 'build' folder.
+// 2. Create a symbolic link (symlink) to the generated wasm file in the root
+//    project's `out` folder, for easy use with near-cli.
+//
+// First, import some helper libraries. `shelljs` is included in the
+// devDependencies of the root project, which is why it's available here. It
+// makes it easy to use *NIX-style scripting (which works on Linux distros,
+// macOS, and Unix systems) on Windows as well.
+const sh = require('shelljs')
+
+// Figure out which directory the user called this script from, which we'll use
+// later to set up the symlink.
+const calledFromDir = sh.pwd().toString()
+
+// For the duration of this script, we want to operate from within the
+// Rust project's folder. Let's change into that directory.
+sh.cd(__dirname)
+
+// You can call this script with `node compile.js` or `node compile.js
+// --debug`. Let's set a variable to track whether `--debug` was used.
+const debug = process.argv.pop() === '--debug'
+
+// You can call this script with `node compile.js` or `node compile.js --debug`.
+// Let's set a variable to track whether `--debug` was used.
+// Note: see other flags in ./cargo/config. Unfortunately, you cannot set the
+// `--target option` in Cargo.toml.
+const buildCmd = debug
+  ? 'cargo build --target wasm32-unknown-unknown'
+  : 'cargo build --target wasm32-unknown-unknown --release'
+
+// Execute the build command, storing exit code for later use
+const { code } = sh.exec(buildCmd)
+
+// Assuming this is compiled from the root project directory, link the compiled
+// contract to the `out` folder –
+// When running commands like `near deploy`, near-cli looks for a contract at
+// <CURRENT_DIRECTORY>/out/main.wasm
+if (code === 0 && calledFromDir !== __dirname) {
+  const linkDir = `${calledFromDir}/out`
+  const link = `${calledFromDir}/out/main.wasm`
+  const packageName = require('fs').readFileSync(`${__dirname}/Cargo.toml`).toString().match(/name = "([^"]+)"/)[1]
+  const outFile = `./target/wasm32-unknown-unknown/${debug ? 'debug' : 'release'}/${packageName}.wasm`
+  sh.mkdir('-p', linkDir)
+  sh.rm('-f', link)
+  //fixes #831: copy-update instead of linking .- sometimes sh.ln does not work on Windows
+  sh.cp('-u',outFile,link)
+}
+
+// exit script with the same code as the build command
+process.exit(code)
+
+'''
+'''--- contract/src/lib.rs ---
+/*!
+Fungible Token implementation with JSON serialization.
+NOTES:
+  - The maximum balance value is limited by U128 (2**128 - 1).
+  - JSON calls should pass U128 as a base-10 string. E.g. "100".
+  - The contract optimizes the inner trie structure by hashing account IDs. It will prevent some
+    abuse of deep tries. Shouldn't be an issue, once NEAR clients implement full hashing of keys.
+  - The contract tracks the change in storage before and after the call. If the storage increases,
+    the contract requires the caller of the contract to attach enough deposit to the function call
+    to cover the storage cost.
+    This is done to prevent a denial of service attack on the contract by taking all available storage.
+    If the storage decreases, the contract will issue a refund for the cost of the released storage.
+    The unused tokens from the attached deposit are also refunded, so it's safe to
+    attach more deposit than required.
+  - To prevent the deployed contract from being modified or deleted, it should not have any access
+    keys on its account.
+*/
+use near_contract_standards::fungible_token::metadata::{
+    FungibleTokenMetadata, FungibleTokenMetadataProvider, FT_METADATA_SPEC,
+};
+use near_contract_standards::fungible_token::FungibleToken;
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::LazyOption;
+use near_sdk::json_types::{ValidAccountId, U128};
+use near_sdk::{env, log, near_bindgen, AccountId, Balance, PanicOnDefault, PromiseOrValue};
+
+near_sdk::setup_alloc!();
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Contract {
+    owner_id: AccountId,
+    token: FungibleToken,
+    metadata: LazyOption<FungibleTokenMetadata>,
+}
+
+const DATA_IMAGE_SVG_NEAR_ICON: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 288 288'%3E%3Cg id='l' data-name='l'%3E%3Cpath d='M187.58,79.81l-30.1,44.69a3.2,3.2,0,0,0,4.75,4.2L191.86,103a1.2,1.2,0,0,1,2,.91v80.46a1.2,1.2,0,0,1-2.12.77L102.18,77.93A15.35,15.35,0,0,0,90.47,72.5H87.34A15.34,15.34,0,0,0,72,87.84V201.16A15.34,15.34,0,0,0,87.34,216.5h0a15.35,15.35,0,0,0,13.08-7.31l30.1-44.69a3.2,3.2,0,0,0-4.75-4.2L96.14,186a1.2,1.2,0,0,1-2-.91V104.61a1.2,1.2,0,0,1,2.12-.77l89.55,107.23a15.35,15.35,0,0,0,11.71,5.43h3.13A15.34,15.34,0,0,0,216,201.16V87.84A15.34,15.34,0,0,0,200.66,72.5h0A15.35,15.35,0,0,0,187.58,79.81Z'/%3E%3C/g%3E%3C/svg%3E";
+
+#[near_bindgen]
+impl Contract {
+    /// Initializes the contract with the given total supply owned by the given `owner_id` with
+    /// default metadata (for example purposes only).
+    #[init]
+    pub fn new_default_meta(owner_id: ValidAccountId, total_supply: U128) -> Self {
+        Self::new(
+            owner_id,
+            total_supply,
+            FungibleTokenMetadata {
+                spec: FT_METADATA_SPEC.to_string(),
+                name: "Example NEAR fungible token".to_string(),
+                symbol: "EXAMPLE".to_string(),
+                icon: Some(DATA_IMAGE_SVG_NEAR_ICON.to_string()),
+                reference: None,
+                reference_hash: None,
+                decimals: 24,
+            },
+        )
+    }
+
+    /// Initializes the contract with the given total supply owned by the given `owner_id` with
+    /// the given fungible token metadata.
+    #[init]
+    pub fn new(
+        owner_id: ValidAccountId,
+        total_supply: U128,
+        metadata: FungibleTokenMetadata,
+    ) -> Self {
+        assert!(!env::state_exists(), "Already initialized");
+        metadata.assert_valid();
+        let mut this = Self {
+            owner_id: owner_id.clone().into(),
+            token: FungibleToken::new(b"a".to_vec()),
+            metadata: LazyOption::new(b"m".to_vec(), Some(&metadata)),
+        };
+        this.token.internal_register_account(owner_id.as_ref());
+        this.token
+            .internal_deposit(owner_id.as_ref(), total_supply.into());
+        this
+    }
+
+    fn on_account_closed(&mut self, account_id: AccountId, balance: Balance) {
+        log!("Closed @{} with {}", account_id, balance);
+    }
+
+    fn on_tokens_burned(&mut self, account_id: AccountId, amount: Balance) {
+        log!("Account @{} burned {}", account_id, amount);
+    }
+
+    #[payable]
+    pub fn buy_tokens(&mut self, account_id: ValidAccountId) {
+        if self.token.accounts.get(account_id.as_ref()).is_none() {
+            // NOTE: if account already register, it will refunding the all the deposit!! and proceed
+            self.storage_deposit(Some(account_id.clone()), None);
+        }
+        self.token.internal_transfer(
+            &self.owner_id,
+            account_id.as_ref(),
+            100 * u128::pow(10, 8),
+            None,
+        );
+    }
+
+    #[payable]
+    pub fn send_tokens(&mut self, receiver_id: ValidAccountId, amount: U128) {
+        let sender = env::predecessor_account_id();
+
+        // NOTE: if account already register, it will refunding the all the deposit!! and proceed
+        self.storage_deposit(Some(receiver_id.clone()), None);
+
+        self.token
+            .internal_transfer(&sender, receiver_id.as_ref(), amount.into(), None);
+        //self.token.ft_transfer(receiver_id, amount, None)
+    }
+}
+
+near_contract_standards::impl_fungible_token_core!(Contract, token, on_tokens_burned);
+near_contract_standards::impl_fungible_token_storage!(Contract, token, on_account_closed);
+
+#[near_bindgen]
+impl FungibleTokenMetadataProvider for Contract {
+    fn ft_metadata(&self) -> FungibleTokenMetadata {
+        self.metadata.get().unwrap()
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::MockedBlockchain;
+    use near_sdk::{testing_env, Balance};
+
+    use super::*;
+
+    const TOTAL_SUPPLY: Balance = 1_000_000_000_000_000;
+
+    fn get_context(predecessor_account_id: ValidAccountId) -> VMContextBuilder {
+        let mut builder = VMContextBuilder::new();
+        builder
+            .current_account_id(accounts(0))
+            .signer_account_id(predecessor_account_id.clone())
+            .predecessor_account_id(predecessor_account_id);
+        builder
+    }
+
+    #[test]
+    fn test_new() {
+        let mut context = get_context(accounts(1));
+        testing_env!(context.build());
+        let contract = Contract::new_default_meta(accounts(1).into(), TOTAL_SUPPLY.into());
+        testing_env!(context.is_view(true).build());
+        assert_eq!(contract.ft_total_supply().0, TOTAL_SUPPLY);
+        assert_eq!(contract.ft_balance_of(accounts(1)).0, TOTAL_SUPPLY);
+    }
+
+    #[test]
+    #[should_panic(expected = "The contract is not initialized")]
+    fn test_default() {
+        let context = get_context(accounts(1));
+        testing_env!(context.build());
+        let _contract = Contract::default();
+    }
+
+    #[test]
+    fn test_transfer() {
+        let mut context = get_context(accounts(2));
+        testing_env!(context.build());
+        let mut contract = Contract::new_default_meta(accounts(2).into(), TOTAL_SUPPLY.into());
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .attached_deposit(contract.storage_balance_bounds().min.into())
+            .predecessor_account_id(accounts(1))
+            .build());
+        // Paying for account registration, aka storage deposit
+        contract.storage_deposit(None, None);
+
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .attached_deposit(1)
+            .predecessor_account_id(accounts(2))
+            .build());
+        let transfer_amount = TOTAL_SUPPLY / 3;
+        contract.ft_transfer(accounts(1), transfer_amount.into(), None);
+
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .account_balance(env::account_balance())
+            .is_view(true)
+            .attached_deposit(0)
+            .build());
+        assert_eq!(
+            contract.ft_balance_of(accounts(2)).0,
+            (TOTAL_SUPPLY - transfer_amount)
+        );
+        assert_eq!(contract.ft_balance_of(accounts(1)).0, transfer_amount);
+    }
+}
+
+'''
+'''--- package.json ---
+{
+  "name": "near-ft-transfer",
+  "version": "0.1.0",
+  "license": "UNLICENSED",
+  "scripts": {
+    "build": "npm run build:contract && npm run build:web",
+    "build:contract": "node contract/compile.js",
+    "build:contract:debug": "node contract/compile.js --debug",
+    "build:web": "parcel build src/index.html --public-url ./",
+    "dev:deploy:contract": "near dev-deploy",
+    "deploy:contract": "near deploy",
+    "deploy:pages": "gh-pages -d dist/",
+    "deploy": "npm run build && npm run deploy:contract && npm run deploy:pages",
+    "prestart": "npm run build:contract:debug && npm run dev:deploy:contract",
+    "start": "echo The app is starting! It will automatically open in your browser when ready && env-cmd -f ./neardev/dev-account.env parcel src/index.html --open",
+    "dev": "nodemon --watch contract/src -e rs --exec \"npm run start\"",
+    "test": "npm run build:contract:debug && cd contract && cargo test -- --nocapture && cd .. && jest test --runInBand"
+  },
+  "devDependencies": {
+    "@babel/core": "~7.14.0",
+    "@babel/preset-env": "~7.14.0",
+    "@babel/preset-react": "~7.13.13",
+    "babel-jest": "~26.6.2",
+    "env-cmd": "~10.1.0",
+    "gh-pages": "~3.1.0",
+    "jest": "~26.6.2",
+    "jest-environment-node": "~26.6.2",
+    "near-cli": "~2.1.1",
+    "nodemon": "~2.0.3",
+    "parcel-bundler": "~1.12.4",
+    "react-test-renderer": "~17.0.1",
+    "shelljs": "~0.8.4"
+  },
+  "dependencies": {
+    "big.js": "^6.1.1",
+    "near-api-js": "~0.43.1",
+    "react": "~17.0.1",
+    "react-dom": "~17.0.1",
+    "regenerator-runtime": "~0.13.5"
+  },
+  "resolutions": {
+    "@babel/preset-env": "7.13.8"
+  },
+  "jest": {
+    "moduleNameMapper": {
+      "\\.(jpg|ico|jpeg|png|gif|eot|otf|webp|svg|ttf|woff|woff2|mp4|webm|wav|mp3|m4a|aac|oga)$": "<rootDir>/src/__mocks__/fileMock.js",
+      "\\.(css|less)$": "<rootDir>/src/__mocks__/fileMock.js"
+    },
+    "setupFiles": [
+      "<rootDir>/src/jest.init.js"
+    ],
+    "testEnvironment": "near-cli/test_environment",
+    "testPathIgnorePatterns": [
+      "<rootDir>/contract/",
+      "<rootDir>/node_modules/"
+    ]
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  }
+}
+
+'''
+'''--- src/App.js ---
+import 'regenerator-runtime/runtime'
+import React from 'react'
+import { login, logout } from './utils'
+import './global.css'
+import Big from 'big.js';
+import { transactions } from "near-api-js";
+
+const BOATLOAD_OF_GAS = Big(3).times(10 ** 13).toFixed();
+const ONE_YOCTO_NEAR = "1";
+const ONE_NEAR = Big(1).times(10 ** 24).toFixed();
+
+import getConfig from './config'
+const { networkId, contractName } = getConfig(process.env.NODE_ENV || 'development')
+
+export default function App() {
+  const [balance, set_balance] = React.useState()
+
+  // when the user has not yet interacted with the form, disable the button
+  const [buttonDisabled, setButtonDisabled] = React.useState(false)
+
+  // The useEffect hook can be used to fire side-effects during render
+  // Learn more: https://reactjs.org/docs/hooks-intro.html
+  React.useEffect(
+    () => {
+      // in this case, we only care to query the contract when signed in
+      if (window.walletConnection.isSignedIn()) {
+
+        // window.contract is set by initContract in index.js
+        window.contract.ft_balance_of({ account_id: window.accountId })
+          .then(val => {
+            val = val / 10 ** 8
+            set_balance(val)
+          })
+      }
+    },
+
+    // The second argument to useEffect tells React when to re-run the effect
+    // Use an empty array to specify "only run on first render"
+    // This works because signing into NEAR Wallet reloads the page
+    []
+  )
+
+  // if not signed in, return early with sign-in prompt
+  if (!window.walletConnection.isSignedIn()) {
+    return (
+      <main>
+        <h1>Welcome to NEARVEMBER Challenge 6!</h1>
+        <p>
+          Go ahead and click the button below to try it out:
+        </p>
+        <p style={{ textAlign: 'center', marginTop: '2.5em' }}>
+          <button onClick={login}>Sign in</button>
+        </p>
+      </main>
+    )
+  }
+
+  return (
+    // use React Fragment, <>, to avoid wrapping elements in unnecessary divs
+    <>
+      <button className="link" style={{ float: 'right' }} onClick={logout}>
+        Sign out
+      </button>
+      <main>
+        <h1>
+          MEME Token balance of {window.accountId}
+          <br />
+          <label
+            htmlFor="balance"
+            style={{
+              color: 'var(--secondary)',
+              borderBottom: '2px solid var(--secondary)'
+            }}
+          >
+          {balance}
+          </label>
+        </h1>
+        <form onSubmit={async event => {
+          event.preventDefault()
+
+          // get elements from the form using their id attribute
+          const { buyForm } = event.target.elements
+
+          // disable the form while the value gets updated on-chain
+          buyForm.disabled = true
+
+          try {
+            // make an update call to the smart contract
+            await window.contract.buy_tokens(
+              {
+                account_id: window.accountId,
+              },
+              BOATLOAD_OF_GAS,
+              ONE_NEAR
+            )
+          } catch (e) {
+            alert(
+              'Something went wrong! ' +
+              'Maybe you need to sign out and back in? ' +
+              'Check your browser console for more info.'
+            )
+            throw e
+          } finally {
+            buyForm.disabled = false
+          }
+        }}>
+          <fieldset id="buyForm">
+            <div style={{ display: 'flex' }}>
+              <button
+                disabled={buttonDisabled}
+                style={{ borderRadius: '5px 5px 5px 5px', margin: 2 }}
+              >
+                Buy 100 MEME for 1 NEAR
+              </button>
+            </div>
+          </fieldset>
+        </form>
+
+        <form onSubmit={async event => {
+          event.preventDefault()
+
+          // get elements from the form using their id attribute
+          const { fieldset, toAccount, toAmount } = event.target.elements
+
+          const toAccountId = toAccount.value
+          const toAmountVal = toAmount.value
+
+          // disable the form while the value gets updated on-chain
+          fieldset.disabled = true
+
+          try {
+            // await window.walletConnection.account().signAndSendTransaction({
+            //   receiverId: contractName,
+            //   actions: [
+            //     transactions.functionCall(
+            //       "storage_deposit", Buffer.from(JSON.stringify({ account_id: toAccountId })), BOATLOAD_OF_GAS,   Big(0.00125).times(10 ** 24).toFixed()
+            //     ),
+            //     transactions.functionCall(
+            //       "ft_transfer",
+            //       Buffer.from(JSON.stringify({
+            //         receiver_id: toAccountId,
+            //         amount: toAmountVal
+            //       })),
+            //       BOATLOAD_OF_GAS,
+            //       ONE_YOCTO_NEAR,
+            //     ),
+            //   ],
+            // });
+
+            await window.contract.send_tokens(
+              {
+                receiver_id: toAccountId,
+                amount: Big(toAmountVal).times(10 ** 8).toFixed()
+              },
+              BOATLOAD_OF_GAS,
+              Big(0.00125).times(10 ** 24).add(ONE_YOCTO_NEAR).toFixed()
+            )
+          } catch (e) {
+            alert(
+              'Something went wrong! ' +
+              'Maybe you need to sign out and back in? ' +
+              'Check your browser console for more info.'
+            )
+            throw e
+          } finally {
+            // re-enable the form, whether the call succeeded or failed
+            fieldset.disabled = false
+          }
+        }}>
+          <fieldset id="fieldset">
+            <label
+              htmlFor="toAccount"
+              style={{
+                display: 'block',
+                color: 'var(--gray)',
+                marginBottom: '0.5em'
+              }}
+            >
+              Transfer MEME Token to
+            </label>
+            <div style={{ display: 'flex' }}>
+              <input
+                autoComplete="off"
+                defaultValue="testdev.testnet"
+                placeholder="your-friend.testnet"
+                id="toAccount"
+                required={true}
+                style={{ flex: 1, margin: 2 }}
+              />
+              <input
+                autoComplete="off"
+                defaultValue="10"
+                placeholder="Amount"
+                datatype="number"
+                id="toAmount"
+                required={true}
+                style={{ flex: 1, margin: 2 }}
+              />
+              <button
+                disabled={buttonDisabled}
+                style={{ borderRadius: '5px 5px 5px 5px', margin: 2 }}
+              >
+                Send
+              </button>
+            </div>
+          </fieldset>
+        </form>
+      </main>
+    </>
+  )
+}
+
+'''
+'''--- src/__mocks__/fileMock.js ---
+// NOTE: This is used to mock resource imports in JSX for tests
+module.exports = '' 
+
+'''
+'''--- src/assets/logo-black.svg ---
+<svg viewBox="0 0 288 288" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><linearGradient id="a" gradientUnits="userSpaceOnUse" x1="76.81" x2="211.16" y1="211.17" y2="76.81"><stop offset=".21" stop-color="#24272a"/><stop offset=".42" stop-color="#24272a" stop-opacity="0"/><stop offset=".59" stop-color="#24272a" stop-opacity="0"/><stop offset=".81" stop-color="#24272a"/></linearGradient><path d="m88.46 216a16.45 16.45 0 0 0 12.46-5.71l112.56-130.57a16.42 16.42 0 0 0 -13.94-7.72 16.46 16.46 0 0 0 -12.41 5.65l-113.13 129.8a16.46 16.46 0 0 0 14.46 8.55z" fill="url(#a)"/><path d="m88.46 216a16.46 16.46 0 0 0 7.54-1.83v-109l87.45 104.94a16.44 16.44 0 0 0 12.64 5.89h3.45a16.46 16.46 0 0 0 16.46-16.46v-111.08a16.46 16.46 0 0 0 -16.46-16.46 16.36 16.36 0 0 0 -7.54 1.81v109.05l-87.45-104.94a16.44 16.44 0 0 0 -12.64-5.92h-3.45a16.46 16.46 0 0 0 -16.46 16.46v111.08a16.46 16.46 0 0 0 16.46 16.46z" fill="#24272a"/></svg>
+'''
+'''--- src/assets/logo-white.svg ---
+<svg viewBox="0 0 288 288" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><linearGradient id="a" gradientUnits="userSpaceOnUse" x1="76.81" x2="211.16" y1="211.17" y2="76.81"><stop offset=".21" stop-color="#fff"/><stop offset=".42" stop-color="#fff" stop-opacity="0"/><stop offset=".59" stop-color="#fff" stop-opacity="0"/><stop offset=".81" stop-color="#fff"/></linearGradient><path d="m88.46 216a16.45 16.45 0 0 0 12.46-5.71l112.56-130.57a16.42 16.42 0 0 0 -13.94-7.72 16.46 16.46 0 0 0 -12.41 5.65l-113.13 129.8a16.46 16.46 0 0 0 14.46 8.55z" fill="url(#a)"/><path d="m88.46 216a16.46 16.46 0 0 0 7.54-1.83v-109l87.45 104.94a16.44 16.44 0 0 0 12.64 5.89h3.45a16.46 16.46 0 0 0 16.46-16.46v-111.08a16.46 16.46 0 0 0 -16.46-16.46 16.36 16.36 0 0 0 -7.54 1.81v109.05l-87.45-104.94a16.44 16.44 0 0 0 -12.64-5.92h-3.45a16.46 16.46 0 0 0 -16.46 16.46v111.08a16.46 16.46 0 0 0 16.46 16.46z" fill="#fff"/></svg>
+'''
+'''--- src/config.js ---
+const CONTRACT_NAME = process.env.CONTRACT_NAME || 'ft.happybits.testnet';
+
+function getConfig(env) {
+  switch (env) {
+
+  case 'production':
+  case 'mainnet':
+    return {
+      networkId: 'mainnet',
+      nodeUrl: 'https://rpc.mainnet.near.org',
+      contractName: CONTRACT_NAME,
+      walletUrl: 'https://wallet.near.org',
+      helperUrl: 'https://helper.mainnet.near.org',
+      explorerUrl: 'https://explorer.mainnet.near.org',
+    }
+  case 'development':
+  case 'testnet':
+    return {
+      networkId: 'testnet',
+      nodeUrl: 'https://rpc.testnet.near.org',
+      contractName: CONTRACT_NAME,
+      walletUrl: 'https://wallet.testnet.near.org',
+      helperUrl: 'https://helper.testnet.near.org',
+      explorerUrl: 'https://explorer.testnet.near.org',
+    }
+  case 'betanet':
+    return {
+      networkId: 'betanet',
+      nodeUrl: 'https://rpc.betanet.near.org',
+      contractName: CONTRACT_NAME,
+      walletUrl: 'https://wallet.betanet.near.org',
+      helperUrl: 'https://helper.betanet.near.org',
+      explorerUrl: 'https://explorer.betanet.near.org',
+    }
+  case 'local':
+    return {
+      networkId: 'local',
+      nodeUrl: 'http://localhost:3030',
+      keyPath: `${process.env.HOME}/.near/validator_key.json`,
+      walletUrl: 'http://localhost:4000/wallet',
+      contractName: CONTRACT_NAME,
+    }
+  case 'test':
+  case 'ci':
+    return {
+      networkId: 'shared-test',
+      nodeUrl: 'https://rpc.ci-testnet.near.org',
+      contractName: CONTRACT_NAME,
+      masterAccount: 'test.near',
+    }
+  case 'ci-betanet':
+    return {
+      networkId: 'shared-test-staging',
+      nodeUrl: 'https://rpc.ci-betanet.near.org',
+      contractName: CONTRACT_NAME,
+      masterAccount: 'test.near',
+    }
+  default:
+    throw Error(`Unconfigured environment '${env}'. Can be configured in src/config.js.`)
+  }
+}
+
+module.exports = getConfig
+'''
+'''--- src/global.css ---
+* {
+  box-sizing: border-box;
+}
+
+html {
+  --bg: #efefef;
+  --fg: #1e1e1e;
+  --gray: #555;
+  --light-gray: #ccc;
+  --shadow: #e6e6e6;
+  --success: rgb(90, 206, 132);
+  --primary: #FF585D;
+  --secondary: #0072CE;
+
+  background-color: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+  font-size: calc(0.9em + 0.5vw);
+  line-height: 1.3;
+}
+
+body {
+  margin: 0;
+  padding: 1em;
+}
+
+main {
+  margin: 0 auto;
+  max-width: 25em;
+}
+
+h1 {
+  background-image: url(assets/logo-black.svg);
+  background-position: center 1em;
+  background-repeat: no-repeat;
+  background-size: auto 1.5em;
+  margin-top: 0;
+  padding: 3.5em 0 0.5em;
+  text-align: center;
+}
+
+a,
+.link {
+  color: var(--primary);
+  text-decoration: none;
+}
+a:hover,
+a:focus,
+.link:hover,
+.link:focus {
+  text-decoration: underline;
+}
+a:active,
+.link:active {
+  color: var(--secondary);
+}
+
+button, input {
+  font: inherit;
+  outline: none;
+}
+
+button {
+  background-color: var(--secondary);
+  border-radius: 5px;
+  border: none;
+  color: #efefef;
+  cursor: pointer;
+  padding: 0.3em 0.75em;
+  transition: transform 30ms;
+}
+button:hover, button:focus {
+  box-shadow: 0 0 10em rgba(255, 255, 255, 0.2) inset;
+}
+button:active {
+  box-shadow: 0 0 10em rgba(0, 0, 0, 0.1) inset;
+}
+button.link {
+  background: none;
+  border: none;
+  box-shadow: none;
+  display: inline;
+}
+[disabled] button, button[disabled] {
+  box-shadow: none;
+  background-color: var(--light-gray);
+  color: gray;
+  cursor: not-allowed;
+  transform: none;
+}
+[disabled] button {
+  text-indent: -900em;
+  width: 2em;
+  position: relative;
+}
+[disabled] button:after {
+  content: " ";
+  display: block;
+  width: 0.8em;
+  height: 0.8em;
+  border-radius: 50%;
+  border: 2px solid #fff;
+  border-color: var(--fg) transparent var(--fg) transparent;
+  animation: loader 1.2s linear infinite;
+  position: absolute;
+  top: 0.45em;
+  right: 0.5em;
+}
+@keyframes loader {
+  0% { transform: rotate(0deg) }
+  100% { transform: rotate(360deg) }
+}
+
+fieldset {
+  border: none;
+  padding: 2em 0;
+}
+
+input {
+  background-color: var(--shadow);
+  border: none;
+  border-radius: 5px 0 0 5px;
+  caret-color: var(--primary);
+  color: inherit;
+  padding: 0.25em 1em;
+}
+input::selection {
+  background-color: var(--secondary);
+  color: #efefef;
+}
+input:focus {
+  box-shadow: 0 0 10em rgba(0, 0, 0, 0.02) inset;
+}
+
+code {
+  color: var(--gray);
+}
+
+li {
+  padding-bottom: 1em;
+}
+
+aside {
+  animation: notify ease-in-out 10s;
+  background-color: var(--shadow);
+  border-radius: 5px;
+  bottom: 0;
+  font-size: 0.8em;
+  margin: 1em;
+  padding: 1em;
+  position: fixed;
+  transform: translateY(10em);
+  right: 0;
+}
+aside footer {
+  display: flex;
+  font-size: 0.9em;
+  justify-content: space-between;
+  margin-top: 0.5em;
+}
+aside footer *:first-child {
+  color: var(--success);
+}
+aside footer *:last-child {
+  color: var(--gray);
+}
+@keyframes notify {
+  0% { transform: translateY(10em) }
+  5% { transform: translateY(0) }
+  95% { transform: translateY(0) }
+  100% { transform: translateY(10em) }
+}
+
+@media (prefers-color-scheme: dark) {
+  html {
+    --bg: #1e1e1e;
+    --fg: #efefef;
+    --gray: #aaa;
+    --shadow: #2a2a2a;
+    --light-gray: #444;
+  }
+  h1 {
+    background-image: url(assets/logo-white.svg);
+  }
+  input:focus {
+    box-shadow: 0 0 10em rgba(255, 255, 255, 0.02) inset;
+  }
+}
+
+'''
+'''--- src/index.html ---
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="./assets/favicon.ico" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="apple-touch-icon" href="./assets/favicon.ico" />
+    <title>Welcome to NEAR with React</title>
+  </head>
+  <body>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="root"></div>
+    <!--
+      This HTML file is a template.
+      If you open it directly in the browser, you will see an empty page.
+
+      You can add webfonts, meta tags, or analytics to this file.
+      The build step will place the bundled scripts into the <body> tag.
+
+      To begin the development, run `npm start` or `yarn start`.
+      To create a production bundle, use `npm run build` or `yarn build`.
+    -->
+    <script src="./index.js"></script>
+  </body>
+</html>
+
+'''
+'''--- src/index.js ---
+import React from 'react'
+import ReactDOM from 'react-dom'
+import App from './App'
+import { initContract } from './utils'
+
+window.nearInitPromise = initContract()
+  .then(() => {
+    ReactDOM.render(
+      <App />,
+      document.querySelector('#root')
+    )
+  })
+  .catch(console.error)
+
+'''
+'''--- src/jest.init.js ---
+import 'regenerator-runtime/runtime'
+
+'''
+'''--- src/main.test.js ---
+beforeAll(async function () {
+  // NOTE: nearlib and nearConfig are made available by near-cli/test_environment
+  const near = await nearlib.connect(nearConfig)
+  window.accountId = nearConfig.contractName
+  window.contract = await near.loadContract(nearConfig.contractName, {
+    viewMethods: ['ft_balance_of'],
+    changeMethods: [],
+    sender: window.accountId
+  })
+
+  window.walletConnection = {
+    requestSignIn() {
+    },
+    signOut() {
+    },
+    isSignedIn() {
+      return true
+    },
+    getAccountId() {
+      return window.accountId
+    }
+  }
+})
+
+test('ft_balance_of', async () => {
+  const balance = await window.contract.ft_balance_of({ account_id: window.accountId })
+  expect(balance).toEqual(0)
+})
+
+'''
+'''--- src/utils.js ---
+import { connect, Contract, keyStores, WalletConnection } from 'near-api-js'
+import getConfig from './config'
+
+const nearConfig = getConfig(process.env.NODE_ENV || 'development')
+
+// Initialize contract & set global variables
+export async function initContract() {
+  // Initialize connection to the NEAR testnet
+  const near = await connect(Object.assign({ deps: { keyStore: new keyStores.BrowserLocalStorageKeyStore() } }, nearConfig))
+
+  // Initializing Wallet based Account. It can work with NEAR testnet wallet that
+  // is hosted at https://wallet.testnet.near.org
+  window.walletConnection = new WalletConnection(near)
+
+  // Getting the Account ID. If still unauthorized, it's just empty string
+  window.accountId = window.walletConnection.getAccountId()
+
+  // Initializing our contract APIs by contract name and configuration
+  window.contract = await new Contract(window.walletConnection.account(), nearConfig.contractName, {
+    // View methods are read only. They don't modify the state, but usually return some value.
+    viewMethods: ['ft_balance_of'],
+    // Change methods can modify the state. But you don't receive the returned value when called.
+    changeMethods: ['ft_transfer', 'buy_tokens', 'send_tokens'],
+  })
+}
+
+export function logout() {
+  window.walletConnection.signOut()
+  // reload page
+  window.location.replace(window.location.origin + window.location.pathname)
+}
+
+export function login() {
+  // Allow the current app to make calls to the specified contract on the
+  // user's behalf.
+  // This works by creating a new access key for the user's account and storing
+  // the private key in localStorage.
+  window.walletConnection.requestSignIn(nearConfig.contractName)
+}
+
+'''
+'''--- src/wallet/login/index.html ---
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.2.1/css/bootstrap.min.css" integrity="sha384-GJzZqFGwb1QTTN6wy59ffF1BuGJpLSa9DkKMp0DgiMDm4iYMj70gZWKYbI706tWS" crossorigin="anonymous">
+</head>
+<body style="background: #fff; margin-top: 3em">
+  <div>For local account login, Please run the following command in NEAR CLI, then enter account id here.
+  </div>
+  <div>
+      <code id="shell-command"></code>
+  </div>
+  <input type="text" id="accountId" name="accountId" placeholder="Account id"></input>
+  <button type="button" onClick="done()">done</button>
+  <script>
+    const currentUrl = new URL(window.location.href);
+    const message = `NODE_ENV=local near create_account {newAccountId} --masterAccount {masterAccountId} --publicKey ${currentUrl.searchParams.get('public_key')} --initialAmount 10000000000000000000`;
+    document.getElementById('shell-command').innerText = message;
+
+    function done() {
+      const successUrl = new URL(currentUrl.searchParams.get('success_url'));
+      successUrl.searchParams.set('account_id', document.getElementById('accountId').value);
+      successUrl.searchParams.set('public_key', currentUrl.searchParams.get('public_key'));
+      window.location.assign(successUrl.toString());
+    }
+  </script>
+</body>
+</html>
+'''

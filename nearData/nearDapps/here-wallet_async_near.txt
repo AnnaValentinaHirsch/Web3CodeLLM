@@ -1,0 +1,1426 @@
+*GitHub Repository "here-wallet/async_near"*
+
+'''--- README.md ---
+<h1 align="center">
+Near async rpc client
+</h1><br>
+
+### JsonProvider
+
+Use JsonProvider to process api calls to NEAR rpc node
+
+`rpc_url` varies by network:
+
+- mainnet https://rpc.mainnet.near.org
+- testnet https://rpc.testnet.near.org
+- betanet https://rpc.betanet.near.org (may be unstable)
+- localnet http://localhost:3030
+
+```python
+from async_near.providers import JsonProvider
+jp = JsonProvider(rpc_url)
+
+res = jp.view_call(account_id, method_name, args, finality="optimistic")
+```
+
+### Signer
+
+Use Signer to sign or request to rpc node
+    
+```python
+from async_near.signer import Signer, KeyPair
+
+key = KeyPair(private_key) # create key pair (private-publish)
+
+signer = Signer(
+        signer_account_id,
+        key,
+    )
+
+signer.sign(message)
+```
+
+### Account
+
+Use Account to create and execute transactions
+    
+```python
+from async_near.signer import Signer, KeyPair
+from async_near.providers import JsonProvider
+from async_near.account import Account
+
+acc = Account(
+        JsonProvider("https://rpc.testnet.near.org"),
+        Signer(
+            "example.testnet",
+            KeyPair("ed25519:5sn12Kwd2TZn4A3...7979"),
+        ),
+    )
+
+await acc.startup()
+```
+
+Make contract calls
+
+```python
+
+btc_amount = (await acc.view_function("btc_contract_id", "available_btc", {})).result
+
+await acc.function_call(
+        "btc_contract_id",
+        "ft_transfer_call",
+        {"target_btc_address": "..."},
+    )
+```
+
+# License
+
+This repository is distributed under the terms of both the MIT license and the Apache License (Version 2.0). See LICENSE and LICENSE-APACHE for details.
+'''
+'''--- async_near/__init__.py ---
+import logging
+
+from async_near import providers
+from async_near import serializer
+from async_near import transactions
+from async_near import account
+from async_near import signer
+
+log = logging.getLogger(__name__)
+
+'''
+'''--- async_near/account.py ---
+import asyncio
+
+import base58
+import json
+import itertools
+
+from async_near import transactions
+from async_near.exceptions.execution import (
+    AccountAlreadyExistsError,
+    AccountDoesNotExistError,
+    CreateAccountNotAllowedError,
+    ActorNoPermissionError,
+    DeleteKeyDoesNotExistError,
+    AddKeyAlreadyExistsError,
+    DeleteAccountStakingError,
+    DeleteAccountHasRentError,
+    RentUnpaidError,
+    TriesToUnstakeError,
+    TriesToStakeError,
+    FunctionCallError,
+    NewReceiptValidationError,
+)
+from async_near.models import TransactionResult, ViewFunctionResult
+from async_near.signer import Signer
+from async_near.providers import JsonProvider
+
+DEFAULT_ATTACHED_GAS = 200000000000000
+
+_ERROR_TYPE_TO_EXCEPTION = {
+    "AccountAlreadyExists": AccountAlreadyExistsError,
+    "AccountDoesNotExist": AccountDoesNotExistError,
+    "CreateAccountNotAllowed": CreateAccountNotAllowedError,
+    "ActorNoPermission": ActorNoPermissionError,
+    "DeleteKeyDoesNotExist": DeleteKeyDoesNotExistError,
+    "AddKeyAlreadyExists": AddKeyAlreadyExistsError,
+    "DeleteAccountStaking": DeleteAccountStakingError,
+    "DeleteAccountHasRent": DeleteAccountHasRentError,
+    "RentUnpaid": RentUnpaidError,
+    "TriesToUnstake": TriesToUnstakeError,
+    "TriesToStake": TriesToStakeError,
+    "FunctionCallError": FunctionCallError,
+    "NewReceiptValidationError": NewReceiptValidationError,
+}
+
+class ViewFunctionError(Exception):
+    pass
+
+class Account(object):
+    _account: dict
+    _access_key: dict
+    _lock: asyncio.Lock
+
+    def __init__(self, provider: JsonProvider, signer: Signer):
+        self._provider = provider
+        self._signer = signer
+        self._account_id = signer.account_id
+
+    async def startup(self):
+        self._lock = asyncio.Lock()
+        self._account = await self._provider.get_account(self._account_id)
+        self._access_key = await self._provider.get_access_key(
+            self._account_id, self._signer.key_pair.encoded_public_key()
+        )
+
+    async def _sync_acc(self):
+        self._account = await self._provider.get_account(self._account_id)
+
+    async def _sign_and_submit_tx(self, receiver_id, actions) -> TransactionResult:
+        async with self._lock:
+            self._access_key["nonce"] += 1
+            block_hash = (await self._provider.get_status())["sync_info"][
+                "latest_block_hash"
+            ]
+            block_hash = base58.b58decode(block_hash.encode("utf8"))
+            serialzed_tx = transactions.sign_and_serialize_transaction(
+                receiver_id,
+                self._access_key["nonce"],
+                actions,
+                block_hash,
+                self._signer,
+            )
+            result = await self._provider.send_tx_and_wait(serialzed_tx)
+            if "Failure" in result["status"]:
+                error_type, args = list(
+                    result["status"]["Failure"]["ActionError"]["kind"].items()
+                )[0]
+                raise _ERROR_TYPE_TO_EXCEPTION[error_type](**args)
+            await self._sync_acc()
+        return TransactionResult(**result)
+
+    @property
+    def account_id(self):
+        return self._account_id
+
+    @property
+    def signer(self):
+        return self._signer
+
+    @property
+    def provider(self):
+        return self._provider
+
+    @property
+    def access_key(self):
+        return self._access_key
+
+    @property
+    def state(self):
+        return self._account
+
+    async def fetch_state(self):
+        """Fetch state for given account."""
+        self._account = await self.provider.get_account(self.account_id)
+
+    async def send_money(self, account_id, amount):
+        """Sends funds to given account_id given amount."""
+        return await self._sign_and_submit_tx(
+            account_id, [transactions.create_transfer_action(amount)]
+        )
+
+    async def function_call(
+        self, contract_id, method_name, args, gas=DEFAULT_ATTACHED_GAS, amount=0
+    ):
+        args = json.dumps(args).encode("utf8")
+        return await self._sign_and_submit_tx(
+            contract_id,
+            [transactions.create_function_call_action(method_name, args, gas, amount)],
+        )
+
+    async def create_account(self, account_id, public_key, initial_balance):
+        actions = [
+            transactions.create_create_account_action(),
+            transactions.create_full_access_key_action(public_key),
+            transactions.create_transfer_action(initial_balance),
+        ]
+        return await self._sign_and_submit_tx(account_id, actions)
+
+    async def deploy_contract(self, contract_code):
+        return await self._sign_and_submit_tx(
+            self._account_id,
+            [transactions.create_deploy_contract_action(contract_code)],
+        )
+
+    async def stake(self, public_key, amount):
+        return await self._sign_and_submit_tx(
+            self._account_id, [transactions.create_staking_action(public_key, amount)]
+        )
+
+    async def create_and_deploy_contract(
+        self, contract_id, public_key, contract_code, initial_balance
+    ):
+        actions = [
+            transactions.create_create_account_action(),
+            transactions.create_transfer_action(initial_balance),
+            transactions.create_deploy_contract_action(contract_code),
+        ] + (
+            [transactions.create_full_access_key_action(public_key)]
+            if public_key is not None
+            else []
+        )
+        return await self._sign_and_submit_tx(contract_id, actions)
+
+    async def create_deploy_and_init_contract(
+        self,
+        contract_id,
+        public_key,
+        contract_code,
+        initial_balance,
+        args,
+        gas=DEFAULT_ATTACHED_GAS,
+        init_method_name="new",
+    ):
+        args = json.dumps(args).encode("utf8")
+        actions = [
+            transactions.create_create_account_action(),
+            transactions.create_transfer_action(initial_balance),
+            transactions.create_deploy_contract_action(contract_code),
+            transactions.create_function_call_action(init_method_name, args, gas, 0),
+        ] + (
+            [transactions.create_full_access_key_action(public_key)]
+            if public_key is not None
+            else []
+        )
+        return await self._sign_and_submit_tx(contract_id, actions)
+
+    async def view_function(self, contract_id, method_name, args) -> ViewFunctionResult:
+        result = await self._provider.view_call(
+            contract_id, method_name, json.dumps(args).encode("utf8")
+        )
+        if "error" in result:
+            raise ViewFunctionError(result["error"])
+        result["result"] = json.loads("".join([chr(x) for x in result["result"]]))
+        return ViewFunctionResult(**result)
+
+'''
+'''--- async_near/exceptions/__init__.py ---
+
+'''
+'''--- async_near/exceptions/execution.py ---
+import json
+
+class RpcNotAvailableError(Exception):
+    pass
+
+class ActionErrorKind(Exception):
+    pass
+
+class AccountAlreadyExistsError(ActionErrorKind):
+    """
+    Happens when CreateAccount action tries to create an account with account_id which is already exists in the storage
+    """
+
+    pass
+
+class AccountDoesNotExistError(ActionErrorKind):
+    """
+    Happens when TX receiver_id doesn't exist (but action is not Action::CreateAccount)
+    """
+
+    pass
+
+class CreateAccountNotAllowedError(ActionErrorKind):
+    """
+    A newly created account must be under a namespace of the creator account
+    """
+
+    account_id: str
+    predecessor_id: str
+
+    def __init__(self, account_id, predecessor_id):
+        self.predecessor_id = predecessor_id
+        self.account_id = account_id
+
+class ActorNoPermissionError(ActionErrorKind):
+    """
+    Administrative actions like `DeployContract`, `Stake`, `AddKey`, `DeleteKey`.
+    can be proceed only if sender=receiver or the first TX action is a `CreateAccount` action
+    """
+
+    account_id: str
+    actor_id: str
+
+    def __init__(self, account_id, actor_id):
+        self.actor_id = actor_id
+        self.account_id = account_id
+
+class DeleteKeyDoesNotExistError(ActionErrorKind):
+    """
+    Account tries to remove an access key that doesn't exist
+    """
+
+    account_id: str
+    public_key: str
+
+    def __init__(self, account_id, public_key):
+        self.actor_id = public_key
+        self.account_id = account_id
+
+class AddKeyAlreadyExistsError(ActionErrorKind):
+    """
+    The public key is already used for an existing access key
+    """
+
+    account_id: str
+    public_key: str
+
+    def __init__(self, account_id, public_key):
+        self.actor_id = public_key
+        self.account_id = account_id
+
+class DeleteAccountStakingError(ActionErrorKind):
+    """
+    Account is staking and can not be deleted
+    """
+
+    account_id: str
+
+    def __init__(self, account_id):
+        self.account_id = account_id
+
+class DeleteAccountHasRentError(ActionErrorKind):
+    """
+    Foreign sender (sender=!receiver) can delete an account only if a target account hasn't enough tokens to pay rent
+    """
+
+    account_id: str
+    balance: str
+
+    def __init__(self, account_id, balance):
+        self.balance = balance
+        self.account_id = account_id
+
+class RentUnpaidError(ActionErrorKind):
+    """
+    ActionReceipt can't be completed, because the remaining balance will not be enough to pay rent.
+    """
+
+    account_id: str
+    amount: str
+
+    def __init__(self, account_id, amount):
+        self.amount = amount
+        self.account_id = account_id
+
+class TriesToUnstakeError(ActionErrorKind):
+    """
+    Account is not yet staked, but tries to unstake
+    """
+
+    account_id: str
+
+    def __init__(self, account_id):
+        self.account_id = account_id
+
+class TriesToStakeError(ActionErrorKind):
+    """
+    The account doesn't have enough balance to increase the stake.
+    """
+
+    account_id: str
+    stake: str
+    locked: str
+    balance: str
+
+    def __init__(self, account_id, stake, locked, balance):
+        self.account_id = account_id
+        self.stake = stake
+        self.locked = locked
+        self.balance = balance
+
+class FunctionCallError(ActionErrorKind):
+    """
+    An error occurred during a `FunctionCall` Action.
+    """
+
+    error: dict
+
+    def __init__(self, **kwargs):
+        super().__init__(json.dumps(kwargs))
+        self.error = kwargs
+
+class NewReceiptValidationError(ActionErrorKind):
+    """
+    Error occurs when a new `ActionReceipt` created by the `FunctionCall` action fails
+    """
+
+    pass
+
+'''
+'''--- async_near/exceptions/provider.py ---
+import json
+from typing import Optional
+
+class JsonProviderError(Exception):
+    pass
+
+class TransactionError(JsonProviderError):
+    pass
+
+class AccountError(JsonProviderError):
+    pass
+
+class BlockError(JsonProviderError):
+    pass
+
+class AccessKeyError(JsonProviderError):
+    pass
+
+class UnknownAccessKeyError(AccessKeyError):
+    """
+    The requested public_key has not been found while viewing since the
+    public key has not been created or has been already deleted
+    """
+
+    pass
+
+class UnknownBlockError(BlockError):
+    """
+    The requested block has not been produced yet or it has been
+    garbage-collected (cleaned up to save space on the RPC node)
+    """
+
+    pass
+
+class InternalError(TransactionError, AccountError, BlockError):
+    """
+    Something went wrong with the node itself or overloaded
+    """
+
+    pass
+
+class NoSyncedYetError(BlockError):
+    """
+    The node is still syncing and the requested block is not in the database yet
+    """
+
+    pass
+
+class InvalidAccount(AccountError):
+    """
+    The requested account_id is invalid
+    """
+
+    pass
+
+class UnknownAccount(AccountError):
+    """
+    The requested account_id has not been found while viewing since the
+    account has not been created or has been already deleted
+    """
+
+    pass
+
+class NoContractCodeError(AccountError):
+    """
+    The account does not have any contract deployed on it
+    """
+
+    pass
+
+class TooLargeContractStateError(AccountError):
+    """
+    The requested contract state is too large to be returned from this node
+    (the default limit is 50kb of state size)
+    """
+
+    pass
+
+class UnavailableShardError(AccountError):
+    """
+    The node was unable to find the requested data because it does not track the shard where data is present
+    """
+
+    pass
+
+class NoSyncedBlocksError(AccountError):
+    """
+    The node is still syncing and the requested block is not in the database yet
+    """
+
+    pass
+
+class InvalidTransactionError(TransactionError):
+    """
+    An error happened during transaction execution
+    """
+
+    pass
+
+class TxExecutionError(InvalidTransactionError):
+    def __init__(self, data):
+        if isinstance(data, str):
+            data = json.loads(data)
+        for key, value in data.items():
+            setattr(self, key, value)
+
+class InvalidTxError(TxExecutionError):
+    pass
+
+class ActionErrorKind(TxExecutionError):
+    pass
+
+class AccountAlreadyExists(ActionErrorKind):
+    account_id: str
+
+class AccountDoesNotExist(ActionErrorKind):
+    account_id: str
+
+class CreateAccountNotAllowed(ActionErrorKind):
+    account_id: str
+    predecessor_id: str
+
+class ActorNoPermission(ActionErrorKind):
+    account_id: str
+    actor_id: str
+
+class DeleteKeyDoesNotExist(ActionErrorKind):
+    account_id: str
+    public_key: str
+
+class AddKeyAlreadyExists(ActionErrorKind):
+    account_id: str
+    public_key: str
+
+class DeleteAccountStaking(ActionErrorKind):
+    account_id: str
+
+class DeleteAccountHasRent(ActionErrorKind):
+    account_id: str
+    balance: str
+
+class RentUnpaid(ActionErrorKind):
+    account_id: str
+    amount: str
+
+class TriesToUnstake(ActionErrorKind):
+    account_id: str
+
+class TriesToStake(ActionErrorKind):
+    account_id: str
+    stake: str
+    locked: str
+    balance: str
+
+class FunctionCallError(ActionErrorKind):
+    pass
+
+class NewReceiptValidationError(ActionErrorKind):
+    pass
+
+_ACTION_ERROR_KINDS = {
+    "AccountAlreadyExists": AccountAlreadyExists,
+    "ActorNoPermission": ActorNoPermission,
+    "CreateAccountNotAllowed": CreateAccountNotAllowed,
+    "AccountDoesNotExist": AccountDoesNotExist,
+    "DeleteKeyDoesNotExist": DeleteKeyDoesNotExist,
+    "DeleteAccountStaking": DeleteAccountStaking,
+    "AddKeyAlreadyExists": AddKeyAlreadyExists,
+    "DeleteAccountHasRent": DeleteAccountHasRent,
+    "RentUnpaid": RentUnpaid,
+    "TriesToUnstake": TriesToUnstake,
+    "TriesToStake": TriesToStake,
+    "FunctionCallError": FunctionCallError,
+    "ActionErrorKind": ActionErrorKind,
+}
+
+class ActionError(TxExecutionError):
+    index: Optional[int]
+    kind: ActionErrorKind
+
+    def __init__(self, data):
+        if isinstance(data, str):
+            data = json.loads(data)
+        self.index = data.get("index", None)
+        key, value = list(data["kind"].items())[0]
+        self.kind = _ACTION_ERROR_KINDS[key](value)
+
+class InvalidNonce(InvalidTxError):
+    tx_nonce: int
+    ak_nonce: int
+
+class InvalidAccessKeyError(InvalidTxError):
+    pass
+
+class InvalidSignerId(InvalidTxError):
+    signer_id: str
+
+class SignerDoesNotExist(InvalidTxError):
+    signer_id: str
+
+class InvalidReceiverId(InvalidTxError):
+    receiver_id: str
+
+class NotEnoughBalance(InvalidTxError):
+    signer_id: str
+    balance: str
+    cost: str
+
+class CostOverflow(InvalidTxError):
+    pass
+
+class InvalidChain(InvalidTxError):
+    pass
+
+class Expired(InvalidTxError):
+    pass
+
+class ActionsValidation(InvalidTxError):
+    pass
+
+class InvalidSignature(InvalidTxError):
+    pass
+
+class RpcTimeoutError(TransactionError):
+    """
+    Transaction was routed, but has not been recorded on chain in 10 seconds.
+    """
+
+    pass
+
+# import inspect
+# import sys
+# clsmembers = inspect.getmembers(sys.modules[__name__], inspect.isclass)
+# res = {}
+# for c in clsmembers:
+#     print(f"\"{c[0]}\": {c[0]},")
+
+ERROR_CODE_TO_EXCEPTION = {
+    "AccessKeyError": AccessKeyError,
+    "AccountAlreadyExists": AccountAlreadyExists,
+    "AccountDoesNotExist": AccountDoesNotExist,
+    "AccountError": AccountError,
+    "ActionError": ActionError,
+    "ActionErrorKind": ActionErrorKind,
+    "ActionsValidation": ActionsValidation,
+    "ActorNoPermission": ActorNoPermission,
+    "AddKeyAlreadyExists": AddKeyAlreadyExists,
+    "BlockError": BlockError,
+    "CostOverflow": CostOverflow,
+    "CreateAccountNotAllowed": CreateAccountNotAllowed,
+    "DeleteAccountHasRent": DeleteAccountHasRent,
+    "DeleteAccountStaking": DeleteAccountStaking,
+    "DeleteKeyDoesNotExist": DeleteKeyDoesNotExist,
+    "Expired": Expired,
+    "FunctionCallError": FunctionCallError,
+    "InternalError": InternalError,
+    "InvalidAccessKeyError": InvalidAccessKeyError,
+    "InvalidAccount": InvalidAccount,
+    "InvalidChain": InvalidChain,
+    "InvalidNonce": InvalidNonce,
+    "InvalidReceiverId": InvalidReceiverId,
+    "InvalidSignature": InvalidSignature,
+    "InvalidSignerId": InvalidSignerId,
+    "InvalidTransactionError": InvalidTransactionError,
+    "InvalidTxError": InvalidTxError,
+    "JsonProviderError": JsonProviderError,
+    "NewReceiptValidationError": NewReceiptValidationError,
+    "NoContractCodeError": NoContractCodeError,
+    "NoSyncedBlocksError": NoSyncedBlocksError,
+    "NoSyncedYetError": NoSyncedYetError,
+    "NotEnoughBalance": NotEnoughBalance,
+    "RentUnpaid": RentUnpaid,
+    "RpcTimeoutError": RpcTimeoutError,
+    "SignerDoesNotExist": SignerDoesNotExist,
+    "TooLargeContractStateError": TooLargeContractStateError,
+    "TransactionError": TransactionError,
+    "TriesToStake": TriesToStake,
+    "TriesToUnstake": TriesToUnstake,
+    "TxExecutionError": TxExecutionError,
+    "UnavailableShardError": UnavailableShardError,
+    "UnknownAccessKeyError": UnknownAccessKeyError,
+    "UnknownAccount": UnknownAccount,
+    "UnknownBlockError": UnknownBlockError,
+}
+
+'''
+'''--- async_near/models.py ---
+from typing import List, Any
+
+class ReceiptOutcome:
+    logs: List[str]
+    metadata: dict
+    receipt_ids: List[str]
+    status: dict
+    tokens_burnt: str
+    executor_id: str
+    gas_burnt: int
+
+    def __init__(self, data):
+        self.logs = data["outcome"]["logs"]
+        self.metadata = data["outcome"]["metadata"]
+        self.receipt_ids = data["outcome"]["receipt_ids"]
+        self.status = data["outcome"]["status"]
+        self.tokens_burnt = data["outcome"]["tokens_burnt"]
+        self.gas_burnt = data["outcome"]["gas_burnt"]
+
+class TransactionData:
+    hash: str
+    public_key: str
+    receiver_id: str
+    signature: str
+    signer_id: str
+    nonce: int
+    actions: List[dict]
+
+    def __init__(
+        self,
+        hash,
+        public_key,
+        receiver_id,
+        signature,
+        signer_id,
+        nonce,
+        actions,
+        **kargs,
+    ):
+        self.actions = actions
+        self.nonce = nonce
+        self.signer_id = signer_id
+        self.public_key = public_key
+        self.receiver_id = receiver_id
+        self.signature = signature
+        self.hash = hash
+
+class TransactionResult:
+    receipt_outcome: List[ReceiptOutcome]
+    transaction_outcome: ReceiptOutcome
+    status: dict
+    transaction: TransactionData
+
+    def __init__(self, receipts_outcome, transaction_outcome, transaction, status):
+        self.status = status
+        self.transaction = TransactionData(**transaction)
+        self.transaction_outcome = ReceiptOutcome(transaction_outcome)
+
+        self.receipt_outcome = []
+        for ro in receipts_outcome:
+            self.receipt_outcome.append(ReceiptOutcome(ro))
+
+    @property
+    def logs(self):
+        logs = self.transaction_outcome.logs
+        for ro in self.receipt_outcome:
+            logs.extend(ro.logs)
+        return logs
+
+class ViewFunctionResult:
+    block_hash: str
+    block_height: str
+    logs: List[str]
+    result: Any
+
+    def __init__(self, block_hash, block_height, logs, result):
+        self.block_hash = block_hash
+        self.block_height = block_height
+        self.logs = logs
+        self.result = result
+
+'''
+'''--- async_near/providers.py ---
+import asyncio
+
+import aiohttp
+import base64
+import json
+
+from aiohttp import ClientResponseError, ClientConnectorError
+
+from async_near.exceptions.execution import RpcNotAvailableError
+from async_near.exceptions.provider import (
+    UnknownBlockError,
+    InvalidAccount,
+    NoContractCodeError,
+    UnknownAccount,
+    TooLargeContractStateError,
+    UnavailableShardError,
+    NoSyncedBlocksError,
+    InternalError,
+    NoSyncedYetError,
+    InvalidTransactionError,
+    RpcTimeoutError,
+    UnknownAccessKeyError,
+    TxExecutionError,
+    ERROR_CODE_TO_EXCEPTION,
+)
+
+_ERROR_CODE_TO_EXCEPTION = {
+    "UNKNOWN_BLOCK": UnknownBlockError,
+    "INVALID_ACCOUNT": InvalidAccount,
+    "UNKNOWN_ACCOUNT": UnknownAccount,
+    "NO_CONTRACT_CODE": NoContractCodeError,
+    "TOO_LARGE_CONTRACT_STATE": TooLargeContractStateError,
+    "UNAVAILABLE_SHARD": UnavailableShardError,
+    "NO_SYNCED_BLOCKS": NoSyncedBlocksError,
+    "INTERNAL_ERROR": InternalError,
+    "NOT_SYNCED_YET": NoSyncedYetError,
+    "INVALID_TRANSACTION": InvalidTransactionError,
+    "TIMEOUT_ERROR": RpcTimeoutError,
+    "UNKNOWN_ACCESS_KEY": UnknownAccessKeyError,
+}
+
+class JsonProvider(object):
+
+    def __init__(self, rpc_addr):
+        if isinstance(rpc_addr, tuple):
+            self._rpc_addresses = ["http://{}:{}".format(*rpc_addr)]
+        elif isinstance(rpc_addr, list):
+            self._rpc_addresses = rpc_addr
+        else:
+            self._rpc_addresses = [rpc_addr]
+
+    async def json_rpc(self, method, params, timeout=60):
+        j = {"method": method, "params": params, "id": "dontcare", "jsonrpc": "2.0"}
+
+        content = None
+        for rpc_addr in self._rpc_addresses:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    r = await session.post(rpc_addr, json=j, timeout=timeout)
+                    r.raise_for_status()
+                    content = json.loads(await r.text())
+                if self._rpc_addresses[0] != rpc_addr:
+                    self._rpc_addresses.remove(rpc_addr)
+                    self._rpc_addresses.insert(0, rpc_addr)
+                    print("Switching RPC to %s" % rpc_addr)
+                break
+            except ClientResponseError:
+                continue
+            except ClientConnectorError:
+                continue
+            except ConnectionError:
+                continue
+
+        if not content:
+            raise RpcNotAvailableError("RPC not available")
+
+        if "error" in content:
+            error_code = content["error"].get("cause", {}).get("name", "")
+            body = content["error"]["data"]
+            error = _ERROR_CODE_TO_EXCEPTION.get(error_code, InternalError)(body)
+            while True:
+                if not isinstance(body, dict):
+                    break
+                key, body = list(body.items())[0]
+                if key in ERROR_CODE_TO_EXCEPTION:
+                    error = ERROR_CODE_TO_EXCEPTION[key](body)
+                else:
+                    break
+            raise error
+        return content["result"]
+
+    async def send_tx(self, signed_tx):
+        return await self.json_rpc(
+            "broadcast_tx_async", [base64.b64encode(signed_tx).decode("utf8")]
+        )
+
+    async def send_tx_and_wait(self, signed_tx, timeout=60):
+        return await self.json_rpc(
+            "broadcast_tx_commit",
+            [base64.b64encode(signed_tx).decode("utf8")],
+            timeout=timeout,
+        )
+
+    async def get_status(self):
+        async with aiohttp.ClientSession() as session:
+            r = await session.get("%s/status" % self._rpc_addresses[0], timeout=5)
+            r.raise_for_status()
+            return json.loads(await r.text())
+
+    async def get_validators(self):
+        return await self.json_rpc("validators", [None])
+
+    async def query(self, query_object):
+        return await self.json_rpc("query", query_object)
+
+    async def get_account(self, account_id, finality="optimistic"):
+        return await self.json_rpc(
+            "query",
+            {
+                "request_type": "view_account",
+                "account_id": account_id,
+                "finality": finality,
+            },
+        )
+
+    async def get_access_key_list(self, account_id, finality="optimistic"):
+        return await self.json_rpc(
+            "query",
+            {
+                "request_type": "view_access_key_list",
+                "account_id": account_id,
+                "finality": finality,
+            },
+        )
+
+    async def get_access_key(self, account_id, public_key, finality="optimistic"):
+        return await self.json_rpc(
+            "query",
+            {
+                "request_type": "view_access_key",
+                "account_id": account_id,
+                "public_key": public_key,
+                "finality": finality,
+            },
+        )
+
+    async def view_call(self, account_id, method_name, args, finality="optimistic"):
+        return await self.json_rpc(
+            "query",
+            {
+                "request_type": "call_function",
+                "account_id": account_id,
+                "method_name": method_name,
+                "args_base64": base64.b64encode(args).decode("utf8"),
+                "finality": finality,
+            },
+        )
+
+    async def get_block(self, block_id):
+        return await self.json_rpc("block", [block_id])
+
+    async def get_chunk(self, chunk_id):
+        return await self.json_rpc("chunk", [chunk_id])
+
+    async def get_tx(self, tx_hash, tx_recipient_id):
+        return await self.json_rpc("tx", [tx_hash, tx_recipient_id])
+
+    async def get_changes_in_block(self, changes_in_block_request):
+        return await self.json_rpc(
+            "EXPERIMENTAL_changes_in_block", changes_in_block_request
+        )
+
+    async def get_validators_ordered(self, block_hash):
+        return await self.json_rpc("EXPERIMENTAL_validators_ordered", [block_hash])
+
+    async def get_light_client_proof(
+        self, outcome_type, tx_or_receipt_id, sender_or_receiver_id, light_client_head
+    ):
+        if outcome_type == "receipt":
+            params = {
+                "type": "receipt",
+                "receipt_id": tx_or_receipt_id,
+                "receiver_id": sender_or_receiver_id,
+                "light_client_head": light_client_head,
+            }
+        else:
+            params = {
+                "type": "transaction",
+                "transaction_hash": tx_or_receipt_id,
+                "sender_id": sender_or_receiver_id,
+                "light_client_head": light_client_head,
+            }
+        return await self.json_rpc("light_client_proof", params)
+
+    async def get_next_light_client_block(self, last_block_hash):
+        return await self.json_rpc("next_light_client_block", [last_block_hash])
+
+'''
+'''--- async_near/serializer.py ---
+class BinarySerializer:
+    def __init__(self, schema):
+        self.array = bytearray()
+        self.schema = schema
+
+    def serialize_num(self, value, n_bytes):
+        orig_value = value
+        assert value >= 0, "Can't serialize negative numbers %d" % value
+        for i in range(n_bytes):
+            self.array.append(value & 255)
+            value //= 256
+        assert value == 0, "Value %d has more than %d bytes" % (orig_value, n_bytes)
+
+    def serialize_field(self, value, fieldType):
+        try:
+            if type(fieldType) == str:
+                if fieldType[0] == "u":
+                    self.serialize_num(value, int(fieldType[1:]) // 8)
+                elif fieldType == "string":
+                    b = value.encode("utf8")
+                    self.serialize_num(len(b), 4)
+                    self.array += b
+                else:
+                    assert False, fieldType
+            elif type(fieldType) == list:
+                assert len(fieldType) == 1
+                if type(fieldType[0]) == int:
+                    assert type(value) == bytes, "type(%s) = %s != bytes" % (
+                        value,
+                        type(value),
+                    )
+                    assert len(value) == fieldType[0], "len(%s) = %s != %s" % (
+                        value,
+                        len(value),
+                        fieldType[0],
+                    )
+                    self.array += bytearray(value)
+                else:
+                    self.serialize_num(len(value), 4)
+                    for el in value:
+                        self.serialize_field(el, fieldType[0])
+            elif type(fieldType) == dict:
+                assert fieldType["kind"] == "option"
+                if value is None:
+                    self.serialize_num(0, 1)
+                else:
+                    self.serialize_num(1, 1)
+                    self.serialize_field(value, fieldType["type"])
+            elif type(fieldType) == type:
+                assert type(value) == fieldType, "%s != type(%s)" % (fieldType, value)
+                self.serialize_struct(value)
+            else:
+                assert False, type(fieldType)
+        except:
+            print("Failed to serialize %s as %s" % (value, fieldType))
+            raise
+
+    def serialize_struct(self, obj):
+        structSchema = self.schema[type(obj)]
+        if structSchema["kind"] == "struct":
+            for fieldName, fieldType in structSchema["fields"]:
+                self.serialize_field(getattr(obj, fieldName), fieldType)
+        elif structSchema["kind"] == "enum":
+            name = getattr(obj, structSchema["field"])
+            for idx, (fieldName, fieldType) in enumerate(structSchema["values"]):
+                if fieldName == name:
+                    self.serialize_num(idx, 1)
+                    self.serialize_field(getattr(obj, fieldName), fieldType)
+                    break
+        else:
+            assert False, structSchema
+
+    def serialize(self, obj):
+        self.serialize_struct(obj)
+        return bytes(self.array)
+
+'''
+'''--- async_near/signer.py ---
+import json
+
+import base58
+import ed25519
+
+class KeyPair(object):
+    def __init__(self, secret_key):
+        secret_key = secret_key.split(":")[1] if ":" in secret_key else secret_key
+        self._secret_key = ed25519.SigningKey(base58.b58decode(secret_key))
+        self._public_key = self._secret_key.get_verifying_key()
+
+    @property
+    def public_key(self):
+        return self._public_key.to_bytes()
+
+    def encoded_public_key(self):
+        return base58.b58encode(self._public_key.to_bytes()).decode("utf-8")
+
+    def sign(self, message):
+        return self._secret_key.sign(message)
+
+class Signer(object):
+    def __init__(self, account_id, key_pair):
+        self._account_id = account_id
+        self._key_pair = key_pair
+
+    @property
+    def account_id(self):
+        return self._account_id
+
+    @property
+    def key_pair(self):
+        return self._key_pair
+
+    @property
+    def public_key(self):
+        return self._key_pair.public_key
+
+    def sign(self, message):
+        return self._key_pair.sign(message)
+
+    @classmethod
+    def from_json(self, j):
+        return Signer(j["account_id"], KeyPair(j["secret_key"]))
+
+    @classmethod
+    def from_json_file(self, json_file):
+        with open(json_file) as f:
+            return Signer.from_json(json.loads(f.read()))
+
+'''
+'''--- async_near/transactions.py ---
+import hashlib
+
+from async_near.serializer import BinarySerializer
+
+class Signature:
+    pass
+
+class SignedTransaction:
+    pass
+
+class Transaction:
+    pass
+
+class PublicKey:
+    pass
+
+class AccessKey:
+    pass
+
+class AccessKeyPermission:
+    pass
+
+class FunctionCallPermission:
+    pass
+
+class FullAccessPermission:
+    pass
+
+class Action:
+    pass
+
+class CreateAccount:
+    pass
+
+class DeployContract:
+    pass
+
+class FunctionCall:
+    pass
+
+class Transfer:
+    pass
+
+class Stake:
+    pass
+
+class AddKey:
+    pass
+
+class DeleteKey:
+    pass
+
+class DeleteAccount:
+    pass
+
+tx_schema = dict(
+    [
+        [Signature, {"kind": "struct", "fields": [["keyType", "u8"], ["data", [64]]]}],
+        [
+            SignedTransaction,
+            {
+                "kind": "struct",
+                "fields": [["transaction", Transaction], ["signature", Signature]],
+            },
+        ],
+        [
+            Transaction,
+            {
+                "kind": "struct",
+                "fields": [
+                    ["signerId", "string"],
+                    ["publicKey", PublicKey],
+                    ["nonce", "u64"],
+                    ["receiverId", "string"],
+                    ["blockHash", [32]],
+                    ["actions", [Action]],
+                ],
+            },
+        ],
+        [PublicKey, {"kind": "struct", "fields": [["keyType", "u8"], ["data", [32]]]}],
+        [
+            AccessKey,
+            {
+                "kind": "struct",
+                "fields": [
+                    ["nonce", "u64"],
+                    ["permission", AccessKeyPermission],
+                ],
+            },
+        ],
+        [
+            AccessKeyPermission,
+            {
+                "kind": "enum",
+                "field": "enum",
+                "values": [
+                    ["functionCall", FunctionCallPermission],
+                    ["fullAccess", FullAccessPermission],
+                ],
+            },
+        ],
+        [
+            FunctionCallPermission,
+            {
+                "kind": "struct",
+                "fields": [
+                    ["allowance", {"kind": "option", type: "u128"}],
+                    ["receiverId", "string"],
+                    ["methodNames", ["string"]],
+                ],
+            },
+        ],
+        [FullAccessPermission, {"kind": "struct", "fields": []}],
+        [
+            Action,
+            {
+                "kind": "enum",
+                "field": "enum",
+                "values": [
+                    ["createAccount", CreateAccount],
+                    ["deployContract", DeployContract],
+                    ["functionCall", FunctionCall],
+                    ["transfer", Transfer],
+                    ["stake", Stake],
+                    ["addKey", AddKey],
+                    ["deleteKey", DeleteKey],
+                    ["deleteAccount", DeleteAccount],
+                ],
+            },
+        ],
+        [CreateAccount, {"kind": "struct", "fields": []}],
+        [DeployContract, {"kind": "struct", "fields": [["code", ["u8"]]]}],
+        [
+            FunctionCall,
+            {
+                "kind": "struct",
+                "fields": [
+                    ["methodName", "string"],
+                    ["args", ["u8"]],
+                    ["gas", "u64"],
+                    ["deposit", "u128"],
+                ],
+            },
+        ],
+        [Transfer, {"kind": "struct", "fields": [["deposit", "u128"]]}],
+        [
+            Stake,
+            {"kind": "struct", "fields": [["stake", "u128"], ["publicKey", PublicKey]]},
+        ],
+        [
+            AddKey,
+            {
+                "kind": "struct",
+                "fields": [["publicKey", PublicKey], ["accessKey", AccessKey]],
+            },
+        ],
+        [DeleteKey, {"kind": "struct", "fields": [["publicKey", PublicKey]]}],
+        [DeleteAccount, {"kind": "struct", "fields": [["beneficiaryId", "string"]]}],
+    ]
+)
+
+def sign_and_serialize_transaction(receiverId, nonce, actions, blockHash, signer):
+    assert signer.public_key != None
+    assert blockHash != None
+    tx = Transaction()
+    tx.signerId = signer.account_id
+    tx.publicKey = PublicKey()
+    tx.publicKey.keyType = 0
+    tx.publicKey.data = signer.public_key
+    tx.nonce = nonce
+    tx.receiverId = receiverId
+    tx.actions = actions
+    tx.blockHash = blockHash
+
+    msg = BinarySerializer(tx_schema).serialize(tx)
+    hash_ = hashlib.sha256(msg).digest()
+
+    signature = Signature()
+    signature.keyType = 0
+    signature.data = signer.sign(hash_)
+
+    signedTx = SignedTransaction()
+    signedTx.transaction = tx
+    signedTx.signature = signature
+
+    return BinarySerializer(tx_schema).serialize(signedTx)
+
+def create_create_account_action():
+    createAccount = CreateAccount()
+    action = Action()
+    action.enum = "createAccount"
+    action.createAccount = createAccount
+    return action
+
+def create_full_access_key_action(pk):
+    permission = AccessKeyPermission()
+    permission.enum = "fullAccess"
+    permission.fullAccess = FullAccessPermission()
+    accessKey = AccessKey()
+    accessKey.nonce = 0
+    accessKey.permission = permission
+    publicKey = PublicKey()
+    publicKey.keyType = 0
+    publicKey.data = pk
+    addKey = AddKey()
+    addKey.accessKey = accessKey
+    addKey.publicKey = publicKey
+    action = Action()
+    action.enum = "addKey"
+    action.addKey = addKey
+    return action
+
+def create_delete_access_key_action(pk):
+    publicKey = PublicKey()
+    publicKey.keyType = 0
+    publicKey.data = pk
+    deleteKey = DeleteKey()
+    deleteKey.publicKey = publicKey
+    action = Action()
+    action.enum = "deleteKey"
+    action.deleteKey = deleteKey
+    return action
+
+def create_transfer_action(amount):
+    transfer = Transfer()
+    transfer.deposit = amount
+    action = Action()
+    action.enum = "transfer"
+    action.transfer = transfer
+    return action
+
+create_payment_action = create_transfer_action
+
+def create_staking_action(amount, pk):
+    stake = Stake()
+    stake.stake = amount
+    stake.publicKey = PublicKey()
+    stake.publicKey.keyType = 0
+    stake.publicKey.data = pk
+    action = Action()
+    action.enum = "stake"
+    action.stake = stake
+    return action
+
+def create_deploy_contract_action(code):
+    deployContract = DeployContract()
+    deployContract.code = code
+    action = Action()
+    action.enum = "deployContract"
+    action.deployContract = deployContract
+    return action
+
+def create_function_call_action(methodName, args, gas, deposit):
+    functionCall = FunctionCall()
+    functionCall.methodName = methodName
+    functionCall.args = args
+    functionCall.gas = gas
+    functionCall.deposit = deposit
+    action = Action()
+    action.enum = "functionCall"
+    action.functionCall = functionCall
+    return action
+
+'''
+'''--- setup.py ---
+from setuptools import find_packages, setup
+
+with open("README.md", "r", encoding="utf-8") as fh:
+    long_description = fh.read()
+
+setup(
+    name="async_near",
+    author_email="petr@herewallet.app",
+    url="https://github.com/here-wallet/async_near",
+    packages=find_packages(include=["async_near", "async_near.exceptions"]),
+    version="1.0.11",
+    description="Near async rpc client",
+    long_description=long_description,
+    long_description_content_type="text/markdown",
+    author="Petr Volnov",
+    license="MIT",
+    install_requires=["base58", "ed25519", "aiohttp"],
+)
+
+'''

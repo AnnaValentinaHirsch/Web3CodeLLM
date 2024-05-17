@@ -1,0 +1,1484 @@
+*GitHub Repository "keypom/trial-accounts"*
+
+'''--- .eslintrc.js ---
+module.exports = {
+	parserOptions: {
+		ecmaVersion: 2020,
+        sourceType: 'module',
+        ecmaFeatures: {
+            jsx: true,
+        }
+    },
+	rules: {
+        semi: [2, 'always'],
+        indent: [2, 'tab'],
+	}
+};
+
+'''
+'''--- README.md ---
+# Keypom Accounts
+
+'''
+'''--- __tests__/trial-tests.ava.ts ---
+import anyTest, { TestFn } from "ava";
+import { claimTrialAccountDrop, createDrop, createTrialAccountDrop, getDrops, getUserBalance, parseNearAmount, trialCallMethod } from "keypom-js";
+import { NearAccount, Worker } from "near-workspaces";
+import { CONTRACT_METADATA, initKeypomConnection } from "./utils/general";
+const { readFileSync } = require('fs');
+
+const test = anyTest as TestFn<{
+    worker: Worker;
+    accounts: Record<string, NearAccount>;
+    rpcPort: string;
+  }>;
+
+test.beforeEach(async (t) => {
+    console.log(t.title);
+    // Init the worker and start a Sandbox server
+    const worker = await Worker.init();
+
+    const rpcPort = (worker as any).config.rpcAddr
+    console.log(`rpcPort: `, rpcPort)
+    
+    // Prepare sandbox for tests, create accounts, deploy contracts, etc.
+    const root = worker.rootAccount;
+    
+    const keypom = await root.createSubAccount('keypom');
+    const mapping = await root.createSubAccount('mapping');
+    
+    // Custom-root.near, deploy contracts to it and init new linkdrop
+    await root.deploy(`./out/linkdrop.wasm`);
+    // Deploy the keypom contract.
+    await keypom.deploy(`./out/keypom.wasm`);
+    await mapping.deploy(`./out/mapping.wasm`);
+    
+    // Init empty/default linkdrop contract
+    await root.call(root, 'new', {});
+    // Init the contract
+    await keypom.call(keypom, 'new', {root_account: 'testnet', owner_id: keypom, contract_metadata: CONTRACT_METADATA});
+    await mapping.call(mapping, 'new', {});
+
+    // Test users
+    const funder = await root.createSubAccount('funder');
+
+    // Save state for test runs
+    t.context.worker = worker;
+    t.context.accounts = { root, keypom, funder, mapping };
+    t.context.rpcPort = rpcPort;
+});
+
+// If the environment is reused, use test.after to replace test.afterEach
+test.afterEach(async t => {
+    await t.context.worker.tearDown().catch(error => {
+        console.log('Failed to tear down the worker:', error);
+    });
+});
+
+//testing drop empty initialization and that default values perform as expected
+test('Claim trial account drop', async t => {
+    const {keypom, funder, mapping} = t.context.accounts;
+    const rpcPort = t.context.rpcPort;
+    await initKeypomConnection(rpcPort, funder);
+
+    const callableContracts = [
+        `mapping.test.near`,
+        `keypom.test.near`,
+    ]
+
+    const {keys} 
+    //@ts-ignore
+    = await createTrialAccountDrop({
+        numKeys: 1,
+        contractBytes: [...readFileSync('./out/trial.wasm')],
+        startingBalanceNEAR: 1,
+        callableContracts: callableContracts,
+        callableMethods: ['*', 'add_to_balance'],
+        maxAttachableNEARPerContract: callableContracts.map(() => '1'),
+        trialEndFloorNEAR: (1 + 0.3) - 0.5,
+        config: {
+            dropRoot: `test.near`
+        }
+    })
+
+    const trialAccountId = `trial.test.near`
+    const trialAccountSecretKey = keys!.secretKeys[0]
+    await claimTrialAccountDrop({
+        secretKey: keys!.secretKeys[0],
+        desiredAccountId: trialAccountId
+    })
+
+    const balBefore = await getUserBalance({
+        accountId: trialAccountId
+    })
+    console.log('balBefore: ', balBefore)
+
+    await trialCallMethod({
+        trialAccountId,
+        trialAccountSecretKey,
+        contractId: `keypom.test.near`,
+        methodName: `add_to_balance`,
+        args: '',
+        attachedDeposit: parseNearAmount("0.1")!,
+        attachedGas: '10000000000000'
+    })
+
+    const balAfter = await getUserBalance({
+        accountId: trialAccountId
+    })
+    console.log('balAfter: ', balAfter)
+
+    // //@ts-ignore
+    // const drops = await getDrops({
+    //     accountId: funder.accountId,
+    // })
+    // console.log('drops: ', drops)
+});
+'''
+'''--- __tests__/utils/general.ts ---
+import { initKeypom } from "keypom-js";
+import { Near } from "near-api-js";
+import { InMemoryKeyStore } from "near-api-js/lib/key_stores";
+import { BN, KeyPair, NEAR, NearAccount, TransactionResult } from "near-workspaces";
+import { JsonDrop, JsonKeyInfo } from "./types";
+
+export const DEFAULT_GAS: string = "30000000000000";
+export const LARGE_GAS: string = "300000000000000";
+export const WALLET_GAS: string = "100000000000000";
+export const DEFAULT_DEPOSIT: string = "1000000000000000000000000";
+export const GAS_PRICE: BN = new BN("100000000");
+export const DEFAULT_TERRA_IN_NEAR: string = "3000000000000000000000";
+export const CONTRACT_METADATA = {
+  "version": "1.0.0",
+  "link": "https://github.com/mattlockyer/proxy/commit/71a943ea8b7f5a3b7d9e9ac2208940f074f8afba",
+}
+
+export async function initKeypomConnection(
+  rpcPort: string,
+  funder: NearAccount
+) {
+  console.log("init keypom connection")
+  const network = 'sandbox';
+    let networkConfig = {
+        networkId: 'localnet',
+        viewAccountId: 'test.near',
+        nodeUrl: rpcPort,
+        walletUrl: `https://wallet.${network}.near.org`,
+		helperUrl: `https://helper.${network}.near.org`,
+	};
+
+    const keyStore =  new InMemoryKeyStore();
+	  const near = new Near({
+        ...networkConfig,
+        keyStore,
+        headers: {}
+    });
+
+    const funderKey = (await funder.getKey())?.toString()
+    console.log(`funderKey: `, funderKey)
+    await initKeypom({
+        near,
+        network: "localnet",
+        funder: {
+            accountId: funder.accountId,
+            secretKey: funderKey
+        }
+    })
+}
+
+export function displayFailureLog(
+  transaction: TransactionResult
+) {
+  // Loop through each receipts_outcome in the transaction's result field
+  transaction.result.receipts_outcome.forEach((receipt) => {
+    const status = (receipt.outcome.status as any);
+    if (status.Failure?.ActionError?.kind?.FunctionCallError) {
+      console.log('Failure: ', status.Failure?.ActionError?.kind?.FunctionCallError)
+    }
+  })
+}
+
+export function displayAllLogs(
+  transaction: TransactionResult
+) {
+  // Loop through each receipts_outcome in the transaction's result field
+  transaction.result.receipts_outcome.forEach((receipt) => {
+    if (receipt.outcome.logs.length > 0) {
+      console.log('Log: ', receipt.outcome.logs)
+    }
+  })
+}
+
+export async function getDropSupplyForOwner(
+  keypom: NearAccount,
+  ownerId: string
+): Promise<number> {
+  const dropSupplyForOwner: number = await keypom.view('get_drop_supply_for_owner', {account_id: ownerId});
+  return dropSupplyForOwner;
+}
+
+export async function getKeySupplyForDrop(
+  keypom: NearAccount,
+  dropId: string
+): Promise<number> {
+  const getKeySupplyForDrop: number = await keypom.view('get_key_supply_for_drop', {drop_id: dropId});
+  return getKeySupplyForDrop;
+}
+
+export async function getKeyInformation(
+  keypom: NearAccount,
+  publicKey: string
+): Promise<JsonKeyInfo> {
+  const keyInformation: JsonKeyInfo = await keypom.view('get_key_information', {key: publicKey});
+  return keyInformation;
+}
+
+export async function getDropInformation(
+  keypom: NearAccount,
+  dropId: string
+): Promise<JsonDrop> {
+  const dropInfo: JsonDrop = await keypom.view('get_drop_information', {drop_id: dropId});
+  return dropInfo;
+}
+
+export async function generateKeyPairs(
+  numKeys: number,
+): Promise<{ keys: KeyPair[]; publicKeys: string[] }> {
+  // Generate NumKeys public keys
+  let kps: KeyPair[] = [];
+  let pks: string[] = [];
+  for (let i = 0; i < numKeys; i++) {
+    let keyPair = await KeyPair.fromRandom('ed25519');
+    kps.push(keyPair);
+    pks.push(keyPair.getPublicKey().toString());
+  }
+  return {
+    keys: kps,
+    publicKeys: pks
+  }
+}
+
+export function defaultCallOptions(
+  gas: string = DEFAULT_GAS,
+  attached_deposit: string = DEFAULT_DEPOSIT
+) {
+  return {
+    gas: new BN(gas),
+    attachedDeposit: new BN(attached_deposit),
+  };
+}
+
+// export function assertBalanceChange(b1: NEAR, b2: NEAR, expected_change: NEAR, precision: number) {
+//   console.log('expected change: ', expected_change.toString())
+
+//   let numToDivide = new BN(Math.ceil(1 / precision));
+//   let range = expected_change.abs().div(numToDivide);
+//   console.log('range addition: ', range.toString())
+
+//   let acceptableRange = {
+//     upper: expected_change.abs().add(range), // 1 + .05 = 1.05
+//     lower: expected_change.abs().sub(range) // 1 - .05  = .95
+//   }
+//   let diff = b2.sub(b1).abs();
+//   console.log(`diff: ${diff.toString()} range: ${JSON.stringify(acceptableRange)}`)
+//   return diff.gte(acceptableRange.lower) && diff.lte(acceptableRange.upper)
+// }
+
+export async function queryAllViewFunctions(
+  {
+  contract,
+  drop_id = null,
+  key = null,
+  from_index = '0',
+  limit = 50,
+  account_id = null
+  }: 
+  {
+    contract: NearAccount,
+    drop_id?: string | null,
+    key?: string | null,
+    from_index?: string | null,
+    limit?: number | null,
+    account_id?: string | null
+  }
+): Promise<{
+  keyBalance: string | null,
+  keyInformation: JsonKeyInfo | null,
+  dropInformation: JsonDrop | null,
+  keySupplyForDrop: number | null,
+  keysForDrop: JsonKeyInfo[] | null,
+  tokenIdsForDrop: string[] | null,
+  dropSupplyForOwner: number | null,
+  dropsForOwner: JsonDrop[] | null,
+  gasPrice: number,
+  rootAccount: string,
+  feesCollected: string,
+  nextDropId: number,
+  keyTotalSupply: number,
+  keys: JsonKeyInfo[],
+}> {
+  let getGasPrice: number = await contract.view('get_gas_price', {});
+  let getRootAccount: string = await contract.view('get_root_account', {});
+  let getFeesCollected: string = await contract.view('get_fees_collected', {});
+  let getNextDropId: number = await contract.view('get_next_drop_id', {});
+  let keyTotalSupply: number = await contract.view('get_key_total_supply', {});
+  let getKeys: JsonKeyInfo[] = await contract.view('get_keys', {from_index, limit});
+
+  let getKeyBalance: string | null = null;
+  let getKeyInformation: JsonKeyInfo | null = null;
+  if(key != null) {
+    getKeyBalance = await contract.view('get_key_balance', {key});
+    getKeyInformation = await contract.view('get_key_information', {key});
+  }
+
+  let getDropInformation: JsonDrop | null = null;
+  let getKeySupplyForDrop: number | null = null;
+  let getKeysForDrop: JsonKeyInfo[] | null = null;
+  let tokenIdsForDrop: string[] | null = null;
+  if(drop_id != null) {
+    getDropInformation = await contract.view('get_drop_information', {drop_id});
+    getKeySupplyForDrop = await contract.view('get_key_supply_for_drop', {drop_id});
+    getKeysForDrop = await contract.view('get_keys_for_drop', {drop_id, from_index, limit});
+    tokenIdsForDrop = await contract.view('get_nft_token_ids_for_drop', {drop_id, from_index, limit});
+  }
+
+  let dropSupplyForOwner: number | null = null;
+  let dropsForOwner: JsonDrop[] | null = null;
+  if(account_id != null) {
+    dropSupplyForOwner = await contract.view('get_drop_supply_for_owner', {account_id});
+    dropsForOwner = await contract.view('get_drops_for_owner', {account_id, from_index, limit});
+  }
+
+  return {
+    keyBalance: getKeyBalance,
+    keyInformation: getKeyInformation,
+    dropInformation: getDropInformation,
+    keySupplyForDrop: getKeySupplyForDrop,
+    keysForDrop: getKeysForDrop,
+    tokenIdsForDrop: tokenIdsForDrop,
+    dropSupplyForOwner: dropSupplyForOwner,
+    dropsForOwner: dropsForOwner,
+    gasPrice: getGasPrice,
+    rootAccount: getRootAccount,
+    feesCollected: getFeesCollected,
+    nextDropId: getNextDropId,
+    keyTotalSupply: keyTotalSupply,
+    keys: getKeys,
+  }
+}
+'''
+'''--- __tests__/utils/types.ts ---
+export type JsonDrop = {
+    drop_id: string;
+    owner_id: string,
+    deposit_per_use: string;
+    simple?: SimpleData;
+    nft?: JsonNFTData;
+    ft?: FTData;
+    fc?: FCData;
+    config: DropConfig | null;
+    metadata: string | null;
+    registered_uses: number;
+    required_gas: string;
+    next_key_id: number;
+}
+
+export type JsonToken = {
+    series_id: number;
+    token_id: string;
+    owner_id: string;
+    metadata: TokenMetadata;
+    approved_account_ids: Record<string, number>;
+    royalty: Record<string, number> | null;
+}
+
+export type JsonNFTData = {
+    sender_id?: string;
+    contract_id: string;
+}
+
+export type SimpleData = {
+    lazy_register?: boolean
+}
+
+export type FTData = {
+    sender_id?: string;
+    contract_id: string;
+    balance_per_use: string;
+}
+
+export type FCData = {
+    methods: Array<(MethodData | null)[]>
+}
+
+export type FCConfig = {
+    attached_gas?: string
+}
+
+export type MethodData = {
+    receiver_id: string;
+    method_name: string;
+    args: string;
+    attached_deposit: string;
+    attached_gas?: string;
+    account_id_field?: string;
+    drop_id_field?: string;
+    key_id_field?: string;
+    funder_id_field?: string;
+    user_args_rule?: string;
+}
+
+export type JsonKeyInfo = {
+    drop_id: string;
+    pk: string;
+    // How many uses this key has left. Once 0 is reached, the key is deleted
+    remaining_uses: number,
+    // When was the last time the key was used
+    last_used: number,
+    // How much allowance does the key have left. When the key is deleted, this is refunded to the funder's balance.
+    allowance: number,
+    // Nonce for the current key.
+    key_id: number,
+    // Which use is the key currently on?
+    cur_key_use: number
+}
+
+export type KeyInfo = {
+    remaining_uses: number;
+    last_used: number;
+    allowance: number;
+    key_id: number;
+}
+
+export type TimeConfig = {
+    start?: number;
+    end?: number;
+    throttle?: number;
+    interval?: number;
+}
+
+export type JsonPublicSaleConfig = {
+    /// Maximum number of keys that can be added to this drop. If None, there is no max.
+    max_num_keys?: number;
+ 
+    /// Amount of $NEAR that the user needs to attach (if they are not the funder) on top of costs. This amount will be
+    /// Automatically sent to the funder's balance. If None, the keys are free to the public.
+    price_per_key?: string;
+
+    /// Should the revenue generated be sent to the funder's account balance or
+    /// automatically withdrawn and sent to their NEAR wallet?
+    auto_withdraw_funds?: boolean;
+
+    allowlist? : string[];
+    blocklist? : string[];
+
+    /// Minimum block timestamp before the public sale starts. If None, keys can be added immediately
+    /// Measured in number of non-leap-nanoseconds since January 1, 1970 0:00:00 UTC.
+    start?: number;
+
+    /// Block timestamp dictating the end of the public sale. If None, keys can be added indefinitely
+    /// Measured in number of non-leap-nanoseconds since January 1, 1970 0:00:00 UTC.
+    end?: number;
+}
+
+export type UsageConfig = {
+    permissions?: string;
+    refund_deposit?: boolean;
+    auto_delete_drop?: boolean;
+    auto_withdraw?: boolean;
+    account_creation_fields?: {
+        account_id_field?: String,
+        drop_id_field?: String,
+        key_id_field?: String,
+        funder_id_field?: String,
+    }
+}
+
+export type DropConfig = {
+    uses_per_key?: number;
+    time?: TimeConfig;
+    usage?: UsageConfig;
+    sale?: JsonPublicSaleConfig;
+    root_account_id?: string;
+}
+
+export type TokenMetadata = {
+    title: string | null;
+    description: string | null;
+    media: string | null;
+    media_hash: string | null;
+    copies: number | null;
+    issued_at: number | null;
+    expires_at: number | null;
+    starts_at: number | null;
+    updated_at: number | null;
+    extra: string | null;
+    reference: string | null;
+    reference_hash: string | null;
+}
+'''
+'''--- mapping-contract/Cargo.toml ---
+[package]
+name = "mapping-contract"
+version = "0.1.0"
+authors = ["Ben Kurrek <bkurrek@uwaterloo.ca>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+near-sdk = "4.1.1"
+
+[profile.release]
+codegen-units = 1
+opt-level = "s"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+'''
+'''--- mapping-contract/build.sh ---
+#!/bin/bash
+set -e
+
+cargo build --target wasm32-unknown-unknown --release
+mkdir -p ../out
+cp target/wasm32-unknown-unknown/release/*.wasm ../out/mapping.wasm
+
+'''
+'''--- mapping-contract/rust-toolchain.toml ---
+[toolchain]
+channel = "nightly"
+'''
+'''--- mapping-contract/src/lib.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::LookupMap;
+use near_sdk::{env, near_bindgen, AccountId, BorshStorageKey, PanicOnDefault, PublicKey, Promise};
+
+#[derive(BorshSerialize, BorshStorageKey)]
+enum StorageKeys {
+    NearByPk,
+}
+
+#[near_bindgen]
+#[derive(BorshSerialize, BorshDeserialize, PanicOnDefault)]
+pub struct Mapping {
+    near_by_pk: LookupMap<PublicKey, AccountId>
+}
+
+#[near_bindgen]
+impl Mapping {
+    #[init]
+    pub fn new() -> Self {
+        Self {
+            near_by_pk: LookupMap::new(StorageKeys::NearByPk)
+        }
+    }
+
+    #[payable]
+    pub fn set(&mut self) {
+        let pk = env::signer_account_pk();
+        let account_id = env::signer_account_id();
+
+        let initial_storage = env::storage_usage();
+        
+        self.near_by_pk.insert(&pk, &account_id);
+
+        let net = env::storage_usage() - initial_storage;
+        let price = net as u128 * env::storage_byte_cost();
+
+        let attached_deposit = env::attached_deposit();
+        assert!(attached_deposit >= price, "ERR_NOT_ENOUGH_DEPOSIT");
+
+        // Refund any unused deposit
+        if attached_deposit > price {
+            near_sdk::log!(
+                "Refunding: {} for {} excess storage",
+                env::signer_account_id(),
+                attached_deposit - price
+            );
+            Promise::new(env::signer_account_id()).transfer(attached_deposit - price);
+        }
+    }
+
+    pub fn get_account_id(&self, pk: PublicKey) -> Option<AccountId> {
+        self.near_by_pk
+            .get(&pk)
+    }
+}
+'''
+'''--- package.json ---
+{
+	"name": "keypom-trial-accounts",
+	"version": "1.0.0",
+	"license": "MIT",
+	"author": "Ben Kurrek, Matt Lockyer",
+	"scripts": {
+		"build:contracts": "yarn build:mapping && yarn build:trial",
+		"build:trial": "cd trial-contract && ./build.sh",
+		"build:mapping": "cd mapping-contract && ./build.sh",
+		"test": "ava __tests__/trial-tests.ava.ts"
+	},
+	"dependencies": {
+		"@types/bn.js": "^5.1.0",
+		"ava": "^5.2.0",
+		"near-api-js": "^0.45.1",
+		"near-workspaces": "^3.3.0",
+		"ts-node": "^10.8.0",
+		"typescript": "^4.6.4",
+		"keypom-js": "1.4.5"
+	}
+}
+'''
+'''--- trial-contract/.cargo/config.toml ---
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=-s"]
+
+'''
+'''--- trial-contract/Cargo.toml ---
+[package]
+name = "trial-accounts"
+edition = "2021"
+version = "0.1.0"
+authors = ["Matt Lockyer <matt@proximity.dev>", "Ben Kurrek <bkurrek@uwaterloo.ca>"]
+license = "Apache2"
+description = "Give users a seamless no-rug trial to an app on NEAR"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wee_alloc = { version = "0.4.5", default-features = false }
+near-sys = "0.2"
+
+[profile.release]
+codegen-units = 1
+opt-level = "z"
+lto = true
+debug = false
+stri= true
+panic = "abort"
+
+'''
+'''--- trial-contract/build.sh ---
+#!/bin/bash
+set -e
+
+cargo build --target wasm32-unknown-unknown --release
+mkdir -p ../out
+cp target/wasm32-unknown-unknown/release/*.wasm ../out/trial.wasm
+
+'''
+'''--- trial-contract/rust-toolchain.toml ---
+[toolchain]
+channel = "nightly"
+'''
+'''--- trial-contract/src/lib.rs ---
+#![cfg_attr(target_arch = "wasm32", no_std)]
+#![cfg_attr(target_arch = "wasm32", feature(alloc_error_handler))]
+
+/// storage keys used by this contract because it uses raw storage key value writes and reads
+const RULES_KEY: &[u8] = b"r";
+const FLOOR_KEY: &[u8] = b"f";
+/// register constants used
+const REGISTER_0: u64 = 0;
+/// string literals (improve readability)
+const DOUBLE_QUOTE_BYTE: u8 = b'\"';
+const RECEIVER_HEADER: &str = "\"|kR|\":";
+const ACTION_HEADER: &str = "\"|kA|\":";
+const PARAM_STOP: &str = "|kS|\"";
+const COMMA: &str = ",";
+const ANY_METHOD: &str = "*";
+const CALLBACK_GAS: u64 = 20_000_000_000_000;
+const YOCTO_PER_GAS_UNIT: u128 = 100_000_000;
+
+/// repeated string literals (in parsing tx payloads)
+const DEPOSIT: &str = "|kP|deposit";
+const CALLBACK_METHOD_NAME: &str = "callback";
+
+extern crate alloc;
+
+/// DEBUGGING REMOVE
+// use alloc::format;
+
+use alloc::vec;
+use alloc::vec::Vec;
+use alloc::format;
+use alloc::string::String;
+use alloc::string::ToString;
+use core::convert::TryInto;
+
+mod sys;
+use sys::*;
+mod parse;
+use parse::*;
+
+#[cfg(target_arch = "wasm32")]
+#[global_allocator]
+static ALLOC: wee_alloc::WeeAlloc = wee_alloc::WeeAlloc::INIT;
+
+#[cfg(target_arch = "wasm32")]
+#[panic_handler]
+#[no_mangle]
+pub unsafe fn on_panic(_info: &::core::panic::PanicInfo) -> ! {
+    core::arch::wasm32::unreachable()
+}
+
+#[cfg(target_arch = "wasm32")]
+#[alloc_error_handler]
+#[no_mangle]
+pub unsafe fn on_alloc_error(_: core::alloc::Layout) -> ! {
+    core::arch::wasm32::unreachable()
+}
+
+#[no_mangle]
+pub fn setup() {
+	// check if funder is calling to switch rules, if not funder and rules set, panic
+	unsafe {
+		if near_sys::storage_has_key(RULES_KEY.len() as u64, RULES_KEY.as_ptr() as u64) == 1 {
+			let rules_str = storage_read_str(RULES_KEY);
+			let funder = get_string(&rules_str, "|kP|funder").to_string();
+			let predecessor_account_id = sys_account_id(1);
+			if funder != predecessor_account_id {
+				log("only funder");
+				sys::panic();
+			}
+		}
+	}
+	
+    let input_str = get_input(true);
+	swrite(RULES_KEY, input_str.as_bytes());
+	let floor = account_balance();
+    swrite(FLOOR_KEY, &floor.to_le_bytes());
+}
+
+#[no_mangle]
+pub fn execute() {
+
+	let rules_str = &storage_read_str(RULES_KEY);
+
+	let contracts: Vec<&str> = get_string(rules_str, "|kP|contracts").split(",").collect();
+	let methods: Vec<Vec<&str>> = get_string(rules_str, "|kP|methods").split(",").map(|s| s.split(":").collect()).collect();
+	let amounts: Vec<u128> = get_string(rules_str, "|kP|amounts")
+		.split(",")
+		.map(|a| {
+			let amount: u128 = a.parse().ok().unwrap_or_else(|| sys::panic());
+			amount
+		})
+		.collect();
+
+	// args
+	let input_str = get_input(true);
+    
+	// transactions
+	let mut transactions: Vec<&str> = input_str.split(RECEIVER_HEADER).collect();
+	transactions.remove(0);
+
+	// promise ids for each tx
+	let mut promises: Vec<u64> = vec![];
+
+	// execute transactions
+	while transactions.len() > 0 {
+		let tx = transactions.remove(0);
+
+		let (receiver_id_str, tx_rest) = split_once(tx, COMMA);
+		let receiver_id = receiver_id_str[1..receiver_id_str.len()-1].to_string();
+		// log(receiver_id);
+
+		let receiver_index_option = contracts.iter().position(|c| c == &receiver_id);
+		if receiver_index_option.is_none() {
+			sys::panic()
+		}
+		let receiver_index = receiver_index_option.unwrap();
+
+		let id = if promises.len() == 0 {
+			create_promise_batch(receiver_id, None)
+		} else {
+			create_promise_batch(receiver_id, Some(promises[promises.len() - 1]))
+		};
+		promises.push(id);
+
+		// actions for tx
+		let mut actions: Vec<&str> = tx_rest.split(ACTION_HEADER).collect();
+		actions.remove(0);
+		let mut action_gas = 0;
+		let mut action_deposits: u128 = 0;
+		
+		while actions.len() > 0 {
+			let action = actions.remove(0);
+
+			let (mut action_type, params) = split_once(action, COMMA);
+			action_type = &action_type[1..action_type.len()-1];
+			// log(action_type);
+			// log(params);
+
+			// TODO do we support NEAR transfers?
+
+			match action_type.as_bytes() {
+				b"FunctionCall" => {
+					let method_name = get_string(params, "|kP|methodName");
+
+					if methods[receiver_index][0] != ANY_METHOD && !methods[receiver_index].contains(&method_name) {
+						sys::panic()
+					}
+					let args = &get_string(params, "|kP|args")
+						.replace("\\\\", "\\");
+					let deposit = get_u128(params, DEPOSIT);
+					// check if deposit exceeds allowed limit for function calls for this contract
+					if deposit > amounts[receiver_index] {
+						sys::panic()
+					}
+					action_deposits += deposit;
+					let gas = get_u128(params, "|kP|gas") as u64;
+					action_gas += gas;
+					
+					unsafe {
+						near_sys::promise_batch_action_function_call(
+							id,
+							method_name.len() as u64,
+							method_name.as_ptr() as u64,
+							args.len() as u64,
+							args.as_ptr() as u64,
+							deposit.to_le_bytes().as_ptr() as u64,
+							gas,
+						);
+					};
+				}
+				_ => {}
+			}
+		}
+
+		// after all action promise calls have been added to the batch, promise.then call a new self callback call
+		unsafe {
+			let cb_id = create_promise_batch(sys_account_id(0), Some(id));
+			promises.push(cb_id);
+			// all deposits and gas attached to actions count against the floor and used gas up to this call (ignore callback gas)
+			let callback_deposit: u64 = 0;
+			let args = format!("{},{}", action_deposits, action_gas + near_sys::used_gas());
+			near_sys::promise_batch_action_function_call(
+				cb_id,
+				CALLBACK_METHOD_NAME.len() as u64,
+				CALLBACK_METHOD_NAME.as_ptr() as u64,
+				args.len() as u64,
+				args.as_ptr() as u64,
+				callback_deposit.to_le_bytes().as_ptr() as u64,
+				CALLBACK_GAS,
+			);
+		}
+	}
+}
+
+#[no_mangle]
+pub unsafe fn callback() {
+	// log(CALLBACK_METHOD_NAME);
+
+	near_sys::promise_result(0, REGISTER_0);
+	let result_bytes = register_read(REGISTER_0);
+	let result = alloc::str::from_utf8(&result_bytes).ok().unwrap_or_else(|| sys::panic());
+	
+	if result == "false" {
+		return log("promise false");
+	}
+
+	// parse the attachedDeposit from the call
+    let input_str = get_input(false);
+	let (attached_deposit_str, prepaid_gas_str) = split_once(&input_str, ",");
+	let attached_deposit: u128 = attached_deposit_str.parse().ok().unwrap_or_else(|| sys::panic());
+	let prepaid_gas: u128 = prepaid_gas_str.parse().ok().unwrap_or_else(|| sys::panic());
+	let gas_cost = prepaid_gas * YOCTO_PER_GAS_UNIT;
+
+	// update floor
+	let mut floor = get_floor();
+	floor = floor - attached_deposit - gas_cost;
+    swrite(FLOOR_KEY, &floor.to_le_bytes());
+}
+
+fn can_exit(rules_str: &str) -> Option<u128> {
+	// rules
+	let repay: u128 = get_u128(rules_str, "|kP|repay");
+	let floor_exit: u128 = get_u128(rules_str, "|kP|floor");
+	let account_balance = account_balance();
+	// log(&format!("repay: {}", repay));
+	// log(&format!("floor_exit: {}", floor_exit));
+	// log(&format!("account_balance: {}", account_balance));
+	// repay
+	if account_balance < repay {
+		log("cannot repay");
+		return None;
+	}
+	// floor
+	let floor = get_floor();
+	// log(&format!("floor: {}", floor));
+	if floor > floor_exit {
+		log("floor > floor_exit");
+		return None;
+	}
+
+	Some(repay)
+}
+
+#[no_mangle]
+pub fn create_account_and_claim() {
+	let rules_str = storage_read_str(RULES_KEY);
+	let funder = get_string(&rules_str, "|kP|funder").to_string();
+	let predecessor_account_id = sys_account_id(1);
+
+	// allow funder to claim trial with new full access key at any time
+	let refund_id = if funder != predecessor_account_id {
+		// non-funder e.g. user will have to pass exit conditions
+		let exit_option = can_exit(&rules_str);
+		let repay = exit_option.unwrap_or_else(|| sys::panic());
+
+		// non-funder will have to repay funder from this account
+		let refund_id = create_promise_batch(funder, None);
+		unsafe {
+			near_sys::promise_batch_action_transfer(
+				refund_id,
+				repay.to_le_bytes().as_ptr() as u64,
+			)
+		}
+		Some(refund_id)
+	} else {
+		None
+	};
+	
+	// parse the input and get the public key
+    let input_str = get_input(true);	
+	let (_, public_key_str) = split_once(&input_str, "\"new_public_key\":\"");
+	let (_, mut public_key_str) = split_once(public_key_str, "ed25519:");
+	public_key_str = &public_key_str[..public_key_str.len() - 2];
+	let public_key = string_to_base58(public_key_str);
+	// log(&format!("public_key_str: {}", public_key_str));
+	// log(&format!("public_key: {:?}", public_key));
+	// log(&format!("public_key_len: {}", public_key.len()));
+
+	// cleanup account storage, keys, deploy empty string for contract
+	storage_remove(RULES_KEY);
+	storage_remove(FLOOR_KEY);
+	// promise for add key .then from refund make sure refund finishes first
+	let exit_id = create_promise_batch(sys_account_id(0), refund_id);
+	unsafe {
+		near_sys::promise_batch_action_deploy_contract(
+			exit_id,
+			0,
+			"".as_ptr() as u64,
+		);
+		let signer_pk_bytes = sys_signer_pk_bytes();
+
+		near_sys::promise_batch_action_delete_key(
+			exit_id,
+			signer_pk_bytes.len() as u64,
+			signer_pk_bytes.as_ptr() as u64,
+		);
+		near_sys::promise_batch_action_add_key_with_full_access(
+			exit_id,
+			public_key.len() as u64,
+			public_key.as_ptr() as u64,
+			0,
+		);
+	}
+}
+
+/// helpers
+
+pub fn get_floor() -> u128 {
+	let floor_bytes = storage_read(FLOOR_KEY);
+	u128::from_le_bytes(floor_bytes.try_into().ok().unwrap_or_else(|| sys::panic()))
+}
+
+/// views
+
+#[no_mangle]
+pub(crate) unsafe fn get_rules() {
+	// get rules str pop last char '}'
+	let mut rules = storage_read_str(RULES_KEY);
+	rules.pop();
+	// get current floor value as string
+	let floor_str = get_floor().to_string();
+	// inject and return bytes
+    return_bytes(&format!("{},\"current_floor\":\"{}\"}}", rules, floor_str).as_bytes(), true);
+}
+
+#[no_mangle]
+pub(crate) unsafe fn get_key_information() {
+	let exit_option = can_exit(&storage_read_str(RULES_KEY));
+    return_value(format!("{{\"required_gas\":\"50000000000000\",\"yoctoNEAR\": \"0\",\"balance\":\"0\",\"trial_data\":{{\"exit\":{}}}}}", exit_option.is_some()).as_bytes());
+}
+
+'''
+'''--- trial-contract/src/parse.rs ---
+use crate::*;
+
+/// helper to get next value from string key in stringified json
+pub(crate) fn get_string<'a>(string: &'a str, key: &str) -> &'a str {
+    let (_, value) = split_once(string, key);
+    let (value, _) = split_once(value, PARAM_STOP);
+    &value[3..]
+}
+
+/// helper to get and parse the next u128 value from a string key in stringified json
+pub(crate) fn get_u128(str: &str, key: &str) -> u128 {
+    let amount = get_string(str, key);
+    // TODO: This should be minimal, but can explore removing ToStr usage for code size
+    amount.parse().ok().unwrap_or_else(|| sys::panic())
+}
+
+pub(crate) fn get_input(strip_slashes: bool) -> String {
+    unsafe { near_sys::input(REGISTER_0) };
+    let input = register_read(REGISTER_0);
+    // if from_borsh {
+    //     input = input[1..input.len()-1].to_vec();
+    // }
+	let input_str = alloc::str::from_utf8(&input).ok().unwrap_or_else(|| sys::panic());
+    if strip_slashes {
+        return input_str.replace("\\\"", "\"");
+    }
+    input_str.to_string()
+}
+
+pub(crate) fn split_once<'a>(string: &'a str, del: &str) -> (&'a str, &'a str) {
+    string.split_once(del).unwrap_or_else(|| sys::panic())
+}
+
+// decode base58 public keys
+
+const B58_DIGITS_MAP: &'static [i8] = &[
+	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+	-1, 0, 1, 2, 3, 4, 5, 6, 7, 8,-1,-1,-1,-1,-1,-1,
+	-1, 9,10,11,12,13,14,15,16,-1,17,18,19,20,21,-1,
+	22,23,24,25,26,27,28,29,30,31,32,-1,-1,-1,-1,-1,
+	-1,33,34,35,36,37,38,39,40,41,42,43,-1,44,45,46,
+	47,48,49,50,51,52,53,54,55,56,57,-1,-1,-1,-1,-1,
+];
+
+pub(crate) fn string_to_base58(string: &str) -> Vec<u8> {
+    let mut bin = [0u8; 132];
+    let mut out = [0u32; (132 + 3) / 4];
+    let bytesleft = (bin.len() % 4) as u8;
+    let zeromask = match bytesleft {
+        0 => 0u32,
+        _ => 0xffffffff << (bytesleft * 8),
+    };
+
+    let zcount = string.chars().take_while(|x| *x == '1').count();
+    let mut i = zcount;
+    let b58: Vec<u8> = string.bytes().collect();
+
+    while i < string.len() {
+        if (b58[i] & 0x80) != 0 {
+            // High-bit set on invalid digit
+            log("High-bit set on invalid digit");
+            sys::panic()
+        }
+
+        if B58_DIGITS_MAP[b58[i] as usize] == -1 {
+            log("Invalid base58 digit");
+            sys::panic()
+        }
+
+        let mut c = B58_DIGITS_MAP[b58[i] as usize] as u64;
+        let mut j = out.len();
+        while j != 0 {
+            j -= 1;
+            let t = out[j] as u64 * 58 + c;
+            c = (t & 0x3f00000000) >> 32;
+            out[j] = (t & 0xffffffff) as u32;
+        }
+
+        if c != 0 {
+            log("Output number too big");
+            sys::panic()
+        }
+
+        if (out[0] & zeromask) != 0 {
+            log("Output number too big");
+            sys::panic()
+        }
+
+        i += 1;
+    }
+
+    let mut i = 1;
+    let mut j = 0;
+
+    bin[0] = match bytesleft {
+        3 => ((out[0] & 0xff0000) >> 16) as u8,
+        2 => ((out[0] & 0xff00) >> 8) as u8,
+        1 => {
+            j = 1;
+            (out[0] & 0xff) as u8
+        },
+        _ => {
+            i = 0;
+            bin[0]
+        }
+    };
+
+    while j < out.len() {
+        bin[i] = ((out[j] >> 0x18) & 0xff) as u8;
+        bin[i + 1] = ((out[j] >> 0x10) & 0xff) as u8;
+        bin[i + 2] = ((out[j] >> 8) & 0xff) as u8;
+        bin[i + 3] = ((out[j] >> 0) & 0xff) as u8;
+        i += 4;
+        j += 1;
+    }
+
+    let leading_zeros = bin.iter().take_while(|x| **x == 0).count();
+    bin[leading_zeros - zcount - 1..].to_vec()
+}
+
+// pub(crate) fn update_string(string: &str, key: &str, val: &str) -> String {
+//     let mut ret: String = String::new();
+//     let (left, right) = string.split_once(key).unwrap_or_else(|| sys::panic());
+//     let (_, right) = right.split_once(PARAM_STOP).unwrap_or_else(|| sys::panic());
+    
+//     ret.push_str(left);
+//     ret.push_str(key);
+//     ret.push_str("\",\"");
+//     ret.push_str(val);
+//     ret.push_str(PARAM_STOP);
+//     ret.push_str(right);
+
+//     ret
+// }
+
+// const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+// const fn val(c: u8) -> u8 {
+//     match c {
+//         b'A'..=b'F' => c - b'A' + 10,
+//         b'a'..=b'f' => c - b'a' + 10,
+//         b'0'..=b'9' => c - b'0',
+//         _ => 0
+//     }
+// }
+
+// const fn byte2hex(byte: u8) -> (u8, u8) {
+//     let high = HEX_CHARS[((byte & 0xf0) >> 4) as usize];
+//     let low = HEX_CHARS[(byte & 0x0f) as usize];
+//     (high, low)
+// }
+
+// pub(crate) fn bytes2hex(bytes: &[u8]) -> Vec<u8> {
+//     let mut ret = vec![];
+// 	for byte in bytes {
+// 		if *byte == 0 {
+// 			continue;
+// 		}
+// 		let (byte1, byte2) = byte2hex(*byte);
+// 		ret.push(byte1);
+// 		ret.push(byte2);
+// 	}
+//     ret
+// }
+
+// pub(crate) fn hex2bytes(hex: &[u8], len: usize) -> Vec<u8> {
+//     let mut ret = vec![];
+//     for i in (0..len).step_by(2) {
+//         ret.push(val(hex[i]) << 4 | val(hex[i+1]))
+//     }
+//     ret
+// }
+'''
+'''--- trial-contract/src/sys.rs ---
+use crate::*;
+
+/// debugging only
+use near_sys::log_utf8;
+pub fn log(message: &str) {
+    unsafe {
+        log_utf8(message.len() as _, message.as_ptr() as _);
+    }
+}
+
+pub(crate) fn create_promise_batch(account_id: String, prev_id: Option<u64>) -> u64 {
+    // then make another promise back receiver == current_account_id
+    if let Some(prev_id) = prev_id {
+        unsafe {
+                near_sys::promise_batch_then(
+                prev_id,
+                account_id.len() as u64,
+                account_id.as_ptr() as u64,
+            )
+        }
+    } else {
+        unsafe {
+            near_sys::promise_batch_create(
+                account_id.len() as u64,
+                account_id.as_ptr() as u64,
+            )
+        }
+    }
+}
+
+pub(crate) fn return_bytes_format(bytes: &[u8], json: bool) -> Vec<u8> {
+    let mut ret_data = vec![];
+    if json == true {
+        let bytes_str = alloc::str::from_utf8(&bytes).ok().unwrap_or_else(|| sys::panic());
+        ret_data.extend_from_slice(bytes_str
+            // .replace("\"", "\\\"")
+            .replace("|kP|", "")
+            .replace("|kS|", "")
+            .as_bytes()
+        );
+    } else {
+        ret_data.extend_from_slice(&[DOUBLE_QUOTE_BYTE]);
+        ret_data.extend_from_slice(bytes);
+        ret_data.extend_from_slice(&[DOUBLE_QUOTE_BYTE]);
+    }
+    ret_data
+}
+
+pub(crate) fn return_value(bytes: &[u8]) {
+    unsafe {
+        near_sys::value_return(bytes.len() as u64, bytes.as_ptr() as u64);
+    }
+}
+
+pub(crate) fn return_bytes(bytes: &[u8], json: bool) {
+    return_value(&return_bytes_format(bytes, json));
+}
+
+pub(crate) fn swrite(key: &[u8], val: &[u8]) {
+    //* SAFETY: Assumes valid storage_write implementation.
+    unsafe {
+        near_sys::storage_write(
+            key.len() as u64,
+            key.as_ptr() as u64,
+            val.len() as u64,
+            val.as_ptr() as u64,
+            REGISTER_0,
+        );
+    }
+}
+
+pub(crate) fn storage_read_str(key: &[u8]) -> String {
+    let data = storage_read(key);
+	let data_str = alloc::str::from_utf8(&data).ok().unwrap_or_else(|| sys::panic());
+    data_str.to_string()
+}
+
+pub(crate) fn storage_remove(key: &[u8]) {
+    unsafe {
+        near_sys::storage_remove(
+            key.len() as u64,
+            key.as_ptr() as u64,
+            REGISTER_0
+        );
+    }
+}
+
+pub(crate) fn storage_read(key: &[u8]) -> Vec<u8> {
+    let key_exists =
+        unsafe { near_sys::storage_read(key.len() as u64, key.as_ptr() as u64, REGISTER_0) };
+    if key_exists == 0 {
+        // Return code of 0 means storage key had no entry.
+        sys::panic()
+    }
+    register_read(REGISTER_0)
+}
+
+pub(crate) fn account_balance() -> u128 {
+    let buffer = [0u8; 16];
+    unsafe { near_sys::account_balance(buffer.as_ptr() as u64) };
+    u128::from_le_bytes(buffer)
+}
+
+pub(crate) fn sys_signer_pk_bytes() -> Vec<u8> {
+    log("sys_signer_pk called!");
+
+    unsafe {
+        near_sys::signer_account_pk(REGISTER_0);
+    }
+
+    register_read(REGISTER_0)
+}
+
+pub(crate) fn sys_account_id(which: u8) -> String {
+    unsafe {
+        match which {
+            0 => near_sys::current_account_id(REGISTER_0),
+            1 => near_sys::predecessor_account_id(REGISTER_0),
+            _ => near_sys::current_account_id(REGISTER_0),
+        }
+    };
+    let current_account_id_bytes = register_read(REGISTER_0);
+    alloc::str::from_utf8(&current_account_id_bytes).ok().unwrap_or_else(|| sys::panic()).to_string()
+}
+
+pub(crate) fn register_read(id: u64) -> Vec<u8> {
+    let len = unsafe { near_sys::register_len(id) };
+    if len == u64::MAX {
+        // Register was not found
+        sys::panic()
+    }
+    let data = vec![0u8; len as usize];
+
+    //* SAFETY: Length of buffer is set dynamically based on `register_len` so it will always
+    //* 		be sufficient length.
+    unsafe { near_sys::read_register(id, data.as_ptr() as u64) };
+    data
+}
+
+pub(crate) fn panic() -> ! {
+    //* SAFETY: Assumed valid panic host function implementation
+    unsafe { near_sys::panic() }
+}
+'''
+'''--- utils/config.js ---
+const { parseSeedPhrase } = require('near-seed-phrase');
+let contractFromProcess = process.env.REACT_APP_CONTRACT_ID
+const fundingSeedPhrase = process.env.REACT_APP_FUNDING_SEED_PHRASE
+if (fundingSeedPhrase) {
+	const { publicKey, secretKey } = parseSeedPhrase(process.env.REACT_APP_FUNDING_SEED_PHRASE)
+	contractFromProcess = publicKey
+}
+
+const contractName = contractFromProcess || 'testnet';
+
+module.exports = function getConfig(network = process.env.REACT_APP_NETWORK_ID || 'testnet') {
+	let config = {
+		networkId: "testnet",
+		nodeUrl: "https://rpc.testnet.near.org",
+		walletUrl: "https://testnet.mynearwallet.com",
+		helperUrl: "https://helper.testnet.near.org",
+		contractName,
+	};
+
+	switch (network) {
+		case 'testnet':
+			config = {
+				...config,
+				explorerUrl: "https://explorer.testnet.near.org",
+				GAS: "200000000000000",
+				gas: "200000000000000",
+				attachedDeposit: '10000000000000000000000', // 0.01 N (1kb storage)
+				NEW_ACCOUNT_AMOUNT: '1000000000000000000000000',
+				NEW_CONTRACT_AMOUNT: '5000000000000000000000000',
+				contractId: contractName,
+				isBrowser: new Function("try {return this===window;}catch(e){ return false;}")()
+			};
+			break;
+
+		case 'mainnet':
+			config = {
+				...config,
+				networkId: "mainnet",
+				nodeUrl: "https://rpc.mainnet.near.org",
+				walletUrl: "https://app.mynearwallet.com",
+				helperUrl: "https://helper.near.org",
+				explorerUrl: "https://explorer.near.org",
+				GAS: "200000000000000",
+				gas: "200000000000000",
+				attachedDeposit: '10000000000000000000000', // 0.01 N (1kb storage)
+				NEW_ACCOUNT_AMOUNT: '1000000000000000000000000',
+				NEW_CONTRACT_AMOUNT: '5000000000000000000000000',
+				contractId: contractName,
+				isBrowser: new Function("try {return this===window;}catch(e){ return false;}")()
+			};
+			break;
+	}
+	return config;
+};
+
+'''
+'''--- utils/near-utils.js ---
+const fs = require("fs");
+const nearAPI = require("near-api-js");
+const getConfig = require("./config");
+const { nodeUrl, walletUrl, networkId, contractId, isBrowser } = getConfig();
+
+const {
+	keyStores: { InMemoryKeyStore, BrowserLocalStorageKeyStore },
+	Near,
+	Account,
+	Contract,
+	KeyPair,
+	utils: {
+		format: { parseNearAmount },
+	},
+} = nearAPI;
+
+let credentials, keyStore;
+
+if (isBrowser) {
+	keyStore = new BrowserLocalStorageKeyStore();
+} else {
+
+	let keyPair
+
+	const { parseSeedPhrase } = require('near-seed-phrase');
+	const fundingSeedPhrase = process.env.REACT_APP_FUNDING_SEED_PHRASE
+	if (fundingSeedPhrase) {
+		const { publicKey, secretKey } = parseSeedPhrase(process.env.REACT_APP_FUNDING_SEED_PHRASE)
+		contractFromProcess = publicKey
+		keyPair = KeyPair.fromString(secretKey)
+	} else {
+		/// nodejs (for tests)
+		try {
+			console.log(`Loading Credentials: ${process.env.HOME}/.near-credentials/${networkId}/${contractId}.json`);
+			credentials = JSON.parse(
+				fs.readFileSync(
+					`${process.env.HOME}/.near-credentials/${networkId}/${contractId}.json`
+				)
+			);
+		} catch(e) {
+			console.warn(`Loading Credentials: ./neardev/${networkId}/${contractId}.json`);
+			credentials = JSON.parse(
+				fs.readFileSync(
+					`./neardev/${networkId}/${contractId}.json`
+				)
+			);
+		}
+		KeyPair.fromString(credentials.private_key)
+	}
+
+	keyStore = new InMemoryKeyStore();
+	keyStore.setKey(
+		networkId,
+		contractId,
+		keyPair
+	);
+}
+
+const near = new Near({
+	networkId,
+	nodeUrl,
+	walletUrl,
+	deps: { keyStore },
+});
+const { connection } = near;
+const contractAccount = new Account(connection, contractId);
+
+module.exports = {
+	near,
+	networkId,
+	accountSuffix: networkId === 'mainnet' ? '.near' : '.' + networkId,
+	credentials,
+	keyStore,
+	connection,
+	contractId,
+	contractAccount,
+};
+
+'''
+'''--- utils/patch-config.js ---
+const fs = require('fs');
+const contractName = fs.readFileSync('./neardev/dev-account').toString()
+const path = './utils/config.js'
+ 
+fs.readFile(path, 'utf-8', function(err, data) {
+    if (err) throw err;
+ 
+    data = data.replace(/.*const contractName.*/gim, `const contractName = '${contractName}';`);
+ 
+    fs.writeFile(path, data, 'utf-8', function(err) {
+        if (err) throw err;
+        console.log('Done!');
+    })
+})
+
+'''

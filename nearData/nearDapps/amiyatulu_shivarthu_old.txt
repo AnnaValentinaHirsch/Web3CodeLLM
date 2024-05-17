@@ -1,0 +1,2547 @@
+*GitHub Repository "amiyatulu/shivarthu_old"*
+
+'''--- README.md ---
+# Shivarthu
+
+### Decentralized democracy with experts as leaders.
+https://shivarthu.reaudito.com/#/
+
+Whitepaper
+https://shivarthu.reaudito.com/paper/Shivarthu_whitepaper.pdf
+
+Decentralized Democracy UI
+https://gateway.ipfs.io/ipfs/QmUTMU4ndH6TpjYZkuES78wDNbMKLr1d2eSjE6SMh4nmwJ/
+
+Video:  
+[![Shivarthu](https://img.youtube.com/vi/JhTgKYNNUjY/0.jpg)](https://www.youtube.com/watch?v=JhTgKYNNUjY "Shivarthu")
+
+Build with near protocol blockchain, ipfs and react
+<p>
+<img src="https://nearprotocol.com/wp-content/themes/near-19/assets/img/logo.svg?t=1553011311" width="240">
+<img src="ipfs.png" height="150">
+</p>
+'''
+'''--- approval-voting/Cargo.toml ---
+[package]
+name = "approval-voting"
+version = "0.1.0"
+authors = ["Amiya Behera <amiyatulu@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "2.0.0"
+wee_alloc = "0.4.5"
+chrono = "0.4.13"
+sha3 = "0.9.1"
+hex = "0.4.2"
+itertools = "0.9.0"
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+
+[workspace]
+members = []
+
+'''
+'''--- approval-voting/build.js ---
+const shell = require('shelljs');
+
+shell.fatal = true; // same as "set -e"
+
+shell.cd('contract');
+// Note: see flags in ./cargo/config
+shell.exec('cargo build --target wasm32-unknown-unknown --release');
+shell.cp('./target/wasm32-unknown-unknown/release/status_message.wasm', './res');
+'''
+'''--- approval-voting/src/lib.rs ---
+/*
+ * Learn more about writing NEAR smart contracts with Rust:
+ * https://github.com/near/near-sdk-rs
+ *
+ */
+
+// To conserve gas, efficient serialization is achieved through Borsh (http://borsh.io/)
+use chrono::{Duration, NaiveDateTime};
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::{TreeMap, Vector};
+use near_sdk::wee_alloc;
+use near_sdk::{env, near_bindgen};
+use sha3::{Digest, Keccak256};
+
+#[global_allocator]
+static ALLOC: wee_alloc::WeeAlloc = wee_alloc::WeeAlloc::INIT;
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct CommitRevealElection {
+    candidate_id: u128,
+    candidate_map: TreeMap<u128, String>, // candidateId, candidateName
+    candidate_votes: TreeMap<u128, u128>, //candiateId, candidateVotes
+    commit_phase_end_time: String,
+    number_of_votes_cast: u128,
+    vote_commits: Vector<String>,
+    vote_statuses: TreeMap<String, bool>,
+}
+
+impl Default for CommitRevealElection {
+    fn default() -> Self {
+        panic!("Please intialize the contract first")
+    }
+}
+
+#[near_bindgen]
+impl CommitRevealElection {
+    #[init]
+    pub fn new(commit_phase_length_in_secs: u128) -> Self {
+        assert!(env::state_read::<Self>().is_none(), "Already initialized");
+        if commit_phase_length_in_secs < 20 {
+            panic!("Commit phase length can't be less than 20 secs");
+        }
+        let timestamp = env::block_timestamp();
+        println!("{}, timestamp", timestamp);
+        let naive = NaiveDateTime::from_timestamp(timestamp as i64, 0);
+        println!("{}, now", naive);
+        let seconds = Duration::seconds(commit_phase_length_in_secs as i64);
+        let endtime = naive + seconds;
+        println!("{}, time after addition", endtime);
+
+        let commitreveal = Self {
+            candidate_id: 0,
+            candidate_map: TreeMap::new(b"4008c2a0-370c-4749-82ba-cc9a013c9416".to_vec()),
+            candidate_votes: TreeMap::new(b"05943884-211d-4063-91c1-b802c2352fa4".to_vec()),
+            commit_phase_end_time: endtime.to_string(),
+            number_of_votes_cast: 0,
+            vote_commits: Vector::new(b"a2e2c5d2-26e8-4eda-8b64-63786b9a1cad".to_vec()),
+            vote_statuses: TreeMap::new(b"76234189-ba21-49d8-a77f-2c5f728891e0".to_vec()),
+        };
+        commitreveal
+    }
+
+    pub fn add_candidate(&mut self, name: String) {
+        self.candidate_id += 1;
+        self.candidate_map.insert(&self.candidate_id, &name);
+    }
+
+    pub fn commit_vote(&mut self, vote_commit: String) {
+        let timestamp = env::block_timestamp();
+        let naive_now = NaiveDateTime::from_timestamp(timestamp as i64, 0);
+        println!("{}, now2", naive_now);
+        let naive_end_time =
+            NaiveDateTime::parse_from_str(&self.commit_phase_end_time, "%Y-%m-%d %H:%M:%S")
+                .unwrap();
+        println!("{}, naive_end_time", naive_end_time);
+        if naive_now > naive_end_time {
+            panic!("Commiting time has ended")
+        }
+        let votecommit = self.vote_statuses.get(&vote_commit);
+        match votecommit {
+            Some(_commit) => panic!("Vote commit is already done"),
+            None => {
+                println!("{} vote commit in commit fn", vote_commit);
+                self.vote_commits.push(&vote_commit);
+                self.vote_statuses.insert(&vote_commit, &true);
+                self.number_of_votes_cast = self.number_of_votes_cast + 1;
+            }
+        }
+    }
+
+    pub fn reveal_vote(&mut self, vote: String, vote_commit: String) {
+        let timestamp = env::block_timestamp();
+        let naive_now = NaiveDateTime::from_timestamp(timestamp as i64, 0);
+        let naive_end_time =
+            NaiveDateTime::parse_from_str(&self.commit_phase_end_time, "%Y-%m-%d %H:%M:%S")
+                .unwrap();
+        if naive_now < naive_end_time {
+            panic!("Commiting time has not ended");
+        }
+        println!("{} vote commit in reveal fn", vote_commit);
+        let votecommit = self.vote_statuses.get(&vote_commit);
+        match votecommit {
+            Some(commit) => {
+                if commit == false {
+                    panic!("The vote was already casted");
+                }
+            }
+            None => {
+                panic!("Vote with this commit was not cast");
+            }
+        }
+        let mut hasher = Keccak256::new();
+        hasher.update(vote.as_bytes());
+        let result = hasher.finalize();
+        let vote_hex = format!("{:x}", result);
+        println!("{} vote hex in reveal fn", vote_hex);
+        if vote_commit == vote_hex {
+            println!("commit and vote matches");
+        }
+        if vote_commit != vote_hex {
+            panic!("Vote hash doesn't match the vote commit");
+        }
+        println!("{}", &vote[0..1]);
+        let my_candidate_id_string = format!("{}", &vote[0..1]);
+        match my_candidate_id_string.parse::<u128>() {
+            Ok(n) => {
+                if n > self.candidate_id {
+                    panic!("Candidate id doesnot exist");
+                } else {
+                    let candidate_votes_option = self.candidate_votes.get(&n);
+                    match candidate_votes_option {
+                        Some(candidate_votes) => {
+                            let votecount = candidate_votes + 1;
+                            self.candidate_votes.insert(&n, &votecount);
+                            println!("{} candidate got {} votes", n, votecount);
+                        }
+                        None => {
+                            self.candidate_votes.insert(&n, &1);
+                            println!("First vote");
+                        }
+                    }
+                }
+            }
+
+            Err(e) => {
+                panic!("{}", e);
+            }
+        }
+
+        self.vote_statuses.insert(&vote_commit, &false);
+    }
+
+    pub fn n_winner(&self, n: usize) {
+        let mut data = self.candidate_votes.to_vec();
+        data.sort_by(|a, b| b.1.cmp(&a.1));
+        println!("Sorted data {:?}", data);
+        println!("Winners {:?}", &data[0..n]);
+    }
+}
+
+/*
+ * The rest of this file holds the inline tests for the code above
+ * Learn more about Rust tests: https://doc.rust-lang.org/book/ch11-01-writing-tests.html
+ *
+ * To run from contract directory:
+ * cargo test -- --nocapture
+ *
+ * From project root, to run in combination with frontend tests:
+ * yarn test
+ *
+ */
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{DateTime, Utc};
+    use near_sdk::MockedBlockchain;
+    use near_sdk::{testing_env, VMContext};
+    use sha3::{Digest, Keccak256};
+    use std::{thread, time};
+
+    fn get_timstamp() -> u64 {
+        let now: DateTime<Utc> = Utc::now();
+        now.timestamp() as u64
+    }
+
+    // mock the context for testing, notice "signer_account_id" that was accessed above from env::
+    fn get_context(input: Vec<u8>, is_view: bool) -> VMContext {
+        VMContext {
+            current_account_id: "alice_near".to_string(),
+            signer_account_id: "bob_near".to_string(),
+            signer_account_pk: vec![0, 1, 2],
+            predecessor_account_id: "carol_near".to_string(),
+            input,
+            block_index: 0,
+            block_timestamp: get_timstamp(),
+            account_balance: 0,
+            account_locked_balance: 0,
+            storage_usage: 500,
+            attached_deposit: 0,
+            prepaid_gas: 10u64.pow(18),
+            random_seed: vec![0, 1, 2],
+            is_view,
+            output_data_receivers: vec![],
+            epoch_height: 19,
+        }
+    }
+
+    #[test]
+    fn contract_test() {
+        let mut context = get_context(vec![], false);
+        testing_env!(context.clone());
+        let mut contract = CommitRevealElection::new(20);
+        let breaktime = time::Duration::from_secs(10);
+        for number in 1..=5 {
+            contract.add_candidate(format!("Paul{}", number).to_owned());
+        }
+        thread::sleep(breaktime);
+        // Vote commit 1
+        let vote = "1password".to_owned();
+        let mut hasher = Keccak256::new();
+        hasher.update(vote.as_bytes());
+        let result = hasher.finalize();
+        let commit = format!("{:x}", result);
+        println!("{} commit in test", commit);
+        context.block_timestamp = get_timstamp();
+        testing_env!(context.clone());
+        contract.commit_vote(commit.clone());
+
+        // Vote commit 2
+        let vote = "1mypass".to_owned();
+        let mut hasher = Keccak256::new();
+        hasher.update(vote.as_bytes());
+        let result = hasher.finalize();
+        let commit2 = format!("{:x}", result);
+        println!("{} commit in test", commit);
+        contract.commit_vote(commit2.clone());
+
+        for number in 2..=5 {
+            let vote = format!("{}mypass1", number).to_owned();
+            let mut hasher = Keccak256::new();
+            hasher.update(vote.as_bytes());
+            let result = hasher.finalize();
+            let commit = format!("{:x}", result);
+            println!("{} commit in test", commit);
+            contract.commit_vote(commit.clone());
+        }
+
+        for number in 3..=5 {
+            let vote = format!("{}mypass2", number).to_owned();
+            let mut hasher = Keccak256::new();
+            hasher.update(vote.as_bytes());
+            let result = hasher.finalize();
+            let commit = format!("{:x}", result);
+            println!("{} commit in test", commit);
+            contract.commit_vote(commit.clone());
+        }
+
+        for number in 4..=5 {
+            let vote = format!("{}mypass3", number).to_owned();
+            let mut hasher = Keccak256::new();
+            hasher.update(vote.as_bytes());
+            let result = hasher.finalize();
+            let commit = format!("{:x}", result);
+            println!("{} commit in test", commit);
+            contract.commit_vote(commit.clone());
+        }
+
+        let breaktime2 = time::Duration::from_secs(15);
+        thread::sleep(breaktime2);
+        context.block_timestamp = get_timstamp();
+        testing_env!(context.clone());
+        // Vote reveal 1
+        contract.reveal_vote("1password".to_owned(), commit.clone());
+        // Vote reveal 2
+        contract.reveal_vote("1mypass".to_owned(), commit2.clone());
+
+        // Vote reveal loop
+
+        for number in 2..=5 {
+            let vote = format!("{}mypass1", number).to_owned();
+            let mut hasher = Keccak256::new();
+            hasher.update(vote.as_bytes());
+            let result = hasher.finalize();
+            let commit = format!("{:x}", result);
+            contract.reveal_vote(vote, commit.clone());
+        }
+        for number in 3..=5 {
+            let vote = format!("{}mypass2", number).to_owned();
+            let mut hasher = Keccak256::new();
+            hasher.update(vote.as_bytes());
+            let result = hasher.finalize();
+            let commit = format!("{:x}", result);
+            contract.reveal_vote(vote, commit.clone());
+        }
+
+        for number in 4..=5 {
+            let vote = format!("{}mypass3", number).to_owned();
+            let mut hasher = Keccak256::new();
+            hasher.update(vote.as_bytes());
+            let result = hasher.finalize();
+            let commit = format!("{:x}", result);
+            contract.reveal_vote(vote, commit.clone());
+        }
+
+        //Winners
+        contract.n_winner(3);
+    }
+}
+
+'''
+'''--- contract/Cargo.toml ---
+[package]
+name = "contract"
+version = "0.1.0"
+authors = ["Amiya Behera <amiyatulu@gmail.com>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+near-sdk = "2.0.0"
+wee_alloc = "0.4.5"
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+
+[workspace]
+members = []
+
+'''
+'''--- contract/build.js ---
+const shell = require('shelljs');
+
+shell.fatal = true; // same as "set -e"
+
+shell.cd('contract');
+// Note: see flags in ./cargo/config
+shell.exec('cargo build --target wasm32-unknown-unknown --release');
+shell.cp('./target/wasm32-unknown-unknown/release/status_message.wasm', './res');
+'''
+'''--- contract/src/lib.rs ---
+use near_sdk::{env, near_bindgen};
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::UnorderedMap;
+
+#[global_allocator]
+static ALLOC: wee_alloc::WeeAlloc = wee_alloc::WeeAlloc::INIT;
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct StatusMessage {
+    records: UnorderedMap<String, String>,
+}
+
+#[near_bindgen]
+impl StatusMessage {
+    pub fn set_status(&mut self, message: String) {
+        env::log(b"A");
+        let account_id = env::signer_account_id();
+        self.records.insert(&account_id, &message);
+    }
+
+    pub fn get_status(&self, account_id: String) -> Option<String> {
+        env::log(b"A");
+        return self.records.get(&account_id);
+    }
+
+    pub fn new() -> Self {
+        let id = "68dbf390-0b13-4db1-bb7d-9bf6ac5d23ab".to_string().into_bytes();
+        Self{
+            records:UnorderedMap::new(id)
+        }
+    }
+}
+
+impl Default for StatusMessage {
+    fn default() -> Self {
+        panic!("StatusMessage should be initialized before usage")
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use near_sdk::MockedBlockchain;
+    use near_sdk::{testing_env, VMContext};
+
+    fn get_context(input: Vec<u8>, is_view: bool) -> VMContext {
+        VMContext {
+            current_account_id: "alice_near".to_string(),
+            signer_account_id: "bob_near".to_string(),
+            signer_account_pk: vec![0, 1, 2],
+            predecessor_account_id: "carol_near".to_string(),
+            input,
+            block_index: 0,
+            block_timestamp: 0,
+            account_balance: 0,
+            account_locked_balance: 0,
+            storage_usage: 0,
+            attached_deposit: 0,
+            prepaid_gas: 10u64.pow(18),
+            random_seed: vec![0, 1, 2],
+            is_view,
+            output_data_receivers: vec![],
+            epoch_height: 0,
+        }
+    }
+
+    #[test]
+    fn set_get_message() {
+        let context = get_context(vec![], false);
+        testing_env!(context);
+        let mut contract = StatusMessage::new();
+        contract.set_status("hello".to_string());
+        assert_eq!(
+            "hello".to_string(),
+            contract.get_status("bob_near".to_string()).unwrap()
+        );
+    }
+
+    #[test]
+    fn get_nonexistent_message() {
+        let context = get_context(vec![], true);
+        testing_env!(context);
+        let contract = StatusMessage::new();
+        assert_eq!(None, contract.get_status("francis.near".to_string()));
+    }
+}
+
+'''
+'''--- package.json ---
+{
+  "name": "shivarthu-ui",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": {
+    "@testing-library/jest-dom": "^4.2.4",
+    "@testing-library/react": "^9.3.2",
+    "@testing-library/user-event": "^7.1.2",
+    "axios": "^0.20.0",
+    "formik": "^2.1.5",
+    "near-api-js": "^0.29.1",
+    "react": "^16.13.1",
+    "react-dom": "^16.13.1",
+    "react-router-dom": "^5.2.0",
+    "react-router-hash-link": "^2.1.0",
+    "react-scripts": "3.4.3",
+    "yup": "^0.29.3"
+  },
+  "scripts": {
+    "build:contract": "node ./contract/build",
+    "dev:deploy:contract": "near dev-deploy --wasmFile ./contract/res/status_message.wasm",
+    "prestart": "npm run build:contract && npm run dev:deploy:contract",
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test",
+    "eject": "react-scripts eject",
+    "ctest": "cd contract && cargo test --package status-message -- --nocapture"
+  },
+  "eslintConfig": {
+    "extends": "react-app"
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  },
+  "devDependencies": {
+    "shelljs": "^0.8.4"
+  }
+}
+
+'''
+'''--- public/index.html ---
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="%PUBLIC_URL%/favicon.ico" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#000000" />
+    <meta
+      name="description"
+      content="Web site created using create-react-app"
+    />
+    <link rel="apple-touch-icon" href="%PUBLIC_URL%/logo192.png" />
+    <!--
+      manifest.json provides metadata used when your web app is installed on a
+      user's mobile device or desktop. See https://developers.google.com/web/fundamentals/web-app-manifest/
+    -->
+    <link rel="manifest" href="%PUBLIC_URL%/manifest.json" />
+    <!--
+      Notice the use of %PUBLIC_URL% in the tags above.
+      It will be replaced with the URL of the `public` folder during the build.
+      Only files inside the `public` folder can be referenced from the HTML.
+
+      Unlike "/favicon.ico" or "favicon.ico", "%PUBLIC_URL%/favicon.ico" will
+      work correctly both with client-side routing and a non-root public URL.
+      Learn how to configure a non-root public URL by running `npm run build`.
+    -->
+    <title>React App</title>
+  </head>
+  <body>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="root"></div>
+    <!--
+      This HTML file is a template.
+      If you open it directly in the browser, you will see an empty page.
+
+      You can add webfonts, meta tags, or analytics to this file.
+      The build step will place the bundled scripts into the <body> tag.
+
+      To begin the development, run `npm start` or `yarn start`.
+      To create a production bundle, use `npm run build` or `yarn build`.
+    -->
+  </body>
+</html>
+
+'''
+'''--- public/manifest.json ---
+{
+  "short_name": "React App",
+  "name": "Create React App Sample",
+  "icons": [
+    {
+      "src": "favicon.ico",
+      "sizes": "64x64 32x32 24x24 16x16",
+      "type": "image/x-icon"
+    },
+    {
+      "src": "logo192.png",
+      "type": "image/png",
+      "sizes": "192x192"
+    },
+    {
+      "src": "logo512.png",
+      "type": "image/png",
+      "sizes": "512x512"
+    }
+  ],
+  "start_url": ".",
+  "display": "standalone",
+  "theme_color": "#000000",
+  "background_color": "#ffffff"
+}
+
+'''
+'''--- public/robots.txt ---
+# https://www.robotstxt.org/robotstxt.html
+User-agent: *
+Disallow:
+
+'''
+'''--- sortitionsumtree/Cargo.toml ---
+[package]
+name = "sortition"
+version = "0.1.0"
+authors = ["Near Inc <hello@nearprotocol.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { git = "https://github.com/nearprotocol/json", rev = "1f5779f3b0bd3d2a4b0b975abc46f3d3fe873331", features = ["no_floats"] }
+near-sdk = "0.11.0"
+borsh = "0.6.1"
+wee_alloc = "0.4.5"
+uuid = { version = "0.8", features = ["serde", "v4"] }
+rand = "0.7.3"
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+
+'''
+'''--- sortitionsumtree/build.js ---
+const shell = require('shelljs');
+
+shell.fatal = true; // same as "set -e"
+
+shell.cd('contract');
+// Note: see flags in ./cargo/config
+shell.exec('cargo build --target wasm32-unknown-unknown --release');
+shell.cp('./target/wasm32-unknown-unknown/release/status_message.wasm', './res');
+'''
+'''--- sortitionsumtree/src/lib.rs ---
+use borsh::{BorshDeserialize, BorshSerialize};
+use near_sdk::collections::{TreeMap, Vector};
+use near_sdk::{env, near_bindgen};
+
+#[global_allocator]
+static ALLOC: wee_alloc::WeeAlloc = wee_alloc::WeeAlloc::INIT;
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct SortitionSumTree {
+    k: u128,
+    stack: Vector<u128>,
+    nodes: Vector<u128>,
+    ids_to_node_indexes: TreeMap<String, u128>,
+    node_indexes_to_ids: TreeMap<u128, String>,
+}
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct SortitionSumTrees {
+    sortition_sum_trees: TreeMap<String, SortitionSumTree>,
+    uniquecount: u128,
+}
+
+#[near_bindgen]
+impl SortitionSumTrees {
+    pub fn new() -> SortitionSumTrees {
+        let id = "68dbf390-0b13-4db1-bb7d-9bf6ac5d23ab".to_string().into_bytes();
+        SortitionSumTrees {
+            sortition_sum_trees: TreeMap::new(id),
+            uniquecount: 0
+        }
+    }
+    pub fn create_tree(&mut self, _key: String, _k: u128) {
+        if _k < 1 {
+            panic!("K must be greater than one");
+        }
+        let tree_option = self.sortition_sum_trees.get(&_key);
+        match tree_option {
+            Some(_tree) => {
+                panic!("The tree already exists.");
+            }
+            None => {
+                let s = "SortitionSumTree";
+                self.uniquecount = self.uniquecount + 1;
+                let t = format!("{}{}", s, self.uniquecount);
+                println!("{:?}", t);
+                let node_id = t.to_string().into_bytes();
+                self.uniquecount = self.uniquecount + 1;
+                let t = format!("{}{}", s, self.uniquecount);
+                println!("{:?}", t);
+                let stack_id = t.to_string().into_bytes();
+                self.uniquecount = self.uniquecount+ 1;
+                let t = format!("{}{}", s, self.uniquecount);
+                println!("{:?}", t);
+                let ids_to_node_indexes_id = t.to_string().into_bytes();
+                self.uniquecount = self.uniquecount+ 1;
+                let t = format!("{}{}", s, self.uniquecount);
+                println!("{:?}", t);
+                let node_indexes_to_ids_id = t.to_string().into_bytes();
+                let mut firstnode = Vector::new(node_id);
+                firstnode.push(&0);
+                let sum_tree = SortitionSumTree {
+                    k: _k,
+                    stack: Vector::new(stack_id),
+                    nodes: firstnode,
+                    ids_to_node_indexes: TreeMap::new(ids_to_node_indexes_id),
+                    node_indexes_to_ids: TreeMap::new(node_indexes_to_ids_id),
+                };
+                self.sortition_sum_trees.insert(&_key, &sum_tree);
+            }
+        }
+    }
+
+    pub fn set(&mut self, _key: String, _value: u128, _id: String) {
+        let tree_option = self.sortition_sum_trees.get(&_key);
+
+        match tree_option {
+            Some(mut tree) => {
+                let ids_to_node_option = tree.ids_to_node_indexes.get(&_id);
+                println!("ids_to_node_option {:?}", ids_to_node_option);
+                match ids_to_node_option {
+                    Some(tree_index) => {
+                        if _value == 0 {
+                            let value = tree.nodes.get(tree_index as u64).unwrap();
+                            tree.nodes.replace(tree_index as u64, &0);
+                            tree.stack.push(&tree_index);
+                            tree.ids_to_node_indexes.remove(&_id);
+                            tree.node_indexes_to_ids.remove(&tree_index);
+                            self.sortition_sum_trees.insert(&_key, &tree);
+                            self.update_parents(_key, tree_index, false, value);
+                        } else if _value != tree.nodes.get(tree_index as u64).unwrap() {
+                            let plus_or_minus =
+                                tree.nodes.get(tree_index as u64).unwrap() <= _value;
+                            let plus_or_minus_value = if plus_or_minus {
+                                _value - tree.nodes.get(tree_index as u64).unwrap()
+                            } else {
+                                tree.nodes.get(tree_index as u64).unwrap() - _value
+                            };
+                            tree.nodes.replace(tree_index as u64, &_value);
+
+                            self.sortition_sum_trees.insert(&_key, &tree);
+                            self.update_parents(
+                                _key,
+                                tree_index,
+                                plus_or_minus,
+                                plus_or_minus_value,
+                            );
+                        }
+                    }
+                    None => {
+                        if _value != 0 {
+                            println!("{:?}", tree.stack.len());
+                            let mut tree_index: u128 = 0;
+                            if tree.stack.len() == 0 {
+                                tree_index = tree.nodes.len() as u128;
+                                println!("Node length {:?}", tree_index);
+                                tree.nodes.push(&_value);
+                                println!("{:?}: Nodes", tree.nodes.to_vec());
+
+                                if tree_index != 1 && (tree_index - 1) % tree.k == 0 {
+                                    println!("Inside a long test");
+                                    println!("Tree index {:?}", tree_index);
+                                    println!("K value {:?}", tree.k);
+                                    let parent_index = tree_index / tree.k;
+                                    println!("{:?}: parent_index", parent_index);
+                                    println!(
+                                        "nodes_indexes_to_ids: {:?}",
+                                        tree.node_indexes_to_ids.to_vec()
+                                    );
+                                    let parent_id =
+                                        tree.node_indexes_to_ids.get(&parent_index).unwrap();
+                                    println!("{:?}: parent_id", parent_id);
+                                    let new_index = tree_index + 1;
+                                    tree.nodes
+                                        .push(&tree.nodes.get(parent_index as u64).unwrap());
+                                    tree.node_indexes_to_ids.remove(&parent_index);
+                                    tree.ids_to_node_indexes.insert(&parent_id, &new_index);
+                                    tree.node_indexes_to_ids.insert(&new_index, &parent_id);
+                                    self.sortition_sum_trees.insert(&_key, &tree);
+                                }
+                            } else {
+                                println!("Inside else block long test");
+
+                                let tree_index = tree.stack.get(tree.stack.len() - 1);
+                                tree.stack.pop();
+                                tree.nodes.replace(tree_index.unwrap() as u64, &_value);
+                                self.sortition_sum_trees.insert(&_key, &tree);
+                            }
+                            println!("Before appending 0 and id");
+                            println!("Tree index {:?}", tree_index);
+                            tree.ids_to_node_indexes.insert(&_id, &tree_index);
+                            tree.node_indexes_to_ids.insert(&tree_index, &_id);
+                            println!(
+                                "node_indexes_to_ids {:?}",
+                                tree.node_indexes_to_ids.to_vec()
+                            );
+                            println!(
+                                "ids_to_node_indexes {:?}",
+                                tree.ids_to_node_indexes.to_vec()
+                            );
+                            self.sortition_sum_trees.insert(&_key, &tree);
+                            self.update_parents(_key, tree_index, true, _value);
+                        }
+                    }
+                }
+            }
+
+            None => {
+                println!("Null");
+            }
+        }
+    }
+
+    fn update_parents(
+        &mut self,
+        _key: String,
+        _tree_index: u128,
+        _plus_or_minus: bool,
+        _value: u128,
+    ) {
+        let mut tree = self.sortition_sum_trees.get(&_key).unwrap();
+
+        println!("{:?} hello", tree.ids_to_node_indexes.to_vec());
+
+        let mut parent_index = _tree_index;
+        println!("{:?} parent index", parent_index);
+
+        while parent_index != 0 {
+            parent_index = (parent_index - 1) / tree.k;
+            let nodes = tree.nodes.get(parent_index as u64).unwrap();
+            println!("{:?}", nodes);
+            let tree_node_value = if _plus_or_minus {
+                tree.nodes.get(parent_index as u64).unwrap() + _value
+            } else {
+                tree.nodes.get(parent_index as u64).unwrap() - _value
+            };
+
+            tree.nodes.replace(parent_index as u64, &tree_node_value);
+            println!("Final K: {:?}", tree.k);
+            println!("Final stack: {:?}", tree.stack.to_vec());
+            println!("Final nodes: {:?}", tree.nodes.to_vec());
+            println!(
+                "Final ids_to_node_indexes: {:?}",
+                tree.ids_to_node_indexes.to_vec()
+            );
+            println!(
+                "Final node_indexes_to_ids: {:?}",
+                tree.node_indexes_to_ids.to_vec()
+            );
+
+            self.sortition_sum_trees.insert(&_key, &tree);
+        }
+    }
+
+    pub fn draw(&mut self, _key: String, _draw_number: u128) -> String {
+        let tree = self.sortition_sum_trees.get(&_key).unwrap();
+        let mut tree_index = 0;
+        let mut current_draw_number = _draw_number % tree.nodes.get(0).unwrap();
+
+        while (tree.k * tree_index) + 1 < (tree.nodes.len() as u128) {
+            for i in 1..tree.k + 1 {
+                let node_index = (tree.k * tree_index) + i;
+                let node_value = tree.nodes.get(node_index as u64).unwrap();
+                if current_draw_number >= node_value {
+                    current_draw_number -= node_value;
+                } else {
+                    tree_index = node_index;
+                    break;
+                }
+            }
+        }
+
+        tree.node_indexes_to_ids.get(&tree_index).unwrap()
+    }
+    pub fn stake_of(&mut self, _key: String, _id: String) -> u128 {
+        let tree = self.sortition_sum_trees.get(&_key).unwrap();
+        let tree_index = tree.ids_to_node_indexes.get(&_id).unwrap();
+        let  value:u128;
+        if tree_index == 0 {
+            value = 0;
+        } else {
+            value = tree.nodes.get(tree_index as u64).unwrap();
+        }
+        value
+
+    }
+
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use near_sdk::MockedBlockchain;
+    use near_sdk::{testing_env, VMContext};
+    use rand::Rng;
+    fn rand_vector() -> Vec<u8> {
+        let mut rng = rand::thread_rng();
+
+        let mut randvec: Vec<u8> = Vec::new();
+        let mut counter = 0;
+        let result = loop {
+            counter += 1;
+            let n1: u8 = rng.gen();
+            randvec.push(n1);
+
+            if counter == 32 {
+                break randvec;
+            }
+        };
+        return result;
+    }
+
+    fn get_context(input: Vec<u8>, is_view: bool) -> VMContext {
+        VMContext {
+            current_account_id: "alice_near".to_string(),
+            signer_account_id: "bob_near".to_string(),
+            signer_account_pk: vec![0, 1, 2],
+            predecessor_account_id: "carol_near".to_string(),
+            input,
+            block_index: 0,
+            block_timestamp: 0,
+            account_balance: 0,
+            account_locked_balance: 0,
+            storage_usage: 0,
+            attached_deposit: 0,
+            prepaid_gas: 10u64.pow(18),
+            random_seed: rand_vector(),
+            is_view,
+            epoch_height: 0,
+            output_data_receivers: vec![],
+        }
+    }
+
+    #[test]
+
+    fn set_get_message() {
+        // for x in 0..1000{
+        let context = get_context(vec![], false);
+        testing_env!(context);
+        let mut contract = SortitionSumTrees::new();
+        contract.create_tree("Python".to_owned(), 2);
+        // data.create_tree("Python".to_owned(), 1);
+        contract.set("Python".to_owned(), 15, "Code1".to_owned());
+        println!("---------------------------------------------");
+        contract.set("Python".to_owned(), 5, "Code2".to_owned());
+        println!("---------------------------------------------");
+        contract.set("Python".to_owned(), 10, "Code3".to_owned());
+        println!("---------------------------------------------");
+        contract.set("Python".to_owned(), 20, "Code4".to_owned());
+
+        let draw_value = contract.draw("Python".to_owned(), 13);
+        println!("draw value {:?}", draw_value);
+        let draw_value = contract.draw("Python".to_owned(), 27);
+        println!("draw value {:?}", draw_value);
+
+        let draw_value = contract.draw("Python".to_owned(), 3);
+        println!("draw value {:?}", draw_value);
+        let draw_value = contract.draw("Python".to_owned(), 19);
+        println!("draw value {:?}", draw_value);
+        let draw_value = contract.draw("Python".to_owned(), 49);
+        println!("draw value {:?}", draw_value);
+        let draw_value = contract.draw("Python".to_owned(), 0);
+        println!("draw value {:?}", draw_value);
+        let value = contract.stake_of("Python".to_owned(), "Code4".to_owned());
+        println!("draw value {:?}", value);
+
+        contract.create_tree("Python2".to_owned(), 2);
+        contract.set("Python2".to_owned(), 15, "Code1".to_owned());
+
+        // }
+        
+    }
+}
+
+'''
+'''--- src/App.css ---
+.App {
+  text-align: center;
+}
+
+.App-logo {
+  height: 40vmin;
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .App-logo {
+    animation: App-logo-spin infinite 20s linear;
+  }
+}
+
+.App-header {
+  background-color: #282c34;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  font-size: calc(10px + 2vmin);
+  color: white;
+}
+
+.App-link {
+  color: #61dafb;
+}
+
+@keyframes App-logo-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+'''
+'''--- src/App.js ---
+import React from 'react';
+import logo from './logo.svg';
+import './App.css';
+
+function App() {
+  return (
+    <div className="App">
+      <header className="App-header">
+        <img src={logo} className="App-logo" alt="logo" />
+        <p>
+          Edit <code>src/App.js</code> and save to reload.
+        </p>
+        <a
+          className="App-link"
+          href="https://reactjs.org"
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          Learn React
+        </a>
+      </header>
+    </div>
+  );
+}
+
+export default App;
+
+'''
+'''--- src/App.test.js ---
+import React from 'react';
+import { render } from '@testing-library/react';
+import App from './App';
+
+test('renders learn react link', () => {
+  const { getByText } = render(<App />);
+  const linkElement = getByText(/learn react/i);
+  expect(linkElement).toBeInTheDocument();
+});
+
+'''
+'''--- src/index.css ---
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+code {
+  font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
+    monospace;
+}
+
+'''
+'''--- src/index.js ---
+import React from 'react';
+import ReactDOM from 'react-dom';
+import './index.css';
+import App from './App';
+import * as serviceWorker from './serviceWorker';
+
+ReactDOM.render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>,
+  document.getElementById('root')
+);
+
+// If you want your app to work offline and load faster, you can change
+// unregister() to register() below. Note this comes with some pitfalls.
+// Learn more about service workers: https://bit.ly/CRA-PWA
+serviceWorker.unregister();
+
+'''
+'''--- src/logo.svg ---
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 841.9 595.3">
+    <g fill="#61DAFB">
+        <path d="M666.3 296.5c0-32.5-40.7-63.3-103.1-82.4 14.4-63.6 8-114.2-20.2-130.4-6.5-3.8-14.1-5.6-22.4-5.6v22.3c4.6 0 8.3.9 11.4 2.6 13.6 7.8 19.5 37.5 14.9 75.7-1.1 9.4-2.9 19.3-5.1 29.4-19.6-4.8-41-8.5-63.5-10.9-13.5-18.5-27.5-35.3-41.6-50 32.6-30.3 63.2-46.9 84-46.9V78c-27.5 0-63.5 19.6-99.9 53.6-36.4-33.8-72.4-53.2-99.9-53.2v22.3c20.7 0 51.4 16.5 84 46.6-14 14.7-28 31.4-41.3 49.9-22.6 2.4-44 6.1-63.6 11-2.3-10-4-19.7-5.2-29-4.7-38.2 1.1-67.9 14.6-75.8 3-1.8 6.9-2.6 11.5-2.6V78.5c-8.4 0-16 1.8-22.6 5.6-28.1 16.2-34.4 66.7-19.9 130.1-62.2 19.2-102.7 49.9-102.7 82.3 0 32.5 40.7 63.3 103.1 82.4-14.4 63.6-8 114.2 20.2 130.4 6.5 3.8 14.1 5.6 22.5 5.6 27.5 0 63.5-19.6 99.9-53.6 36.4 33.8 72.4 53.2 99.9 53.2 8.4 0 16-1.8 22.6-5.6 28.1-16.2 34.4-66.7 19.9-130.1 62-19.1 102.5-49.9 102.5-82.3zm-130.2-66.7c-3.7 12.9-8.3 26.2-13.5 39.5-4.1-8-8.4-16-13.1-24-4.6-8-9.5-15.8-14.4-23.4 14.2 2.1 27.9 4.7 41 7.9zm-45.8 106.5c-7.8 13.5-15.8 26.3-24.1 38.2-14.9 1.3-30 2-45.2 2-15.1 0-30.2-.7-45-1.9-8.3-11.9-16.4-24.6-24.2-38-7.6-13.1-14.5-26.4-20.8-39.8 6.2-13.4 13.2-26.8 20.7-39.9 7.8-13.5 15.8-26.3 24.1-38.2 14.9-1.3 30-2 45.2-2 15.1 0 30.2.7 45 1.9 8.3 11.9 16.4 24.6 24.2 38 7.6 13.1 14.5 26.4 20.8 39.8-6.3 13.4-13.2 26.8-20.7 39.9zm32.3-13c5.4 13.4 10 26.8 13.8 39.8-13.1 3.2-26.9 5.9-41.2 8 4.9-7.7 9.8-15.6 14.4-23.7 4.6-8 8.9-16.1 13-24.1zM421.2 430c-9.3-9.6-18.6-20.3-27.8-32 9 .4 18.2.7 27.5.7 9.4 0 18.7-.2 27.8-.7-9 11.7-18.3 22.4-27.5 32zm-74.4-58.9c-14.2-2.1-27.9-4.7-41-7.9 3.7-12.9 8.3-26.2 13.5-39.5 4.1 8 8.4 16 13.1 24 4.7 8 9.5 15.8 14.4 23.4zM420.7 163c9.3 9.6 18.6 20.3 27.8 32-9-.4-18.2-.7-27.5-.7-9.4 0-18.7.2-27.8.7 9-11.7 18.3-22.4 27.5-32zm-74 58.9c-4.9 7.7-9.8 15.6-14.4 23.7-4.6 8-8.9 16-13 24-5.4-13.4-10-26.8-13.8-39.8 13.1-3.1 26.9-5.8 41.2-7.9zm-90.5 125.2c-35.4-15.1-58.3-34.9-58.3-50.6 0-15.7 22.9-35.6 58.3-50.6 8.6-3.7 18-7 27.7-10.1 5.7 19.6 13.2 40 22.5 60.9-9.2 20.8-16.6 41.1-22.2 60.6-9.9-3.1-19.3-6.5-28-10.2zM310 490c-13.6-7.8-19.5-37.5-14.9-75.7 1.1-9.4 2.9-19.3 5.1-29.4 19.6 4.8 41 8.5 63.5 10.9 13.5 18.5 27.5 35.3 41.6 50-32.6 30.3-63.2 46.9-84 46.9-4.5-.1-8.3-1-11.3-2.7zm237.2-76.2c4.7 38.2-1.1 67.9-14.6 75.8-3 1.8-6.9 2.6-11.5 2.6-20.7 0-51.4-16.5-84-46.6 14-14.7 28-31.4 41.3-49.9 22.6-2.4 44-6.1 63.6-11 2.3 10.1 4.1 19.8 5.2 29.1zm38.5-66.7c-8.6 3.7-18 7-27.7 10.1-5.7-19.6-13.2-40-22.5-60.9 9.2-20.8 16.6-41.1 22.2-60.6 9.9 3.1 19.3 6.5 28.1 10.2 35.4 15.1 58.3 34.9 58.3 50.6-.1 15.7-23 35.6-58.4 50.6zM320.8 78.4z"/>
+        <circle cx="420.9" cy="296.5" r="45.7"/>
+        <path d="M520.5 78.1z"/>
+    </g>
+</svg>
+
+'''
+'''--- src/serviceWorker.js ---
+// This optional code is used to register a service worker.
+// register() is not called by default.
+
+// This lets the app load faster on subsequent visits in production, and gives
+// it offline capabilities. However, it also means that developers (and users)
+// will only see deployed updates on subsequent visits to a page, after all the
+// existing tabs open on the page have been closed, since previously cached
+// resources are updated in the background.
+
+// To learn more about the benefits of this model and instructions on how to
+// opt-in, read https://bit.ly/CRA-PWA
+
+const isLocalhost = Boolean(
+  window.location.hostname === 'localhost' ||
+    // [::1] is the IPv6 localhost address.
+    window.location.hostname === '[::1]' ||
+    // 127.0.0.0/8 are considered localhost for IPv4.
+    window.location.hostname.match(
+      /^127(?:\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)){3}$/
+    )
+);
+
+export function register(config) {
+  if (process.env.NODE_ENV === 'production' && 'serviceWorker' in navigator) {
+    // The URL constructor is available in all browsers that support SW.
+    const publicUrl = new URL(process.env.PUBLIC_URL, window.location.href);
+    if (publicUrl.origin !== window.location.origin) {
+      // Our service worker won't work if PUBLIC_URL is on a different origin
+      // from what our page is served on. This might happen if a CDN is used to
+      // serve assets; see https://github.com/facebook/create-react-app/issues/2374
+      return;
+    }
+
+    window.addEventListener('load', () => {
+      const swUrl = `${process.env.PUBLIC_URL}/service-worker.js`;
+
+      if (isLocalhost) {
+        // This is running on localhost. Let's check if a service worker still exists or not.
+        checkValidServiceWorker(swUrl, config);
+
+        // Add some additional logging to localhost, pointing developers to the
+        // service worker/PWA documentation.
+        navigator.serviceWorker.ready.then(() => {
+          console.log(
+            'This web app is being served cache-first by a service ' +
+              'worker. To learn more, visit https://bit.ly/CRA-PWA'
+          );
+        });
+      } else {
+        // Is not localhost. Just register service worker
+        registerValidSW(swUrl, config);
+      }
+    });
+  }
+}
+
+function registerValidSW(swUrl, config) {
+  navigator.serviceWorker
+    .register(swUrl)
+    .then(registration => {
+      registration.onupdatefound = () => {
+        const installingWorker = registration.installing;
+        if (installingWorker == null) {
+          return;
+        }
+        installingWorker.onstatechange = () => {
+          if (installingWorker.state === 'installed') {
+            if (navigator.serviceWorker.controller) {
+              // At this point, the updated precached content has been fetched,
+              // but the previous service worker will still serve the older
+              // content until all client tabs are closed.
+              console.log(
+                'New content is available and will be used when all ' +
+                  'tabs for this page are closed. See https://bit.ly/CRA-PWA.'
+              );
+
+              // Execute callback
+              if (config && config.onUpdate) {
+                config.onUpdate(registration);
+              }
+            } else {
+              // At this point, everything has been precached.
+              // It's the perfect time to display a
+              // "Content is cached for offline use." message.
+              console.log('Content is cached for offline use.');
+
+              // Execute callback
+              if (config && config.onSuccess) {
+                config.onSuccess(registration);
+              }
+            }
+          }
+        };
+      };
+    })
+    .catch(error => {
+      console.error('Error during service worker registration:', error);
+    });
+}
+
+function checkValidServiceWorker(swUrl, config) {
+  // Check if the service worker can be found. If it can't reload the page.
+  fetch(swUrl, {
+    headers: { 'Service-Worker': 'script' },
+  })
+    .then(response => {
+      // Ensure service worker exists, and that we really are getting a JS file.
+      const contentType = response.headers.get('content-type');
+      if (
+        response.status === 404 ||
+        (contentType != null && contentType.indexOf('javascript') === -1)
+      ) {
+        // No service worker found. Probably a different app. Reload the page.
+        navigator.serviceWorker.ready.then(registration => {
+          registration.unregister().then(() => {
+            window.location.reload();
+          });
+        });
+      } else {
+        // Service worker found. Proceed as normal.
+        registerValidSW(swUrl, config);
+      }
+    })
+    .catch(() => {
+      console.log(
+        'No internet connection found. App is running in offline mode.'
+      );
+    });
+}
+
+export function unregister() {
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.ready
+      .then(registration => {
+        registration.unregister();
+      })
+      .catch(error => {
+        console.error(error.message);
+      });
+  }
+}
+
+'''
+'''--- src/setupTests.js ---
+// jest-dom adds custom jest matchers for asserting on DOM nodes.
+// allows you to do things like:
+// expect(element).toHaveTextContent(/react/i)
+// learn more: https://github.com/testing-library/jest-dom
+import '@testing-library/jest-dom/extend-expect';
+
+'''
+'''--- voter-validation/Cargo.toml ---
+[package]
+name = "voter-validation"
+version = "0.1.0"
+authors = ["Amiya Behera <amiyatulu@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+near-sdk = "2.0.0"
+wee_alloc = "0.4.5"
+rand = "0.7.3"
+
+'''
+'''--- voter-validation/build.js ---
+const shell = require('shelljs');
+
+shell.fatal = true; // same as "set -e"
+
+shell.cd('contract');
+// Note: see flags in ./cargo/config
+shell.exec('cargo build --target wasm32-unknown-unknown --release');
+shell.cp('./target/wasm32-unknown-unknown/release/status_message.wasm', './res');
+'''
+'''--- voter-validation/src/lib.rs ---
+pub mod shivarthu;
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(test)]
+mod tests {
+    use crate::shivarthu::{FungibleToken, STORAGE_PRICE_PER_BYTE};
+    use near_sdk::MockedBlockchain;
+    use near_sdk::{env, AccountId, Balance};
+    use near_sdk::{testing_env, VMContext};
+    use rand::Rng;
+    use std::panic;
+
+    fn rand_vector() -> Vec<u8> {
+        let mut rng = rand::thread_rng();
+
+        let mut randvec: Vec<u8> = Vec::new();
+        let mut counter = 0;
+        let result = loop {
+            counter += 1;
+            let n1: u8 = rng.gen();
+            randvec.push(n1);
+
+            if counter == 32 {
+                break randvec;
+            }
+        };
+        return result;
+    }
+
+    fn alice() -> AccountId {
+        "alice.near".to_string()
+    }
+    fn bob() -> AccountId {
+        "bob.near".to_string()
+    }
+    fn carol() -> AccountId {
+        "carol.near".to_string()
+    }
+
+    fn user2() -> AccountId {
+        "user2.near".to_string()
+    }
+
+    fn user3() -> AccountId {
+        "user3.near".to_string()
+    }
+
+    fn get_context(predecessor_account_id: AccountId) -> VMContext {
+        VMContext {
+            current_account_id: alice(), //The id of the account that owns the current contract.
+            signer_account_id: bob(), // The id of the account that either signed the original transaction or issued the initial cross-contract call
+            signer_account_pk: vec![0, 1, 2],
+            predecessor_account_id, //The id of the account that was the previous contract in the chain of cross-contract calls. If this is the first contract, it is equal to signer_account_id
+            input: vec![],
+            block_index: 0,
+            block_timestamp: 0,
+            account_balance: 1_000_000_000_000_000_000_000_000_000u128,
+            account_locked_balance: 0,
+            storage_usage: 10u64.pow(6),
+            attached_deposit: 0, //The balance that was attached to the call that will be immediately deposited before the contract execution starts
+            prepaid_gas: 10u64.pow(18),
+            random_seed: vec![0, 1, 2],
+            is_view: false,
+            output_data_receivers: vec![],
+            epoch_height: 0,
+        }
+    }
+
+    #[test]
+    fn test_initialize_new_token() {
+        let context = get_context(carol());
+        testing_env!(context);
+        let total_supply = 1_000_000_000_000_000u128;
+        let contract = FungibleToken::new(bob(), total_supply.into());
+        assert_eq!(contract.get_total_supply().0, total_supply);
+        assert_eq!(contract.get_balance(bob()).0, total_supply);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_initialize_new_token_twice_fails() {
+        let context = get_context(carol());
+        testing_env!(context);
+        let total_supply = 1_000_000_000_000_000u128;
+        {
+            let _contract = FungibleToken::new(bob(), total_supply.into());
+        }
+        FungibleToken::new(bob(), total_supply.into());
+    }
+
+    #[test]
+    fn test_transfer_to_a_different_account_works() {
+        let mut context = get_context(carol());
+        testing_env!(context.clone());
+        let total_supply = 1_000_000_000_000_000u128;
+        let mut contract = FungibleToken::new(carol(), total_supply.into());
+        context.storage_usage = env::storage_usage();
+
+        context.attached_deposit = 1000 * STORAGE_PRICE_PER_BYTE;
+        testing_env!(context.clone());
+        let transfer_amount = total_supply / 3;
+        contract.transfer(bob(), transfer_amount.into());
+        context.storage_usage = env::storage_usage();
+        context.account_balance = env::account_balance();
+
+        context.is_view = true;
+        context.attached_deposit = 0;
+        testing_env!(context.clone());
+        assert_eq!(
+            contract.get_balance(carol()).0,
+            (total_supply - transfer_amount)
+        );
+        assert_eq!(contract.get_balance(bob()).0, transfer_amount);
+    }
+
+    #[test]
+    #[should_panic(expected = "The new owner should be different from the current owner")]
+    fn test_transfer_to_self_fails() {
+        let mut context = get_context(carol());
+        testing_env!(context.clone());
+        let total_supply = 1_000_000_000_000_000u128;
+        let mut contract = FungibleToken::new(carol(), total_supply.into());
+        context.storage_usage = env::storage_usage();
+
+        context.attached_deposit = 1000 * STORAGE_PRICE_PER_BYTE;
+        testing_env!(context.clone());
+        let transfer_amount = total_supply / 3;
+        contract.transfer(carol(), transfer_amount.into());
+    }
+
+    #[test]
+    #[should_panic(expected = "Can not increment allowance for yourself")]
+    fn test_increment_allowance_to_self_fails() {
+        let mut context = get_context(carol());
+        testing_env!(context.clone());
+        let total_supply = 1_000_000_000_000_000u128;
+        let mut contract = FungibleToken::new(carol(), total_supply.into());
+        context.attached_deposit = STORAGE_PRICE_PER_BYTE * 1000;
+        testing_env!(context.clone());
+        contract.inc_allowance(carol(), (total_supply / 2).into());
+    }
+
+    #[test]
+    #[should_panic(expected = "Can not decrement allowance for yourself")]
+    fn test_decrement_allowance_to_self_fails() {
+        let mut context = get_context(carol());
+        testing_env!(context.clone());
+        let total_supply = 1_000_000_000_000_000u128;
+        let mut contract = FungibleToken::new(carol(), total_supply.into());
+        context.attached_deposit = STORAGE_PRICE_PER_BYTE * 1000;
+        testing_env!(context.clone());
+        contract.dec_allowance(carol(), (total_supply / 2).into());
+    }
+
+    #[test]
+    fn test_decrement_allowance_after_allowance_was_saturated() {
+        let mut context = get_context(carol());
+        testing_env!(context.clone());
+        let total_supply = 1_000_000_000_000_000u128;
+        let mut contract = FungibleToken::new(carol(), total_supply.into());
+        context.attached_deposit = STORAGE_PRICE_PER_BYTE * 1000;
+        testing_env!(context.clone());
+        contract.dec_allowance(bob(), (total_supply / 2).into());
+        assert_eq!(contract.get_allowance(carol(), bob()), 0.into())
+    }
+
+    #[test]
+    fn test_increment_allowance_does_not_overflow() {
+        let mut context = get_context(carol());
+        testing_env!(context.clone());
+        let total_supply = std::u128::MAX;
+        let mut contract = FungibleToken::new(carol(), total_supply.into());
+        context.attached_deposit = STORAGE_PRICE_PER_BYTE * 1000;
+        testing_env!(context.clone());
+        contract.inc_allowance(bob(), total_supply.into());
+        contract.inc_allowance(bob(), total_supply.into());
+        assert_eq!(
+            contract.get_allowance(carol(), bob()),
+            std::u128::MAX.into()
+        )
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "The required attached deposit is 33100000000000000000000, but the given attached deposit is is 0"
+    )]
+    fn test_increment_allowance_with_insufficient_attached_deposit() {
+        let mut context = get_context(carol());
+        testing_env!(context.clone());
+        let total_supply = 1_000_000_000_000_000u128;
+        let mut contract = FungibleToken::new(carol(), total_supply.into());
+        context.attached_deposit = 0;
+        testing_env!(context.clone());
+        contract.inc_allowance(bob(), (total_supply / 2).into());
+    }
+
+    #[test]
+    fn test_carol_escrows_to_bob_transfers_to_alice() {
+        // Acting as carol
+        let mut context = get_context(carol());
+        testing_env!(context.clone());
+        let total_supply = 1_000_000_000_000_000u128;
+        let mut contract = FungibleToken::new(carol(), total_supply.into());
+        context.storage_usage = env::storage_usage();
+
+        context.is_view = true;
+        testing_env!(context.clone());
+        assert_eq!(contract.get_total_supply().0, total_supply);
+
+        let allowance = total_supply / 3;
+        let transfer_amount = allowance / 3;
+        context.is_view = false;
+        context.attached_deposit = STORAGE_PRICE_PER_BYTE * 1000;
+        testing_env!(context.clone());
+        contract.inc_allowance(bob(), allowance.into());
+        context.storage_usage = env::storage_usage();
+        context.account_balance = env::account_balance();
+
+        context.is_view = true;
+        context.attached_deposit = 0;
+        testing_env!(context.clone());
+        assert_eq!(contract.get_allowance(carol(), bob()).0, allowance);
+
+        // Acting as bob now
+        context.is_view = false;
+        context.attached_deposit = STORAGE_PRICE_PER_BYTE * 1000;
+        context.predecessor_account_id = bob();
+        testing_env!(context.clone());
+        contract.transfer_from(carol(), alice(), transfer_amount.into());
+        context.storage_usage = env::storage_usage();
+        context.account_balance = env::account_balance();
+
+        context.is_view = true;
+        context.attached_deposit = 0;
+        testing_env!(context.clone());
+        assert_eq!(
+            contract.get_balance(carol()).0,
+            total_supply - transfer_amount
+        );
+        assert_eq!(contract.get_balance(alice()).0, transfer_amount);
+        assert_eq!(
+            contract.get_allowance(carol(), bob()).0,
+            allowance - transfer_amount
+        );
+    }
+
+    #[test]
+    fn test_carol_escrows_to_bob_locks_and_transfers_to_alice() {
+        // Acting as carol
+        let mut context = get_context(carol());
+        testing_env!(context.clone());
+        let total_supply = 1_000_000_000_000_000u128;
+        let mut contract = FungibleToken::new(carol(), total_supply.into());
+        context.storage_usage = env::storage_usage();
+
+        context.is_view = true;
+        testing_env!(context.clone());
+        assert_eq!(contract.get_total_supply().0, total_supply);
+
+        let allowance = total_supply / 3;
+        let transfer_amount = allowance / 3;
+        context.is_view = false;
+        context.attached_deposit = STORAGE_PRICE_PER_BYTE * 1000;
+        testing_env!(context.clone());
+        contract.inc_allowance(bob(), allowance.into());
+        context.storage_usage = env::storage_usage();
+        context.account_balance = env::account_balance();
+
+        context.is_view = true;
+        context.attached_deposit = 0;
+        testing_env!(context.clone());
+        assert_eq!(contract.get_allowance(carol(), bob()).0, allowance);
+        assert_eq!(contract.get_balance(carol()).0, total_supply);
+
+        // Acting as bob now
+        context.is_view = false;
+        context.attached_deposit = STORAGE_PRICE_PER_BYTE * 1000;
+        context.predecessor_account_id = bob();
+        testing_env!(context.clone());
+        contract.transfer_from(carol(), alice(), transfer_amount.into());
+        context.storage_usage = env::storage_usage();
+        context.account_balance = env::account_balance();
+
+        context.is_view = true;
+        context.attached_deposit = 0;
+        testing_env!(context.clone());
+        assert_eq!(
+            contract.get_balance(carol()).0,
+            (total_supply - transfer_amount)
+        );
+        assert_eq!(contract.get_balance(alice()).0, transfer_amount);
+        assert_eq!(
+            contract.get_allowance(carol(), bob()).0,
+            allowance - transfer_amount
+        );
+    }
+
+    #[test]
+    fn test_self_allowance_set_for_refund() {
+        let mut context = get_context(carol());
+        testing_env!(context.clone());
+        let total_supply = 1_000_000_000_000_000u128;
+        let mut contract = FungibleToken::new(carol(), total_supply.into());
+        context.storage_usage = env::storage_usage();
+
+        let initial_balance = context.account_balance;
+        let initial_storage = context.storage_usage;
+        context.attached_deposit = STORAGE_PRICE_PER_BYTE * 1000;
+        testing_env!(context.clone());
+        contract.inc_allowance(bob(), (total_supply / 2).into());
+        context.storage_usage = env::storage_usage();
+        context.account_balance = env::account_balance();
+        assert_eq!(
+            context.account_balance,
+            initial_balance
+                + Balance::from(context.storage_usage - initial_storage) * STORAGE_PRICE_PER_BYTE
+        );
+
+        let initial_balance = context.account_balance;
+        let initial_storage = context.storage_usage;
+        testing_env!(context.clone());
+        context.attached_deposit = 0;
+        testing_env!(context.clone());
+        contract.dec_allowance(bob(), (total_supply / 2).into());
+        context.storage_usage = env::storage_usage();
+        context.account_balance = env::account_balance();
+        assert!(context.storage_usage < initial_storage);
+        assert!(context.account_balance < initial_balance);
+        assert_eq!(
+            context.account_balance,
+            initial_balance
+                - Balance::from(initial_storage - context.storage_usage) * STORAGE_PRICE_PER_BYTE
+        );
+    }
+
+    #[test]
+    fn test_voter_addition() {
+        let mut context = get_context(carol());
+        testing_env!(context.clone());
+        let total_supply = 1_000_000_000_000_000u128;
+        let mut contract = FungibleToken::new(carol(), total_supply.into());
+        context.storage_usage = env::storage_usage();
+        contract.create_voter_profile("c1d1a89574c6e744d982e0f2bf1154ef05c13".to_owned());
+        let voter_id = contract.get_user_id(&bob());
+        assert_eq!(voter_id, 1);
+        let voter = contract.get_voter_details(1);
+        assert_eq!(
+            "c1d1a89574c6e744d982e0f2bf1154ef05c13".to_owned(),
+            voter.profile_hash
+        );
+    }
+
+    fn voter_stake() -> (FungibleToken, VMContext) {
+        let mut context = get_context(carol());
+        testing_env!(context.clone());
+        let total_supply = 1_000_000_000_000_000u128;
+        let mut contract = FungibleToken::new(carol(), total_supply.into());
+        context.storage_usage = env::storage_usage();
+        contract.create_voter_profile("c1d1a89574c6e744d982e0f2bf1154ef05c13".to_owned());
+        let voter_id = contract.get_user_id(&bob());
+        assert_eq!(voter_id, 1);
+        let voter = contract.get_voter_details(1);
+        assert_eq!(
+            "c1d1a89574c6e744d982e0f2bf1154ef05c13".to_owned(),
+            voter.profile_hash
+        );
+        context.storage_usage = env::storage_usage();
+
+        context.attached_deposit = 1000 * STORAGE_PRICE_PER_BYTE;
+        testing_env!(context.clone());
+        let transfer_amount = total_supply / 3;
+        contract.transfer(bob(), transfer_amount.into());
+        context.storage_usage = env::storage_usage();
+        context.account_balance = env::account_balance();
+
+        context.is_view = true;
+        context.attached_deposit = 0;
+        testing_env!(context.clone());
+        assert_eq!(
+            contract.get_balance(carol()).0,
+            (total_supply - transfer_amount)
+        );
+        assert_eq!(contract.get_balance(bob()).0, transfer_amount);
+        context.is_view = false;
+        testing_env!(context.clone());
+        // println!("{}", contract.get_balance(bob()).0);
+        let intialtotalsupply = contract.get_total_supply().0;
+        contract.create_voter_stake(50);
+        // println!("{}", contract.get_balance(bob()).0);
+        assert_eq!(contract.get_balance(bob()).0, transfer_amount - 50);
+        // let totalsupply = contract.get_total_supply();
+        // println!("{}", totalsupply.0);
+        assert_eq!(contract.get_total_supply().0, intialtotalsupply - 50);
+        let stake = contract.get_voter_stake(voter_id);
+        // println!(">>>>>{}<<<<<<<", stake);
+        assert_eq!(stake, 50);
+
+        // Test for jury addition
+        context.signer_account_id = user2();
+        context.attached_deposit = 1000 * STORAGE_PRICE_PER_BYTE;
+        testing_env!(context.clone());
+        contract.transfer(user2(), 150.into());
+        context.is_view = false;
+        testing_env!(context.clone());
+        contract.create_voter_profile("user2profile".to_owned());
+        let juror_id = contract.get_user_id(&user2());
+        // println!(">>>>>>{}<<<<<<<", juror_id);
+        assert_eq!(juror_id, 2);
+        let voter = contract.get_voter_details(2);
+        assert_eq!("user2profile".to_owned(), voter.profile_hash);
+
+        contract.apply_jurors(bob(), 51);
+        let voter_id = contract.get_user_id(&bob());
+        assert_eq!(contract.get_total_supply().0, intialtotalsupply - 50 - 51);
+        let data = contract.get_juror_stakes(voter_id, juror_id);
+        assert_eq!(data, 51);
+        // println!(">>>>>>>>{:?}<<<<<<<<<", all_data.get(&1));
+
+        return (contract, context);
+    }
+    #[test]
+    fn test_voter_stake() {
+        let (_contract, _context) = voter_stake();
+    }
+
+    #[test]
+    #[should_panic(expected = "You have already staked")]
+    fn add_multiple_stake_per_voter() {
+        let (mut contract, _context) = voter_stake();
+        contract.apply_jurors(bob(), 30);
+    }
+
+    #[test]
+    #[should_panic(expected = "User id doesnot exist for AccountId")]
+    fn apply_juror_but_user_doesnot_exist() {
+        let (mut contract, _context) = voter_stake();
+        contract.apply_jurors(user3(), 50);
+    }
+
+    #[test]
+    fn same_juror_different_voter() {
+        let (mut contract, mut context) = voter_stake();
+        context.signer_account_id = user3();
+        testing_env!(context.clone());
+        contract.create_voter_profile("user3profile".to_owned());
+        let voter_id = contract.get_user_id(&user3());
+        // println!(">>>>>>{}<<<<<<<", voter_id);
+        assert_eq!(voter_id, 3);
+        context.signer_account_id = user2();
+        testing_env!(context.clone());
+        let intialtotalsupply = contract.get_total_supply().0;
+        // println!("Initial Supply>>>>{}<<<<<<",intialtotalsupply);
+        contract.apply_jurors(user3(), 53);
+        assert_eq!(contract.get_total_supply().0, intialtotalsupply - 53);
+    }
+
+    fn create_a_user(
+        username: AccountId,
+        profilehash: String,
+        mut contract: FungibleToken,
+        mut context: VMContext,
+    ) -> (FungibleToken, VMContext) {
+        context.signer_account_id = username.clone();
+        testing_env!(context.clone());
+        contract.create_voter_profile(profilehash);
+        context.attached_deposit = 1000 * STORAGE_PRICE_PER_BYTE;
+        testing_env!(context.clone());
+        contract.transfer(username, 150.into());
+        (contract, context)
+    }
+
+    fn apply_jurors_for_test_function(
+        voterusername: AccountId,
+        signerusername: AccountId,
+        stake: u128,
+        mut contract: FungibleToken,
+        mut context: VMContext,
+    ) -> (FungibleToken, VMContext) {
+        context.signer_account_id = signerusername;
+        testing_env!(context.clone());
+        contract.apply_jurors(voterusername, stake);
+        (contract, context)
+    }
+
+    #[test]
+    fn draw_juror() {
+        let (contract, context) = voter_stake();
+        // contract.draw_jurors(bob());
+
+        // Add 5 jurors for bob()
+
+        // Create 5 juror
+        let (contract, context) = create_a_user(
+            "juror1".to_owned(),
+            "juror1######XXXXX".to_owned(),
+            contract,
+            context,
+        );
+        let (contract, context) = create_a_user(
+            "juror2".to_owned(),
+            "juror2######XXXXX".to_owned(),
+            contract,
+            context,
+        );
+        let (contract, context) = create_a_user(
+            "juror3".to_owned(),
+            "juror3######XXXXX".to_owned(),
+            contract,
+            context,
+        );
+        let (contract, context) = create_a_user(
+            "juror4".to_owned(),
+            "juror4######XXXXX".to_owned(),
+            contract,
+            context,
+        );
+        let (contract, context) = create_a_user(
+            "juror5".to_owned(),
+            "juror5######XXXXX".to_owned(),
+            contract,
+            context,
+        );
+        let (contract, context) = apply_jurors_for_test_function(
+            bob(),
+            "juror1".to_owned(),
+            60,
+            contract,
+            context.clone(),
+        );
+        let (contract, context) = apply_jurors_for_test_function(
+            bob(),
+            "juror2".to_owned(),
+            40,
+            contract,
+            context.clone(),
+        );
+        let (contract, context) = apply_jurors_for_test_function(
+            bob(),
+            "juror3".to_owned(),
+            30,
+            contract,
+            context.clone(),
+        );
+        let (contract, context) = apply_jurors_for_test_function(
+            bob(),
+            "juror4".to_owned(),
+            20,
+            contract,
+            context.clone(),
+        );
+        let (mut contract, mut context) = apply_jurors_for_test_function(
+            bob(),
+            "juror5".to_owned(),
+            20,
+            contract,
+            context.clone(),
+        );
+        context.random_seed = rand_vector();
+        testing_env!(context.clone());
+        contract.draw_jurors(bob());
+        let bob_id = contract.get_user_id(&bob());
+        let jurylist = contract.get_selected_jurors(bob_id);
+        let four = jurylist.contains(&4);
+        println!("{:?}", four);
+        let two = jurylist.contains(&2);
+        println!("{:?}", two);
+        let three = jurylist.contains(&3);
+        println!("{:?}", three);
+        let seven = jurylist.contains(&7);
+        println!("{:?}", seven);
+        let five = jurylist.contains(&5);
+        println!("{:?}", five);
+        let six = jurylist.contains(&6);
+        println!("{:?}", six);
+        let ten = jurylist.contains(&10);
+        println!("{:?}", ten);
+
+    }
+}
+
+'''
+'''--- voter-validation/src/shivarthu.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::{LookupMap, UnorderedMap, TreeMap, Vector, LookupSet};
+use near_sdk::{near_bindgen, wee_alloc, Balance};
+
+mod account;
+use self::account::Account;
+mod token;
+#[global_allocator]
+static ALLOC: wee_alloc::WeeAlloc = wee_alloc::WeeAlloc::INIT;
+
+/// Price per 1 byte of storage from mainnet genesis config.
+pub const STORAGE_PRICE_PER_BYTE: Balance = 100000000000000000000;
+
+/// Contains balance and allowances information for one account.
+///
+
+// **** Steps for voter validation ****
+// 1) Voters apply their resume
+// 2) Voters stake some amount of token, (if > 2 tokens will get 1 tokens, if less than 2 token, will get 50% of the token), will be quadratic in future https://bioinsilico.blogspot.com/2020/08/perfect-price-discovery-and-blockchain.html
+// 3) Apply jurors using staking using the id of voter application, also set the time till jurors can apply.
+// 4) Draw jurors, 50% of jouror can vote, can't be less than 10
+// 5) Juror Vote, set the time for voting through commit
+// 6) Reveal Juror vote
+// 7) Juror will get the incentives or disinstives 5tokens/total jurors
+
+#[derive(Debug, Default, BorshDeserialize, BorshSerialize)]
+pub struct Voter {
+    pub profile_hash: String, //IPFS Hash
+    pub kyc_done: bool,
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct SortitionSumTree {
+    k: u128,
+    stack: Vector<u128>,
+    nodes: Vector<u128>,
+    ids_to_node_indexes: TreeMap<String, u128>,
+    node_indexes_to_ids: TreeMap<u128, String>,
+}
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct FungibleToken {
+    /// sha256(AccountID) -> Account details.
+    accounts: UnorderedMap<Vec<u8>, Account>,
+
+    /// Total supply of the all token.
+    total_supply: Balance,
+
+    // Voter validation
+    user_id: u128,
+    user_map: LookupMap<String, u128>, // <Account_name, user_id>
+    voter_profile_map: LookupMap<u128, Voter>, // <user_id, Voter>
+    voter_if_staked: LookupMap<u128, bool>, // <user_id, true or false>
+    voter_stakes: LookupMap<u128, u128>, // <user_id, stakes>
+    // juror_stakes: LookupMap<u128, LookupMap<u128, u128>>, //<juror user_id, <voter userid, stakes>>
+    // juror_if_staked: LookupMap<u128, Vector<LookupMap<u128, u128>>>, // <juror user_id, <voter_user_id, true or false>>
+    // juror_applied_for: LookupMap<u128, LookupSet<u128>>, //<juror user_id, voter user id set>
+    user_juror_stakes: LookupMap<u128, LookupMap<u128, u128>>, // <voter_user_id, <jurorid, stakes>>
+    user_juror_stakes_clone: LookupMap<u128, TreeMap<u128, u128>>,
+    juror_stake_unique_id: u128,
+    selected_juror: LookupMap<u128, LookupSet<u128>> // <voter_user_id, jurorid>
+}
+
+'''
+'''--- voter-validation/src/shivarthu/account.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::UnorderedMap;
+use near_sdk::{env, AccountId, Balance};
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Account {
+    /// Current account balance.
+    pub balance: Balance,
+    /// Escrow Account ID hash to the allowance amount.
+    /// Allowance is the amount of tokens the Escrow Account ID can spent on behalf of the account
+    /// owner.
+    pub allowances: UnorderedMap<Vec<u8>, Balance>,
+}
+
+impl Account {
+    /// Initializes a new Account with 0 balance and no allowances for a given `account_hash`.
+    pub fn new(account_hash: Vec<u8>) -> Self {
+        Self {
+            balance: 0,
+            allowances: UnorderedMap::new(account_hash),
+        }
+    }
+
+    /// Sets allowance for account `escrow_account_id` to `allowance`.
+    pub fn set_allowance(&mut self, escrow_account_id: &AccountId, allowance: Balance) {
+        let escrow_hash = env::sha256(escrow_account_id.as_bytes());
+        if allowance > 0 {
+            self.allowances.insert(&escrow_hash, &allowance);
+        } else {
+            self.allowances.remove(&escrow_hash);
+        }
+    }
+
+    /// Returns the allowance of account `escrow_account_id`.
+    pub fn get_allowance(&self, escrow_account_id: &AccountId) -> Balance {
+        let escrow_hash = env::sha256(escrow_account_id.as_bytes());
+        self.allowances.get(&escrow_hash).unwrap_or(0)
+    }
+}
+'''
+'''--- voter-validation/src/shivarthu/token.rs ---
+mod votervalidation;
+use super::{FungibleToken, STORAGE_PRICE_PER_BYTE};
+use near_sdk::collections::{LookupMap, UnorderedMap};
+use near_sdk::json_types::U128;
+use near_sdk::{env, near_bindgen, AccountId, Balance, Promise, StorageUsage};
+use crate::shivarthu::account::Account;
+
+#[near_bindgen]
+impl FungibleToken {
+    /// Initializes the contract with the given total supply owned by the given `owner_id`.
+    #[init]
+    pub fn new(owner_id: AccountId, total_supply: U128) -> Self {
+        let total_supply = total_supply.into();
+        assert!(!env::state_exists(), "Already initialized");
+        let mut ft = Self {
+            accounts: UnorderedMap::new(b"31ec9a4c-af6f-44dd-a488-bfdc45c493a7".to_vec()),
+            total_supply,
+            user_id: 0,
+            user_map: LookupMap::new(b"2a543bc7-a03f-427f-98c4-aa34012fa358".to_vec()),
+            voter_profile_map: LookupMap::new(b"a9d08e6d-fe16-441e-9330-81f45b8a68b3".to_vec()),
+            voter_if_staked: LookupMap::new(b"0e9cdb00-e90a-4aed-8541-1fb2ea6a1538".to_vec()),
+            voter_stakes: LookupMap::new(b"de89b05f-e35d-4237-bba9-64b2baac1ca8".to_vec()),
+            // juror_stakes: LookupMap::new(b"bd08db59-eb71-489e-8cf8-a361a7e7fb39".to_vec()),
+            user_juror_stakes: LookupMap::new(b"96a7bcb7-5c9e-4af5-b33c-eb7a4c3a38a1".to_vec()),
+            user_juror_stakes_clone: LookupMap::new(b"aaabae72-8319-42f0-9e8b-19d5db7d176d".to_vec()),
+            juror_stake_unique_id: 0,
+            selected_juror: LookupMap::new(b"827a829e-e9b9-4e85-908b-49f8dab0e496".to_vec()),
+        };
+        let mut account = ft.get_account(&owner_id);
+        account.balance = total_supply;
+        ft.set_account(&owner_id, &account);
+        ft
+    }
+
+    /// Increments the `allowance` for `escrow_account_id` by `amount` on the account of the caller of this contract
+    /// (`predecessor_id`) who is the balance owner.
+    /// Requirements:
+    /// * Caller of the method has to attach deposit enough to cover storage difference at the
+    ///   fixed storage price defined in the contract.
+    #[payable]
+    pub fn inc_allowance(&mut self, escrow_account_id: AccountId, amount: U128) {
+        let initial_storage = env::storage_usage();
+        assert!(
+            env::is_valid_account_id(escrow_account_id.as_bytes()),
+            "Escrow account ID is invalid"
+        );
+        let owner_id = env::predecessor_account_id();
+        if escrow_account_id == owner_id {
+            env::panic(b"Can not increment allowance for yourself");
+        }
+        let mut account = self.get_account(&owner_id);
+        let current_allowance = account.get_allowance(&escrow_account_id);
+        account.set_allowance(
+            &escrow_account_id,
+            current_allowance.saturating_add(amount.0),
+        );
+        self.set_account(&owner_id, &account);
+        self.refund_storage(initial_storage);
+    }
+
+    /// Decrements the `allowance` for `escrow_account_id` by `amount` on the account of the caller of this contract
+    /// (`predecessor_id`) who is the balance owner.
+    /// Requirements:
+    /// * Caller of the method has to attach deposit enough to cover storage difference at the
+    ///   fixed storage price defined in the contract.
+    #[payable]
+    pub fn dec_allowance(&mut self, escrow_account_id: AccountId, amount: U128) {
+        let initial_storage = env::storage_usage();
+        assert!(
+            env::is_valid_account_id(escrow_account_id.as_bytes()),
+            "Escrow account ID is invalid"
+        );
+        let owner_id = env::predecessor_account_id();
+        if escrow_account_id == owner_id {
+            env::panic(b"Can not decrement allowance for yourself");
+        }
+        let mut account = self.get_account(&owner_id);
+        let current_allowance = account.get_allowance(&escrow_account_id);
+        account.set_allowance(
+            &escrow_account_id,
+            current_allowance.saturating_sub(amount.0),
+        );
+        self.set_account(&owner_id, &account);
+        self.refund_storage(initial_storage);
+    }
+
+    /// Transfers the `amount` of tokens from `owner_id` to the `new_owner_id`.
+    /// Requirements:
+    /// * `amount` should be a positive integer.
+    /// * `owner_id` should have balance on the account greater or equal than the transfer `amount`.
+    /// * If this function is called by an escrow account (`owner_id != predecessor_account_id`),
+    ///   then the allowance of the caller of the function (`predecessor_account_id`) on
+    ///   the account of `owner_id` should be greater or equal than the transfer `amount`.
+    /// * Caller of the method has to attach deposit enough to cover storage difference at the
+    ///   fixed storage price defined in the contract.
+    #[payable]
+    pub fn transfer_from(&mut self, owner_id: AccountId, new_owner_id: AccountId, amount: U128) {
+        let initial_storage = env::storage_usage();
+        assert!(
+            env::is_valid_account_id(new_owner_id.as_bytes()),
+            "New owner's account ID is invalid"
+        );
+        let amount = amount.into();
+        if amount == 0 {
+            env::panic(b"Can't transfer 0 tokens");
+        }
+        assert_ne!(
+            owner_id, new_owner_id,
+            "The new owner should be different from the current owner"
+        );
+        // Retrieving the account from the state.
+        let mut account = self.get_account(&owner_id);
+
+        // Checking and updating unlocked balance
+        if account.balance < amount {
+            env::panic(b"Not enough balance");
+        }
+        account.balance -= amount;
+
+        // If transferring by escrow, need to check and update allowance.
+        let escrow_account_id = env::predecessor_account_id();
+        if escrow_account_id != owner_id {
+            let allowance = account.get_allowance(&escrow_account_id);
+            if allowance < amount {
+                env::panic(b"Not enough allowance");
+            }
+            account.set_allowance(&escrow_account_id, allowance - amount);
+        }
+
+        // Saving the account back to the state.
+        self.set_account(&owner_id, &account);
+
+        // Deposit amount to the new owner and save the new account to the state.
+        let mut new_account = self.get_account(&new_owner_id);
+        new_account.balance += amount;
+        self.set_account(&new_owner_id, &new_account);
+        self.refund_storage(initial_storage);
+    }
+
+    /// Transfer `amount` of tokens from the caller of the contract (`predecessor_id`) to
+    /// `new_owner_id`.
+    /// Act the same was as `transfer_from` with `owner_id` equal to the caller of the contract
+    /// (`predecessor_id`).
+    /// Requirements:
+    /// * Caller of the method has to attach deposit enough to cover storage difference at the
+    ///   fixed storage price defined in the contract.
+    #[payable]
+    pub fn transfer(&mut self, new_owner_id: AccountId, amount: U128) {
+        // NOTE: New owner's Account ID checked in transfer_from.
+        // Storage fees are also refunded in transfer_from.
+        self.transfer_from(env::predecessor_account_id(), new_owner_id, amount);
+    }
+
+    /// Returns total supply of tokens.
+    pub fn get_total_supply(&self) -> U128 {
+        self.total_supply.into()
+    }
+
+    /// Returns balance of the `owner_id` account.
+    pub fn get_balance(&self, owner_id: AccountId) -> U128 {
+        self.get_account(&owner_id).balance.into()
+    }
+
+    /// Returns current allowance of `escrow_account_id` for the account of `owner_id`.
+    ///
+    /// NOTE: Other contracts should not rely on this information, because by the moment a contract
+    /// receives this information, the allowance may already be changed by the owner.
+    /// So this method should only be used on the front-end to see the current allowance.
+    pub fn get_allowance(&self, owner_id: AccountId, escrow_account_id: AccountId) -> U128 {
+        assert!(
+            env::is_valid_account_id(escrow_account_id.as_bytes()),
+            "Escrow account ID is invalid"
+        );
+        self.get_account(&owner_id)
+            .get_allowance(&escrow_account_id)
+            .into()
+    }
+}
+
+impl FungibleToken {
+    /// Helper method to get the account details for `owner_id`.
+    fn get_account(&self, owner_id: &AccountId) -> Account {
+        assert!(
+            env::is_valid_account_id(owner_id.as_bytes()),
+            "Owner's account ID is invalid"
+        );
+        let account_hash = env::sha256(owner_id.as_bytes());
+        self.accounts
+            .get(&account_hash)
+            .unwrap_or_else(|| Account::new(account_hash))
+    }
+
+    /// Helper method to set the account details for `owner_id` to the state.
+    fn set_account(&mut self, owner_id: &AccountId, account: &Account) {
+        let account_hash = env::sha256(owner_id.as_bytes());
+        if account.balance > 0 || !account.allowances.is_empty() {
+            self.accounts.insert(&account_hash, &account);
+        } else {
+            self.accounts.remove(&account_hash);
+        }
+    }
+
+    fn refund_storage(&self, initial_storage: StorageUsage) {
+        let current_storage = env::storage_usage();
+        let attached_deposit = env::attached_deposit();
+        let refund_amount = if current_storage > initial_storage {
+            let required_deposit =
+                Balance::from(current_storage - initial_storage) * STORAGE_PRICE_PER_BYTE;
+            assert!(
+                required_deposit <= attached_deposit,
+                "The required attached deposit is {}, but the given attached deposit is is {}",
+                required_deposit,
+                attached_deposit,
+            );
+            attached_deposit - required_deposit
+        } else {
+            attached_deposit
+                + Balance::from(initial_storage - current_storage) * STORAGE_PRICE_PER_BYTE
+        };
+        if refund_amount > 0 {
+            env::log(format!("Refunding {} tokens for storage", refund_amount).as_bytes());
+            Promise::new(env::predecessor_account_id()).transfer(refund_amount);
+        }
+    }
+}
+
+/// Burn and mint
+#[near_bindgen]
+impl FungibleToken {
+    fn _mint(&mut self, owner_id: &AccountId, amount: u128) {
+        if !owner_id.is_empty() {
+            let initial_storage = env::storage_usage();
+            if amount == 0 {
+                env::panic(b"Can't transfer 0 tokens");
+            }
+            assert!(
+                env::is_valid_account_id(owner_id.as_bytes()),
+                "New owner's account ID is invalid"
+            );
+            let mut account = self.get_account(&owner_id);
+            account.balance += amount;
+            self.set_account(&owner_id, &account);
+            self.total_supply = self.total_supply + amount;
+            self.refund_storage(initial_storage);
+        }
+    }
+
+    fn burn(&mut self, owner_id: &AccountId, amount: u128) {
+        if !owner_id.is_empty() {
+            let initial_storage = env::storage_usage();
+            if amount == 0 {
+                env::panic(b"Can't transfer 0 tokens");
+            }
+            assert!(
+                env::is_valid_account_id(owner_id.as_bytes()),
+                "Owner's account ID is invalid"
+            );
+            let mut account = self.get_account(&owner_id);
+
+            account.balance -= amount;
+            self.set_account(&owner_id, &account);
+            self.total_supply = self.total_supply - amount;
+            self.refund_storage(initial_storage);
+        }
+    }
+}
+
+'''
+'''--- voter-validation/src/shivarthu/token/votervalidation.rs ---
+use super::super::{FungibleToken, Voter};
+use near_sdk::collections::{LookupMap, LookupSet, TreeMap};
+use near_sdk::{env, near_bindgen, AccountId};
+use rand::distributions::WeightedIndex;
+use rand::prelude::*;
+use rand::{rngs::StdRng, SeedableRng};
+
+pub fn get_rng(seed_vec: Vec<u8>) -> StdRng {
+    let mut seed = [0u8; 32];
+    let mut counter = 0;
+    for v in seed_vec.iter() {
+        seed[counter] = *v;
+        counter += 1;
+    }
+
+    let rng: StdRng = SeedableRng::from_seed(seed);
+    rng
+}
+/// Voter Validation impl
+#[near_bindgen]
+impl FungibleToken {
+    pub fn get_user_id(&self, account_id: &AccountId) -> u128 {
+        let user_id_option = self.user_map.get(&account_id);
+        match user_id_option {
+            Some(user_id) => user_id,
+            None => {
+                panic!("User id doesnot exist for AccountId");
+            }
+        }
+    }
+
+    pub fn get_voter_details(&self, user_id: u128) -> Voter {
+        let voter_profile_option = self.voter_profile_map.get(&user_id);
+        let voter = voter_profile_option.unwrap();
+        voter
+    }
+
+    pub fn get_voter_stake(&self, user_id: u128) -> u128 {
+        let voter_stake_option = self.voter_stakes.get(&user_id);
+        let voter_stake = voter_stake_option.unwrap();
+        voter_stake
+    }
+
+    pub fn create_voter_profile(&mut self, profile_hash: String) {
+        let account_id = env::signer_account_id();
+        let account_id_exists_option = self.user_map.get(&account_id);
+        let u = Voter {
+            profile_hash,
+            kyc_done: false,
+        };
+        match account_id_exists_option {
+            Some(_user_id) => panic!("Voter profile already exists"),
+            None => {
+                self.user_id += 1;
+                self.user_map.insert(&account_id, &self.user_id);
+                self.voter_profile_map.insert(&self.user_id, &u);
+            }
+        }
+    }
+
+    pub fn create_voter_stake(&mut self, stake: u128) {
+        let account_id = env::signer_account_id();
+        let account_id_exists_option = self.user_map.get(&account_id);
+        match account_id_exists_option {
+            Some(user_id) => {
+                let if_staked_bool_option = self.voter_if_staked.get(&user_id);
+                // Memo: Test setting voter_if_staked to false
+                match if_staked_bool_option {
+                    Some(if_staked_bool) => {
+                        if !if_staked_bool {
+                            self.burn(&account_id, stake);
+                            self.voter_if_staked.insert(&user_id, &true);
+                            self.voter_stakes.insert(&user_id, &stake);
+                            println!("I am in voter_if_staked false ");
+                        }
+                    }
+                    None => {
+                        self.burn(&account_id, stake);
+                        self.voter_if_staked.insert(&user_id, &true);
+                        self.voter_stakes.insert(&user_id, &stake);
+                        println!("I am in voter_if_staked None");
+                    }
+                }
+            }
+            None => {
+                panic!("User id doesnot exist");
+            }
+        }
+    }
+
+    /// Apply Jurors with stake
+
+    pub fn apply_jurors(&mut self, voter_username: AccountId, stake: u128) {
+        let account_id = env::signer_account_id();
+        let singer_juror_user = self.get_user_id(&account_id);
+        let voter_user_id = self.get_user_id(&voter_username);
+        self.user_juror_stakes_store(
+            account_id.clone(),
+            singer_juror_user.clone(),
+            voter_user_id.clone(),
+            stake.clone(),
+        );
+        self.user_juror_stakes_clone_store(
+            singer_juror_user.clone(),
+            voter_user_id.clone(),
+            stake.clone(),
+        );
+    }
+    fn user_juror_stakes_store(
+        &mut self,
+        account_id: String,
+        singer_juror_user: u128,
+        voter_user_id: u128,
+        stake: u128,
+    ) {
+        let user_juror_stakes_option = self.user_juror_stakes.get(&voter_user_id);
+        match user_juror_stakes_option {
+            Some(mut stake_entries) => {
+                let stake_entries_option = stake_entries.get(&singer_juror_user);
+                match stake_entries_option {
+                    Some(stake) => {
+                        if stake > 0 {
+                            panic!("You have already staked")
+                        } else {
+                            stake_entries.insert(&singer_juror_user, &stake);
+                            self.burn(&account_id, stake);
+                            self.user_juror_stakes
+                                .insert(&voter_user_id, &stake_entries);
+                        }
+                    }
+                    None => {
+                        stake_entries.insert(&singer_juror_user, &stake);
+                        self.burn(&account_id, stake);
+                        self.user_juror_stakes
+                            .insert(&voter_user_id, &stake_entries);
+                    }
+                }
+            }
+            None => {
+                let stakeidstring = format!(
+                    "stakevoterid{}uniqueid{}",
+                    voter_user_id, self.juror_stake_unique_id
+                );
+                let stakeid = stakeidstring.to_string().into_bytes();
+                let mut stake_entries = LookupMap::new(stakeid);
+                stake_entries.insert(&singer_juror_user, &stake);
+                self.burn(&account_id, stake);
+                self.user_juror_stakes
+                    .insert(&voter_user_id, &stake_entries);
+            }
+        }
+    }
+
+    fn user_juror_stakes_clone_store(
+        &mut self,
+        singer_juror_user: u128,
+        voter_user_id: u128,
+        stake: u128,
+    ) {
+        let user_juror_stakes_option = self.user_juror_stakes_clone.get(&voter_user_id);
+        match user_juror_stakes_option {
+            Some(mut stake_entries) => {
+                let stake_entries_option = stake_entries.get(&singer_juror_user);
+                match stake_entries_option {
+                    Some(stake) => {
+                        if stake > 0 {
+                            panic!("You have already staked")
+                        } else {
+                            stake_entries.insert(&singer_juror_user, &stake);
+                            self.user_juror_stakes_clone
+                                .insert(&voter_user_id, &stake_entries);
+                        }
+                    }
+                    None => {
+                        stake_entries.insert(&singer_juror_user, &stake);
+                        self.user_juror_stakes_clone
+                            .insert(&voter_user_id, &stake_entries);
+                    }
+                }
+            }
+            None => {
+                let stakeidstring = format!(
+                    "stakevoteridclone{}uniqueid{}",
+                    voter_user_id, self.juror_stake_unique_id
+                );
+                self.juror_stake_unique_id += 1;
+                let stakeid = stakeidstring.to_string().into_bytes();
+                let mut stake_entries = TreeMap::new(stakeid);
+                stake_entries.insert(&singer_juror_user, &stake);
+                self.user_juror_stakes_clone
+                    .insert(&voter_user_id, &stake_entries);
+            }
+        }
+    }
+
+    pub fn draw_jurors(&mut self, voter_username: AccountId) {
+        let voter_user_id = self.get_user_id(&voter_username);
+        let selected_juror_option = self.selected_juror.get(&voter_user_id);
+        match selected_juror_option {
+            Some(jurysetentries) => {
+                self.draw_jurors_function(voter_user_id, jurysetentries);
+            }
+            None => {
+                let jurysetidstring = format!("jurysetid{}", voter_username);
+                let jurysetid = jurysetidstring.to_string().into_bytes();
+                let jurysetentries = LookupSet::new(jurysetid);
+                self.draw_jurors_function(voter_user_id, jurysetentries);
+            }
+        }
+    }
+    fn draw_jurors_function(&mut self, voter_user_id: u128, mut jurysetentries: LookupSet<u128>) {
+        let user_juror_stakes_clone_option = self.user_juror_stakes_clone.get(&voter_user_id);
+        match user_juror_stakes_clone_option {
+            Some(mut juries_stakes) => {
+                let items = juries_stakes.to_vec();
+                println!(">>>>>>>>Juries{:?}<<<<<<<<<<<", items);
+                let random_vec = env::random_seed();
+                let mut rng = get_rng(random_vec);
+                let mut dist2 = WeightedIndex::new(items.iter().map(|item| item.1)).unwrap();
+                let mut length = items.len();
+                if length > 20 {
+                    length = 20;
+                }
+
+                for _ in 0..length {
+                    let index = dist2.sample(&mut rng);
+                    // println!("{}", index);
+                    let drawindex = items[index].0;
+                    println!("{:?}", drawindex);
+                    juries_stakes.remove(&drawindex);
+                    jurysetentries.insert(&drawindex);
+                    let _d = dist2.update_weights(&[(index, &0)]);
+                }
+                self.user_juror_stakes_clone
+                    .insert(&voter_user_id, &juries_stakes);
+                self.selected_juror.insert(&voter_user_id, &jurysetentries);
+            }
+            None => {
+                panic!("There are no juries");
+            }
+        }
+    }
+
+    pub fn get_selected_jurors(&self, voter_user_id: u128) -> LookupSet<u128> {
+        let selected_juror_option = self.selected_juror.get(&voter_user_id);
+        match selected_juror_option {
+            Some(jurysetentries) => jurysetentries,
+            None => {
+                panic!("No selected juroros");
+            }
+        }
+    }
+    pub fn get_juror_stakes(&self, voter_user_id: u128, juror_user_id: u128) -> u128 {
+        let juror_list_option = self.user_juror_stakes.get(&voter_user_id);
+        match juror_list_option {
+            Some(juror_list) => {
+                let juror_stake = juror_list.get(&juror_user_id).unwrap();
+                juror_stake
+            }
+            None => panic!("No one has staked for the voter"),
+        }
+    }
+}
+
+impl Default for FungibleToken {
+    fn default() -> Self {
+        panic!("Fun token should be initialized before usage")
+    }
+}
+
+'''

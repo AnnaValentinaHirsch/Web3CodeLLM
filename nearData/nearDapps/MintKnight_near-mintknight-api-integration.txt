@@ -1,0 +1,3819 @@
+*GitHub Repository "MintKnight/near-mintknight-api-integration"*
+
+'''--- README.md ---
+# near-mintknight-api-integration
+
+Partial code parts of the integration with Near.
+
+The code in this repository is partially taken from the Mintknight API.
+
+This repository is temporarily publicly available.
+
+Sensitive data is not shared. The code that is exposed refers to the part of the integration with Near.
+
+# Content gates
+
+Content or token gates are used to create access to content linked to a contract and to an NFT.
+
+We have created a CRUD to manage access to content.
+- We can see the code in "src/routes/contentGates"
+- The endpoints are documented in swagger format (openAPI). We can also see them here: [https://api.mintknight.com/api-docs/#/contents](https://api.mintknight.com/api-docs/#/contents)
+
+API calls carry a 'Bearer' bearer token. This token must be provided by the Mintknight team.
+
+The Content gate process would be as follows:
+1. Creation of a "content access" POST (contentGate/v2)
+2. When you want to check access to content, you first have to call the "Get a new challenge" (GET) endpoint. It will return the message with which we have to sign. GET (contentGate/v2/challenge/{address}), where {address} is the accountId of Near. The message is the _id that the call returns.
+3. The user signs with the received challenge. Signature example:
+
+```javascript
+  const network = "near.testnet";
+  const accountId = 'a123.testnet';
+  const privateKey = "0123...";
+  const credentials = { accountId, privateKey };
+
+  // The challenge
+  const challenge = "Message received calling: Get a new challenge from mintknight. _id is the message";
+
+  let ret = await Near.signMessage(
+    challenge,
+    network,
+    credentials,
+  );
+  if (!ret.success) {
+    console.log('Oops! Error sign message. Account Id: ' + accountId);
+    process. exit(1);
+  }
+
+  console.log(`Account: `, accountId);
+  console.log(`Message: `, message);
+  console.log(`Signature`, ret.signature);
+```
+
+4. The user makes the call to Mintknight: POST (contentGate/v2/check) with the following parameters:
+
+```json
+  {
+    "nftId": "string",
+    "address": "string",
+    "walletId": "string",
+    "contentGateId": "string",
+    "signature": "string",
+    "challenge": "string"
+  }
+```
+     a. nftId: NFT identifier (mintknight NFT)
+     b. address: Near accountId
+     c. walletId: WalletId (optional) mintknight internal wallet
+     d. contentGateId: It is the Id of the access to cotentgate that we have created in step 1.
+     e. signature
+     f. challenge: it is the message that we have used to sign. It is the _id returned by the GET (contentGate/v2/challenge/{accountId})
+
+## Integration and examples
+
+All the integration referring to the contents can be found in:
+- src/routes/contenGates.js
+- src/controllers/contenGates.js
+- src/utils/near.js
+
+We can find and script or test how to sign and verify with Near wallets.
+- src/scripts/testSignChallengeNear.js
+
+# Build account abstraction and recovery system for NEAR wallets
+
+When someone creates a new wallet, Mintknight encrypt the private key with 'Shamir Secret Sharing' in 3 portions. To recover the private key we only need 2 portions.
+
+A portion of the this private key (skey1) is returned in the same wallet creation request. It has to be kept by the client. And the other portions (skey and skey2) are kept by Mintknight.
+
+How encryption works:
+
+```javascript
+  const Shamir = require('src/utils/shamir');
+
+  // NEAR PRIVATE KEY
+  const privateKey = keyPair.secretKey;
+
+// Encryption
+  const keys = 3; // Private key will be divided in 3 parts
+  const threshold = 2; // We need 2 parts to build the privatekey
+  const shamir = Shamir.newSharedKeys(
+    privateKey,
+    keys,
+    threshold,
+  );
+
+  const skey = shamir[0];
+  const skey1 = shamir[1];
+  const skey2 = shamir[2];
+```
+
+- skey1: for the user who makes the request to create the wallet
+- skey and skey2: Mintknight save those wallets in two diferent ways.
+
+How the wallet recovery works:
+
+```javascript
+  const Shamir = require('src/utils/shamir');
+
+  const privateKey = Shamir.getSeedFromSharedKeys(skey, skey1);
+```
+
+## Integration and examples
+
+We can see how Mintknight encrypts the wallet and divides it into 3 portions:
+
+- src/utils/near.js
+    - method: deployWallet
+    - method: addWallet
+- src/utils/shamir.js
+
+'''
+'''--- src/controllers/contentGates.js ---
+const ethers = require('ethers');
+const mongoose = require('mongoose');
+// Models
+const ContentGate = require('../models/contentGate');
+const ContentGateChallenge = require('../models/contentGateChallenge');
+const Contract = require('../models/contracts');
+const Nft = require('../models/nfts');
+const Wallet = require('../models/wallets');
+// Utils
+const { throwError } = require('../utils/error');
+const Near = require('../utils/near');
+
+class ContentGatesController {
+  /**
+   * Get list of all content gates
+   *
+   * @param {object} project
+   * @returns {array} List of content gates
+   */
+  static async getAll(project) {
+    // Get wallet tasks
+    const list = await ContentGate.find({
+      projectId: project._id,
+    });
+    return list;
+  }
+
+  /**
+   * Get Content gate
+   *
+   * @param {object} project
+   * @param {string} contentGateId
+   * @returns {object} Content gate
+   */
+  static async getContentGate(project, contentGateId) {
+    // Check content gate
+    if (!mongoose.Types.ObjectId.isValid(contentGateId)) {
+      throwError('Invalid Content gate Id', 0);
+    }
+    const contentGate = await ContentGate.findOne({
+      _id: mongoose.Types.ObjectId(contentGateId),
+    });
+    if (!contentGate) throwError('Invalid Content gate', 0);
+    if (contentGate.projectId.toString() !== project._id.toString()) {
+      throwError('Unauthorized', 0);
+    }
+    return contentGate;
+  }
+
+  /**
+   * Add a new Content gate
+   *
+   * @param {object} project
+   * @param {object} formData
+   * @returns {object} Content gate added
+   */
+  static async addContentGate(project, formData) {
+
+    // Check title
+    if (!formData.title) {
+      throwError('Url is mandatory', 0);
+    }
+    // Check contract
+    if (!mongoose.Types.ObjectId.isValid(formData.contractId)) {
+      throwError('Invalid contract Id', 1513);
+    }
+    const contract = await Contract.findOne({
+      _id: mongoose.Types.ObjectId(formData.contractId),
+    });
+    if (!contract) throwError('Invalid contract', 1514);
+    if (contract.projectId.toString() !== project._id.toString()) {
+      throwError('Unauthorized', 0);
+    }
+
+    // Create Content gate
+    const contentGate = new ContentGate(formData);
+    contentGate.projectId = mongoose.Types.ObjectId(project._id);
+    await contentGate.save();
+
+    // Returns content gate
+    return contentGate;
+  }  
+
+  /**
+   * Update a Content gate
+   *
+   * @param {object} project
+   * @param {string} contentGateId
+   * @param {object} formData
+   * @returns {object} Content gate
+   */
+  static async updateContentGate(project, contentGateId, formData) {
+    // Check content gate
+    if (!mongoose.Types.ObjectId.isValid(contentGateId)) {
+      throwError('Invalid Content gate Id', 0);
+    }
+    const contentGate = await ContentGate.findOne({
+      _id: mongoose.Types.ObjectId(contentGateId),
+    });
+    if (!contentGate) throwError('Invalid Content gate', 0);
+    if (contentGate.projectId.toString() !== project._id.toString()) {
+      throwError('Unauthorized', 0);
+    }
+
+    // Update
+    if (!!formData.title) contentGate.title = formData.title;
+    if (!!formData.contractId) {
+      // Check contract
+      if (!mongoose.Types.ObjectId.isValid(formData.contractId)) {
+        throwError('Invalid contract Id', 1513);
+      }
+      const contract = await Contract.findOne({
+        _id: mongoose.Types.ObjectId(formData.contractId),
+      });
+      if (!contract) throwError('Invalid contract', 1514);
+      contentGate.contractId = formData.contractId;
+    }
+
+    await contentGate.save();
+    return contentGate;
+  }
+
+  /**
+   * Delete Content gate
+   *
+   * @param {object} project
+   * @param {string} contentGateId
+   * @returns {object} Content gate
+   */
+  static async deleteContentGate(project, contentGateId) {
+    // Check content gate
+    if (!mongoose.Types.ObjectId.isValid(contentGateId)) {
+      throwError('Invalid Content gate Id', 0);
+    }
+    const contentGate = await ContentGate.findOne({
+      _id: mongoose.Types.ObjectId(contentGateId),
+    });
+    if (!contentGate) throwError('Invalid Content gate', 0);
+    if (contentGate.projectId.toString() !== project._id.toString()) {
+      throwError('Unauthorized', 0);
+    }
+
+    // delete content gate
+    const removed = await ContentGate.deleteOne({ _id: mongoose.Types.ObjectId(contentGateId) });
+    if (!removed) {
+      throwError('Error removing content gate', 0);
+    }
+
+    return (contentGate);
+  }
+
+  /**
+   * Get a new challenge
+   *
+   * @param {object} project
+   * @param {string} address
+   * @returns {object} Content gate challenge
+   */
+  static async getChallenge(project, address) {
+    if (!address) {
+      throwError('Invalid address', 0);
+    }
+    // Create a new one
+    const doc = new ContentGateChallenge({
+      projectId: mongoose.Types.ObjectId(project._id),
+      address,
+    });
+    await doc.save();
+    return doc._id;
+  }
+
+  /**
+   * Check the content
+   *
+   * @param {object} project
+   * @param {object} formData
+   * @returns {boolean} Content is available or not
+   */
+  static async verifyContentGate(project, formData) {    
+    // Check form
+    if (!formData.address) {
+      throwError('Address is mandatory', 0);
+    }      
+    if (!formData.nftId) {
+      throwError('nftId is mandatory', 0);
+    }  
+    if (!formData.contentGateId) {
+      throwError('contentGateId is mandatory', 0);
+    }
+    if (!!formData.walletId) {
+      if (!mongoose.Types.ObjectId.isValid(formData.walletId)) {
+        throwError('Invalid wallet Id', 0);
+      }
+      const wallet = await Wallet.findOne({
+        _id: mongoose.Types.ObjectId(formData.walletId),
+      });
+      if (!wallet) throwError('Invalid wallet', 0);
+      if (wallet.projectId.toString() !== project._id.toString()) {
+        throwError('Unauthorized (wallet, project)', 0);
+      }
+    } else {
+      if (!formData.signature) {
+        throwError('signature is mandatory', 0);
+      } 
+      if (!formData.challenge) {
+        throwError('challenge is mandatory', 0);
+      }  
+    }
+
+    // Check content gate
+    if (!mongoose.Types.ObjectId.isValid(formData.contentGateId)) {
+      throwError('Invalid content gate Id', 0);
+    }
+    const contentGate = await ContentGate.findOne({
+      _id: mongoose.Types.ObjectId(formData.contentGateId),
+    });
+    if (!contentGate) throwError('Invalid Content gate', 0);
+    if (contentGate.projectId.toString() !== project._id.toString()) {
+      throwError('Unauthorized (project)', 0);
+    }
+    const contractId = contentGate.contractId;
+
+    // Check contract
+    const contract = await Contract.findOne({
+      _id: mongoose.Types.ObjectId(contractId),
+    });
+    if (!contract) throwError('Invalid contract', 1514);   
+
+    // Check NFT
+    if (!mongoose.Types.ObjectId.isValid(formData.nftId)) {
+      throwError('Invalid nft Id', 0);
+    }
+    const nft = await Nft.findOne({
+      _id: mongoose.Types.ObjectId(formData.nftId),
+    });
+    if (!nft) throwError('Invalid nft', 0);
+
+    // Content gate is auth?
+    if (contractId.toString() !== nft.contractId.toString()) {
+      throwError('Unauthorized (nft, contract)', 0);
+    }
+
+    // Check signature
+    if (!formData.walletId) {
+      // Check challenge
+      if (!mongoose.Types.ObjectId.isValid(formData.challenge)) {
+        throwError('Invalid challenge', 0);
+      }
+      const contentGateChallenge = await ContentGateChallenge.findOne({
+        _id: mongoose.Types.ObjectId(formData.challenge),
+      });
+      if (!contentGateChallenge) throwError('Challenge does not exist', 0);
+      if (contentGateChallenge.projectId.toString() !== project._id.toString()) {
+        throwError('Unauthorized (project)', 0);
+      }
+      if (contentGateChallenge.address !== formData.address) {
+        throwError('Unauthorized (address)', 0);
+      }
+      if (contentGateChallenge.used) {
+        throwError('Unauthorized (used)', 0);
+      }    
+      // Check signature
+      const signatureData = contentGateChallenge._id.toString();
+
+      const isNear = project.network === `near.testnet` || project.network === `near.mainnet`;
+      if (isNear) {
+        // Get user wallet
+        const wallet = await Wallet.findOne({
+          accountId: formData.address,
+        });
+        if (!wallet) throwError('Unauthorized', 0);
+        const credentials = await Near.getCredentials_WALLET(wallet);
+        // Verify
+        const ret = await Near.verifySignature(
+          signatureData, 
+          formData.signature,
+          wallet.network,
+          credentials,
+        );
+        if (!ret.success) {
+          throwError('Unauthorized. Error verifying the signature', 0);
+        }        
+        // Verified!!
+      } else {
+        const verify = ethers.utils.verifyMessage(signatureData, formData.signature);
+        // console.log('verify', verify);
+        if (verify !== formData.address) {
+          throwError('Unauthorized. Error verifying the signature', 0);
+        }
+        // Verified!!
+      }
+      // Save
+      contentGateChallenge.used = true;
+      await contentGateChallenge.save();
+    }
+
+    return true;
+  }
+}
+
+module.exports = ContentGatesController;
+'''
+'''--- src/controllers/nfts.js ---
+const { v4 } = require('uuid');
+const mongoose = require('mongoose');
+const fs = require('fs');
+const path = require('path');
+// Controllers
+const TaskController = require('./tasks');
+const MediaController = require('./media');
+const WalletController = require('./wallets');
+// Models
+const Contract = require('../models/contracts');
+const Task = require('../models/tasks');
+const Media = require('../models/media');
+const Nft = require('../models/nfts');
+const Wallet = require('../models/wallets');
+// Utils
+const EVM = require('../utils/evm');
+const Helpers = require('../utils/helpers');
+const securityCheck = require('../utils/security');
+const ImageUtils = require('../utils/image');
+const { throwError } = require('../utils/error');
+const AwsS3 = require('../utils/awsS3');
+const Near = require('../utils/near');
+
+const DATAMK = Helpers.getDATAMK();
+
+class NftController {
+  /**
+   * Add NFT
+   *
+   * @param {object} context
+   * @param {object} walletInfo {walletType, refUser}
+   * @returns {object} Wallet
+   * @returns {object} skeys
+   */
+  static async addNFT(context, formData, file) {
+    const network = context.project.network;
+    const isNear = network === `near.testnet` || network === `near.mainnet`;
+    if (isNear) {
+      return await this.addNFT_NEAR(context, formData);
+    } else {
+      return await this.addNFT_EVM(formData, file);
+    }    
+  }
+
+  /**
+   * Transfer an NFT
+   *
+   * @param {object} context
+   * @param {string} nftId | NFT ID
+   * @param {object} formData | Mint body params
+   * @returns {string} TaskId
+   * @returns {object} nft | NFT model
+   */
+  static async transfer(context, nftId, _formData) {
+    const formData = { ..._formData, nftId };
+    const {
+      contract,
+      from,
+      to,
+      nft,
+    } = await securityCheck(context, formData);
+    const isNear = context.project.network === `near.testnet` || context.project.network === `near.mainnet`;
+
+    // Checks
+    if (!from) throwError('Address (from) is not valid', 0);   
+    if (!to) throwError('Address (to) is not valid', 0);     
+    if (!nft) throwError('Invalid NFT Id', 5506);
+    if (context.project.transfersAvailable <= context.project.transfersUsed) {
+      throwError(`NFTs have reached the limit (${context.project.transfersAvailable}/${context.project.transfersUsed}). Please upgrade`, 5507);
+    }
+    if (contract.status !== 'onchain') throwError('Contract is not deployed yet', 5531);
+    if (nft.state !== 'minted') throwError('NFT has not been minted yet', 5529);
+    if (isNear) {
+      if (from.network !== `near.testnet` && from.network !== `near.mainnet`) {
+        throwError('Wallet (from) is not a Near account', 0);
+      }
+      if (to.network !== `near.testnet` && to.network !== `near.mainnet`) {
+        throwError('Wallet (to) is not a Near account', 0);
+      }
+      if (from.accountId == to.accountId) throwError('Wallets must be diferent', 0);
+      const result = await Near.callContractView(
+        from.accountId, 
+        contract.address, 
+        "nft_tokens_for_owner",
+        { account_id: from.accountId },
+        context.project.network,
+      );
+      if (!result.success) throwError("Error getting 'nft_tokens_for_owner'", 0);
+      // Find NFT
+      const found = result.data.find((n) => n.token_id == nft.tokenId);
+      if (!found) throwError("Wallet is not the owner of the NFT", 0);
+      // Check pending transfer
+      const pending = await Task.findOne({$and: [
+        { network: context.project.network },
+        { $or: [{ state: 'idle' }, { state: 'queued' }, { state: 'running' }] },
+        { wallet1: from._id},
+        { contractId: contract._id},
+      ]});        
+      if (!!pending) throwError("There is still a pending transfer in this wallet", 0);
+    }
+
+    // Cooking task
+    const updatingData = {};
+    const action = 'transferFrom';
+    const taskData = {
+      contractId: nft.contractId,
+      nftId: nft._id,
+      wallet1: from._id,
+      wallet2: to._id,
+    };
+    let walletIndex;
+    let task;
+    if (!isNear) {
+      // Create task tx & Sign tx
+      // Must be atomic: (Create task + update nonce)
+      // *****************
+      walletIndex = await TaskController.getWalletIndex(context.project.network, action, taskData);
+      await WalletController.lockWallet(from._id.toString(), walletIndex);
+      task = await TaskController.createTask(action, context.project, taskData, walletIndex);
+      const nonce = await EVM.updateNonce(task.walletIndex, from._id, from.isMultiNonce);
+      await WalletController.unlockWallet(from._id.toString(), walletIndex);
+      // *****************
+      const payload = { 
+        fromAddress: from.address, 
+        toAddress: to.address, 
+        tokenId: nft.tokenId 
+      };
+      const result = await EVM.signTask(
+        from, 
+        formData.skey, 
+        contract.contractType, 
+        action, 
+        payload, 
+        task, 
+        nonce);    
+      if (result === false) {
+        // Important! delete iddle task
+        if (!!task) await Task.deleteOne({ _id: mongoose.Types.ObjectId(task._id) });
+        throw (new Error('Error signing Tx transfering a NFT'));
+      }
+      // Update & Launching task
+      updatingData.contents = JSON.stringify(result.contents);
+      updatingData.signatures = JSON.stringify(result.signatures);
+    } else {
+      walletIndex = await TaskController.getWalletIndex(context.project.network, action, taskData);
+      task = await TaskController.createTask(action, context.project, taskData, walletIndex);
+    }
+
+    // Add task to queue
+    const taskId = task._id;
+    await TaskController.queueupTask(taskId, updatingData);
+
+    return { taskId, nft };
+  }
+
+  /**
+   * Mint NFT to Near
+   *
+   * @param {object} context
+   * @param {object} formData | NFT Information
+   *      contractId
+   *      type: "EMBASSADOR" or "CARD "
+   *      background
+   *      avatar
+   *      hologram
+   *      frame
+   * @param {file} file | Uploaded media or file
+   * @returns {object} NFT
+   */
+  static async addNFT_NEAR(context, formData) {
+    // Check contract
+    if (!mongoose.Types.ObjectId.isValid(formData.contractId)) throwError('Invalid Contract Id', 5500);
+    const contract = await Contract.findOne({ _id: mongoose.Types.ObjectId(formData.contractId) });
+    if (!contract) throwError('Invalid Contract Id', 5500);
+    // Check basic params
+    if (!formData.to) {
+      throwError('Wallet is not defined', 0);
+    }
+    if (!formData.mint || formData.mint.toString() != 'true') {
+      throwError('mint param must be true', 0);
+    }
+    // Check wallet
+    if (!mongoose.Types.ObjectId.isValid(formData.to)) throwError('Invalid Wallet Id', 0);
+    const walletTo = await Wallet.findOne({ _id: mongoose.Types.ObjectId(formData.to) });
+    if (!walletTo) throwError('Invalid Wallet Id', 5500);
+    if (walletTo.network !== `near.testnet` && walletTo.network !== `near.mainnet`) {
+      throwError('Wallet belongs to Invalid network', 0);
+    }
+    // Check medias
+    if (!formData.background) {
+      throwError('Background image is not defined', 0);
+    }
+    // Download medias
+    const mediasToDownload = [];
+    const getMedia = (imageName) => new Promise( async (resolve) => {
+      const media = await Media.findOne({ 
+        projectId: mongoose.Types.ObjectId(contract.projectId),
+        name: imageName,
+      });
+      resolve(media);
+    });
+    // Add background
+    let mediaName = `${formData.background}.png`;
+    let media = await getMedia(mediaName);
+    if (!media) throwError(`Media ${mediaName} is not uploaded`, 0);
+    mediasToDownload.push(media);
+    // Add avatar
+    if (!!formData.avatar) {
+      mediaName = `${formData.avatar}.png`;
+      media = await getMedia(mediaName);
+      if (!media) throwError(`Media ${mediaName} is not uploaded`, 0);
+      mediasToDownload.push(media);
+    }
+    // Add hologram
+    if (!!formData.hologram) {
+      mediaName = `${formData.hologram}.png`;
+      media = await getMedia(mediaName);
+      if (!media) throwError(`Media ${mediaName} is not uploaded`, 0);
+      mediasToDownload.push(media);
+    }
+    // Add frame
+    let mediaFrame = null;
+    if (!!formData.frame) {
+      mediaName = `${formData.frame}.png`;
+      media = await getMedia(mediaName);
+      if (!media) throwError(`Media ${mediaName} is not uploaded`, 0);
+      mediasToDownload.push(media);
+      mediaFrame = media;
+    }
+    
+    // Set folder to download files from AWS
+    let tmpdir = `${DATAMK}/tmp-medias-${context.project.name}`;
+    tmpdir = path.normalize(tmpdir);
+    // Create locally if not exist & create dir
+    if (!fs.existsSync(tmpdir)) fs.mkdirSync(tmpdir);
+  
+    // Download files
+    const mediaFiles = [];
+    for (let i = 0; i < mediasToDownload.length; i++) { 
+      const media = mediasToDownload[i];
+      const mediaFile = `${tmpdir}/${media.path}`;
+      if (!fs.existsSync(mediaFile)) {
+        console.log(`Downloading media to: ${mediaFile}`);
+        const downloadRet = await AwsS3.download(`media/${media.path}`, `${mediaFile}`);
+        if (downloadRet === false) { 
+          throwError(downloadRet, 0);
+        }
+      } else {
+        console.log(`Good! Media already exist: ${mediaFile}`);
+      }
+      mediaFiles.push(mediaFile)
+    }
+    
+    // Mix images
+    console.log('mediaFiles', mediaFiles);
+    const buffer = await ImageUtils.overlapImage_JIMP(mediaFiles);
+    // Write mixed image locally
+    const mixedMediaPath = `jungly-${v4()}.png`;
+    const mixedFile = `${tmpdir}/${mixedMediaPath}`;
+    console.log('mixedFile', mixedFile);
+    const rollbackFiles = () => new Promise((resolve) => {
+      // if (fs.existsSync(mixedFile)) fs.unlinkSync(mixedFile); // -> It´ll remove the file before minting
+      if (!!mediaFrame) {
+        const mediaFrameFile = `${tmpdir}/${mediaFrame.path}`;
+        console.log('Deleting', mediaFrameFile);
+        if (fs.existsSync(mediaFrameFile)) fs.unlinkSync(mediaFrameFile);
+      }
+      resolve();
+    });
+    let imgInfo;
+    try {
+      // fs.writeFileSync(mixedFile, buffer);
+      buffer.write(mixedFile);
+      imgInfo = await ImageUtils.getBasicInfo(mixedFile);
+    } catch (err) {
+      await rollbackFiles();
+      throwError(`Error writing image locally: ${err}`, 0);
+    }    
+    // Upload image
+    try {
+      await AwsS3.uploadFile(mixedFile, mixedMediaPath, 'media');
+    } catch (err) {
+      await rollbackFiles();
+      throwError(`Error uploading file: ${err}`, 3504);
+    }
+    // Add media
+    const mediaObj = {
+      name: mixedMediaPath,
+      mimetype: imgInfo.mimetype,
+      size: imgInfo.filesize,
+      path: mixedMediaPath,
+      projectId: contract.projectId,
+    };
+    if (!!imgInfo.width) mediaObj.width = imgInfo.width;
+    if (!!imgInfo.height) mediaObj.height = imgInfo.height;
+    const newMedia = new Media(mediaObj);
+    await MediaController.addFileUrl(newMedia);
+    await newMedia.save();
+
+    let name;
+    let description = '';
+    if (!!formData.title) {
+      name = formData.title;
+    } else {
+      name = `Jungly`;
+      if (!!formData.type) name += ' ' + formData.type;
+    }
+    if (!!formData.description) description = formData.description;
+
+    const mediaId = newMedia._id;
+    const metadata = {
+      title: name,
+      description,
+      copies: 1,
+    };
+    if (!!formData.description) metadata.description = formData.description;
+
+    // Add NFT
+    const nft = new Nft({
+      contractId: contract._id,
+      mediaId,
+      media: mediaId, // Populate
+      metadata: JSON.stringify(metadata),
+      name,
+    });
+    const tokenId = `jungly-${nft._id}`;
+    nft.tokenId = tokenId;
+    await nft.save();  
+
+    // Cooking task
+    const action = 'mintTo';
+    const taskData = {
+      contractId: contract._id,
+      nftId: nft._id,
+      wallet2: walletTo._id,
+      data: JSON.stringify({
+        tokenId
+      }),
+    };
+    const walletIndex = 3;
+    // Add task to queue
+    const taskId = await TaskController.addTask(action, context.project, taskData, walletIndex); 
+    
+    await rollbackFiles();
+    return { taskId, nft, media: newMedia };
+  }
+}
+
+module.exports = NftController;
+
+'''
+'''--- src/controllers/tasks.js ---
+const mongoose = require('mongoose');
+const ethers = require('ethers');
+const logger = require('pino')();
+// Models
+const Task = require('../models/tasks');
+const WalletModel = require('../models/wallets');
+const Contract = require('../models/contracts');
+const Project = require('../models/projects');
+const Media = require('../models/media');
+const Nft = require('../models/nfts');
+const DropCode = require('../models/dropCodes');
+// Utils
+const EVM = require('../utils/evm');
+const Near = require('../utils/near');
+const Permaweb = require('../utils/arweave');
+const Wallets = require('../utils/wallets');
+const Helpers = require('../utils/helpers');
+// Services
+const Webhooks = require('../services/webhooks');
+
+class TaskController {
+
+  /**
+  * Execute task
+  *
+  * @param {string} taskId | Task ID
+  * @param {number} walletIndex | Master wallet index
+  * @param {string} network | Network
+  */
+  static async executeTask(taskId, walletIndex, network) {
+    if (this.getTaskProcessRunning(walletIndex, network)) {
+      console.log(`Thread still running. ETH wallet: ${walletIndex}`);
+      return;
+    }
+    this.setTaskProcessRunning(walletIndex, network, true);
+    console.log(`Starting to execute task: ${taskId}. walletIndex: ${walletIndex}, ${network}`);
+    const task = await Task.findOne({ _id: mongoose.Types.ObjectId(taskId) });
+    let action = 'execute';
+    let taskResult = {};
+    let waitAlchemyWebhook = Helpers.IS_ALCHEMY_WEBHOOKS_ENABLED();
+
+    // Find required tasks
+    const data = JSON.parse(task.data);
+    if (!!data.requiredTasks) {
+      const requiredTasks = data.requiredTasks;
+      for (let t = 0; t < requiredTasks.length; t++) {
+        const rtask = requiredTasks[t];
+        const ftask = await Task.findOne({ _id: rtask });
+        if (!ftask || ftask.state === 'failed') {
+          action = 'cancel';
+          logger.error(`(${walletIndex}) Oups! we must cancel this task: ${taskId}`);
+          break;
+        } else if (ftask.state !== 'success') {
+          action = 'skip';
+        }
+      }
+    }
+
+    // Is task iddle yet?
+    if (action !== 'skip') {
+      if (task.state === 'idle') action = 'skip';
+    }
+
+    if (action === 'cancel') {
+      taskResult.success = false;
+    } else if (action === 'skip') {
+      console.log('Skipping task', taskId);
+      await new Promise((r) => setTimeout(r, 1000 * 10));
+      // Finish the process to retry again
+      await this.finishTaskCompletelyAndStartAnotherOne(task);
+      return;
+    } else if (action === 'execute') {
+      const isNear = task.network === `near.testnet` || task.network === `near.mainnet`;
+      // Executing task
+      task.state = 'running';
+      await task.save();
+      try {
+        switch (task.txType) {
+          case 'wallet':
+            if (isNear) {          
+              taskResult = await Near.deployWallet(task);
+            } else {
+              taskResult = await EVM.deployWallets(task);
+            } 
+            break;
+          case 'contract':
+            taskResult = await EVM.deployContract(task);
+            break;
+          case 'mintTo':
+          case 'mint':
+          case 'transferFrom':
+          case 'transfer':
+          case 'setDefaultRoyalty':
+            if (isNear) {
+              taskResult = await Near.multicall(task);
+            } else {
+              taskResult = await EVM.multicall(task);
+            }            
+            break;
+          case 'metadata':
+            waitAlchemyWebhook = false;
+            taskResult = await Permaweb.metadata(task);
+            break;
+          case 'media':
+            waitAlchemyWebhook = false;
+            taskResult = await Permaweb.upload(task);
+            break;
+          default:
+            taskResult.success = false;
+            break;
+        }
+      } catch (err) {
+        console.log('Error executing task', err);
+        taskResult.success = false;
+      }
+    }
+
+    if (!waitAlchemyWebhook || !taskResult.success) {
+      // Update task
+      taskResult.state = taskResult.success ? 'success' : 'failed';
+      await this.updateTask(task, taskResult);
+      // Finishing task without waiting the alchemy webhook
+      await this.finishingTask(task);
+      // Finish task completely & start another one
+      await this.finishTaskCompletelyAndStartAnotherOne(task);      
+    } else {
+      // Update task and Wait the alchemy webhook
+      await this.updateTask(task, taskResult);
+    }
+  }
+
+}
+
+module.exports = TaskController;
+
+'''
+'''--- src/controllers/tokens.js ---
+const mongoose = require('mongoose');
+const ethers = require('ethers');
+// Controllers
+const TaskController = require('./tasks');
+const WalletController = require('./wallets');
+// Models
+const Contract = require('../models/contracts');
+const Wallet = require('../models/wallets');
+const Task = require('../models/tasks');
+// Utils
+const EVM = require('../utils/evm');
+const Near = require('../utils/near');
+const securityCheck = require('../utils/security');
+
+class TokenController {
+
+  /**
+   * Get token info
+   *
+   * @param {string} contractId
+   * @param {string} walletId
+   * @returns {string} Token name
+   * @returns {string} symbol
+   * @returns {number} totalSupply
+   * @returns {number} balanceOf
+   * 
+   */  
+  static async getTokenInfo(contractId, walletId) {
+    const contract = await Contract.findOne({ _id: mongoose.Types.ObjectId(contractId) });
+    if (!contract) throw (new Error('Invalid contract Id'));
+    const wallet = await Wallet.findOne({ _id: mongoose.Types.ObjectId(walletId) });
+    if (!wallet) throw (new Error('Invalid wallet Id'));
+    const isNear = contract.network === `near.testnet` || contract.network === `near.mainnet`;
+    let tokenInfo;
+    if (isNear) {
+      if (!wallet.accountId) throw (new Error('Invalid account'));
+      tokenInfo = await Near.getTokenInfo(contract, wallet.accountId);
+    } else {
+      if (!EVM.isValidAddress(wallet.address)) throw (new Error('Invalid address'));
+      tokenInfo = await EVM.getTokenInfo(contract, wallet.address);
+    }
+    return tokenInfo;
+  }
+
+  /**
+   * Get balance
+   *
+   * @param {string} contractId
+   * @param {string} walletId
+   * @returns {number} balanceOf
+   * 
+   */  
+  static async getBalance(contractId, walletId) {
+    const tokenInfo = await this.getTokenInfo(contractId, walletId);
+    return !!tokenInfo.balanceOf ? tokenInfo.balanceOf.toString() : `0.0`;
+  }
+
+  /**
+   * Transfer amount of tokens
+   *
+   * @param {object} context
+   * @param {object} formData
+   * @returns {object} Task ID
+   */
+  static async transfer(context, formData) {
+    const { contract, from, to } = await securityCheck(context, formData, 'transfer');
+    // Check
+    if (context.project.transfersAvailable <= context.project.transfersUsed) throw (new Error(`Transfers have reached the limit (${context.project.transfersAvailable}/${context.project.transfersUsed}). Please upgrade`));
+    if (contract.status !== 'onchain') throw (new Error('Contract is not deployed yet'));
+    const isNear = context.project.network === `near.testnet` || context.project.network === `near.mainnet`;
+    // Check balance
+    let tokenInfo;
+    if (isNear) {
+      tokenInfo = await Near.getTokenInfo(contract, from.accountId);
+    } else {
+      tokenInfo = await EVM.getTokenInfo(contract, from.address);
+    }
+    const amount = parseFloat(formData.value);
+    console.log(`Amount to transfer`, amount);
+    console.log(`tokenInfo`, tokenInfo);
+    if (tokenInfo.balanceOf <= amount) throw (new Error(`Not enough balance to transfer. Balance: ${tokenInfo.balanceOf}`));
+    // Cooking task
+    const action = 'transfer';
+    const updatingData = {};
+    const taskData = {
+      contractId: contract._id,
+      wallet1: from._id,
+      wallet2: to._id,
+    };
+    let walletIndex;
+    let task;
+    if (isNear) {
+      taskData.data = JSON.stringify({
+        amount: formData.value,
+      }),
+      walletIndex = await TaskController.getWalletIndex(context.project.network, action, taskData);
+      task = await TaskController.createTask(action, context.project, taskData, walletIndex);
+    } else {
+      // Check wallet
+      const skey = !!formData.skey ? formData.skey : from.skey1;
+      if (!skey) throw (new Error(`Invalid Wallet. skey1 is needed`));
+      // Create task tx & Sign tx
+      const amount2Send = ethers.utils.parseEther(formData.value);
+      // Must be atomic: (Create task + update nonce)
+      // *****************
+      walletIndex = await TaskController.getWalletIndex(context.project.network, action, taskData);
+      await WalletController.lockWallet(from._id.toString(), walletIndex);
+      task = await TaskController.createTask(action, context.project, taskData, walletIndex);
+      const nonce = await EVM.updateNonce(task.walletIndex, from._id, from.isMultiNonce);
+      await WalletController.unlockWallet(from._id.toString(), walletIndex);
+      // *****************
+      const payload = { 
+        toAddress: to.address, 
+        amount: amount2Send
+      };
+      const result = await EVM.signTask(
+        from, 
+        skey, 
+        contract.contractType, 
+        action, 
+        payload, 
+        task, 
+        nonce);    
+      if (result === false) {
+        // Important! delete iddle task
+        if (!!task) await Task.deleteOne({ _id: mongoose.Types.ObjectId(task._id) });
+        throw (new Error('Error signing Tx transfering tokens'));
+      }
+      // Update & Launching task
+      updatingData.contents = JSON.stringify(result.contents);
+      updatingData.signatures = JSON.stringify(result.signatures);
+    }
+
+    // Add task to queue
+    const taskId = task._id;
+    await TaskController.queueupTask(taskId, updatingData);
+    return { taskId };
+  }
+}
+
+module.exports = TokenController;
+
+'''
+'''--- src/controllers/wallets.js ---
+// Controllers
+const TaskController = require('./tasks');
+// Models
+const WalletModel = require('../models/wallets');
+
+class WalletController {
+  /**
+   * Add a new wallet
+   *
+   * @param {object} context
+   * @param {object} walletInfo {walletType, refUser}
+   * @returns {object} Wallet
+   * @returns {object} skeys
+   */
+  static async addWallet(context, walletInfo) {
+    const network = context.project.network;
+    const isNear = network === `near.testnet` || network === `near.mainnet`;
+    if (isNear) {
+      return await this.addWallet_NEAR(context, walletInfo);
+    } else {
+      return await this.addWallet_EVM(context, walletInfo);
+    }    
+  }
+  
+  /**
+   * Add a new ETH wallet & Save into DB
+   *
+   * @param {object} context
+   * @param {object} walletInfo {walletType, refUser}
+   * @returns {object} Wallet
+   * @returns {object} skeys
+   */
+  static async addWallet_NEAR(context, walletInfo) {
+    const wallet = new WalletModel({
+      projectId: context.project._id,
+      type: 'onchain',
+      network: context.project.network,
+      refUser: walletInfo.refUser || '',
+    });
+    // Save
+    await wallet.save();
+    // Launch task to deploy the wallet.
+    const taskId = await TaskController.addTask('wallet', context.project, { wallet1: wallet._id });
+    return {
+      taskId, walletId: wallet._id.toString()
+    };   
+  }
+}
+
+module.exports = WalletController;
+
+'''
+'''--- src/routes/contentGates.js ---
+const router = require('express').Router();
+// Controllers
+const ContentGatesController = require('../controllers/contentGates');
+// Schemas & Middlewares
+const userProtected = require('../middlewares/auth');
+// Utils
+const { sendError } = require('../utils/error');
+
+/**
+ * @openapi
+ * tags:
+ *   name: contents
+ *   description: Content gates API Endpoints 
+ * components:
+ *   schemas:
+ *     AddContentGate:
+ *       type: object
+ *       description: Content model (object)
+ *       properties:
+ *         contractId:
+ *           type: string
+ *         title:
+ *           type: string
+ *     ContentGate:
+ *       type: object
+ *       description: Content model (object)
+ *       properties:
+ *         _id:
+ *           type: string
+ *         projectId:
+ *           type: string
+ *         contractId:
+ *           type: string
+ *         title:
+ *           type: string
+ *     CheckContentGate:
+ *       type: object
+ *       description: Input params for checking the NFT
+ *       properties:
+ *         nftId:
+ *           type: string
+ *         address:
+ *           type: string
+ *         walletId:
+ *           type: string
+ *         contentGateId:
+ *           type: string
+ *         signature:
+ *           type: string
+ *         challenge:
+ *           type: string
+ * 
+ */
+
+/**
+ * @openapi
+ * /contentGates/v2/all:
+ *   get:
+ *     tags:
+ *     - contents
+ *     summary: Get content gates
+ *     components:
+ *       securitySchemes:
+ *         BearerAuth:
+ *           type: http
+ *           scheme: bearer
+ *     responses:
+ *       200:
+ *         description: Returns content gates list
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: array
+ *               items:
+ *                 $ref: '#components/schemas/ContentGate'
+ *       400:
+ *         description: The server cannot process the request due to a controlled error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/Error'
+ *       401:
+ *         description: Unauthorized. The client request has not been completed because it lacks valid authentication credentials for the requested resource
+ */
+router.get('/v2/all', userProtected(), async (req, res) => {
+  ContentGatesController.getAll(req.context.project)
+    .then((result) => res.json(result))
+    .catch((e) => sendError(res, e));
+});
+
+/**
+ * @openapi
+ * /contentGates/v2/contentgate/{contentGateId}:
+ *   get:
+ *     tags:
+ *     - contents
+ *     summary: Get content gate
+ *     components:
+ *       securitySchemes:
+ *         BearerAuth:
+ *           type: http
+ *           scheme: bearer
+ *     responses:
+ *       200:
+ *         description: Returns content gate
+ *         content:
+ *            application/json:
+ *              schema:
+ *                $ref: '#/components/schemas/ContentGate'
+ *       400:
+ *         description: The server cannot process the request due to a controlled error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/Error'
+ *       401:
+ *         description: Unauthorized. The client request has not been completed because it lacks valid authentication credentials for the requested resource
+ */
+router.get('/v2/contentgate/:contentGateId', userProtected(), async (req, res) => {
+  ContentGatesController.getContentGate(req.context.project, req.params.contentGateId)
+    .then((result) => res.json(result))
+    .catch((e) => sendError(res, e));
+});
+
+/**
+ * @openapi
+ * /contentGates/v2/challenge/{address}:
+ *   get:
+ *     tags:
+ *     - contents
+ *     summary: Get a new challenge
+ *     parameters:
+ *       - name: address
+ *         in: path
+ *         description: Public wallet address
+ *     components:
+ *       securitySchemes:
+ *         BearerAuth:
+ *           type: http
+ *           scheme: bearer
+ *     responses:
+ *       200:
+ *         description: Returns a new challenge
+ *         content:
+ *           text/plain:
+ *            schema:
+ *              type: string
+ *       400:
+ *         description: The server cannot process the request due to a controlled error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/Error'
+ *       401:
+ *         description: Unauthorized. The client request has not been completed because it lacks valid authentication credentials for the requested resource
+ */
+router.get('/v2/challenge/:address', userProtected(), async (req, res) => {
+  ContentGatesController.getChallenge(req.context.project, req.params.address)
+    .then((result) => res.json(result))
+    .catch((e) => sendError(res, e));
+});
+
+/**
+ * @openapi
+ * /contentGates/v2/check:
+ *   post:
+ *     tags:
+ *     - contents
+ *     summary: Check if the content is available or not
+ *     components:
+ *       securitySchemes:
+ *         BearerAuth:
+ *           type: http
+ *           scheme: bearer
+ *     requestBody:
+ *       content:
+ *         application/json:
+ *           schema:
+ *            $ref: '#/components/schemas/CheckContentGate'
+ *     responses:
+ *       200:
+ *         description: Content is available
+ *       400:
+ *         description: Content is not available
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/Error'
+ *       401:
+ *         description: Unauthorized. The client request has not been completed because it lacks valid authentication credentials for the requested resource
+ */
+router.post('/v2/check', userProtected(), async (req, res) => {
+  const body = { ...req.body }; // Don´t change. Necessary due to call from SDK
+  ContentGatesController.verifyContentGate(req.context.project, body)
+    .then((result) => res.status(200).json(result))
+    .catch((e) => sendError(res, e));
+});
+
+/**
+ * @openapi
+ * /contentGates/v2:
+ *   post:
+ *     tags:
+ *     - contents
+ *     summary: Creates a new content gate
+ *     components:
+ *       securitySchemes:
+ *         BearerAuth:
+ *           type: http
+ *           scheme: bearer
+ *     requestBody:
+ *       description: Content gate to be added
+ *       content:
+ *         application/json:
+ *           schema:
+ *            $ref: '#/components/schemas/AddContentGate'
+ *     responses:
+ *       201:
+ *         description: Content gate has been added
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/ContentGate'
+ *       400:
+ *         description: The server cannot process the request due to a controlled error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/Error'
+ *       401:
+ *         description: Unauthorized. The client request has not been completed because it lacks valid authentication credentials for the requested resource
+ */
+router.post('/v2', userProtected(), async (req, res) => {
+  const body = { ...req.body }; // Don´t change. Necessary due to call from SDK
+  ContentGatesController.addContentGate(req.context.project, body)
+    .then((result) => res.status(201).json(result))
+    .catch((e) => sendError(res, e));
+});
+
+/**
+ * @openapi
+ * /contentGates/v2/{contentGateId}:
+ *   put:
+ *     tags:
+ *     - contents
+ *     summary: Update a Content gate
+ *     parameters:
+ *       - name: contentGateId
+ *         in: path
+ *         description: Id of the Content gate
+ *     requestBody:
+ *       description: Content gate to be added
+ *       content:
+ *         application/json:
+ *           schema:
+ *            $ref: '#/components/schemas/AddContentGate'
+ *     responses:
+ *       200:
+ *         description: Content gate has been updated
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/ContentGate'
+ *       400:
+ *         description: The server cannot process the request due to a controlled error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/Error'
+ *       401:
+ *         description: Unauthorized. The client request has not been completed because it lacks valid authentication credentials for the requested resource
+ */
+router.put('/v2/:contentGateId', userProtected(), async (req, res) => {
+  const body = { ...req.body }; // Don´t change. Necessary due to call from SDK
+  ContentGatesController.updateContentGate(req.context.project, req.params.contentGateId, body)
+    .then((result) => res.json(result))
+    .catch((e) => sendError(res, e));
+});
+
+/**
+ * @openapi
+ * /contentGates/v2/{contentGateId}:
+ *   delete:
+ *     tags:
+ *     - contents
+ *     summary: Delete Content gate
+ *     parameters:
+ *       - name: contentGateId
+ *         in: path
+ *         description: Id of the Content gate
+ *     responses:
+ *       200:
+ *         description: Content gate has been removed
+ *       400:
+ *         description: The server cannot process the request due to a controlled error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/Error'
+ *       401:
+ *         description: Unauthorized. The client request has not been completed because it lacks valid authentication credentials for the requested resource
+ */
+router.delete('/v2/:contentGateId', userProtected(), (req, res) => {
+  ContentGatesController.deleteContentGate(req.context.project, req.params.contentGateId)
+    .then((result) => res.json(result))
+    .catch((e) => sendError(res, e));
+});
+
+module.exports = router;
+
+'''
+'''--- src/routes/nfts.js ---
+const router = require('express').Router();
+const multer = require('multer');
+const fs = require('fs');
+const path = require('path');
+// Controllers
+const NftController = require('../controllers/nfts');
+// Schemas & Middlewares
+const userProtected = require('../middlewares/auth');
+// Utils
+const { sendError } = require('../utils/error');
+
+// Create multer object
+const imageUpload = multer({
+  dest: 'files',
+  // limits: { fileSize: 30 * 1000 * 1024 }, // 30M
+  limits: { fileSize: 3000 * 1000 * 1024 }, // 3000M = 3G
+});
+
+function checkUpload(req, res, next) {
+  let basedir = `${__dirname}/../../files`;
+  basedir = path.normalize(basedir);
+  if (!fs.existsSync(basedir)) fs.mkdirSync(basedir);
+  next();
+}
+const fileSizeLimitErrorHandler = (err, req, res, next) => {
+  if (err) {
+    sendError(res, err);
+  } else {
+    next();
+  }
+};
+
+/**
+ * @openapi
+ * tags:
+ *   name: nfts
+ *   description: NFT API Endpoints
+ * components:
+ *   schemas:
+ *     AddNFT:
+ *       type: object
+ *       properties:
+ *         contractId:
+ *           type: string
+ *         name:
+ *           type: string
+ *         description:
+ *           type: string
+ *         tokenId:
+ *           type: number
+ *         file:
+ *           type: string
+ *           format: binary
+ *         dropId:
+ *           type: string
+ *         mediaId:
+ *           type: string
+ *         attributes:
+ *           type: string
+ *     MintNFT:
+ *       type: object
+ *       properties:
+ *         walletId:
+ *           type: string
+ *         to:
+ *           description: walletId to
+ *           type: string
+ *         skey:
+ *           description: partial key (from)
+ *           type: string
+ *         address:
+ *           type: string
+ *     TransferNFT:
+ *       type: object
+ *       properties:
+ *         walletId:
+ *           type: string
+ *         to:
+ *           description: walletId to
+ *           type: string
+ *         skey:
+ *           description: partial key (from)
+ *           type: string
+ *         address:
+ *           type: string
+ *     NFT:
+ *       type: object
+ *       properties:
+ *         _id:
+ *           type: string
+ *         name:
+ *           type: string
+ *         description:
+ *           type: string
+ *         contractId:
+ *           type: string
+ *         metadata:
+ *           type: string
+ *         state:
+ *           type: string
+ *           enum:
+ *             - draft
+ *             - minted
+ *         createdAt:
+ *           type: string
+ *           format: date
+ *         updatedAt:
+ *           type: string
+ *           format: date
+ *         mintedAt:
+ *           type: string
+ *           format: date
+ *         lastLockAt:
+ *           type: string
+ *           format: date
+ *         addressOfLastLock:
+ *           type: string
+ *         isLockedBySignature:
+ *           type: boolean
+ *         lastLockBySignatureAt:
+ *           type: string
+ *           format: date
+ *         addressOfLastLockBySignature:
+ *           type: string
+ *         walletId:
+ *           type: string
+ *         minterId:
+ *           type: string
+ */
+
+/**
+ * @openapi
+ * /nfts/v2:
+ *   post:
+ *     summary: Add a new NFT into DB
+ *     tags:
+ *     - nfts
+ *     components:
+ *       securitySchemes:
+ *         BearerAuth:
+ *           type: http
+ *           scheme: bearer
+ *     requestBody:
+ *       description: NFT to be added
+ *       content:
+ *         application/json:
+ *           schema:
+ *            $ref: '#/components/schemas/AddNFT'
+ *     responses:
+ *       201:
+ *         description: NFT added into DB (draft)
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/NFT'
+ *       400:
+ *         description: The server cannot process the request due to a controlled error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/Error'
+ *       401:
+ *         description: Unauthorized. The client request has not been completed because it lacks valid authentication credentials for the requested resource
+ */
+router.post('/v2', userProtected(), checkUpload, imageUpload.single('file'), fileSizeLimitErrorHandler, async (req, res) => {
+  const body = { ...req.body }; // Don´t change. Necessary due to call from SDK
+  NftController.addNFT(
+    req.context,
+    body,
+    req.file,
+  )
+    .then((result) => res.status(201).json(result))
+    .catch((e) => sendError(res, e));
+});
+
+/**
+ * @openapi
+ * /nfts/v2/upload/{contractId}:
+ *   post:
+ *     summary: Upload NFTs in bulk mode
+ *     tags:
+ *     - nfts
+ *     components:
+ *       securitySchemes:
+ *         BearerAuth:
+ *           type: http
+ *           scheme: bearer
+ *     parameters:
+ *       - name: contractId
+ *         in: path
+ *         description: Id of the contract
+ *     requestBody:
+ *       description: Body params
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               files:
+ *                 type: array
+ *                 items:
+ *                   $ref: '#components/schemas/File'
+ *               dropId:
+ *                 type: string
+ *     responses:
+ *       201:
+ *         description: NFTs added into DB (draft)
+ *       400:
+ *         description: The server cannot process the request due to a controlled error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/Error'
+ *       401:
+ *         description: Unauthorized. The client request has not been completed because it lacks valid authentication credentials for the requested resource
+ */
+router.post('/v2/upload/:contractId', userProtected(), checkUpload, imageUpload.array('files'), fileSizeLimitErrorHandler, async (req, res) => {
+  NftController.uploadNFTs(
+    req.params.contractId,
+    req.files,
+    req.body.dropId,
+    req.body.csvVersion,
+  )
+    .then((result) => res.status(201).json(result))
+    .catch((e) => sendError(res, e));
+});
+
+/**
+ * @openapi
+ * /nfts/v2/metadata/{nftId}:
+ *   put:
+ *     summary: Upload the NFT´s metadata into Arweave
+ *     tags:
+ *     - nfts
+ *     components:
+ *       securitySchemes:
+ *         BearerAuth:
+ *           type: http
+ *           scheme: bearer
+ *     parameters:
+ *       - name: nftId
+ *         in: query
+ *         description: Id of the NFT
+ *     responses:
+ *       200:
+ *         description: The NFT´s metadata has been queued to be uploaded
+ *         content:
+ *           application/json:
+ *             schema:
+ *              type: object
+ *              properties:
+ *                taskId:
+ *                  type: string
+ *                nft:
+ *                  $ref: '#components/schemas/NFT'
+ *       400:
+ *         description: The server cannot process the request due to a controlled error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/Error'
+ *       401:
+ *         description: Unauthorized. The client request has not been completed because it lacks valid authentication credentials for the requested resource
+ */
+router.put('/v2/metadata/:nftId', userProtected(), async (req, res) => {
+  NftController.addMetadata(req.context, req.params.nftId)
+    .then((result) => res.json(result))
+    .catch((e) => sendError(res, e));
+});
+
+/**
+ * @openapi
+ * /nfts/v2/mint/{nftId}:
+ *   put:
+ *     summary: Mints an NFT
+ *     tags:
+ *     - nfts
+ *     components:
+ *       securitySchemes:
+ *         BearerAuth:
+ *           type: http
+ *           scheme: bearer
+ *     parameters:
+ *       - name: nftId
+ *         in: query
+ *         description: Id of the NFT
+ *     requestBody:
+ *       description: Mint body params
+ *       content:
+ *         application/json:
+ *           schema:
+ *            $ref: '#/components/schemas/MintNFT'
+ *     responses:
+ *       200:
+ *         description: The NFT has been queued to be minted
+ *         content:
+ *           application/json:
+ *             schema:
+ *              type: object
+ *              properties:
+ *                taskId:
+ *                  type: string
+ *                nft:
+ *                  $ref: '#components/schemas/NFT'
+ *       400:
+ *         description: The server cannot process the request due to a controlled error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/Error'
+ *       401:
+ *         description: Unauthorized. The client request has not been completed because it lacks valid authentication credentials for the requested resource
+ */
+router.put('/v2/mint/:nftId', userProtected(), async (req, res) => {
+  NftController.mint(req.context, req.params.nftId, req.body)
+    .then((result) => res.json(result))
+    .catch((e) => sendError(res, e));
+});
+
+/**
+ * @openapi
+ * /nfts/v2/transfer/{nftId}:
+ *   put:
+ *     summary: Transfer an NFT
+ *     tags:
+ *     - nfts
+ *     components:
+ *       securitySchemes:
+ *         BearerAuth:
+ *           type: http
+ *           scheme: bearer
+ *     parameters:
+ *       - name: nftId
+ *         in: query
+ *         description: Id of the NFT
+ *     requestBody:
+ *       description: Transfer body params
+ *       content:
+ *         application/json:
+ *           schema:
+ *            $ref: '#/components/schemas/TransferNFT'
+ *     responses:
+ *       200:
+ *         description: The NFT has been queued to be transferred
+ *         content:
+ *           application/json:
+ *             schema:
+ *              type: object
+ *              properties:
+ *                taskId:
+ *                  type: string
+ *                nft:
+ *                  $ref: '#components/schemas/NFT'
+ *       400:
+ *         description: The server cannot process the request due to a controlled error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/Error'
+ *       401:
+ *         description: Unauthorized. The client request has not been completed because it lacks valid authentication credentials for the requested resource
+ */
+router.put('/v2/transfer/:nftId', userProtected(), async (req, res) => {
+  NftController.transfer(req.context, req.params.nftId, req.body)
+    .then((result) => res.json(result))
+    .catch((e) => sendError(res, e));
+});
+
+/**
+ * @openapi
+ * /nfts/v2/{nftId}:
+ *   put:
+ *     summary: Update NFT
+ *     tags:
+ *     - nfts
+ *     components:
+ *       securitySchemes:
+ *         BearerAuth:
+ *           type: http
+ *           scheme: bearer
+ *     parameters:
+ *       - name: nftId
+ *         in: query
+ *         description: Id of the NFT
+ *     requestBody:
+ *       description: NFT to be updated
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/NFT'
+ *     responses:
+ *       200:
+ *         description: The NFT has been updated
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/NFT'
+ *       400:
+ *         description: The server cannot process the request due to a controlled error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/Error'
+ *       401:
+ *         description: Unauthorized. The client request has not been completed because it lacks valid authentication credentials for the requested resource
+ */
+router.put('/v2/:nftId', userProtected(), async (req, res) => {
+  const body = { ...req.body }; // Don´t change. Necessary due to call from SDK
+  NftController.updateNFT(
+    req.params.nftId,
+    body,
+  )
+    .then((result) => res.json(result))
+    .catch((e) => sendError(res, e));
+});
+
+/**
+ * @openapi
+ * /nfts/v2/byContract/{contractId}:
+ *   get:
+ *     tags:
+ *     - nfts
+ *     summary: Get all NFT by contract
+ *     components:
+ *       securitySchemes:
+ *         BearerAuth:
+ *           type: http
+ *           scheme: bearer
+ *     parameters:
+ *       - name: contractId
+ *         in: query
+ *         description: Id of the Contract
+ *     responses:
+ *       200:
+ *         description: Returns all NFT by contract
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/NFT'
+ *       400:
+ *         description: The server cannot process the request due to a controlled error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/Error'
+ *       401:
+ *         description: Unauthorized. The client request has not been completed because it lacks valid authentication credentials for the requested resource
+ */
+router.get('/v2/byContract/:contractId', userProtected(), async (req, res) => {
+  NftController.getAllNFTsByContract(req.params.contractId)
+    .then((result) => res.json(result))
+    .catch((e) => sendError(res, e));
+});
+
+/**
+ * @openapi
+ * /nfts/v2/byWallet/{walletId}:
+ *   get:
+ *     tags:
+ *     - nfts
+ *     summary: Get all NFT by wallet
+ *     components:
+ *       securitySchemes:
+ *         BearerAuth:
+ *           type: http
+ *           scheme: bearer
+ *     parameters:
+ *       - name: walletId
+ *         in: query
+ *         description: Id of the Wallet
+ *     responses:
+ *       200:
+ *         description: Returns all NFT by wallet
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/NFT'
+ *       400:
+ *         description: The server cannot process the request due to a controlled error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/Error'
+ *       401:
+ *         description: Unauthorized. The client request has not been completed because it lacks valid authentication credentials for the requested resource
+ */
+router.get('/v2/byWallet/:walletId', userProtected(), async (req, res) => {
+  NftController.getAllNFTsByWallet(req.params.walletId)
+    .then((result) => res.json(result))
+    .catch((e) => sendError(res, e));
+});
+
+/**
+ * @openapi
+ * /nfts/v2/blockchain/{address}:
+ *   get:
+ *     tags:
+ *     - nfts
+ *     summary: Get all real NFT from blockchain by address
+ *     components:
+ *       securitySchemes:
+ *         BearerAuth:
+ *           type: http
+ *           scheme: bearer
+ *     parameters:
+ *       - name: address
+ *         in: query
+ *         description: Owner Address
+ *     responses:
+ *       200:
+ *         description: Returns all NFT
+ *         content:
+ *           application/json:
+ *             schema:
+ *              type: object
+ *              properties:
+ *                 ownedNfts:
+ *                   type: array
+ *                 totalCount:
+ *                   type: number
+ *                 blockHash:
+ *                   type: string
+ *       400:
+ *         description: The server cannot process the request due to a controlled error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/Error'
+ *       401:
+ *         description: Unauthorized. The client request has not been completed because it lacks valid authentication credentials for the requested resource
+ */
+router.get('/v2/blockchain/:address', userProtected(), async (req, res) => {
+  NftController.getAllNFTsFromBlockchain(req.context.project, req.params.address, req.query)
+    .then((result) => res.json(result))
+    .catch((e) => sendError(res, e));
+});
+
+/**
+ * @openapi
+ * /nfts/v2/{contractId}/{tokenId}:
+ *   get:
+ *     tags:
+ *     - nfts
+ *     summary: Get the metadata of one NFT
+ *     components:
+ *       securitySchemes:
+ *         BearerAuth:
+ *           type: http
+ *           scheme: bearer
+ *     parameters:
+ *       - name: contractId
+ *         in: query
+ *         description: Id of the NFT
+ *       - name: tokenId
+ *         in: query
+ *         description: Id of the Token in the NFT
+ *     responses:
+ *       200:
+ *         description: Returns all NFT by wallet
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/NFT'
+ *       400:
+ *         description: The server cannot process the request due to a controlled error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/Error'
+ *       401:
+ *         description: Unauthorized. The client request has not been completed because it lacks valid authentication credentials for the requested resource
+ */
+router.get('/v2/:contractId/:tokenId', async (req, res) => {
+  NftController.getMetadata(req.params.contractId, req.params.tokenId)
+    .then((result) => res.json(result))
+    .catch((e) => sendError(res, e));
+});
+// Look out: It´s called from https://nft.mintknight.com/{contractId}/{tokenId}
+router.get('/:contractId/:tokenId', async (req, res) => {
+  NftController.getMetadata(req.params.contractId, req.params.tokenId)
+    .then((result) => res.json(result))
+    .catch((e) => sendError(res, e));
+});
+
+/**
+ * @openapi
+ * /nfts/v2/{nftId}:
+ *   delete:
+ *     tags:
+ *     - nfts
+ *     summary: Delete NFT
+ *     components:
+ *       securitySchemes:
+ *         BearerAuth:
+ *           type: http
+ *           scheme: bearer
+ *     parameters:
+ *       - name: nftId
+ *         in: path
+ *         description: Id of the NFT
+ *     responses:
+ *       200:
+ *         description: Deleted NFT
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/NFT'
+ *       400:
+ *         description: The server cannot process the request due to a controlled error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/Error'
+ *       401:
+ *         description: Unauthorized. The client request has not been completed because it lacks valid authentication credentials for the requested resource
+ */
+router.delete('/v2/:nftId', userProtected(), async (req, res) => {
+  NftController.deleteNft(req.params.nftId)
+    .then((result) => res.json(result))
+    .catch((e) => sendError(res, e));
+});
+
+module.exports = router;
+
+'''
+'''--- src/routes/tasks.js ---
+const router = require('express').Router();
+// Controllers
+const TaskController = require('../controllers/tasks');
+// Utils
+const { sendError } = require('../utils/error');
+
+/**
+ * @openapi
+ * tags:
+ *   name: tasks
+ *   description: Tasks API Endpoints
+ * components:
+ *   schemas:
+ *     Task:
+ *       type: object
+ *       description: Task model (object)
+ *       properties:
+ *         _id:
+ *           type: string
+ *         projectId:
+ *           type: string
+ *         network:
+ *           type: string
+ *           enum:
+ *             - localhost
+ *             - mumbai
+ *             - polygon
+ *         walletIndex:
+ *           type: number
+ *         txHash:
+ *           type: string
+ *         cost:
+ *           type: number
+ *         txType:
+ *           type: string
+ *           enum:
+ *             - wallet
+ *             - media
+ *             - metadata
+ *             - contract
+ *             - mint
+ *             - mintTo
+ *             - transferFrom
+ *             - transfer
+ *             - setVerifier
+ *             - setMinter
+ *             - transferOwnership
+ *             - setDefaultRoyalty
+ *             - getNFTs
+ *         state:
+ *           type: string
+ *           enum:
+ *             - idle
+ *             - queued
+ *             - running
+ *             - success
+ *             - failed
+ *         startedAt:
+ *           type: string
+ *           format: date
+ *         endedAt:
+ *           type: string
+ *           format: date
+ *         tryAgainAt:
+ *           type: string
+ *           format: date
+ *         willTryAgainAt:
+ *           type: string
+ *           format: date
+ *         wallet1:
+ *           type: string
+ *         wallet2:
+ *           type: string
+ *         wallets:
+ *           type: array
+ *         tries:
+ *           type: number
+ *         webhookType:
+ *           type: string
+ *         webhookState:
+ *           type: string
+ *           enum:
+ *             - idle
+ *             - pending
+ *             - success
+ *             - failed
+ *         webhookLastCallAt:
+ *           type: string
+ *           format: date
+ *         webhookErrorCounter:
+ *           type: number
+ *         address:
+ *           type: string
+ *         addresses:
+ *           type: array
+ *         data:
+ *           type: string
+ */
+
+/**
+ * @openapi
+ * /tasks/v2/{taskId}:
+ *   get:
+ *     tags:
+ *     - tasks
+ *     summary: Get task
+ *     components:
+ *       securitySchemes:
+ *         BearerAuth:
+ *           type: http
+ *           scheme: bearer
+ *     parameters:
+ *       - name: taskId
+ *         in: query
+ *         description: Id of the Task
+ *     responses:
+ *       200:
+ *         description: Returns the task
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/Task'
+ *       400:
+ *         description: The server cannot process the request due to a controlled error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/Error'
+ *       401:
+ *         description: Unauthorized. The client request has not been completed because it lacks valid authentication credentials for the requested resource
+ */
+router.get('/v2/:taskId'/*, userProtected()*/, async (req, res) => {
+  TaskController.getTask(req.params.taskId)
+    .then((result) => res.json(result))
+    .catch((e) => sendError(res, e));
+});
+
+/**
+ *  NO SWAGGER!!
+ * /tasks/v2/alchemy/webhook:
+ *   post:
+ *     summary: Alchemy notify MK when the Tx has been mined or dropped
+ */
+router.post('/v2/alchemy/webhook', async (req, res) => {
+  TaskController.checkAlchemyWebhook(req.body)
+    .then(() => res.status(200).send())
+    .catch((e) => sendError(res, e));
+});
+
+module.exports = router;
+
+'''
+'''--- src/routes/tokens.js ---
+const router = require('express').Router();
+// Controllers
+const TokenController = require('../controllers/tokens');
+// Schemas & Middlewares
+const userProtected = require('../middlewares/auth');
+// Utils
+const { sendError } = require('../utils/error');
+
+/**
+ * @openapi
+ * tags:
+ *   name: tokens
+ *   description: Tokens ERC20 API Endpoints
+ * components:
+ *   schemas:
+ *     MintToken:
+ *       type: object
+ *       properties:
+ *         contractId:
+ *           description: ERC20 Contract Id
+ *           type: string
+ *         walletId:
+ *           description: Wallet Id of the project (minter)
+ *           type: string
+ *         skey:
+ *           description: Partial private key (from)
+ *           type: string
+ *         value:
+ *           description: Amount to mint
+ *           type: string
+ *         to:
+ *           description: Wallet Id of the receiver. (to or address. Only needed one of them)
+ *           type: string
+ *         address:
+ *           description: Public address of the receiver. (to or address. Only needed one of them)
+ *           type: string
+ *     TransferToken:
+ *       type: object
+ *       properties:
+ *         contractId:
+ *           description: ERC20 Contract Id
+ *           type: string
+ *         walletId:
+ *           description: Sender wallet Id (any wallet Id from MK)
+ *           type: string
+ *         skey:
+ *           description: partial key (from)
+ *           type: string
+ *         value:
+ *           description: Amount to transfer
+ *           type: string
+ *         to:
+ *           description: Receiver wallet Id (any wallet Id from MK. to or address. Only needed one of them)
+ *           type: string
+ *         address:
+ *           description: Public address of the receiver. (to or address. Only needed one of them)
+ *           type: string
+ *     TokenInfo:
+ *       type: object
+ *       properties:
+ *         name:
+ *           type: string
+ *         symbol:
+ *           type: string
+ *         totalSupply:
+ *           type: number
+ *           description: Total supply of tokens of a specific ERC20 contract
+ *         balanceOf:
+ *           type: number
+ *           description: Amount of tokens of a specific wallet
+ */
+
+/**
+ * @openapi
+ * /tokens/v2:
+ *   post:
+ *     summary: Mint Tokens
+ *     tags:
+ *     - tokens
+ *     requestBody:
+ *       description: Token to be minted
+ *       content:
+ *         application/json:
+ *           schema:
+ *            $ref: '#/components/schemas/MintToken'
+ *     responses:
+ *       201:
+ *         description: The tokens have been queued to be minted
+ *         content:
+ *           application/json:
+ *             schema:
+ *              type: object
+ *              properties:
+ *                taskId:
+ *                  type: string
+ *       400:
+ *         description: The server cannot process the request due to a controlled error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/Error'
+ *       401:
+ *         description: Unauthorized. The client request has not been completed because it lacks valid authentication credentials for the requested resource
+ */
+router.post('/v2/', userProtected(), async (req, res) => {
+  TokenController.mint(req.context, req.body)
+    .then((result) => res.status(201).json(result))
+    .catch((e) => sendError(res, e));
+});
+
+/**
+ * @openapi
+ * /tokens/v2:
+ *   put:
+ *     summary: Transfer tokens
+ *     tags:
+ *     - tokens
+ *     requestBody:
+ *       description: Token to be transferred
+ *       content:
+ *         application/json:
+ *           schema:
+ *            $ref: '#/components/schemas/TransferToken'
+ *     responses:
+ *       200:
+ *         description: The tokens have been queued to be transferred
+ *         content:
+ *           application/json:
+ *             schema:
+ *              type: object
+ *              properties:
+ *                taskId:
+ *                  type: string
+ *       400:
+ *         description: The server cannot process the request due to a controlled error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/Error'
+ *       401:
+ *         description: Unauthorized. The client request has not been completed because it lacks valid authentication credentials for the requested resource
+ */
+router.put('/v2/', userProtected(), async (req, res) => {
+  TokenController.transfer(req.context, req.body)
+    .then((result) => res.json(result))
+    .catch((e) => sendError(res, e));
+});
+
+/**
+ * @openapi
+ * /tokens/v2/{contractId}/{walletId}:
+ *   get:
+ *     tags:
+ *     - tokens
+ *     summary: Get the token info
+ *     parameters:
+ *       - name: contractId
+ *         in: query
+ *         description: Id of the Contract
+ *       - name: walletId
+ *         in: query
+ *         description: Id of the Wallet
+ *     responses:
+ *       200:
+ *         description: Returns the token info
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/TokenInfo'
+ *       400:
+ *         description: The server cannot process the request due to a controlled error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/Error'
+ *       401:
+ *         description: Unauthorized. The client request has not been completed because it lacks valid authentication credentials for the requested resource
+ */
+router.get('/v2/:contractId/:walletId', async (req, res) => {
+  TokenController.getTokenInfo(req.params.contractId, req.params.walletId)
+    .then((result) => res.json(result))
+    .catch((e) => sendError(res, e));
+});
+
+/**
+ * @openapi
+ * /tokens/v2/balance/{contractId}/{walletId}:
+ *   get:
+ *     tags:
+ *     - tokens
+ *     summary: Get balance
+ *     parameters:
+ *       - name: contractId
+ *         in: query
+ *         description: Id of the Contract
+ *       - name: walletId
+ *         in: query
+ *         description: Id of the Wallet
+ *     responses:
+ *       200:
+ *         description: Returns the wallet´s balance
+ *         content:
+ *           text/plain:
+ *            schema:
+ *              type: string
+ *       400:
+ *         description: The server cannot process the request due to a controlled error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/Error'
+ *       401:
+ *         description: Unauthorized. The client request has not been completed because it lacks valid authentication credentials for the requested resource
+ */
+router.get('/v2/balance/:contractId/:walletId', async (req, res) => {
+  TokenController.getBalance(req.params.contractId, req.params.walletId)
+    .then((result) => res.send(result))
+    .catch((e) => sendError(res, e));
+});
+
+module.exports = router;
+
+'''
+'''--- src/routes/wallets.js ---
+const router = require('express').Router();
+// Controllers
+const WalletController = require('../controllers/wallets');
+// Schemas & Middlewares
+const userProtected = require('../middlewares/auth');
+// Utils
+const Wallets = require('../utils/wallets');
+const { sendError } = require('../utils/error');
+
+/**
+ * @openapi
+ * tags:
+ *   name: wallets
+ *   description: Wallet API Endpoints
+ * components:
+ *   schemas:
+ *     AddWallet:
+ *       type: object
+ *       properties:
+ *         refUser:
+ *           type: string
+ *         walletType:
+ *           type: string
+ *           description: Type of wallet
+ *           enum:
+ *             - onchain
+ *             - eoa
+ *             - signer
+ *     Wallet:
+ *       type: object
+ *       description: Wallet model (object)
+ *       properties:
+ *         _id:
+ *           type: string
+ *         projectId:
+ *           type: string
+ *         type:
+ *           type: string
+ *           description: Type of wallet
+ *           enum:
+ *             - onchain
+ *             - eoa
+ *             - signer
+ *         address:
+ *           type: string
+ *         owner:
+ *           type: string
+ *         state:
+ *           type: string
+ *           enum:
+ *             - active
+ *             - blocked
+ *         network:
+ *           type: string
+ *         refUser:
+ *           type: string
+ *         nonce1:
+ *           type: number
+ *         nonce2:
+ *           type: number
+ *         nonce3:
+ *           type: number
+ *         status:
+ *           type: string
+ *           enum:
+ *             - draft
+ *             - onchain
+ *         createdAt:
+ *           type: string
+ *           format: date
+ *         bytecode:
+ *           type: string
+ */
+
+/**
+ * @openapi
+ * /wallets/v2:
+ *   post:
+ *     summary: Add a new wallet into DB
+ *     tags:
+ *     - wallets
+ *     components:
+ *       securitySchemes:
+ *         BearerAuth:
+ *           type: http
+ *           scheme: bearer
+ *     requestBody:
+ *       description: Wallet to be added
+ *       content:
+ *         application/json:
+ *           schema:
+ *            $ref: '#/components/schemas/AddWallet'
+ *     responses:
+ *       201:
+ *         description: Wallet added into DB (draft)
+ *         content:
+ *           application/json:
+ *             schema:
+ *              type: object
+ *              properties:
+ *                skey1:
+ *                  type: string
+ *                skey2:
+ *                  type: string
+ *                wallet:
+ *                  $ref: '#components/schemas/Wallet'
+ *       400:
+ *         description: The server cannot process the request due to a controlled error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/Error'
+ *       401:
+ *         description: Unauthorized. The client request has not been completed because it lacks valid authentication credentials for the requested resource
+ */
+router.post('/v2/', userProtected(), async (req, res) => {
+  WalletController.addWallet(req.context, req.body)
+    .then((result) => res.status(201).json(result))
+    .catch((e) => sendError(res, e));
+});
+
+/**
+ * @openapi
+ * /wallets/v2/deploy/{walletId}:
+ *   put:
+ *     summary: Deploy an existent wallet from DB
+ *     tags:
+ *     - wallets
+ *     components:
+ *       securitySchemes:
+ *         BearerAuth:
+ *           type: http
+ *           scheme: bearer
+ *     parameters:
+ *       - name: walletId
+ *         in: path
+ *         description: Id of the wallet
+ *     responses:
+ *       200:
+ *         description: Deployed wallet
+ *         content:
+ *           application/json:
+ *             schema:
+ *              type: object
+ *              properties:
+ *                taskId:
+ *                  type: string
+ *                wallet:
+ *                  $ref: '#components/schemas/Wallet'
+ *       400:
+ *         description: The server cannot process the request due to a controlled error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/Error'
+ *       401:
+ *         description: Unauthorized. The client request has not been completed because it lacks valid authentication credentials for the requested resource
+ */
+router.put('/v2/deploy/:walletId', userProtected(), async (req, res) => {
+  WalletController.deployWallet(req.context, req.params.walletId)
+    .then((result) => res.status(200).json(result))
+    .catch((e) => sendError(res, e));
+});
+
+/**
+ *  NO SWAGGER!!
+ * /wallets:
+ *   get:
+ *     summary: Get MK wallets or master wallets
+ *     responses:
+ *       200:
+ *         description: Returns master wallets balance
+ */
+router.get('/', async (req, res) => {
+  Wallets.getMasterWalletsBalances()
+    .then((result) => res.json(result))
+    .catch((e) => sendError(res, e));
+});
+
+/**
+ * @openapi
+ * /wallets/v2/{walletId}:
+ *   get:
+ *     summary: Get wallet
+ *     tags:
+ *     - wallets
+ *     components:
+ *       securitySchemes:
+ *         BearerAuth:
+ *           type: http
+ *           scheme: bearer
+ *     parameters:
+ *       - name: walletId
+ *         in: query
+ *         description: Wallet ID
+ *     responses:
+ *       200:
+ *         description: Returns the wallet
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/Wallet'
+ *       400:
+ *         description: The server cannot process the request due to a controlled error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/Error'
+ *       401:
+ *         description: Unauthorized. The client request has not been completed because it lacks valid authentication credentials for the requested resource
+ */
+router.get('/v2/:walletId', userProtected(), async (req, res) => {
+  WalletController.getWallet(req.params.walletId)
+    .then((result) => res.json(result))
+    .catch((e) => sendError(res, e));
+});
+
+/**
+ * @openapi
+ * /wallets/v2:
+ *   get:
+ *     summary: Get all wallets of the project
+ *     tags:
+ *     - wallets
+ *     components:
+ *       securitySchemes:
+ *         BearerAuth:
+ *           type: http
+ *           scheme: bearer
+ *     responses:
+ *       200:
+ *         description: Returns wallets of the project
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: array
+ *               items:
+ *                 $ref: '#components/schemas/Wallet'
+ *       400:
+ *         description: The server cannot process the request due to a controlled error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/Error'
+ *       401:
+ *         description: Unauthorized. The client request has not been completed because it lacks valid authentication credentials for the requested resource
+ */
+router.get('/v2', userProtected(), (req, res) => {
+  WalletController.getWallets(req.context.project)
+    .then((result) => res.json(result))
+    .catch((e) => sendError(res, e));
+});
+
+/**
+ * @openapi
+ * /wallets/v2/addAndDeployWallets/{numberOfWallets}:
+ *   post:
+ *     summary: Add & Deploy several wallets at the same time
+ *     tags:
+ *     - wallets
+ *     components:
+ *       securitySchemes:
+ *         BearerAuth:
+ *           type: http
+ *           scheme: bearer
+ *     parameters:
+ *       - name: numberOfWallets
+ *         in: query
+ *         description: Number of wallet to create and deploy
+ *     requestBody:
+ *       description: Common info (walletType, refUser) for all wallets
+ *       content:
+ *         application/json:
+ *           schema:
+ *            $ref: '#/components/schemas/AddWallet'
+ *     responses:
+ *       201:
+ *         description: The wallets are deploying
+ *         content:
+ *           application/json:
+ *             schema:
+ *              type: object
+ *              properties:
+ *                taskId:
+ *                  type: string
+ *                wallets:
+ *                  type: array
+ *                  items:
+ *                    type: object
+ *                    properties:
+ *                      skey1:
+ *                        type: string
+ *                      skey2:
+ *                        type: string
+ *                      wallet:
+ *                        $ref: '#components/schemas/Wallet'
+ *       400:
+ *         description: The server cannot process the request due to a controlled error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#components/schemas/Error'
+ *       401:
+ *         description: Unauthorized. The client request has not been completed because it lacks valid authentication credentials for the requested resource
+ */
+router.post('/v2/addAndDeployWallets/:numberOfWallets', userProtected(), async (req, res) => {
+  WalletController.addAndDeployWallets(req.context, req.params.numberOfWallets, req.body)
+    .then((result) => res.status(201).json(result))
+    .catch((e) => sendError(res, e));
+});
+
+module.exports = router;
+
+'''
+'''--- src/scripts/testSignChallengeNear.js ---
+// Utils
+const Near = require('../src/utils/near');
+
+// Doc src: https://github.com/near/near-api-js/blob/master/packages/cookbook/utils/verify-signature.js
+
+(async () => {
+
+  const accountId = 'a123.testnet';
+  const privateKey = "0123...";
+  const network = "near.testnet";
+  const address = "0123...";
+  const message = "Hi mintknight";
+  const credentials = { accountId, privateKey, address };
+
+  let ret = await Near.signMessage(
+    message, 
+    network,
+    credentials,
+  );
+  if (!ret.success) {
+    console.log('Oups! Error sign message. Account Id: ' + accountId);
+    process.exit(1);
+  }   
+
+  console.log(`Account: `, accountId);
+  console.log(`Message: `, message);
+  console.log(`Signature`, ret.signature);
+
+  // Verify
+  ret = await Near.verifySignature(
+    message, 
+    ret.signature,
+    network,
+    credentials,
+  );
+  console.log(`Verified`, ret.success);
+
+  process.exit();
+})();
+
+'''
+'''--- src/utils/near.js ---
+const mongoose = require('mongoose');
+const fs = require('fs');
+const path = require('path');
+const CryptoJS = require('crypto-js');
+const { connect, KeyPair, keyStores, utils, transactions, Account } = require("near-api-js");
+const { v4 } = require('uuid');
+// Controllers
+const MailController = require('../controllers/mails');
+// Models
+const WalletModel = require('../models/wallets');
+const Contract = require('../models/contracts');
+const Project = require('../models/projects');
+const Nft = require('../models/nfts');
+const Media = require('../models/media');
+const Task = require('../models/tasks');
+// Utils
+const Shamir = require('./shamir');
+const Helpers = require('./helpers');
+const EVM = require('./evm');
+const BundlrClient = require('./bundlr');
+const AwsS3 = require('./awsS3');
+
+const HOME = (process.env.HOME || process.env.USERPROFILE);
+const HOMEMK = (process.env.DATA || `${HOME}/.mintknight`);
+const DATAMK = Helpers.getDATAMK();
+
+const saveShareSKey2 = (idWallet, skey2) => {
+  const jsonFile = path.resolve(HOMEMK, `share-wallet.${idWallet}.json`);
+  const json = {
+    share: skey2,
+  };
+  fs.writeFileSync(jsonFile, encrypt(JSON.stringify(json)));
+}
+
+const encrypt = (message) => {
+  const password = process.env.TOKEN_SECRET;
+  const encrypted = CryptoJS.AES.encrypt(
+    message,
+    password,
+  ).toString();
+  return encrypted;
+};
+
+const decrypt = (encryptedMessage) => {
+  if (!encryptedMessage) return null;
+  const password = process.env.TOKEN_SECRET;
+  const decryptedMessage = CryptoJS.AES.decrypt(encryptedMessage, password);
+  const ret = decryptedMessage.toString(CryptoJS.enc.Utf8);
+  return ret;
+};
+
+/**
+ * Javascript Class to interact with Near
+ */
+module.exports = class Near {
+
+  /**
+   * Open Near masterwallet
+   *
+   * @param {string} Bundlr network
+   * @param {number} walletIndex | Master wallet index
+   * @param {boolean} getBalance
+   * @returns {object} Bundlr instance & address & balance
+   */
+  static async getNearWallet(network, walletIndex, getBalance = true) {
+    const jsonFile = path.resolve(HOMEMK, `wallet.${network}.${walletIndex}.json`);
+    if (fs.existsSync(jsonFile)) {
+      const rawdata = fs.readFileSync(jsonFile, 'utf8');
+      const json = JSON.parse(decrypt(rawdata));
+      let balance = 0;
+      if (getBalance) {
+        balance = await this.getBalance(json.accountId, network);
+      }
+      const privateKey = Shamir.getSeedFromSharedKeys(json.shamir[0], json.shamir[1]);
+      return {
+        address: json.address,
+        balance,
+        accountId: json.accountId,
+        privateKey,
+      };
+    }
+    return false;
+  }
+
+  /**
+   * Deploy or add a new Wallet from task
+   *
+   * @param {object} task model
+   * @returns {object} Shamir Shared keys and public address
+   */
+  static async deployWallet(task) {
+    const ret = {};
+    // Get project
+    const project = await Project.findOne({ _id: task.projectId});
+    if (!project) {
+      return {success: false, error: `The project does not exist`};
+    }
+    // Get wallet
+    const wallet = await WalletModel.findOne({ _id: task.wallet1 });
+    if (!wallet) {
+      return {success: false, error: `The wallet does not exist`};
+    }
+    // Add wallet
+    const result = await this.addWallet(project.network, 3, 2, project, null, wallet._id.toString());
+    if (!result.success) return result;
+    // Update wallet
+    wallet.address = result.address;
+    wallet.owner = result.address;
+    wallet.skey = result.shamir[0];
+    wallet.accountId = result.accountId;
+    await wallet.save(); 
+    // Save skey2 (mintknight secrets)
+    saveShareSKey2(wallet._id, result.shamir[2]);
+    // Happy end
+    ret.success = true;
+    ret.txHash = '';
+    ret.cost = 0;    
+    ret.address = result.publicKey;
+    ret.skey = result.shamir[1];
+    return ret;
+  }
+
+  /**
+   * Adds a new Wallet.
+   *
+   * @param {string} network | "near.testnet" or "near.mainnet"
+   * @param {number} keys Number of keys (total)
+   * @param {number} threshold Threshold (minimum)
+   * @param {object} project (optional)
+   * @param {number} attachedDeposit (optional)
+   * @param {string} walletId (optional)
+   * @returns {object} Shamir Shared keys and public address
+   */
+  static async addWallet(network, keys, threshold, project = null, attachedDeposit = null, walletId = null) {
+    const result = await this.createSubAccount(network, project, attachedDeposit, walletId);
+    if (!result.success) {
+      return {success: false, error: result.error};
+    }    
+    const { accountId, keyPair, nearConnection } = result;
+    const publicKey = keyPair.publicKey.toString();
+    const privateKey = keyPair.secretKey;
+
+    // Check if exist
+    let account;
+    try {
+      account = await nearConnection.account(accountId);
+      await account.state(); // If the account does not exist, it´ll resolve false
+    } catch (error) {
+      console.log('addWallet error', error);
+      return {success: false, error};
+    }
+
+    const shared = Shamir.newSharedKeys(
+      privateKey,
+      keys,
+      threshold,
+    );
+
+    return { success: true, shamir: shared, address: publicKey, accountId, account };
+  }
+
+  /**
+   * Create a new child account
+   *
+   * @param {string} network | "near.testnet" or "near.mainnet"
+   * @param {object} project (optional)
+   * @param {string} attachedDeposit (optional)
+   * @param {string} walletId (optional)
+   * @returns {object} account, keyPair
+   */  
+  static async createSubAccount(network, project = null, attachedDeposit = null, walletId = null) {
+    const networkId = this.getNearNetworkId(network);
+    // Set accountId
+    let accountId;
+    // if (false && !!project && !!walletId && networkId !== "testnet") {
+    //   // We dont know why throw erro when create this kind of accounts!!
+    //   // DISABLED
+    //   accountId = `${walletId}.${project.accountId}`;
+    // } else {
+    //   accountId = v4();
+    //   if (networkId === "testnet") {
+    //     accountId += ".testnet";
+    //   } else {
+    //     accountId += ".near";
+    //   }
+    // }
+    accountId = `${walletId}-${project.accountId}`;
+
+    // Get credentials
+    let credentials;
+    if (!!project) {
+      credentials = await this.getCredentials_PROJECT(project);
+    } else {
+      credentials = await this.getCredentials_MINTKNIGHT(network);
+    }
+
+    // Connect
+    const connResult = await this.connectNear(network, credentials);
+    if (!connResult.success) {
+      return {success: false, error: connResult.error};
+    }
+    const senderAccountId = connResult.accountId;
+    const keyStore = connResult.keyStore;
+    const nearConnection = connResult.conn;
+
+    const senderAccount = await nearConnection.account(senderAccountId);
+    const keyPair = KeyPair.fromRandom("ed25519");
+    const publicKey = keyPair.publicKey.toString();
+    await keyStore.setKey(networkId, accountId, keyPair);
+
+    /**
+     * The account wouldn't have enough balance to cover storage, required to have 1820000000000000000000 yoctoNEAR more
+     */
+    if (!attachedDeposit) {
+      // attachedDeposit = '0.00182';
+      // Transfer : The account  wouldn't have enough balance to cover storage, required to have 1600864824171987354801 yoctoNEAR more
+      // Total needed: 3420864824171987354801 (0,003420864824171987624013)
+      // attachedDeposit = '0.00343';
+      // 2023-03-02: ServerError: The account wouldn't have enough balance to cover storage, required to have 812718106034788610602 yoctoNEAR more
+      // attachedDeposit = '0.005'; > 3 transfers
+      // 0.1N > 64 transfers
+      // 0.025 > 15 transfers
+      attachedDeposit = '0.025';
+    }
+  
+    console.log(`Creating account ${accountId} ...`);
+    return new Promise((resolve) => {
+      senderAccount.functionCall({
+        contractId: networkId === "testnet" ? "testnet" : "near",
+        methodName: "create_account",
+        args: {
+          new_account_id: accountId,
+          new_public_key: publicKey,
+        },
+        gas: "300000000000000",
+        attachedDeposit: utils.format.parseNearAmount(attachedDeposit),
+      })
+        .then( async (response) => {
+          console.log(`Account ${accountId} has been created`);
+          resolve({ success: true, accountId, response, keyPair, nearConnection });
+        })
+        .catch(error => {
+          console.log('createSubAccount error', error);
+          resolve({success: false, error});
+        });
+    });
+  }
+
+  /**
+   * getCredentials_MINTKNIGHT
+   *
+   * @param {string} network | "near.testnet" or "near.mainnet"
+   * @returns {object} { accountId, privateKey }
+   */  
+  static async getCredentials_MINTKNIGHT(network) {
+    const networkId = this.getNearNetworkId(network);
+    // Get credentials from Mintknight account (mintknight.near)
+    const accountId = networkId === "testnet" ? process.env.NEAR_TESTNET_ACCOUNT_ID : process.env.NEAR_MAINNET_ACCOUNT_ID;
+    const privateKey = networkId === "testnet" ? process.env.NEAR_TESTNET_PRIVATE_KEY : process.env.NEAR_MAINNET_PRIVATE_KEY;
+    return { accountId, privateKey };
+  }
+
+  /**
+   * getCredentials_PROJECT
+   *
+   * @param {object} project
+   * @returns {object} { accountId, privateKey }
+   */  
+  static async getCredentials_PROJECT(project) {
+    const accountId = project.accountId;
+    const privateKey = project.privateKey;
+    return { accountId, privateKey };
+  }
+
+  /**
+   * getCredentials_WALLET
+   *
+   * @param {object} wallet
+   * @returns {object} { accountId, privateKey, address }
+   */  
+  static async getCredentials_WALLET(wallet) {
+    const accountId = wallet.accountId;
+    const privateKey = Shamir.getSeedFromSharedKeys(wallet.skey, wallet.skey1);
+    const address = wallet.address;
+    return { accountId, privateKey, address };
+  }
+
+  /**
+   * getCredentials_MASTERWALLET
+   *
+   * @param {string} network | "near.testnet" or "near.mainnet"
+   * @param {number} walletIndex
+   * @returns {object} { accountId, privateKey, address }
+   */  
+  static async getCredentials_MASTERWALLET(network, walletIndex) {
+    const resultNearWallet = await this.getNearWallet(network, walletIndex, false);
+    const accountId = resultNearWallet.accountId;
+    const privateKey = resultNearWallet.privateKey;
+    const address = resultNearWallet.address;
+    return { accountId, privateKey, address };
+  }
+
+  /**
+   * Connect Near
+   *
+   * @param {string} network | "near.testnet" or "near.mainnet"
+   * @param {object} credentials { accountId, privateKey }
+   * @returns {object} Near connection
+   */  
+  static async connectNear(network, credentials = null) {
+    const networkId = this.getNearNetworkId(network);
+    let keyStore = null;
+    let accountId = null;
+    let privateKey = null;
+
+    // Set config
+    const config = {
+      networkId,
+      nodeUrl: `https://rpc.${networkId}.near.org`,
+      walletUrl: `https://wallet.${networkId}.near.org`,
+      helperUrl: `https://helper.${networkId}.near.org`,
+      explorerUrl: `https://explorer.${networkId}.near.org`,
+    };
+
+    if (!!credentials) {
+      accountId = credentials.accountId;
+      privateKey = credentials.privateKey;
+      // Set key store
+      keyStore = new keyStores.InMemoryKeyStore();
+      // creates a public / private key pair using the provided private key
+      const mkKeyPair = KeyPair.fromString(privateKey);
+      // adds the keyPair you created to keyStore
+      await keyStore.setKey(networkId, accountId, mkKeyPair);  
+      config.keyStore = keyStore;
+    }
+
+    // console.log('Connecting..');
+    return new Promise((resolve) => {
+      connect(config)
+        .then((conn) => {
+          resolve({success: true, conn, keyStore, accountId});
+        })
+        .catch(error => {
+          console.log('connectNear error', error);
+          resolve({success: false, error});
+        });
+    });
+  }
+
+  /**
+   * Get Near Network Id
+   *
+   * @param {string} network | "near.testnet" or "near.mainnet"
+   * @returns {string} Near Network Id
+   */  
+  static getNearNetworkId(network) {
+    return network === "near.testnet" ? "testnet" : "mainnet";
+  }
+
+  /**
+   * Get balance account
+   *
+   * @param {string} accountId
+   * @param {string} network | "near.testnet" or "near.mainnet"
+   * @returns {string} balance
+   */  
+  static async getBalance(accountId, network) {
+    // Connect
+    const connResult = await Near.connectNear(network);
+    if (!connResult.success) {
+      return 0;
+    }
+    const nearConnection = connResult.conn;
+    const account = await nearConnection.account(accountId);
+    const balance = await account.getAccountBalance();
+    return utils.format.formatNearAmount(balance.available);
+  }
+
+  /**
+   * Send money
+   *
+   * @param {string} senderAccountId
+   * @param {string} receiverAccountId
+   * @param {string} amount
+   * @param {string} network | "near.testnet" or "near.mainnet"
+   * @param {object} credentials { accountId, privateKey }
+   * @returns {object} common ret
+   */  
+  static async sendMoney(
+    senderAccountId, 
+    receiverAccountId, 
+    amount, 
+    network,
+    credentials,
+  ) {
+    // Connect
+    const connResult = await Near.connectNear(network, credentials);
+    if (!connResult.success) {
+      return connResult;
+    }
+    const nearConnection = connResult.conn;
+
+    const yoctoNEAR = utils.format.parseNearAmount(amount);
+    return new Promise(async (resolve) => {
+      try {
+        const account = await nearConnection.account(senderAccountId);
+        await account.sendMoney(receiverAccountId, yoctoNEAR);
+        resolve({success: true});
+      } catch (error) {
+        console.log('sendMoney error', error);
+        resolve({success: false, error});
+      }
+    });
+  }
+
+  /**
+   * Delete account
+   * 
+   * @param {string} accountId 
+   * @param {string} beneficiaryAccountId 
+   * @param {string} network | "near.testnet" or "near.mainnet"
+   * @param {object} credentials { accountId, privateKey }
+   * @returns {object} common ret
+   */
+  static async deleteAccount(
+    accountId, 
+    beneficiaryAccountId, 
+    network,
+    credentials,
+  ) {
+    // Connect
+    const connResult = await Near.connectNear(network, credentials);
+    if (!connResult.success) {
+      return connResult;
+    }
+    const nearConnection = connResult.conn;
+
+    return new Promise(async (resolve) => {
+      try {
+        const account = await nearConnection.account(accountId);
+        const ret = await account.deleteAccount(beneficiaryAccountId);
+        resolve({success: true, data: ret});
+      } catch (error) {
+        console.log('deleteAccount error', error);
+        resolve({success: false, error});
+      }
+    });
+  }  
+
+  /**
+   * Call contract view
+   *
+   * @param {string} accountId
+   * @param {string} contractId
+   * @param {string} methodName
+   * @param {object} args
+   * @param {string} network | "near.testnet" or "near.mainnet"
+   * @returns {string} storage paid
+   */  
+  static async callContractView(
+    accountId, 
+    contractId, 
+    methodName,
+    args,
+    network,
+  ) {
+    // Connect
+    const connResult = await Near.connectNear(network);
+    if (!connResult.success) {
+      return connResult;
+    }
+    const nearConnection = connResult.conn;
+
+    return new Promise(async (resolve) => {
+      try {
+        const account = await nearConnection.account(accountId);
+        const data = await account.viewFunction(
+          contractId,
+          methodName,
+          args,
+        );
+        resolve({success: true, data});
+      } catch (error) {
+        console.log('callContractView error', error);
+        resolve({success: false, error});
+      }
+    });
+  }
+
+  /**
+   * Call balance of (FT) account
+   *
+   * @param {string} accountId
+   * @param {string} contractId
+   * @param {string} network | "near.testnet" or "near.mainnet"
+   * @returns {string} storage paid
+   */  
+  static async getBalanceOf(
+    accountId, 
+    contractId, 
+    network,
+  ) {
+    const result = await Near.callContractView(
+      accountId, 
+      contractId, 
+      "ft_balance_of",
+      { account_id: accountId },
+      network,
+    );
+    if (!result.success) {
+      return 0;
+    }
+    return result.data;
+  }
+
+  /**
+   * Send tx
+   * 
+   * @param {string} receiverId
+   * @param {Array<any>} actions
+   * @param {string} network | "near.testnet" or "near.mainnet"
+   * @param {object} credentials { accountId, privateKey }
+   * @returns {object} result
+   */  
+  static async sendContractTx(
+    receiverId, 
+    actions,
+    network, 
+    credentials,
+  ) {
+    // Connect
+    const connResult = await this.connectNear(network, credentials);
+    if (!connResult.success) {
+      return {success: false, error: connResult.error};
+    }
+    const senderAccountId = connResult.accountId;
+    const nearConnection = connResult.conn;
+    const senderAccount = await nearConnection.account(senderAccountId);
+
+    const txActions = [];
+    for (let i = 0; i < actions.length; i++) {
+      const action = actions[i];
+      txActions.push(
+        transactions.functionCall(
+          action.methodName,
+          Buffer.from(JSON.stringify(action.args)),
+          "10000000000000",
+          utils.format.parseNearAmount(action.deposit),
+        ),
+      );
+    }
+
+    // console.log(`Sending Tx ...`);
+    return new Promise((resolve) => {
+      senderAccount.signAndSendTransaction({
+        receiverId,
+        actions: txActions,
+      })
+      .then( async (response) => {
+        resolve({ success: true, response });
+      })
+      .catch(error => {
+        console.log('sendContractTx error', error);
+        resolve({success: false, error});
+      });
+    });
+  }
+
+  /*
+  * GET Token Info.
+  */
+  static async getTokenInfo(contract, accountId) {
+    return new Promise(async (resolve) => {
+      const data = {
+        name: contract.name,
+        symbol: contract.symbol,
+        totalSupply: contract.totalSupply,
+      };
+      if (!!accountId) {
+        const balance = await this.getBalanceOf(
+          accountId, 
+          contract.address, 
+          contract.network, 
+        );  
+        data.balanceOf = balance;
+        data.address = accountId;
+      }
+      resolve(data);
+    });
+  }
+
+  /**
+   * Multicall
+   */
+  static async multicall(task) {
+    const ret = {
+      success: false,
+      cost: 0,
+      txHash: '',
+    };
+    let msg, isMajorError;
+    let contract, from = null, to, data = null, amount = null, nft = null;
+    let credentials;
+    // Set main vars
+    contract = await Contract.findOne({ _id: task.contractId });
+    if (!!task.wallet1) from = await WalletModel.findOne({ _id: task.wallet1 });
+    to = await WalletModel.findOne({ _id: task.wallet2 });
+    if (!!task.data) data = JSON.parse(task.data);
+    if (!!task.nftId) nft = await Nft.findOne({ _id: mongoose.Types.ObjectId(task.nftId) });
+    // Check task types
+    switch (task.txType) {
+      case 'mintTo':
+      case 'transferFrom':
+        break;
+      case 'transfer':
+        // Fix amount
+        amount = data.amount;
+        amount = amount.toString().replace(',', '.');
+        amount = parseInt(amount).toString();        
+        break;
+      default:
+        return ret;
+    }
+    
+    // Infinite loop
+    let tries = 0;
+    do {
+      isMajorError = false;
+      try {
+        // Call tx
+        console.log(`(${task.walletIndex}) Start executing Multicall, TaskId: ${task._id.toString()}, Tries: ${tries}`);
+        // // Get master wallet credentials
+        // const mkCredentials = await Near.getCredentials_MASTERWALLET(task.network, task.walletIndex);        
+        // console.log(`MK accountId: ${mkCredentials.accountId}`);
+        // console.log(`MK privateKey: ${mkCredentials.privateKey}`);
+        // console.log(`MK address: ${mkCredentials.address}`);
+        
+        // set actions
+        let anyError = false;
+        const actions = [];        
+        if (task.txType === 'transfer') {
+          // Set credentials from (subaccount)
+          credentials = await this.getCredentials_WALLET(from);
+          // Set action
+          actions.push({
+            methodName: "ft_transfer",
+            args: { receiver_id: to.accountId, amount },
+            // Smart contract panicked: Requires attached deposit of exactly 1 yoctoNEAR
+            deposit: '0.000000000000000000000001',
+          });
+        } else if (task.txType === 'mintTo') {
+          // Set credentials from project
+          const project = await Project.findOne({ _id: mongoose.Types.ObjectId(task.projectId) });
+          credentials = await this.getCredentials_PROJECT(project);
+          // Get nft
+          let media = await Media.findOne({ _id: mongoose.Types.ObjectId(nft.mediaId) });
+          let metadata = JSON.parse(nft.metadata);
+          metadata.media = media.fileUrl;
+          // Upload files
+          const retUpload = await this.uploadFiles(project, contract, media, nft);
+          if (!retUpload.success) {
+            console.log('retUpload', retUpload);
+            anyError = true;
+          }
+          // Set action
+          if (!anyError) {
+            nft = retUpload.nft;
+            // media = retUpload.media;
+            actions.push({
+              methodName: "nft_mint",
+              args: { 
+                receiver_id: to.accountId, 
+                token_id: nft.tokenId,
+                token_metadata: JSON.parse(nft.metadata)
+              },
+              // Smart contract panicked: Requires attached deposit of exactly 
+              // 6870000000000000000000 yoctoNEAR
+              // 8430000000000000000000
+              // deposit: '0.006870000000000001105782',
+              // 'Smart contract panicked: Must attach 8470000000000000000000 yoctoNEAR to cover storage'
+              // deposit: '0.008430000000000001728062',
+              // deposit: '0.0085',
+              // 'Smart contract panicked: Must attach 9860000000000000000000 yoctoNEAR to cover storage'
+              deposit: '0.01',
+            });
+            console.log('actions', actions);
+            console.log('actions[0].args.token_metadata', actions[0].args.token_metadata);
+          }          
+        } else if (task.txType === 'transferFrom') {
+          // Set credentials from (subaccount)
+          credentials = await this.getCredentials_WALLET(from);
+          // Set action
+          actions.push({
+            methodName: "nft_transfer",
+            args: { 
+              receiver_id: to.accountId, 
+              token_id: nft.tokenId,
+              memo: "transfer ownership" 
+            },
+            // Smart contract panicked: Requires attached deposit of exactly 1 yoctoNEAR
+            deposit: '0.000000000000000000000001',
+          });
+          console.log('actions', actions);
+        }
+
+        // Send tx
+        if (!anyError) {
+          const receiverId = contract.address;
+          const txResult = await Near.sendContractTx(
+            receiverId, 
+            actions,
+            task.network, 
+            credentials);
+          if (txResult.success) {
+            task.txHash = txResult.response.transaction.hash;
+            console.log(`(${task.walletIndex}) End executing Multicall, TaskId: ${task._id.toString()}, Tries: ${tries}, txHash: ${task.txHash}`);
+            await task.save();        
+            ret.cost = txResult.response.transaction_outcome.outcome.gas_burnt;
+            ret.txHash = task.txHash;
+            // Happy end
+            ret.success = true;
+            return ret;
+          }  
+        }
+
+      } catch (err) {
+        if (!!err.code) console.log('err.code', err.code);
+        if (!!err.message) {
+          console.log('err.message', err.message);
+          isMajorError = 
+            err.message.includes("Only owner can sign transactions") ||
+            err.message.includes("Token already exist") ||
+            err.message.includes("Smart contract panicked") ||
+            err.message.includes("transfer caller is not owner nor approved");
+        } else {
+          console.log('ERROR WITH NO MESSAGE', err);
+        }
+      }
+
+      // Oups! there´s an error!
+
+      // Check if it´s a major error
+      if (task.txType === 'transferFrom') {
+        // Check balance and send Nears to account if it´s necessary
+        const balanceNeeded = 0.01;
+        const balance = await this.getBalance(from.accountId, task.network);
+        console.log('balance', balance, from.accountId);
+        if (balance >= balanceNeeded) {
+          console.log('Balance enough!');
+          isMajorError = true;
+        } else {
+          const project = await Project.findOne({ _id: mongoose.Types.ObjectId(task.projectId) });
+          const credentials = await this.getCredentials_PROJECT(project); 
+          const balanceToTransfer = balanceNeeded - balance;         
+          const sendMoneyResult = await Near.sendMoney(
+            project.accountId, 
+            from.accountId, 
+            balanceToTransfer.toString(), 
+            task.network,
+            credentials,
+          );
+          console.log('sendMoneyResult', sendMoneyResult);
+        }
+      }
+      
+      console.log('isMajorError', isMajorError);
+      msg = `(${task.walletIndex}) Error executing Multicall , TaskId: ${task._id.toString()}, Tries: ${tries}`;
+      console.log(msg);
+      if (isMajorError) {
+        // Fail task
+        await MailController.sendToAdmin('Error executing Multicall', msg);
+        return ret;
+      } else {
+        // Retry again
+        /*if (tries >= 100) {
+          return ret;
+        }*/
+        // Notify by email
+        if (tries === 10) await MailController.sendToAdmin('Error executing Multicall', msg);
+        // Delay
+        await EVM.pauseProcess(tries);
+        // Check the real transaction
+        // Si la crida al node falla per BAD RESPONSE, és posible que la transacció s´hagi efectuat. En aquest cas donarà error de manera perpètua.
+        // Per tant, comprobarem l´estat real de la transacció
+        // TODO
+      }
+      // Update tries
+      tries++;
+      task.tries = tries;
+      task.tryAgainAt = new Date();
+      await task.save();
+
+    } while (true);
+  }
+
+  /**
+   * Upload files
+   */
+  static async uploadFiles(project, contract, media, nft) {
+    // Set folder to download files from AWS
+    let tmpdir = `${DATAMK}/tmp-medias-${project.name}`;
+    tmpdir = path.normalize(tmpdir);
+    // Create locally if not exist & create dir
+    if (!fs.existsSync(tmpdir)) fs.mkdirSync(tmpdir);
+
+    // Set files
+    const mediaFile = `${tmpdir}/${media.path}`;
+    const metadataFile = `${tmpdir}/${nft.tokenId}.json`;
+
+    // Rollback
+    const rollbackFiles = () => new Promise((resolve) => {
+      if (fs.existsSync(mediaFile)) fs.unlinkSync(mediaFile);
+      if (fs.existsSync(metadataFile)) fs.unlinkSync(metadataFile);
+      resolve();
+    });
+
+    // Initialize Bundlr
+    const walletIndex = 1;
+    let bundlrNetwork = `bundlr.mainnet`;    
+    const { bundlr, address, balance } = await BundlrClient.getBundlrWallet(bundlrNetwork, walletIndex);
+    if (!bundlr) {
+      await rollbackFiles();
+      return { success: false, msg: `Error initializing Bundlr wallet` };
+    }
+    console.log(`Bundlr address`, address);
+    console.log(`Bundlr balance`, balance);   
+
+    // Upload MEDIA
+    if (!media.url) {
+      // Download files
+      if (!fs.existsSync(mediaFile)) {
+        console.log(`NEAR. Downloading media to: ${mediaFile}`);
+        const downloadRet = await AwsS3.download(`media/${media.path}`, `${mediaFile}`);
+        if (downloadRet === false) { 
+          await rollbackFiles();
+          return { success: false, msg: downloadRet };
+        }
+      } else {
+        console.log(`NEAR. Good! Media already exist: ${mediaFile}`);
+      }
+      // Check files
+      if (!fs.existsSync(mediaFile)) {
+        await rollbackFiles();
+        return { success: false, msg: `${mediaFile} does not exist locally` };
+      }
+      // Add task.
+      const task = new Task({
+        projectId: project._id,
+        network: contract.network,
+        walletIndex,
+        contractId: contract._id,
+        txType: 'uploadMedia',
+        startedAt: new Date(),
+        data: JSON.stringify({ medias: [ media._id.toString() ] }),
+      });  
+      await task.save();   
+      // Upload file
+      const uploadRet = await BundlrClient.uploadFile(bundlr, mediaFile);
+      // Update task
+      task.state = uploadRet.success ? `success` : `failed`;
+      task.endedAt = new Date();
+      task.cost = uploadRet.cost;
+      await task.save();   
+      if (!uploadRet.success) {
+        await rollbackFiles();
+        return {success: false, msg: uploadRet.msg};
+      }   
+      // Update media
+      media.url = uploadRet.url;
+      await media.save();   
+    }
+
+    // Update NFT
+    let metadata = JSON.parse(nft.metadata);
+    metadata.media = media.url;       
+    nft.metadata = JSON.stringify(metadata);
+    await nft.save();     
+
+    await rollbackFiles();
+    return {success: true, nft, media};
+  }
+
+  /*
+   * Verify address
+   *
+   * @param {string}  address EVM address
+   */
+  static isValidAddress(addr) {
+    const sufix1 = '.testnet';
+    // const sufix2 = '.near';
+    if (addr.length <= sufix1.length) return false;
+    const pieces = addr.split('.');
+    if (pieces.length === 0 || pieces.length > 2) return false;
+    const lastPiece = pieces[pieces.length - 1];
+    if (lastPiece !== 'testnet' && lastPiece !== 'near') return false;
+    return true;
+  }
+
+  /**
+   *  Sign message
+   *
+   * @param {string} message
+   * @param {string} network | "near.testnet" or "near.mainnet"
+   * @param {object} credentials { accountId, privateKey }
+   * @returns {object} common ret
+   */  
+  static async signMessage(
+    message, 
+    network,
+    credentials,
+  ) {
+    // Connect
+    const connResult = await Near.connectNear(network, credentials);
+    if (!connResult.success) {
+      return connResult;
+    }
+    const mkKeyPair = connResult.mkKeyPair;
+    const msg = Buffer.from(message);
+    const { signature } = mkKeyPair.sign(msg);
+    return {success: true, signature};
+  }
+
+  /**
+   *  Verify signature
+   *
+   * @param {string} msg
+   * @param {string} signature
+   * @param {string} network | "near.testnet" or "near.mainnet"
+   * @param {object} credentials { accountId, privateKey }
+   * @returns {object} common ret
+   */  
+  static async verifySignature(
+    message, 
+    signature, 
+    network,
+    credentials,
+  ) {
+    // Connect
+    const connResult = await Near.connectNear(network, credentials);
+    if (!connResult.success) {
+      return connResult;
+    }
+    const mkKeyPair = connResult.mkKeyPair;
+    const msg = Buffer.from(message);
+    const isValid = mkKeyPair.verify(msg, signature);
+    return {success: isValid};
+  }
+};
+
+};
+
+'''
+'''--- src/utils/shamir.js ---
+const secrets = require('secrets.js-grempe');
+
+/**
+ * Javascript Class to interact with SSS
+ */
+module.exports = class Shamir {
+  /**
+   * New Blockchain KeyPair.
+   *
+   * @returns {object} Key pair
+   */
+  static newSharedKeys(secret, max = 3, threshold = 2) {
+    const pwHex = secrets.str2hex(secret); // => hex string
+    const shares = secrets.share(pwHex, max, threshold);
+    return shares;
+  }
+
+  /**
+   * Combine keys to get the seed
+   *
+   * @param {string} skey1 Shared Key 1
+   * @param {string} skey2 Shared Key 2
+   * @returns {string} Seed
+   */
+  static getSeedFromSharedKeys(skey1, skey2) {
+    const seed = secrets.combine([skey1, skey2]);
+    return secrets.hex2str(seed);
+  }
+
+  /**
+   * Get shared key
+   *
+   * @param {integer} shared index we want to recover
+   * @param {string} skey1 Shared Key 1
+   * @param {string} skey2 Shared Key 2
+   * @returns {string} Recovered shared key
+   */
+  static getSharedKey(index, skey, skey2) {
+    const share = secrets.newShare(index, [skey, skey2]);
+    return share;
+  }
+};
+
+'''
+'''--- src/utils/wallets.js ---
+const fs = require('fs');
+const path = require('path');
+// Utils
+const Near = require('./near');
+
+/**
+ * Javascript Class to interact with SSS
+ */
+module.exports = class Wallets {
+  
+  /**
+   * Init Near masterwallet
+   */
+  static async initNearWallet(network, walletIndex) {
+    const jsonFile = path.resolve(HOMEMK, `wallet.${network}.${walletIndex}.json`);
+    if (!fs.existsSync(jsonFile)) {
+      const result = await Near.addWallet(network, 2, 2, null, '5');
+      if (!result.success) {
+        console.log(result.error);
+        return;
+      }
+      const { shamir, address, accountId } = result;
+      const json = { shamir, address, accountId };
+      fs.writeFileSync(jsonFile, encrypt(JSON.stringify(json)));
+    }
+  }
+};
+
+'''

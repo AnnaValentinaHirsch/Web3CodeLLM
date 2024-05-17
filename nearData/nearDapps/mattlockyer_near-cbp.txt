@@ -1,0 +1,588 @@
+*GitHub Repository "mattlockyer/near-cbp"*
+
+'''--- .eslintrc.js ---
+module.exports = {
+	parserOptions: {
+		ecmaVersion: 2020,
+        sourceType: 'module',
+        ecmaFeatures: {
+            jsx: true,
+        }
+    },
+	rules: {
+        semi: [2, 'always'],
+        indent: [2, 'tab'],
+	}
+};
+
+'''
+'''--- README.md ---
+# NEAR Protocol Smart Contract Boilerplate
+
+🚨🚨🚨 WARNING WIP 🚨🚨🚨
+
+It's not that bad...
+
+## Instructions
+
+Install rust: https://www.rust-lang.org/tools/install
+
+`yarn && yarn test:deploy`
+
+If no contract edits (only test changes) use `yarn test`
+
+Review code in `/test/*` and don't bother me when it doesn't work 😏
+
+'''
+'''--- contract/Cargo.toml ---
+[package]
+name = "near-cbp"
+version = "0.1.0"
+authors = ["Matt Lockyer <mattdlockyer@gmail.com>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+near-sdk = "4.0.0-pre.5"
+near-contract-standards = "4.0.0-pre.5"
+
+[profile.release]
+codegen-units = 1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+
+'''
+'''--- contract/build.sh ---
+#!/bin/bash
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo build --target wasm32-unknown-unknown --release
+mkdir -p ../out
+cp target/wasm32-unknown-unknown/release/*.wasm ../out/main.wasm
+
+'''
+'''--- contract/src/lib.rs ---
+mod utils;
+
+use crate::utils::*;
+
+use near_sdk::{
+	// log,
+	require,
+	env, near_bindgen, Balance, AccountId, BorshStorageKey, PanicOnDefault, Promise,
+	borsh::{self, BorshDeserialize, BorshSerialize},
+	collections::{LookupMap, UnorderedMap, UnorderedSet},
+	json_types::{U128},
+};
+
+pub const STORAGE_KEY_DELIMETER: char = '|';
+
+#[derive(BorshSerialize, BorshStorageKey)]
+enum StorageKey {
+	EventsByName,
+    NetworksByOwner { event_name: String },
+    Connections { event_name_and_owner_id: String },
+}
+
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Network {
+	connections: UnorderedSet<AccountId>,
+}
+
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Event {
+	networks_by_owner: LookupMap<AccountId, Network>,
+}
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Contract {
+	owner_id: AccountId,
+	events_by_name: UnorderedMap<String, Event>,
+}
+
+#[near_bindgen]
+impl Contract {
+    #[init]
+    pub fn new(owner_id: AccountId) -> Self {
+        Self {
+			owner_id,
+			events_by_name: UnorderedMap::new(StorageKey::EventsByName),
+        }
+    }
+	
+    #[payable]
+    pub fn create_event(&mut self, event_name: String) {
+		let initial_storage_usage = env::storage_usage();
+
+		require!(env::predecessor_account_id() == self.owner_id, "owner only");
+		
+        require!(self.events_by_name.insert(&event_name.clone(), &Event{
+			networks_by_owner: LookupMap::new(StorageKey::NetworksByOwner { event_name }),
+		}).is_none(), "event exists");
+
+        refund_deposit(env::storage_usage() - initial_storage_usage);
+    }
+	
+    #[payable]
+    pub fn create_connection(&mut self, event_name: String, new_connection_id: AccountId) {
+		let initial_storage_usage = env::storage_usage();
+
+		let network_owner_id = env::predecessor_account_id();
+		let mut event = self.events_by_name.get(&event_name).unwrap_or_else(|| env::panic_str("no event"));
+		let mut network = event.networks_by_owner.get(&network_owner_id).unwrap_or_else(|| Network{
+			connections: UnorderedSet::new(StorageKey::Connections { event_name_and_owner_id: format!("{}{}{}", event_name, STORAGE_KEY_DELIMETER, network_owner_id.clone()) })
+		});
+
+		network.connections.insert(&new_connection_id);
+		event.networks_by_owner.insert(&network_owner_id, &network);
+
+        refund_deposit(env::storage_usage() - initial_storage_usage);
+    }
+
+	/// views
+	
+    pub fn get_events(&self, from_index: Option<U128>, limit: Option<u64>) -> Vec<String> {
+		unordered_map_key_pagination(&self.events_by_name, from_index, limit)
+    }
+	
+    pub fn get_connections(&self, event_name: String, network_owner_id: AccountId, from_index: Option<U128>, limit: Option<u64>) -> Vec<AccountId> {
+		let event = self.events_by_name.get(&event_name).unwrap_or_else(|| env::panic_str("no event"));
+		let network = event.networks_by_owner.get(&network_owner_id).unwrap_or_else(|| env::panic_str("no network"));
+		unordered_set_pagination(&network.connections, from_index, limit)
+    }
+}
+'''
+'''--- contract/src/utils.rs ---
+use crate::*;
+
+pub(crate) fn unordered_map_key_pagination<K, V>(
+    map: &UnorderedMap<K, V>,
+    from_index: Option<U128>,
+    limit: Option<u64>,
+) -> Vec<K> where K: BorshSerialize + BorshDeserialize, V: BorshSerialize + BorshDeserialize {
+	let len = map.keys_as_vector().len();
+	if len == 0 {
+		return vec![];
+	}
+	let limit = limit.map(|v| v as usize).unwrap_or(usize::MAX);
+	assert_ne!(limit, 0, "limit 0");
+	let start_index: u128 = from_index.map(From::from).unwrap_or_default();
+	assert!(
+		len as u128 > start_index,
+		"start_index gt len"
+	);
+	map
+		.keys()
+		.skip(start_index as usize)
+		.take(limit)
+		.map(|k: K| k)
+		.collect()
+}
+
+pub(crate) fn unordered_set_pagination<V>(
+    set: &UnorderedSet<V>,
+    from_index: Option<U128>,
+    limit: Option<u64>,
+) -> Vec<V> where V: BorshSerialize + BorshDeserialize {
+	let len = set.len();
+	if len == 0 {
+		return vec![];
+	}
+	let limit = limit.map(|v| v as usize).unwrap_or(usize::MAX);
+	assert_ne!(limit, 0, "limit 0");
+	let start_index: u128 = from_index.map(From::from).unwrap_or_default();
+	assert!(
+		len as u128 > start_index,
+		"start_index gt len"
+	);
+	set
+		.iter()
+		.skip(start_index as usize)
+		.take(limit)
+		.map(|v| v)
+		.collect()
+}
+	
+/// from https://github.com/near/near-sdk-rs/blob/e4abb739ff953b06d718037aa1b8ab768db17348/near-contract-standards/src/non_fungible_token/utils.rs#L29
+
+pub(crate) fn refund_deposit(storage_used: u64) {
+    let required_cost = env::storage_byte_cost() * Balance::from(storage_used);
+    let attached_deposit = env::attached_deposit();
+
+    assert!(
+        required_cost <= attached_deposit,
+        "Must attach {} yoctoNEAR to cover storage",
+        required_cost,
+    );
+
+    let refund = attached_deposit - required_cost;
+	// log!("refund_deposit amount {}", refund);
+    if refund > 1 {
+        Promise::new(env::predecessor_account_id()).transfer(refund);
+    }
+}
+'''
+'''--- package.json ---
+{
+	"name": "near-cbp",
+	"version": "1.0.0",
+	"main": "index.js",
+	"author": "mattlockyer",
+	"license": "MIT",
+	"devDependencies": {
+		"ava": "^3.15.0",
+		"eslint": "^8.6.0",
+		"near-api-js": "^0.44.2"
+	},
+	"scripts": {
+		"build-contract": "cd contract && ./build.sh && cd ..",
+		"patch-config": "node ./utils/patch-config.js",
+		"dev-deploy": "rm -rf neardev && (near dev-deploy || exit 0) && yarn patch-config",
+		"test-deploy": "yarn build-contract && yarn dev-deploy && yarn test",
+		"test": "ava test/contract.test.js -vs --timeout=5m",
+		"fix": "eslint test/ --fix"
+	}
+}
+
+'''
+'''--- test/contract.test.js ---
+const test = require('ava');
+const {
+	getAccount, init,
+	recordStart, recordStop,
+} = require('./test-utils');
+const getConfig = require("../utils/config");
+const {
+	contractId,
+	gas,
+	attachedDeposit,
+} = getConfig();
+
+// test.beforeEach((t) => {
+// });
+
+let contractAccount, event_name, aliceId, bobId, alice, bob;
+
+test('contract is deployed', async (t) => {
+	contractAccount = await init();
+
+	t.is(contractId, contractAccount.accountId);
+});
+
+test('users initialized', async (t) => {
+	aliceId = 'alice.' + contractId;
+	bobId = 'bob.' + contractId;
+	alice = await getAccount(aliceId);
+	bob = await getAccount(bobId);
+
+	t.true(true);
+});
+
+test('create an event', async (t) => {
+	event_name = 'event-' + Date.now();
+
+	const res = await contractAccount.functionCall({
+		contractId,
+		methodName: 'create_event',
+		args: {
+			event_name,
+		},
+		gas,
+		attachedDeposit,
+	});
+
+	t.is(res?.status?.SuccessValue, '');
+});
+
+test('get events', async (t) => {
+	const res = await contractAccount.viewFunction(
+		contractId,
+		'get_events',
+		{}
+	);
+
+	// console.log(res)
+
+	t.true(res.length >= 1);
+});
+
+test('create a connection', async (t) => {
+
+	await recordStart(contractId);
+	
+	const res = await alice.functionCall({
+		contractId,
+		methodName: 'create_connection',
+		args: {
+			event_name,
+			new_connection_id: bobId,
+		},
+		gas,
+		attachedDeposit,
+	});
+
+	await recordStop(contractId);
+
+	t.is(res?.status?.SuccessValue, '');
+});
+
+test('create another connection', async (t) => {
+
+	const carolId = 'car.' + contractId;
+
+	await recordStart(contractId);
+
+	const res = await alice.functionCall({
+		contractId,
+		methodName: 'create_connection',
+		args: {
+			event_name,
+			new_connection_id: carolId,
+		},
+		gas,
+		attachedDeposit,
+	});
+	
+	await recordStop(contractId);
+
+	t.is(res?.status?.SuccessValue, '');
+});
+
+test('get connections', async (t) => {
+	const res = await alice.viewFunction(
+		contractId,
+		'get_connections',
+		{
+			event_name,
+			network_owner_id: aliceId,
+		}
+	);
+
+	console.log(res);
+
+	t.true(res.length >= 1);
+});
+'''
+'''--- test/test-utils.js ---
+const fs = require('fs');
+const BN = require('bn.js');
+const nearAPI = require('near-api-js');
+const { 
+	KeyPair,
+	utils: { format: {
+		formatNearAmount
+	} }
+} = nearAPI;
+const { connection, keyStore, contractAccount } = require('../utils/near-utils');
+const getConfig = require("../utils/config");
+const {
+	networkId, contractId, gas,
+	NEW_ACCOUNT_AMOUNT,
+} = getConfig();
+
+const init = async (owner_id = contractId) => {
+	/// try to call new on contract, swallow e if already initialized
+	try {
+		await contractAccount.functionCall({
+			contractId,
+			methodName: 'new',
+			args: {
+				owner_id
+			},
+			gas
+		});
+	} catch (e) {
+		console.log('contract already initialized');
+		if (!/initialized/.test(e.toString())) {
+			throw e;
+		}
+	}
+	return contractAccount;
+};
+
+const getAccount = async (accountId, fundingAmount = NEW_ACCOUNT_AMOUNT, secret) => {
+	const account = new nearAPI.Account(connection, accountId);
+	try {
+		const secret = await fs.readFileSync(`./neardev/${accountId}`, 'utf-8');
+		const newKeyPair = KeyPair.fromString(secret);
+		keyStore.setKey(networkId, accountId, newKeyPair);
+		await account.state();
+		return account;
+	} catch(e) {
+		if (!/no such file|does not exist/.test(e.toString())) {
+			throw e;
+		}
+	}
+	return await createAccount(accountId, fundingAmount, secret);
+};
+
+const createAccount = async (accountId, fundingAmount = NEW_ACCOUNT_AMOUNT, secret) => {
+	const newKeyPair = secret ? KeyPair.fromString(secret) : KeyPair.fromRandom('ed25519');
+	fs.writeFileSync(`./neardev/${accountId}` , newKeyPair.toString(), 'utf-8');
+	await contractAccount.createAccount(accountId, newKeyPair.publicKey, fundingAmount);
+	keyStore.setKey(networkId, accountId, newKeyPair);
+	return new nearAPI.Account(connection, accountId);
+};
+
+/// debugging
+
+const getAccountBalance = (accountId) => (new nearAPI.Account(connection, accountId)).getAccountBalance();
+const getAccountState = (accountId) => (new nearAPI.Account(connection, accountId)).state();
+const stateCost = (balanceBefore, balanceAfter) => formatNearAmount(new BN(balanceAfter.stateStaked).sub(new BN(balanceBefore.stateStaked)).toString(), 8);
+const bytesUsed = (stateBefore, stateAfter) => parseInt(stateAfter.storage_usage, 10) - parseInt(stateBefore.storage_usage);
+
+/// analyzing
+
+let data = {};
+const recordStart = async (accountId) => {
+	data[accountId] = {
+		balance: await getAccountBalance(accountId),
+		state: await getAccountState(accountId),
+	};
+};
+
+const recordStop = async (accountId) => {
+	const before = data[accountId];
+	const after = {
+		balance: await getAccountBalance(accountId),
+		state: await getAccountState(accountId),
+	};
+
+	console.log('\nAnalysis:\n');
+	console.log('State stake:', stateCost(before.balance, after.balance));
+	console.log('Bytes used:', bytesUsed(before.state, after.state));
+	console.log('\n');
+};
+
+module.exports = {
+	init,
+	getAccount,
+	createAccount,
+	getAccountBalance,
+	getAccountState,
+	stateCost,
+	bytesUsed,
+	recordStart,
+	recordStop,
+};
+'''
+'''--- utils/config.js ---
+const contractName = 'dev-1641483836346-29918414578346';
+
+module.exports = function getConfig(network = 'testnet') {
+	let config = {
+		networkId: "testnet",
+		nodeUrl: "https://rpc.testnet.near.org",
+		walletUrl: "https://wallet.testnet.near.org",
+		helperUrl: "https://helper.testnet.near.org",
+		contractName,
+	};
+
+	switch (network) {
+	case 'testnet':
+		config = {
+			explorerUrl: "https://explorer.testnet.near.org",
+			...config,
+			GAS: "200000000000000",
+			gas: "200000000000000",
+			attachedDeposit: '10000000000000000000000', // 0.01 N (1kb storage)
+			NEW_ACCOUNT_AMOUNT: '1000000000000000000000000',
+			NEW_CONTRACT_AMOUNT: '5000000000000000000000000',
+			contractId: contractName,
+			isBrowser: new Function("try {return this===window;}catch(e){ return false;}")(),
+		};
+		break;
+	}
+
+	return config;
+};
+
+'''
+'''--- utils/near-utils.js ---
+const fs = require("fs");
+const nearAPI = require("near-api-js");
+const getConfig = require("./config");
+const { nodeUrl, walletUrl, networkId, contractId, isBrowser } = getConfig();
+
+const {
+	keyStores: { InMemoryKeyStore, BrowserLocalStorageKeyStore },
+	Near,
+	Account,
+	Contract,
+	KeyPair,
+	utils: {
+		format: { parseNearAmount },
+	},
+} = nearAPI;
+
+let credentials, keyStore;
+
+if (isBrowser) {
+	keyStore = new BrowserLocalStorageKeyStore();
+} else {
+	/// nodejs (for tests)
+	try {
+		console.log(`Loading Credentials: ${process.env.HOME}/.near-credentials/${networkId}/${contractId}.json`);
+		credentials = JSON.parse(
+			fs.readFileSync(
+				`${process.env.HOME}/.near-credentials/${networkId}/${contractId}.json`
+			)
+		);
+	} catch(e) {
+		console.warn(`Loading Credentials: ./neardev/${networkId}/${contractId}.json`);
+		credentials = JSON.parse(
+			fs.readFileSync(
+				`./neardev/${networkId}/${contractId}.json`
+			)
+		);
+	}
+	keyStore = new InMemoryKeyStore();
+	keyStore.setKey(
+		networkId,
+		contractId,
+		KeyPair.fromString(credentials.private_key)
+	);
+}
+
+const near = new Near({
+	networkId,
+	nodeUrl,
+	walletUrl,
+	deps: { keyStore },
+});
+const { connection } = near;
+const contractAccount = new Account(connection, contractId);
+
+module.exports = {
+	near,
+	credentials,
+	keyStore,
+	connection,
+	contractId,
+	contractAccount,
+};
+
+'''
+'''--- utils/patch-config.js ---
+const fs = require('fs');
+const contractName = fs.readFileSync('./neardev/dev-account').toString()
+const path = './utils/config.js'
+ 
+fs.readFile(path, 'utf-8', function(err, data) {
+    if (err) throw err;
+ 
+    data = data.replace(/.*const contractName.*/gim, `const contractName = '${contractName}';`);
+ 
+    fs.writeFile(path, data, 'utf-8', function(err) {
+        if (err) throw err;
+        console.log('Done!');
+    })
+})
+
+'''

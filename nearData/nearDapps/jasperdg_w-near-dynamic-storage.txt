@@ -1,0 +1,1163 @@
+*GitHub Repository "jasperdg/w-near-dynamic-storage"*
+
+'''--- Cargo.toml ---
+[workspace]
+members = [
+  "receiver",
+  "wnear"
+]
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+'''
+'''--- build.sh ---
+#!/bin/bash
+set -e
+
+pushd flux
+./scripts/build.sh
+cp ../res/flux.wasm ./tests/wasm/
+popd
+'''
+'''--- receiver/Cargo.toml ---
+[package]
+name = "receiver"
+version = "0.1.0"
+authors = ["Near Inc <hello@nearprotocol.com>", "Vincent <vincent@decentralisedengineeringltd.co.uk>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "2.0.0"
+
+[profile.release]
+codegen-units=1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+
+'''
+'''--- receiver/scripts/build.sh ---
+#!/bin/bash
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo build --target wasm32-unknown-unknown --release
+cp ../target/wasm32-unknown-unknown/release/flux.wasm ../res
+cp ../res/flux.wasm tests/wasm
+'''
+'''--- receiver/scripts/flags.sh ---
+#!/bin/bash
+
+if [ -z "$KEEP_NAMES" ]; then
+  export RUSTFLAGS='-C link-arg=-s'
+else
+  export RUSTFLAGS=''
+fi
+'''
+'''--- receiver/scripts/test.sh ---
+bash ./scripts/build.sh 
+cargo test -p flux $1 -- --nocapture 
+'''
+'''--- receiver/src/lib.rs ---
+/**
+* wNear NEP-141 Token contract
+*
+* The aim of the contract is to enable the wrapping of the native NEAR token into a NEP-141 compatible token.
+* It supports methods `near_deposit` and `near_withdraw` that wraps and unwraps NEAR tokens.
+* They are effectively mint and burn underlying wNEAR tokens.
+*
+* lib.rs is the main entry point.
+* fungible_token_core.rs implements NEP-146 standard
+* storage_manager.rs implements NEP-145 standard for allocating storage per account
+* fungible_token_metadata.rs implements NEP-148 standard for providing token-specific metadata.
+* w_near.rs contains interfaces for depositing and withdrawing
+* internal.rs contains internal methods for fungible token.
+*/
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::LookupMap;
+use near_sdk::json_types::U128;
+use near_sdk::{env, near_bindgen, AccountId, Balance, Promise, StorageUsage};
+use near_sdk::serde::Serialize;
+
+mod storage_manager;
+const STORAGE_PRICE_PER_BYTE: Balance = 100_000_000_000_000_000_000;
+
+#[global_allocator]
+static ALLOC: near_sdk::wee_alloc::WeeAlloc<'_> = near_sdk::wee_alloc::WeeAlloc::INIT;
+
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct WrappedAccountStorageBalance {
+    total: U128,
+    available: U128
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct AccountStorageBalance { 
+    total: Balance,
+    available: Balance
+}
+
+impl AccountStorageBalance {
+    pub fn wrap(&self) -> WrappedAccountStorageBalance {
+        WrappedAccountStorageBalance {
+            total: self.total.into(),
+            available: self.available.into()
+        }
+    }
+}
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Contract {
+    /// AccountID -> Account balance.
+    pub accounts: LookupMap<AccountId, AccountStorageBalance>,
+
+    /// Total supply of the all token.
+    pub total_supply: Balance,
+
+    /// The storage size in bytes for one account.
+    pub account_storage_usage: StorageUsage,
+
+    /// Dynamic storage map used for demo purposes
+    pub essay: LookupMap<AccountId, String>
+}
+
+impl Default for Contract {
+    fn default() -> Self {
+        env::panic(b"Contract is not initialized");
+    }
+}
+
+#[near_bindgen]
+impl Contract {
+    #[init]
+    pub fn new() -> Self {
+        assert!(!env::state_exists(), "Already initialized");
+        let mut this = Self {
+            accounts: LookupMap::new(b"a".to_vec()),
+            total_supply: 0,
+            account_storage_usage: 0,
+            essay: LookupMap::new(b"b".to_vec()),
+        };
+        let initial_storage_usage = env::storage_usage();
+        let tmp_account_id = unsafe { String::from_utf8_unchecked(vec![b'a'; 64]) };
+        let tmp_account_balance = AccountStorageBalance {
+            total: 0u128, 
+            available: 0u128
+        };
+        this.accounts.insert(&tmp_account_id, &tmp_account_balance);
+        this.account_storage_usage = env::storage_usage() - initial_storage_usage;
+        this.accounts.remove(&tmp_account_id);
+        this
+    }
+
+    pub fn on_transfer_call(
+        &mut self, 
+        sender: AccountId, 
+        amount: U128, 
+        msg: String, 
+        _memo: Option<String>
+    ) -> U128 {
+        let amount: u128 = amount.into();
+        assert_eq!(sender, "wnear.near".to_string(), "only accepts WNEAR as payment");
+        assert_eq!(amount, 10_u128.pow(24), "it costs 1 WNEAR to write a new essay");
+        let mut account_storage_balances = self.accounts.get(&sender).expect("sender is not registered with the contract");
+
+        let pre_insert_storage_usage: u128 = env::storage_usage().into();
+        
+        self.essay.insert(&sender, &msg);
+
+        let post_insert_storage_usage: u128 = env::storage_usage().into();
+
+        if post_insert_storage_usage > pre_insert_storage_usage {
+            let cost  = post_insert_storage_usage - pre_insert_storage_usage * STORAGE_PRICE_PER_BYTE;
+            assert!(cost <= account_storage_balances.available, "err not enough storage balance for payment");
+            account_storage_balances.available -= cost;
+        } else if post_insert_storage_usage < pre_insert_storage_usage {
+            let refund  = pre_insert_storage_usage - post_insert_storage_usage * STORAGE_PRICE_PER_BYTE;
+            // Can refund (subtract from total and transfer) or add to available balance.account_storage_balances
+            account_storage_balances.available += refund;
+        }
+
+        // Store updated storage balances
+        self.accounts.insert(&sender, &account_storage_balances);
+
+        return amount.into()
+    }
+}
+'''
+'''--- receiver/src/storage_manager.rs ---
+use super::*;
+use near_sdk::json_types::{ValidAccountId, U128};
+
+/// Price per 1 byte of storage from mainnet config after `0.18` release and protocol version `42`.
+/// It's 10 times lower than the genesis price.
+const STORAGE_PRICE_PER_BYTE: Balance = 10_000_000_000_000_000_000;
+
+pub(crate) fn assert_one_yocto() {
+    assert_eq!(
+        env::attached_deposit(),
+        1,
+        "Requires attached deposit of exactly 1 yoctoNEAR"
+    )
+}
+
+pub trait StorageManager {
+    fn storage_deposit(&mut self, account_id: Option<ValidAccountId>) -> WrappedAccountStorageBalance;
+
+    fn storage_withdraw(&mut self, amount: U128) -> WrappedAccountStorageBalance;
+
+    fn storage_minimum_balance(&self) -> U128;
+
+    fn storage_balance_of(&self, account_id: ValidAccountId) -> WrappedAccountStorageBalance;
+}
+
+#[near_bindgen]
+impl StorageManager for Contract {
+    #[payable]
+    fn storage_deposit(&mut self, account_id: Option<ValidAccountId>) -> WrappedAccountStorageBalance {
+        let amount = env::attached_deposit();
+        assert!(amount > 0, "Requires NEAR deposit");
+
+        let account_id = account_id
+            .map(|a| a.into())
+            .unwrap_or_else(|| env::predecessor_account_id());
+
+        let new_balances = match self.accounts.get(&account_id) {
+            Some(balances) => AccountStorageBalance {
+                total: balances.total + amount,
+                available: balances.available + amount,
+            }, 
+            None => {
+                assert!(amount >= u128::from(self.storage_minimum_balance()), "amount is less than minimum amount required");
+                AccountStorageBalance {
+                    total: amount,
+                    available: amount - u128::from(self.storage_minimum_balance()),
+                }
+            }
+        };
+      
+        self.accounts.insert(&account_id, &new_balances);
+
+        new_balances.wrap()
+    }
+
+    #[payable]
+    fn storage_withdraw(&mut self, amount: U128) -> WrappedAccountStorageBalance {
+        assert_one_yocto();
+
+        let amount: Balance = amount.into();
+        let account_id = env::predecessor_account_id();
+
+        if let Some(balances) = self.accounts.get(&account_id) {
+            assert!(balances.available >= amount, "Not enough available balance to withdraw");
+            let new_balances = AccountStorageBalance {
+                total: balances.total - amount,
+                available: balances.available - amount
+            };
+
+            self.accounts.insert(&account_id, &new_balances);
+            Promise::new(account_id).transfer(amount + 1);
+
+            new_balances.wrap()
+        } else {
+            env::panic(b"The account is not registered");
+        }
+    }
+
+    fn storage_minimum_balance(&self) -> U128 {
+        (Balance::from(self.account_storage_usage) * STORAGE_PRICE_PER_BYTE).into()
+    }
+
+    fn storage_balance_of(&self, account_id: ValidAccountId) -> WrappedAccountStorageBalance {
+        if let Some(balances) = self.accounts.get(account_id.as_ref()) {
+            balances.wrap()
+        } else {
+            WrappedAccountStorageBalance {
+                total: 0.into(),
+                available: 0.into(),
+            }
+        }
+    }
+}
+
+'''
+'''--- wnear/Cargo.toml ---
+[package]
+name = "w_near"
+version = "0.1.0"
+authors = ["Near Inc <hello@nearprotocol.com>", "Vincent <vincent@decentralisedengineeringltd.co.uk>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "2.0.0"
+
+[profile.release]
+codegen-units=1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+
+'''
+'''--- wnear/README.md ---
+# TBD
+
+'''
+'''--- wnear/build.sh ---
+#!/bin/bash
+set -e
+cd "`dirname $0`"
+RUSTFLAGS='-C link-arg=-s' cargo build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/w_near.wasm ./res/
+
+'''
+'''--- wnear/src/fungible_token_core.rs ---
+use crate::*;
+use near_sdk::json_types::ValidAccountId;
+use near_sdk::{ext_contract, Gas, PromiseResult};
+use std::convert::TryInto;
+
+const GAS_FOR_RESOLVE_TRANSFER: Gas = 5_000_000_000_000;
+const GAS_FOR_STORAGE_DEPOSIT: Gas = 5_000_000_000_000;
+const GAS_FOR_FT_TRANSFER_CALL: Gas = 25_000_000_000_000 + GAS_FOR_RESOLVE_TRANSFER + GAS_FOR_STORAGE_DEPOSIT;
+
+const NO_DEPOSIT: Balance = 0;
+
+pub trait FungibleTokenCore {
+    /// Transfers positive `amount` of tokens from the `env::predecessor_account_id` to `receiver_id`.
+    /// Both accounts must be registered with the contract for transfer to succeed. (See [NEP-145](https://github.com/near/NEPs/discussions/145))
+    /// This method must to be able to accept attached deposits, and must not panic on attached deposit.
+    /// Exactly 1 yoctoNEAR must be attached.
+    /// See [the Security section](https://github.com/near/NEPs/issues/141#user-content-security) of the standard.
+    ///
+    /// Arguments:
+    /// - `receiver_id` - the account ID of the receiver.
+    /// - `amount` - the amount of tokens to transfer. Must be a positive number in decimal string representation.
+    /// - `memo` - an optional string field in a free form to associate a memo with this transfer.
+    fn ft_transfer(&mut self, receiver_id: ValidAccountId, amount: U128, memo: Option<String>);
+
+    /// Transfers positive `amount` of tokens from the `env::predecessor_account_id` to `receiver_id` account. Then
+    /// calls `ft_on_transfer` method on `receiver_id` contract and attaches a callback to resolve this transfer.
+    /// `ft_on_transfer` method must return the amount of tokens unused by the receiver contract, the remaining tokens
+    /// must be refunded to the `predecessor_account_id` at the resolve transfer callback.
+    ///
+    /// Token contract must pass all the remaining unused gas to the `ft_on_transfer` call.
+    ///
+    /// Malicious or invalid behavior by the receiver's contract:
+    /// - If the receiver contract promise fails or returns invalid value, the full transfer amount must be refunded.
+    /// - If the receiver contract overspent the tokens, and the `receiver_id` balance is lower than the required refund
+    /// amount, the remaining balance must be refunded. See [the Security section](https://github.com/near/NEPs/issues/141#user-content-security) of the standard.
+    ///
+    /// Both accounts must be registered with the contract for transfer to succeed. (See #145)
+    /// This method must to be able to accept attached deposits, and must not panic on attached deposit. Exactly 1 yoctoNEAR must be attached. See [the Security
+    /// section](https://github.com/near/NEPs/issues/141#user-content-security) of the standard.
+    ///
+    /// Arguments:
+    /// - `receiver_id` - the account ID of the receiver contract. This contract will be called.
+    /// - `amount` - the amount of tokens to transfer. Must be a positive number in a decimal string representation.
+    /// - `msg` - a string message that will be passed to `ft_on_transfer` contract call.
+    /// - `memo` - an optional string field in a free form to associate a memo with this transfer.
+    ///
+    /// Returns a promise which will result in the amount of tokens withdrawn from sender's account.
+    fn ft_transfer_call(
+        &mut self,
+        receiver_id: ValidAccountId,
+        amount: U128,
+        msg: String,
+        memo: Option<String>,
+    ) -> Promise;
+
+    /// Returns the total supply of the token in a decimal string representation.
+    fn ft_total_supply(&self) -> U128;
+
+    /// Returns the balance of the account. If the account doesn't exist must returns `"0"`.
+    fn ft_balance_of(&self, account_id: ValidAccountId) -> U128;
+}
+
+#[ext_contract(ext_fungible_token_receiver)]
+trait FungibleTokenReceiver {
+    /// Called by fungible token contract after `ft_transfer_call` was initiated by
+    /// `sender_id` of the given `amount` with the transfer message given in `msg` field.
+    /// The `amount` of tokens were already transferred to this contract account and ready to be used.
+    ///
+    /// The method must return the amount of tokens that are *not* used/accepted by this contract from the transferred
+    /// amount. Examples:
+    /// - The transferred amount was `500`, the contract completely takes it and must return `0`.
+    /// - The transferred amount was `500`, but this transfer call only needs `450` for the action passed in the `msg`
+    ///   field, then the method must return `50`.
+    /// - The transferred amount was `500`, but the action in `msg` field has expired and the transfer must be
+    ///   cancelled. The method must return `500` or panic.
+    ///
+    /// Arguments:
+    /// - `sender_id` - the account ID that initiated the transfer.
+    /// - `amount` - the amount of tokens that were transferred to this account in a decimal string representation.
+    /// - `msg` - a string message that was passed with this transfer call.
+    ///
+    /// Returns the amount of unused tokens that should be returned to sender, in a decimal string representation.
+    fn ft_on_transfer(&mut self, sender_id: AccountId, amount: U128, msg: String) -> Promise;
+    
+    fn storage_deposit(&mut self, account_id: Option<AccountId>) -> Promise;
+}
+
+#[ext_contract(ext_self)]
+trait FungibleTokenResolver {
+    fn ft_resolve_transfer(
+        &mut self,
+        sender_id: AccountId,
+        receiver_id: AccountId,
+        amount: U128,
+    ) -> U128;
+}
+
+trait FungibleTokenResolver {
+    fn ft_resolve_transfer(
+        &mut self,
+        sender_id: AccountId,
+        receiver_id: AccountId,
+        amount: U128,
+    ) -> U128;
+
+    fn ft_execute_transfer_call(
+        &mut self, 
+        receiver_id: AccountId,
+        amount: U128,
+        msg: String,
+        memo: Option<String>,
+    ) -> Promise;
+}
+
+#[near_bindgen]
+impl FungibleTokenCore for Contract {
+    #[payable]
+    fn ft_transfer(&mut self, receiver_id: ValidAccountId, amount: U128, memo: Option<String>) {
+        assert_one_yocto();
+        let sender_id = env::predecessor_account_id();
+        let amount = amount.into();
+        self.internal_transfer(&sender_id, receiver_id.as_ref(), amount, memo);
+    }
+
+    #[payable]
+    fn ft_transfer_call(
+        &mut self,
+        receiver_id: ValidAccountId,
+        amount: U128,
+        msg: String,
+        memo: Option<String>,
+    ) -> Promise {
+        assert!(env::attached_deposit() > 0, "Required at least 1 yocto");
+        assert!(env::prepaid_gas() >= GAS_FOR_FT_TRANSFER_CALL, "Less gas attached than minimally required");
+        let receiver_id: String = receiver_id.into();
+        
+        if env::attached_deposit() > 1 {
+            ext_fungible_token_receiver::storage_deposit(
+                Some(env::predecessor_account_id()), 
+                &receiver_id, 
+                env::attached_deposit(),
+                GAS_FOR_STORAGE_DEPOSIT
+            )
+            .then(
+                self.ft_execute_transfer_call(
+                    receiver_id.into(),
+                    amount.into(),
+                    msg,
+                    memo,
+                )
+            )
+        } else {
+            self.ft_execute_transfer_call(
+                receiver_id.into(),
+                amount.into(),
+                msg,
+                memo,
+            )
+        }
+
+    }
+
+    fn ft_total_supply(&self) -> U128 {
+        self.total_supply.into()
+    }
+
+    fn ft_balance_of(&self, account_id: ValidAccountId) -> U128 {
+        self.accounts.get(account_id.as_ref()).unwrap_or(0).into()
+    }
+}
+
+#[near_bindgen]
+impl FungibleTokenResolver for Contract {
+
+    fn ft_execute_transfer_call(
+        &mut self,
+        receiver_id: AccountId,
+        amount: U128,
+        msg: String,
+        memo: Option<String>,
+    ) -> Promise {
+        let sender_id = env::predecessor_account_id();
+        let amount = amount.into();
+        self.internal_transfer(&sender_id, &receiver_id, amount, memo);
+
+        // Initiating receiver's call and the callback
+        ext_fungible_token_receiver::ft_on_transfer(
+            sender_id.clone(),
+            amount.into(),
+            msg,
+            &receiver_id,
+            NO_DEPOSIT,
+            env::prepaid_gas() - GAS_FOR_FT_TRANSFER_CALL,
+        )
+        .then(ext_self::ft_resolve_transfer(
+            sender_id,
+            receiver_id.into(),
+            amount.into(),
+            &env::current_account_id(),
+            NO_DEPOSIT,
+            GAS_FOR_RESOLVE_TRANSFER,
+        ))
+    }
+
+    fn ft_resolve_transfer(
+        &mut self,
+        sender_id: AccountId,
+        receiver_id: AccountId,
+        amount: U128,
+    ) -> U128 {
+        assert_self();
+        let amount: Balance = amount.into();
+
+        // Get the unused amount from the `ft_on_transfer` call result.
+        let unused_amount = match env::promise_result(0) {
+            PromiseResult::NotReady => unreachable!(),
+            PromiseResult::Successful(value) => {
+                if let Ok(unused_amount) = near_sdk::serde_json::from_slice::<U128>(&value) {
+                    std::cmp::min(amount, unused_amount.0)
+                } else {
+                    amount
+                }
+            }
+            PromiseResult::Failed => amount,
+        };
+
+        if unused_amount > 0 {
+            let receiver_balance = self.accounts.get(&receiver_id).unwrap_or(0);
+            if receiver_balance > 0 {
+                let refund_amount = std::cmp::min(receiver_balance, unused_amount);
+                self.accounts
+                    .insert(&receiver_id, &(receiver_balance - refund_amount));
+
+                if let Some(sender_balance) = self.accounts.get(&sender_id) {
+                    self.accounts
+                        .insert(&sender_id, &(sender_balance + refund_amount));
+                    env::log(
+                        format!(
+                            "Refund {} from {} to {}",
+                            refund_amount, receiver_id, sender_id
+                        )
+                        .as_bytes(),
+                    );
+                    return (amount - refund_amount).into();
+                } else {
+                    // Sender's account was deleted, so we need to burn tokens.
+                    self.total_supply -= refund_amount;
+                    env::log(b"The account of the sender was deleted");
+                    env::log(format!("Burn {}", refund_amount).as_bytes());
+                }
+            }
+        }
+        amount.into()
+    }
+}
+
+'''
+'''--- wnear/src/fungible_token_metadata.rs ---
+use super::*;
+use near_sdk::serde::Serialize;
+
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct FungibleTokenMetadata {
+    version: String,
+    name: String,
+    symbol: String,
+    reference: String,
+    decimals: u8,
+}
+
+pub trait FungibleTokenMetadataProvider {
+    fn ft_metadata() -> FungibleTokenMetadata;
+}
+
+#[near_bindgen]
+impl FungibleTokenMetadataProvider for Contract {
+    fn ft_metadata() -> FungibleTokenMetadata {
+        FungibleTokenMetadata {
+            version: String::from("0.1.0"),
+            name: String::from("Wrapped NEAR fungible token"),
+            symbol: String::from("wNEAR"),
+            reference: String::from(
+                "https://github.com/near/core-contracts/tree/master/w-near-141",
+            ),
+            decimals: 24,
+        }
+    }
+}
+
+'''
+'''--- wnear/src/internal.rs ---
+use crate::*;
+
+pub(crate) fn assert_one_yocto() {
+    assert_eq!(
+        env::attached_deposit(),
+        1,
+        "Requires attached deposit of exactly 1 yoctoNEAR"
+    )
+}
+
+pub(crate) fn assert_self() {
+    assert_eq!(
+        env::predecessor_account_id(),
+        env::current_account_id(),
+        "Method is private"
+    );
+}
+
+impl Contract {
+    pub(crate) fn internal_deposit(&mut self, account_id: &AccountId, amount: Balance) {
+        let balance = self
+            .accounts
+            .get(&account_id)
+            .expect("The account is not registered");
+        if let Some(new_balance) = balance.checked_add(amount) {
+            self.accounts.insert(&account_id, &new_balance);
+        } else {
+            env::panic(b"Balance overflow");
+        }
+    }
+
+    pub(crate) fn internal_withdraw(&mut self, account_id: &AccountId, amount: Balance) {
+        let balance = self
+            .accounts
+            .get(&account_id)
+            .expect("The account is not registered");
+        if let Some(new_balance) = balance.checked_sub(amount) {
+            self.accounts.insert(&account_id, &new_balance);
+        } else {
+            env::panic(b"The account doesn't have enough balance");
+        }
+    }
+
+    pub(crate) fn internal_transfer(
+        &mut self,
+        sender_id: &AccountId,
+        receiver_id: &AccountId,
+        amount: Balance,
+        memo: Option<String>,
+    ) {
+        assert_ne!(
+            sender_id, receiver_id,
+            "Sender and receiver should be different"
+        );
+        assert!(amount > 0, "The amount should be a positive number");
+        self.internal_withdraw(sender_id, amount);
+        self.internal_deposit(receiver_id, amount);
+        env::log(format!("Transfer {} from {} to {}", amount, sender_id, receiver_id).as_bytes());
+        if let Some(memo) = memo {
+            env::log(format!("Memo: {}", memo).as_bytes());
+        }
+    }
+}
+
+'''
+'''--- wnear/src/lib.rs ---
+/**
+* wNear NEP-141 Token contract
+*
+* The aim of the contract is to enable the wrapping of the native NEAR token into a NEP-141 compatible token.
+* It supports methods `near_deposit` and `near_withdraw` that wraps and unwraps NEAR tokens.
+* They are effectively mint and burn underlying wNEAR tokens.
+*
+* lib.rs is the main entry point.
+* fungible_token_core.rs implements NEP-146 standard
+* storage_manager.rs implements NEP-145 standard for allocating storage per account
+* fungible_token_metadata.rs implements NEP-148 standard for providing token-specific metadata.
+* w_near.rs contains interfaces for depositing and withdrawing
+* internal.rs contains internal methods for fungible token.
+*/
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::LookupMap;
+use near_sdk::json_types::U128;
+use near_sdk::{env, near_bindgen, AccountId, Balance, Promise, StorageUsage};
+
+pub use crate::fungible_token_core::*;
+pub use crate::fungible_token_metadata::*;
+use crate::internal::*;
+pub use crate::storage_manager::*;
+pub use crate::w_near::*;
+
+mod fungible_token_core;
+mod fungible_token_metadata;
+mod internal;
+mod storage_manager;
+mod w_near;
+
+#[global_allocator]
+static ALLOC: near_sdk::wee_alloc::WeeAlloc<'_> = near_sdk::wee_alloc::WeeAlloc::INIT;
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Contract {
+    /// AccountID -> Account balance.
+    pub accounts: LookupMap<AccountId, Balance>,
+
+    /// Total supply of the all token.
+    pub total_supply: Balance,
+
+    /// The storage size in bytes for one account.
+    pub account_storage_usage: StorageUsage,
+}
+
+impl Default for Contract {
+    fn default() -> Self {
+        env::panic(b"Contract is not initialized");
+    }
+}
+
+#[near_bindgen]
+impl Contract {
+    #[init]
+    pub fn new() -> Self {
+        assert!(!env::state_exists(), "Already initialized");
+        let mut this = Self {
+            accounts: LookupMap::new(b"a".to_vec()),
+            total_supply: 0,
+            account_storage_usage: 0,
+        };
+        let initial_storage_usage = env::storage_usage();
+        let tmp_account_id = unsafe { String::from_utf8_unchecked(vec![b'a'; 64]) };
+        this.accounts.insert(&tmp_account_id, &0u128);
+        this.account_storage_usage = env::storage_usage() - initial_storage_usage;
+        this.accounts.remove(&tmp_account_id);
+        this
+    }
+}
+'''
+'''--- wnear/src/storage_manager.rs ---
+use super::*;
+use near_sdk::json_types::{ValidAccountId, U128};
+use near_sdk::serde::Serialize;
+
+/// Price per 1 byte of storage from mainnet config after `0.18` release and protocol version `42`.
+/// It's 10 times lower than the genesis price.
+const STORAGE_PRICE_PER_BYTE: Balance = 10_000_000_000_000_000_000;
+
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct AccountStorageBalance {
+    total: U128,
+    available: U128,
+}
+
+pub trait StorageManager {
+    fn storage_deposit(&mut self, account_id: Option<ValidAccountId>) -> AccountStorageBalance;
+
+    fn storage_withdraw(&mut self, amount: U128) -> AccountStorageBalance;
+
+    fn storage_minimum_balance(&self) -> U128;
+
+    fn storage_balance_of(&self, account_id: ValidAccountId) -> AccountStorageBalance;
+}
+
+#[near_bindgen]
+impl StorageManager for Contract {
+    #[payable]
+    fn storage_deposit(&mut self, account_id: Option<ValidAccountId>) -> AccountStorageBalance {
+        let amount = env::attached_deposit();
+        assert_eq!(
+            amount,
+            self.storage_minimum_balance().0,
+            "Requires attached deposit of the exact storage minimum balance"
+        );
+        let account_id = account_id
+            .map(|a| a.into())
+            .unwrap_or_else(|| env::predecessor_account_id());
+        if self.accounts.insert(&account_id, &0).is_some() {
+            env::panic(b"The account is already registered");
+        }
+        AccountStorageBalance {
+            total: amount.into(),
+            available: amount.into(),
+        }
+    }
+
+    #[payable]
+    fn storage_withdraw(&mut self, amount: U128) -> AccountStorageBalance {
+        assert_one_yocto();
+        let amount: Balance = amount.into();
+        assert_eq!(
+            amount,
+            self.storage_minimum_balance().0,
+            "The withdrawal amount should be the exact storage minimum balance"
+        );
+        let account_id = env::predecessor_account_id();
+        if let Some(balance) = self.accounts.remove(&account_id) {
+            if balance > 0 {
+                env::panic(b"The account has positive token balance");
+            } else {
+                Promise::new(account_id).transfer(amount + 1);
+                AccountStorageBalance {
+                    total: 0.into(),
+                    available: 0.into(),
+                }
+            }
+        } else {
+            env::panic(b"The account is not registered");
+        }
+    }
+
+    fn storage_minimum_balance(&self) -> U128 {
+        (Balance::from(self.account_storage_usage) * STORAGE_PRICE_PER_BYTE).into()
+    }
+
+    fn storage_balance_of(&self, account_id: ValidAccountId) -> AccountStorageBalance {
+        if let Some(balance) = self.accounts.get(account_id.as_ref()) {
+            AccountStorageBalance {
+                total: self.storage_minimum_balance(),
+                available: if balance > 0 {
+                    0.into()
+                } else {
+                    self.storage_minimum_balance()
+                },
+            }
+        } else {
+            AccountStorageBalance {
+                total: 0.into(),
+                available: 0.into(),
+            }
+        }
+    }
+}
+
+'''
+'''--- wnear/src/w_near.rs ---
+use crate::*;
+
+#[near_bindgen]
+impl Contract {
+    /// Deposit NEAR to mint wNEAR tokens to the predecessor account in this contract.
+    /// Requirements:
+    /// * The predecessor account should be registered.
+    /// * Requires positive attached deposit.
+    #[payable]
+    pub fn near_deposit(&mut self) {
+        let amount = env::attached_deposit();
+        assert!(amount > 0, "Requires positive attached deposit");
+        let account_id = env::predecessor_account_id();
+        self.internal_deposit(&account_id, amount);
+        self.total_supply += amount;
+        env::log(format!("Deposit {} NEAR to {}", amount, account_id).as_bytes());
+    }
+
+    /// Withdraws wNEAR and send NEAR back to the predecessor account.
+    /// Requirements:
+    /// * The predecessor account should be registered.
+    /// * `amount` must be a positive integer.
+    /// * The predecessor account should have at least the `amount` of wNEAR tokens.
+    /// * Requires attached deposit of exactly 1 yoctoNEAR.
+    #[payable]
+    pub fn near_withdraw(&mut self, amount: U128) -> Promise {
+        assert_one_yocto();
+        let account_id = env::predecessor_account_id();
+        let amount = amount.into();
+        self.internal_withdraw(&account_id, amount);
+        self.total_supply -= amount;
+        env::log(format!("Withdraw {} NEAR from {}", amount, account_id).as_bytes());
+        // Transferring NEAR and refunding 1 yoctoNEAR.
+        Promise::new(account_id).transfer(amount + 1)
+    }
+}
+
+'''
+'''--- wnear/tests/general.rs ---
+
+'''
+'''--- wnear/tests/test_utils.rs ---
+// #![allow(clippy::needless_pass_by_value)]
+// use std::convert::TryInto;
+// use near_sdk::{
+//     PendingContractTx,
+//     AccountId,
+//     json_types::{
+//         U64,
+//         U128,
+//         ValidAccountId
+//     },
+//     serde_json::json,
+//     serde_json
+// };
+
+// use near_sdk_sim::{
+//     ExecutionResult,
+//     call,
+//     view,
+//     deploy, 
+//     init_simulator, 
+//     to_yocto, 
+//     ContractAccount, 
+//     UserAccount, 
+//     STORAGE_AMOUNT,
+//     DEFAULT_GAS
+// };
+
+// extern crate wnear;
+
+// pub use wnear::*;
+// use receiver::*;
+
+// const REGISTRY_STORAGE: u128 = 8_300_000_000_000_000_000_000;
+// const TOKEN_CONTRACT_ID: &str = "token";
+// const AMM_CONTRACT_ID: &str = "amm";
+
+// // Load in contract bytes
+// near_sdk_sim::lazy_static! {
+//     static ref AMM_WASM_BYTES: &'static [u8] = include_bytes!("./wasm/flux.wasm").as_ref();
+//     static ref TOKEN_WASM_BYTES: &'static [u8] = include_bytes!("./wasm/token.wasm").as_ref();
+// }
+
+// pub fn init(
+//     gov_id: AccountId
+// ) -> (UserAccount, ContractAccount<ProtocolContract>, AccountId, UserAccount, UserAccount, UserAccount) {
+//     let master_account = init_simulator(None);
+
+//     // deploy amm
+//     let amm_contract = deploy!(
+//         // Contract Proxy
+//         contract: ProtocolContract,
+//         // Contract account id
+//         contract_id: AMM_CONTRACT_ID,
+//         // Bytes of contract
+//         bytes: &AMM_WASM_BYTES,
+//         // User deploying the contract,
+//         signer_account: master_account,
+//         deposit: to_yocto("1000"),
+//         // init method
+//         init_method: init(
+//             gov_id.try_into().unwrap(),
+//             vec!["token".try_into().unwrap()],
+//             vec![24]
+//         )
+//     );
+
+//     // deploy token
+//     let token_contract = deploy!(
+//         // Contract Proxy
+//         contract: ContractContract,
+//         // Contract account id
+//         contract_id: TOKEN_CONTRACT_ID,
+//         // Bytes of contract
+//         bytes: &TOKEN_WASM_BYTES,
+//         // User deploying the contract,
+//         signer_account: master_account,
+//         deposit: to_yocto("1000"),
+//         // init method
+//         init_method: new()
+//     );
+
+//     let storage_amount = get_storage_amount(&master_account);
+//     storage_deposit(&master_account, storage_amount.into(), Some(AMM_CONTRACT_ID.to_string()));
+    
+//     let alice = master_account.create_user("alice".to_string(), to_yocto("10000"));
+//     storage_deposit(&alice, storage_amount.into(), None);
+//     near_deposit(&alice, init_balance());
+//     let bob = master_account.create_user("bob".to_string(), to_yocto("10000"));
+//     storage_deposit(&bob, storage_amount.into(), None);
+//     near_deposit(&bob, init_balance());
+//     let carol = master_account.create_user("carol".to_string(), to_yocto("10000"));
+//     storage_deposit(&carol, storage_amount.into(), None);
+//     near_deposit(&carol, init_balance());
+
+//     (master_account, amm_contract, TOKEN_CONTRACT_ID.to_string(), alice, bob, carol)
+// }
+
+// pub fn get_storage_amount(sender: &UserAccount) -> U128 {
+//     sender.view(
+//         PendingContractTx::new(
+//             TOKEN_CONTRACT_ID, 
+//             "storage_minimum_balance", 
+//             json!({}), 
+//             true
+//         )
+//     ).unwrap_json()
+// }
+
+// pub fn token_denom() -> u128 {
+//     to_yocto("1")
+// }
+
+// pub fn init_balance() -> u128 {
+//     to_yocto("1000")
+// }
+
+// pub fn storage_deposit(sender: &UserAccount, deposit: u128, to_register: Option<AccountId>) {
+//     let res = sender.call(
+//         PendingContractTx::new(
+//             TOKEN_CONTRACT_ID,
+//             "storage_deposit",
+//             json!({
+//                 "account_id": to_register
+//             }),
+//             false
+//         ),
+//         deposit,
+//         DEFAULT_GAS
+//     );
+//     assert!(res.is_ok(), "storage deposit failed with res: {:?}", res);
+// }
+
+// pub fn near_deposit(sender: &UserAccount, deposit: u128) {
+//     let res = sender.call(
+//         PendingContractTx::new(
+//             TOKEN_CONTRACT_ID,
+//             "near_deposit",
+//             json!({}),
+//             false
+//         ),
+//         deposit,
+//         DEFAULT_GAS
+//     );
+//     assert!(res.is_ok(), "wnear deposit failed with res: {:?}", res);
+// }
+
+// pub fn ft_balance_of(sender: &UserAccount, account_id: &AccountId) -> U128 {
+//     sender.view(
+//         PendingContractTx::new(
+//             TOKEN_CONTRACT_ID, 
+//             "ft_balance_of", 
+//             json!({
+//                 "account_id": account_id.to_string()
+//             }), 
+//             true
+//         )
+//     ).unwrap_json()
+// }
+
+// pub fn transfer_unsafe(
+//     sender: &UserAccount,
+//     receiver_id: &AccountId,
+//     amount: u128,
+// ) {
+//     let res = sender.call(
+//         PendingContractTx::new(
+//             TOKEN_CONTRACT_ID, 
+//             "ft_transfer", 
+//             json!({
+//                 "receiver_id": receiver_id,
+//                 "amount": U128::from(amount),
+//                 "memo": "".to_string()
+//             }), 
+//             true
+//         ),
+//         1,
+//         DEFAULT_GAS
+//     );
+
+//     assert!(res.is_ok(), "ft_transfer_call failed with res: {:?}", res);
+// }
+// pub fn ft_transfer_call(
+//     sender: &UserAccount, 
+//     amount: u128,
+//     msg: String
+// ) {
+//     let res = sender.call(
+//         PendingContractTx::new(
+//             TOKEN_CONTRACT_ID, 
+//             "ft_transfer_call", 
+//             json!({
+//                 "receiver_id": AMM_CONTRACT_ID.to_string(),
+//                 "amount": U128::from(amount),
+//                 "msg": msg,
+//                 "memo": "".to_string()
+//             }), 
+//             true
+//         ),
+//         1,
+//         DEFAULT_GAS
+//     );
+
+//     assert!(res.is_ok(), "ft_transfer_call failed with res: {:?}", res);
+// }
+
+// pub fn empty_string() -> String { "".to_string() }
+
+// pub fn empty_string_vec(len: u16) -> Vec<String> { 
+//     let mut tags: Vec<String> = vec![];
+//     for i in 0..len {
+//         tags.push(empty_string());
+//     }
+    
+//     tags
+// }
+
+// pub fn env_time() -> U64{ 
+//     1609951265967.into()
+// }
+// pub fn fee() -> U128 {
+//     (10_u128.pow(24) / 50).into() // 2%
+// }
+
+// pub fn create_market(creator: &UserAccount, amm: &ContractAccount<ProtocolContract>, outcomes: u16, fee_opt: Option<U128>) -> U64 {
+//     call!(
+//         creator,
+//         amm.create_market(empty_string(), empty_string(), outcomes, empty_string_vec(outcomes), empty_string_vec(2), env_time(), "token".to_string(), fee_opt.unwrap_or(fee())),
+//         deposit = STORAGE_AMOUNT
+//     ).unwrap_json()
+// }
+
+// pub fn to_token_denom(amt: u128) -> u128 {
+//     amt * 10_u128.pow(24)
+// }
+
+// pub fn swap_fee() -> U128 {
+//     U128(to_token_denom(2) / 100)
+// }
+
+// pub fn product_of(nums: &Vec<U128>) -> u128 {
+//     assert!(nums.len() > 1, "ERR_INVALID_NUMS");
+//     nums.iter().fold(token_denom(), |prod, &num| {
+//         let num_u128: u128 = num.into();
+//         math::mul_u128(token_denom(), prod, num_u128)
+//     })
+// }
+
+// pub fn calc_weights_from_price(prices: Vec<U128>) -> Vec<U128> {
+//     let product = product_of(&prices);
+    
+//     prices.iter().map(|price| {
+//        U128(math::div_u128(token_denom(), u128::from(product), u128::from(*price)))
+//     }).collect()
+// }
+
+// pub fn unwrap_u128_vec(vec_in: &Vec<U128>) -> Vec<u128> {
+//     vec_in.iter().map(|n| { u128::from(*n) }).collect()
+// }
+
+// pub fn wrap_u128_vec(vec_in: &Vec<u128>) -> Vec<U128> {
+//     vec_in.iter().map(|n| { U128(*n) }).collect()
+// }
+'''

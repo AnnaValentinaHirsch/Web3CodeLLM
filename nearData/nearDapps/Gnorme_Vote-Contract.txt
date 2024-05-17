@@ -1,0 +1,576 @@
+*GitHub Repository "Gnorme/Vote-Contract"*
+
+'''--- README.md ---
+# Vote-Contract
+
+This project was started for completion of the NEAR Developer Certificate Program. I chose to build a contract that would be similar in functionality to the challenge system I will be making for the platform we’re building, AllSkills (https://allskills.ca).
+
+At the core, the contract sets up a challenge between pieces of media that users can vote on to determine the winner. The contract is initialized with a chosen round length, number of opponents, and list of opponents to chose from. Users can vote more than once, and the time between is determined by a set cooldown. The system can be modified to accept challenges resulting in a tie, but currently If the challenge ends in a tie, the challenge goes in to overtime. After a winner is decided, a reward pool distribution is calculated. In the final system, all votes will be tokens that get distributed to voters and winners. 
+
+This contract is written using AssemblyScript. I was in the process of building a factory for this contract and started to run in to some issues when I decided it would be best to switch over to using Rust. I’m using this as my submission for now though. 
+
+# Deploy
+To deploy the contract, follow these steps:
+1. clone this repo locally
+2. run yarn to install dependencies
+3. run ./scripts/dev-deploy.sh and follow the on-screen instruction to deploy the contract
+
+# Usage
+Run ./scripts/run-duel.sh to simulate a duel
+
+'''
+'''--- as-pect.config.js ---
+module.exports = require("near-sdk-as/imports");
+module.exports.include.push("**/*.unit.spec.ts");
+'''
+'''--- as-pect.d.ts ---
+/// <reference types="@as-pect/assembly/types/as-pect" />
+'''
+'''--- as_types.d.ts ---
+/// <reference types="near-sdk-as/assembly/as_types" />
+'''
+'''--- asconfig.json ---
+{
+    "extends": "near-sdk-as/asconfig.json"
+}
+'''
+'''--- assembly/index.ts ---
+import {context, storage, PersistentMap, RNG} from "near-sdk-as";
+import { Duel, AccountId, Opponent, MAX_OPPONENTS, Timestamp , opIDs, owners} from "./models";
+
+export function init(submissions: Map<AccountId, Opponent>,numOpponents: i32, lenInSeconds: Timestamp = 1200): void {
+    assert(submissions.size >= numOpponents, "Not enough opponents")
+    validate_submissions(submissions)
+    const rng = new RNG<u32>(submissions.size, submissions.size);
+    const opponents = new PersistentMap<AccountId, Opponent>("o");
+    const accounts = submissions.keys()
+    let r = rng.next()
+    let last: i32;
+    for (let i = 0; i < numOpponents; i++) {
+        const sub = submissions.get(accounts[r])
+        opponents.set(accounts[r], sub)
+        opIDs.add(accounts[r])
+        last = r;
+        r = rng.next()
+        while (r == last) {
+            r = rng.next()
+        }
+    }
+    owners.add(context.predecessor)
+    Duel.create(opponents, lenInSeconds);
+}
+export function end_duel(): string {
+    assert_owner()
+    const ended = Duel.end()
+    if (ended) {
+        return "Duel ended"
+    } else {
+        return "No winner decided, duel still going"
+    }
+}
+export function validate_submissions(submissions: Map<AccountId, Opponent>): bool {
+    assert(submissions.size < MAX_OPPONENTS, "Too many opponents")
+    let accounts = submissions.keys()
+    for(let i = 0; i < submissions.size; i++){
+        let sub = submissions.get(accounts[i])
+        assert_account_is_valid(accounts[i], sub.account)
+        assert_data_is_valid(sub.data)
+        assert_title_is_valid(sub.title)
+    }
+    return true
+}
+export function vote_for(receiver: AccountId): string {
+    assert_contract_is_initialized()
+    assert(context.sender == context.predecessor, "Users must vote directly")
+    //assert(!voters.has(context.sender), "You have already voted.")
+    return Duel.vote_for(context.predecessor, receiver)
+}
+export function get_vote_score(): i32 {
+    assert_contract_is_initialized()
+   return Duel.get_total_votes()
+}
+export function get_vote_score_for(receiver: AccountId): i32 {
+    assert_contract_is_initialized()
+    assert(opIDs.has(receiver), "Opponent doesn't exist.")
+    return Duel.get_vote_count_for(receiver)
+}
+export function check_if_active(): bool {
+    return Duel.get().active
+}
+export function get_opponents(): Array<Opponent> {
+    assert_contract_is_initialized()
+    const ops = new Array<Opponent>();
+    let opponents = Duel.get().opponents
+    for (let i = 0; i < opIDs.size; i++) {
+        let opponent = opponents.get(opIDs.values()[i])!
+        ops.push(opponent)
+    }
+    return ops
+}
+export function get_opponent(opponent: AccountId): Opponent {
+    assert(opIDs.has(opponent), "Opponent doesn't exist")
+    return Duel.get().opponents.get(opponent)!
+}
+export function get_duel(): Duel {
+    return Duel.get()
+}
+export function get_pool_distribution(): Map<string, number> {
+    return Duel.get().poolDistribution
+}
+function assert_owner(): void {
+    const caller = context.predecessor
+    assert(owners.has(caller), "Only the owners of this contract may call this function")
+}
+function assert_data_is_valid(data: string): void {
+    assert(data.includes("9gag"), "Link data is invalid.")
+}
+
+function assert_title_is_valid(title: string): void {
+    assert(title.length > 0, "Missing a title.")
+    assert(title.length < 100, "Title is too long.")
+}
+
+function assert_account_is_valid(account: string, sub: string): void {
+    assert(account == sub, "Account info doesn't match.")
+}
+
+function is_initialized(): bool {
+    return storage.hasKey("state");
+}
+
+function assert_contract_is_initialized(): void {
+    assert(is_initialized(), "Contract must be initialized first.");
+}
+
+'''
+'''--- assembly/models.ts ---
+import {
+    context,
+    storage,
+    PersistentMap,
+    PersistentSet,
+} from "near-sdk-as";
+
+export type Timestamp = u64;
+export type VoteCount = i32;
+export type AccountId = string;
+export const NANO_FROM_S:Timestamp = 1000000000;
+export const NANO_FROM_MS:Timestamp = 1000000;
+export const MAX_OPPONENTS = 10;
+//Shortened for testing
+export const VOTE_COOLDOWN:Timestamp = 12 * NANO_FROM_S;
+
+const WINNER_CUT = 0.1
+const OVERTIME:Timestamp = 600 * NANO_FROM_S
+
+//Holds count of total votes received and a map of the vote count of each user that voted for it
+@nearBindgen
+export class Opponent {
+    voteScore: VoteCount = 0;
+    voters: Map<AccountId,VoteCount> = new Map<AccountId, VoteCount>();
+    constructor(
+        public title: string,
+        public data: string,
+        public account: AccountId,     
+    ) {}
+}
+//Handles logic for a Duel between X# Opponents, up to MAX_OPPONENTS, decided by votes. Rounds last for X# seconds.
+//Users can vote for either opponent, not exclusively, and once per VOTE_COOLDOWN
+//If result is a tie, increase round length by OVERTIME
+//Once complete, set to inactive and distribute reward pool to winner and voters
+@nearBindgen
+export class Duel {
+    created_at: Timestamp = context.blockTimestamp;
+    active: bool;
+    winner: Opponent;
+    overtime: bool = false;
+    totalVotes: i32 = 0;
+    poolDistribution: Map<AccountId, f64> = new Map<AccountId, f64>();
+    constructor(
+        public opponents: PersistentMap<AccountId, Opponent>,
+        public roundLength: u64,
+        public numOpponents: i32
+    ) {}
+    static create(challengers: PersistentMap<AccountId, Opponent>, lenInSeconds: u64): void {
+        let numOpponents = challengers.get.length
+        assert(numOpponents < MAX_OPPONENTS, "Too many opponents")
+        const duel = new Duel(challengers, lenInSeconds * NANO_FROM_S, numOpponents)
+        duel.active = true;
+        this.set(duel);
+    }
+    static vote_for(voter: string, receiver: AccountId): string {
+        //Checks if duel is active, if it should be inactivated, if opponent exists, and if user can vote
+        assert(this.get().active, "This duel is no longer active")
+        if(!this.shouldBeActive()) return "This duel has just completed"
+        const duel = this.get()
+        assert(duel.opponents.contains(receiver), "Opponent doesn't exist.")
+        const opponent = duel.opponents.get(receiver)!
+        assert(this.canVote(voter), "You must wait longer to vote again.")
+        //if voter has already voted, increase their vote count by 1
+        if (opponent.voters.has(voter)) {
+            var voteCount = opponent.voters.get(voter)
+            voteCount = voteCount + 1
+            opponent.voters.set(voter, voteCount)
+        //else add voter
+        } else {
+            opponent.voters.set(voter, 1)
+        }
+        //increase voteScore and totalVotes, save opponents/duel/voterHistory
+        opponent.voteScore = opponent.voteScore + 1
+        duel.totalVotes  = duel.totalVotes + 1
+        duel.opponents.set(receiver, opponent)
+        this.set(duel)
+        //Used to track times of votes to check if voter cooldown is up
+        voterHistory.set(voter, context.blockTimestamp)
+        return "Vote accepted"
+    }
+    static canVote(voter: AccountId): bool {
+        //More logic to verify if user can vote can go here
+        if (voterHistory.contains(voter)) {
+            let lastVoted = voterHistory.getSome(voter)
+            return this.isLaterThan(lastVoted, VOTE_COOLDOWN)
+        } else {
+            return true
+        }     
+    }
+    static shouldBeActive(): bool {
+        //Checks if the time since start of duel is longer than roundLength then checks for winner
+        if (this.isLaterThan(this.get().created_at, this.get().roundLength)) {
+            return this.end()
+        }
+        return true
+    }
+    //Checks if now is later than the given start time and duration
+    static isLaterThan(time: u64, duration: u64): bool {
+        const now = context.blockTimestamp
+        const timeDiff = now - time
+        if (timeDiff > duration) {
+            return true
+        } else {
+            return false
+        }
+    }
+    //Checks for winner, if more than 1 winner (tie) then engage overtime
+    static winnerDecided(): bool {
+        const duel = this.get()
+        let winner: Array<Opponent> = []
+        let highest = 0
+        let opponentIDs = opIDs.values()
+        for (let i = 0; i < opIDs.size; i++) {
+            assert(duel.opponents.contains(opponentIDs[i]), "Opponent missing?")
+            let op = duel.opponents.get(opponentIDs[i])!
+            let score = op.voteScore
+            if (score > highest) {
+                winner = [op]
+                highest = score
+            } else if (score == highest) {
+                winner.push(op)
+            }
+        }
+        //Can add system to handle multiple winners/ties, for now only engages overtime
+        if (winner.length > 1) {
+            this.engageOvertime()
+            return false
+        } else {
+            duel.winner = winner[0]
+            this.set(duel)
+            return true
+        }
+    }
+    static engageOvertime(): void {
+        const duel = this.get()
+        duel.roundLength = duel.roundLength + OVERTIME
+        duel.overtime = true
+        this.set(duel)
+    }
+    static end(): bool {
+        //More logic to handle end of duel can go here
+        const ended = this.winnerDecided()
+        if(ended === true) {
+            const duel = this.get()
+            duel.active = false
+            this.set(duel)
+            this.distributePool();
+            return true
+        }
+
+        return false
+    }
+    //Calculates share the winner receives, and each voter receives, and sets poolDistribution
+    static distributePool(): void {
+        const duel = this.get()
+        assert(duel.active === false, "Duel is still active")
+        assert(duel.winner !== null, "Winner not decided?")
+        //One improvement would be a sliding scale for WINNER_CUT, closer the votes = bigger cut
+        let winnerShare = duel.totalVotes * WINNER_CUT
+        duel.poolDistribution.set(duel.winner.account.toString(), winnerShare)
+        let votersOfWinner = duel.winner.voters
+        let voterSharePerPoint = ((duel.totalVotes - winnerShare) / duel.winner.voteScore)
+        for (let i = 0; i < votersOfWinner.size; i++){
+            let voter = votersOfWinner.keys()[i]
+            let voteCount = votersOfWinner.get(voter)
+            let voterShare = voteCount * voterSharePerPoint
+            duel.poolDistribution.set(voter, voterShare)
+        }
+        this.set(duel)
+        //give share to winner
+        //give share to voters    
+    }
+    static get_total_votes(): i32 {
+        const duel = this.get()
+        return duel.totalVotes
+    }
+    static get_vote_count_for(receiver: AccountId): i32 {
+        const duel = this.get()
+        assert(duel.opponents.contains(receiver), "Opponent doesn't exist.")
+        const votes = duel.opponents.get(receiver)!.voteScore
+        return votes
+    }
+    static get(): Duel {
+        return storage.getSome<Duel>("state")
+    }
+    static set(duel: Duel): void {
+        storage.set("state", duel)
+    }
+}
+export const opIDs = new PersistentSet<AccountId>("ops");
+export const owners = new PersistentSet<AccountId>("admin")
+const voterHistory = new PersistentMap<AccountId, Timestamp>("voters");
+'''
+'''--- package.json ---
+{
+  "name": "vote_contract",
+  "version": "1.0.0",
+  "author": "Me",
+  "license": "ISC",
+  "devDependencies": {
+    "@as-pect/cli": "^6.2.4",
+    "near-sdk-as": "^3.2.3"
+  },
+  "scripts": {
+    "build": "asb --target debug",
+    "build:release": "asb",
+    "test": "yarn build:release && npx asp --verbose --nologo"
+  }
+}
+
+'''
+'''--- scripts/dev-deploy.sh ---
+#!/usr/bin/env bash
+echo
+echo "Removing contents of ./neardev folder"
+echo
+rm -rf ./neardev
+echo
+echo "Building contract"
+echo
+yarn build:release
+echo
+echo "Deploying contract"
+echo
+near dev-deploy ./build/release/vote_contract.wasm
+echo "Run the following commands"
+echo
+echo 'export CONTRACT=<dev-123>'
+echo 'export OWNER=<dev-123>'
+echo 'export CALLER=<another-account-id>'
+echo "near call \$CONTRACT init '{\"lenInSeconds\": \"120\",\"numOpponents\":2, \"submissions\": {\"test1\": {\"title\": \"first\", \"data\":\"https://9gag.com/gag/ayMDG8Y\", \"account\": \"test1\"},\"test2\": {\"title\": \"second\", \"data\":\"https://9gag.com/gag/ayMDG8Y\", \"account\": \"test2\"}}}' --accountId \$CONTRACT"
+echo
+
+exit 0
+'''
+'''--- scripts/run-duel.sh ---
+#!/usr/bin/env bash
+set -e
+
+[ -z "$CONTRACT" ] && echo "Missing \$CONTRACT environment variable" && exit 1
+[ -z "$OWNER" ] && echo "Missing \$OWNER environment variable" && exit 1
+[ -z "$CALLER" ] && echo "Missing \$CALLER environment variable" && exit 1
+
+echo "Owner voting for: "
+near call $CONTRACT vote_for '{"receiver":"test1"}' --accountId $OWNER
+echo "Getting vote score"
+near view $CONTRACT get_vote_score_for '{"receiver":"test1"}'
+echo "Caller voting for: "
+near call $CONTRACT vote_for '{"receiver":"test2"}' --accountId $CALLER
+echo "Getting vote score"
+near view $CONTRACT get_vote_score_for '{"receiver":"test2"}'
+echo "Vote cooldown set to 12s, sleeping for 12s"
+sleep 12
+echo "Owner voting again for:"
+near call $CONTRACT vote_for '{"receiver":"test1"}' --accountId $OWNER
+near view $CONTRACT get_vote_score_for '{"receiver":"test1"}'
+echo "Get opponent data"
+near view $CONTRACT get_opponents 
+echo "End duel early"
+near call $CONTRACT end_duel --accountId $CONTRACT
+echo "Verify duel completed"
+near view $CONTRACT check_if_active
+echo "View reward pool distribution"
+near view $CONTRACT get_pool_distribution
+echo "View duel details"
+near view $CONTRACT get_duel
+
+exit 0
+'''
+'''--- tests/index.unit.spec.ts ---
+import { VMContext } from "near-sdk-as";
+import * as model from "../assembly/models";
+import * as contract from "../assembly";
+
+const OP_ONE = new model.Opponent("first", "https://9gag.com/gag/ayMDG8Y", "test1");
+const OP_TWO = new model.Opponent("second", "https://9gag.com/gag/ayMDG8Y", "test2");
+const OP_THREE = new model.Opponent("third", "https://9gag.com/gag/ayMDG8Y", "test3");
+const OP_FOUR = new model.Opponent("fourth", "https://9gag.com/gag/ayMDG8Y", "test4");
+const NANO_TO_MS: model.Timestamp = 1000000;
+
+const NUM_OPPONENTS = 2
+
+describe("Duel initialization", () =>{
+    it("Starts a duel with the correct number of opponents", () => {
+        let opponents = new Map<string, model.Opponent>()
+        opponents.set("test1", OP_ONE)
+        opponents.set("test2", OP_TWO)
+        opponents.set("test3", OP_THREE)
+        opponents.set("test4", OP_FOUR)
+        
+        contract.init(opponents, NUM_OPPONENTS)
+
+        const ops = contract.get_opponents()
+
+        expect(ops.length).toBe(NUM_OPPONENTS)
+    })
+    it("Starts a duel with valid submissions and no duplicates", () => {
+        let opponents = new Map<string, model.Opponent>()
+        opponents.set("test1", OP_ONE)
+        opponents.set("test2", OP_TWO)
+
+        contract.init(opponents, opponents.size)
+
+        const ops = contract.get_opponents()
+
+        expect(ops[0].account).not.toBe(ops[1].account)
+        expect(ops).toContainEqual(OP_ONE)
+        expect(ops).toContainEqual(OP_TWO)
+    })
+    throws("Fails to start a duel because of incorect metadata", () => {
+        let opponents = new Map<string, model.Opponent>()
+        opponents.set("test1", OP_ONE)
+        opponents.set("fail", OP_TWO)
+
+        contract.init(opponents, opponents.size)
+    })
+    throws("Fails to start a duel because of missing metadata", () => {
+        let opponents = new Map<string, model.Opponent>()
+        opponents.set("test1", OP_ONE)
+        opponents.set("test2", new model.Opponent("second", "", "test2"))
+
+        contract.init(opponents, opponents.size)
+    })
+    throws("Fails when trying to create duel with too many opponents", () => {
+        let opponents = new Map<string, model.Opponent>()
+        let tooManyOpponents = model.MAX_OPPONENTS + 2
+        for (let i = 0; i < tooManyOpponents; i++) {
+            opponents.set(i.toString(), new model.Opponent(i.toString(), "https://9gag.com/gag/ayMDG8Y", i.toString()))
+        }
+
+        contract.init(opponents, tooManyOpponents)
+    })
+    throws("Fails when trying to create duel with not enough opponents", () => {
+        let opponents = new Map<string, model.Opponent>()
+        opponents.set("test1", OP_ONE)
+        opponents.set("test2", OP_TWO)
+        opponents.set("test3", OP_THREE)
+        
+        let notEnoughOpponents = opponents.size + 1
+
+        contract.init(opponents, notEnoughOpponents)
+    })
+})
+
+describe("Duel voting", () => {
+    beforeEach(() => {
+        VMContext.setPredecessor_account_id("allskills");
+        let opponents = new Map<string, model.Opponent>()
+        opponents.set("test1", OP_ONE)
+        opponents.set("test2", OP_TWO)
+        contract.init(opponents, opponents.size)
+        VMContext.setPredecessor_account_id("bob");
+    })
+
+    it("Sends vote to correct opponent",() => {
+        contract.vote_for("test1")
+        expect(contract.get_vote_score_for("test1")).toBe(1)
+        expect(contract.get_vote_score_for("test2")).toBe(0)
+    })
+    throws("Stops user from voting too often.", () => {
+        contract.vote_for("test1")
+        expect(contract.get_vote_score_for("test1")).toBe(1)
+        contract.vote_for("test1")
+    })
+    it("Keeps track of total votes",() => {
+        contract.vote_for("test1")
+        VMContext.setSigner_account_id("allskills")
+        VMContext.setPredecessor_account_id("allskills");
+        contract.vote_for("test2")
+
+        expect(contract.get_vote_score()).toBe(2);
+    })
+    it("Keeps track of users vote counts per opponent",() => {
+        contract.vote_for("test1")
+        const opponent = contract.get_opponent("test1")
+        expect(opponent.voters.get("bob")).toBe(1)
+    })
+})
+ /*Can't get these tests to work? functionality works in contracts. 
+describe("Duel time restraints", () => {
+    it("Should deny the second vote report as inactive", () => {
+        VMContext.setPredecessor_account_id("allskills");
+        VMContext.setSigner_account_id("allskills")
+        let opponents = new Map<string, model.Opponent>()
+        let roundLength = 5
+        opponents.set("test1", OP_ONE)
+        opponents.set("test2", OP_TWO)
+        contract.init(opponents, opponents.size, roundLength)  
+        contract.vote_for("test1")
+        const target = Date.now() + roundLength * 1000 + 1000 
+        while(target > Date.now()) {} 
+        VMContext.setPredecessor_account_id("bob");
+        VMContext.setSigner_account_id("bob")
+        expect(contract.vote_for("test1")).toBe("This duel has just completed")
+        expect(contract.check_if_active()).toBe(false)
+    })
+    it("Allows users to vote again after certain time",() => {
+        let opponents = new Map<string, model.Opponent>()
+        opponents.set("test1", OP_ONE)
+        opponents.set("test2", OP_TWO)
+        contract.init(opponents, opponents.size)  
+        contract.vote_for("test1")
+        expect(contract.get_vote_score_for("test1")).toBe(1)
+        const target = Date.now() + (model.VOTE_COOLDOWN / NANO_TO_MS) + 1000
+        while(target > Date.now()) {}
+        contract.vote_for("test1")
+        expect(contract.get_vote_score_for("test1")).toBe(2)
+    })
+})
+/*describe("Reward pool distribution", () => {
+    beforeEach(() => {
+        let opponents = new Map<string, model.Opponent>()
+        opponents.set("test1", OP_ONE)
+        opponents.set("test2", OP_TWO)
+        contract.init(opponents, opponents.size)        
+    })
+    it("Checks if winner gets correct share", () => {
+
+    })
+    it("Checks if voters receive correct share", () => {
+
+    })
+})*/
+'''
+'''--- tsconfig.json ---
+{
+    "extends": "./node_modules/assemblyscript/std/assembly.json",
+    "include": ["./**/*.ts"]
+}
+'''

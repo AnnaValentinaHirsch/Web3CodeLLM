@@ -1,0 +1,283 @@
+*GitHub Repository "adieUkid/near-tree-hole"*
+
+'''--- babel.config.js ---
+module.exports = {
+  presets: [
+    '@vue/cli-plugin-babel/preset'
+  ]
+}
+
+'''
+'''--- contract/compile.js ---
+// This file does two things:
+//
+// 1. Compile the Rust contract using cargo (see buildCmd below). This will
+//    create a wasm file in the 'build' folder.
+// 2. Create a symbolic link (symlink) to the generated wasm file in the root
+//    project's `out` folder, for easy use with near-cli.
+//
+// First, import some helper libraries. `shelljs` is included in the
+// devDependencies of the root project, which is why it's available here. It
+// makes it easy to use *NIX-style scripting (which works on Linux distros,
+// macOS, and Unix systems) on Windows as well.
+const sh = require('shelljs')
+
+// Figure out which directory the user called this script from, which we'll use
+// later to set up the symlink.
+const calledFromDir = sh.pwd().toString()
+
+// For the duration of this script, we want to operate from within the
+// Rust project's folder. Let's change into that directory.
+sh.cd(__dirname)
+
+// You can call this script with `node compile.js` or `node compile.js
+// --debug`. Let's set a variable to track whether `--debug` was used.
+const debug = process.argv.pop() === '--debug'
+
+// You can call this script with `node compile.js` or `node compile.js --debug`.
+// Let's set a variable to track whether `--debug` was used.
+// Note: see other flags in ./cargo/config. Unfortunately, you cannot set the
+// `--target option` in Cargo.toml.
+const buildCmd = debug
+  ? 'cargo build --target wasm32-unknown-unknown'
+  : 'cargo build --target wasm32-unknown-unknown --release'
+
+// Execute the build command, storing exit code for later use
+const { code } = sh.exec(buildCmd)
+
+// Assuming this is compiled from the root project directory, link the compiled
+// contract to the `out` folder –
+// When running commands like `near deploy`, near-cli looks for a contract at
+// <CURRENT_DIRECTORY>/out/main.wasm
+if (code === 0 && calledFromDir !== __dirname) {
+  const linkDir = `${calledFromDir}/out`
+  const link = `${calledFromDir}/out/main.wasm`
+  const packageName = require('fs').readFileSync(`${__dirname}/Cargo.toml`).toString().match(/name = "([^"]+)"/)[1]
+  const outFile = `./target/wasm32-unknown-unknown/${debug ? 'debug' : 'release'}/${packageName}.wasm`
+  sh.mkdir('-p', linkDir)
+  sh.rm('-f', link)
+  //fixes #831: copy-update instead of linking .- sometimes sh.ln does not work on Windows
+  sh.cp('-u',outFile,link)
+}
+
+// exit script with the same code as the build command
+process.exit(code)
+
+'''
+'''--- copy-dev-account.js ---
+let fs=require('fs')
+// copy created contract name for vue-cli-service at ./.env
+const contractNameFilePath = './neardev/dev-account';
+const existingContractName = fs.readFileSync(contractNameFilePath, { encoding: "utf8" }).trim();
+const vueEnvFile = "./.env.development.local"
+fs.writeFileSync(vueEnvFile , "VUE_APP_CONTRACT_NAME=" + existingContractName)
+console.log(`copied ${contractNameFilePath} to ${vueEnvFile}`)
+'''
+'''--- jest.config.js ---
+module.exports = {
+  preset: '@vue/cli-plugin-unit-jest',
+  modulePaths: [
+    "node_modules",
+    "src"
+  ]
+}
+
+'''
+'''--- src/config.js ---
+const CONTRACT_NAME = process.env.VUE_APP_CONTRACT_NAME || 'dev-1630168857905-2908007'
+
+function getConfig(env) {
+  switch (env) {
+    case 'production':
+    case 'mainnet':
+      return {
+        networkId: 'mainnet',
+        nodeUrl: 'https://rpc.mainnet.near.org',
+        contractName: CONTRACT_NAME,
+        walletUrl: 'https://wallet.near.org',
+        helperUrl: 'https://helper.mainnet.near.org',
+        explorerUrl: 'https://explorer.mainnet.near.org',
+      }
+    case 'development':
+    case 'testnet':
+      return {
+        networkId: 'testnet',
+        nodeUrl: 'https://rpc.testnet.near.org',
+        contractName: CONTRACT_NAME,
+        walletUrl: 'https://wallet.testnet.near.org',
+        helperUrl: 'https://helper.testnet.near.org',
+        explorerUrl: 'https://explorer.testnet.near.org',
+      }
+    case 'betanet':
+      return {
+        networkId: 'betanet',
+        nodeUrl: 'https://rpc.betanet.near.org',
+        contractName: CONTRACT_NAME,
+        walletUrl: 'https://wallet.betanet.near.org',
+        helperUrl: 'https://helper.betanet.near.org',
+        explorerUrl: 'https://explorer.betanet.near.org',
+      }
+    case 'local':
+      return {
+        networkId: 'local',
+        nodeUrl: 'http://localhost:3030',
+        keyPath: `${process.env.HOME}/.near/validator_key.json`,
+        walletUrl: 'http://localhost:4000/wallet',
+        contractName: CONTRACT_NAME,
+      }
+    case 'test':
+    case 'ci':
+      return {
+        networkId: 'shared-test',
+        nodeUrl: 'https://rpc.ci-testnet.near.org',
+        contractName: CONTRACT_NAME,
+        masterAccount: 'test.near',
+      }
+    case 'ci-betanet':
+      return {
+        networkId: 'shared-test-staging',
+        nodeUrl: 'https://rpc.ci-betanet.near.org',
+        contractName: CONTRACT_NAME,
+        masterAccount: 'test.near',
+      }
+    default:
+      throw Error(`Unconfigured environment '${env}'. Can be configured in src/config.js.`)
+  }
+}
+
+module.exports = getConfig
+
+'''
+'''--- src/main.js ---
+import Vue from 'vue'
+import App from './App.vue'
+import ViewUI from 'view-design'
+
+import { initContract } from './utils'
+
+Vue.use(ViewUI)
+Vue.config.productionTip = false
+
+window.nearInitPromise = initContract().then(() => {
+  new Vue({
+    render: (h) => h(App),
+  }).$mount('#app')
+})
+
+'''
+'''--- src/utils.js ---
+import { connect, Contract, keyStores, WalletConnection } from 'near-api-js'
+import getConfig from './config'
+
+const nearConfig = getConfig(process.env.NODE_ENV || 'development')
+
+console.log(nearConfig)
+
+// Initialize contract & set global variables
+export async function initContract() {
+  // Initialize connection to the NEAR testnet
+  const near = await connect(
+    Object.assign({ deps: { keyStore: new keyStores.BrowserLocalStorageKeyStore() } }, nearConfig)
+  )
+
+  // Initializing Wallet based Account. It can work with NEAR testnet wallet that
+  // is hosted at https://wallet.testnet.near.org
+  window.walletConnection = new WalletConnection(near)
+
+  // Getting the Account ID. If still unauthorized, it's just empty string
+  window.accountId = window.walletConnection.getAccountId()
+
+  // Initializing our contract APIs by contract name and configuration
+  window.contract = await new Contract(window.walletConnection.account(), nearConfig.contractName, {
+    // View methods are read only. They don't modify the state, but usually return some value.
+    viewMethods: ['get_secrets'],
+    // Change methods can modify the state. But you don't receive the returned value when called.
+    changeMethods: ['add_secret'],
+  })
+}
+
+export function logout() {
+  window.walletConnection.signOut()
+  // reload page
+  window.location.replace(window.location.origin + window.location.pathname)
+}
+
+export function login() {
+  // Allow the current app to make calls to the specified contract on the
+  // user's behalf.
+  // This works by creating a new access key for the user's account and storing
+  // the private key in localStorage.
+  window.walletConnection.requestSignIn(nearConfig.contractName)
+}
+
+'''
+'''--- tests/unit/Notification.spec.js ---
+import { shallowMount } from '@vue/test-utils'
+import Notification from 'components/Notification.vue'
+
+describe('Notification.vue Test', () => {
+  it('renders message when component is created', () => {
+    // render the component
+    const wrapper = shallowMount(Notification, {
+      propsData: {
+        msg: 'Test Message'
+      }
+    })
+
+    console.log(wrapper.text())
+
+    //check msg prop
+    expect(wrapper.props("msg")).toMatch('Test Message')
+
+    // check that the message is rendered
+    expect(wrapper.text()).toMatch('Test Message')
+
+    // check that additional the text is rendered
+    expect(wrapper.text()).toMatch('in contract')
+
+  })
+})
+'''
+'''--- tests/unit/SignedIn.spec.js ---
+import { shallowMount } from '@vue/test-utils'
+import SignedIn from 'components/SignedIn.vue'
+import Notification from 'components/Notification.vue'
+
+describe('SignedIn.vue Test', () => {
+  it('compose component', () => {
+    // render the component
+    const wrapper = shallowMount(SignedIn, {})
+
+    // check that the text is rendered
+    expect(wrapper.text()).toMatch('This greeting is stored on the NEAR blockchain')
+
+    // check that the logout button is rendered
+    expect(wrapper.find('button').text()).toBe("Sign out")
+
+    // check that the save button is rendered
+    expect(wrapper.find('#save').text()).toBe("Save")
+
+    // check the notification component is present
+    expect(wrapper.findComponent(Notification).exists()).toBe(true)
+
+  })
+})
+'''
+'''--- tests/unit/SignedOut.spec.js ---
+import { shallowMount } from '@vue/test-utils'
+import SignedOut from 'components/SignedOut.vue'
+
+describe('SignedOut.vue Test', () => {
+  it('compose main page', () => {
+    // render the component
+    const wrapper = shallowMount(SignedOut, {})
+
+    // check that the text is rendered
+    expect(wrapper.text()).toMatch('Welcome to NEAR')
+
+    // check that the login button rendered
+    expect(wrapper.find('button').text()).toBe("Sign in")
+
+  })
+})
+'''

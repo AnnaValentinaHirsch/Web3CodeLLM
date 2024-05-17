@@ -1,0 +1,955 @@
+*GitHub Repository "NEARFoundation/api.smart-whitelist"*
+
+'''--- README.md ---
+# api.smart-whitelist
+
+Before run create .env file and fill it with:
+```
+MONGO,
+PORT,
+NETWORK,
+SERVICE_ACCOUNT_SEED_PHRASE,
+SERVICE_ACCOUNT_ID,
+SMART_WHITELIST_CONTRACT_ID,
+ONFIDO_API_TOKEN,
+ONFIDO_REFERRER,
+EXTERNAL_SERVER_URL
+```
+
+'''
+'''--- package.json ---
+{
+  "name": "api.smart-whitelist",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "start-dev": "nodemon -r dotenv/config src/index.js dotenv_config_path=.env.development",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NEAR-labs/api.smart-whitelist.git"
+  },
+  "dependencies": {
+    "axios": "^0.26.1",
+    "bs58": "^5.0.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.0.0",
+    "express": "^4.17.3",
+    "mongoose": "^6.2.2",
+    "near-api-js": "^0.44.2",
+    "near-seed-phrase": "^0.2.0",
+    "@onfido/api": "^2.1.2"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.15",
+    "prettier": "^2.5.1"
+  },
+  "keywords": [],
+  "author": "Oleh Ivaniuk",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/NEAR-labs/api.smart-whitelist/issues"
+  },
+  "homepage": "https://github.com/NEAR-labs/api.smart-whitelist#readme"
+}
+
+'''
+'''--- src/config/near.config.js ---
+const networkId = process.env.NETWORK;
+
+export const getNearConfig = () => {
+  let config;
+  switch (networkId) {
+    case 'production':
+    case 'mainnet':
+      config = {
+        networkId: 'mainnet',
+        nodeUrl: 'https://rpc.mainnet.near.org',
+      };
+      break;
+    case 'development':
+    case 'testnet':
+      config = {
+        networkId: 'testnet',
+        nodeUrl: 'https://rpc.testnet.near.org',
+      };
+      break;
+    default:
+      config = {
+        networkId: 'unknown',
+        nodeUrl: 'unknown',
+      };
+  }
+  return config;
+}
+
+'''
+'''--- src/helpers/checkParameters.js ---
+import { Account } from "../models/Account.js";
+import { checkSessionToken } from "./checkSessionToken.js";
+import { getApplicantPk } from "./getApplicantPk.js";
+import { verifySignature } from "./verifySignature.js";
+
+export const checkParameters = async (req, res, useContract = true) => {
+  let message = null;
+  let account = null;
+
+  const accountId = req.body["account_id"];
+  if (!accountId) {
+    message = 'No account_id specified';
+    res.status(400).send({ error: message });
+  } else {
+    let publicKey = null;
+    if (useContract) {
+      publicKey = await getApplicantPk(accountId, req.app.get('near'));
+      if (!publicKey) {
+        message = 'Unknown applicant';
+        res.status(400).send({ error: message });
+      } else {
+        console.log(`PublicKey: ${publicKey}`);
+      }
+    }
+
+    if (!message) {
+      const signature = `${req.body["signature"]}`;
+      account = await Account.findOne({ accountId });
+      if (!account) {
+        message = 'Account ID has not registered in the system. Try to sign up first';
+        res.status(400).send({ error: message });
+      } else if (!checkSessionToken(account)) {
+        message = 'Session expired, sign in again';
+        res.status(401).send({ error: message });
+      }
+      else if (
+        !verifySignature(
+          signature,
+          useContract ? publicKey : account.publicKey,
+          account.sessionToken
+        )
+      ) {
+        message = 'Incorrect signature';
+        res.status(401).send({ error: message });
+      } else {
+        console.log(`Signature is ok`);
+      }
+    }
+  }
+
+  return { account, message };
+}
+
+'''
+'''--- src/helpers/checkSessionToken.js ---
+export const checkSessionToken = (account, delay = 1800) =>
+  Date.now() <= account.sessionTokenTimestamp.getTime() + delay * 1000; // 30 min delay
+
+'''
+'''--- src/helpers/getApplicantPk.js ---
+import { getSmartWhitelistContract } from "./getSmartWhitelistContract.js";
+
+export const getApplicantPk = async (accountId, near) => {
+  const smartWhitelistContract = getSmartWhitelistContract(near);
+  return await smartWhitelistContract.get_applicant_pk({applicant_account_id: accountId});
+}
+
+'''
+'''--- src/helpers/getED25519KeyPair.js ---
+import { parseSeedPhrase } from 'near-seed-phrase';
+
+export const getED25519KeyPair = () => {
+  return parseSeedPhrase(process.env.SERVICE_ACCOUNT_SEED_PHRASE, "m/44'/397'/0'");
+};
+
+'''
+'''--- src/helpers/getSmartWhitelistContract.js ---
+import { Account, Contract } from 'near-api-js';
+
+export const getSmartWhitelistContract = (near) => {
+  const contractId = process.env.SMART_WHITELIST_CONTRACT_ID;
+  const accountId = process.env.SERVICE_ACCOUNT_ID;
+  return new Contract(new Account(near.connection, accountId), contractId, {
+    viewMethods: ['get_applicant_pk'],
+    changeMethods: ['add_account', 'remove_account'],
+  });
+}
+
+'''
+'''--- src/helpers/initNear.js ---
+import { connect, keyStores } from 'near-api-js';
+import { KeyPair } from 'near-api-js';
+import { getED25519KeyPair } from './getED25519KeyPair.js';
+import { getNearConfig } from '../config/near.config.js';
+
+export const initNear = async () => {
+  const accountId = process.env.SERVICE_ACCOUNT_ID;
+  const { networkId, nodeUrl } = getNearConfig();
+
+  const keyStore = new keyStores.InMemoryKeyStore();
+  const keyPair = KeyPair.fromString(getED25519KeyPair().secretKey);
+  await keyStore.setKey(networkId, accountId, keyPair);
+
+  return connect({
+    networkId,
+    nodeUrl,
+    keyStore,
+  });
+};
+
+'''
+'''--- src/helpers/initOnfido.js ---
+import { Onfido, Region } from "@onfido/api";
+
+export const initOnfido = () => {
+  return new Onfido({
+    apiToken: process.env.ONFIDO_API_TOKEN,
+    region: Region.EU
+  });
+}
+
+'''
+'''--- src/helpers/initWebhookEventVerifier.js ---
+import { Webhook } from "../models/Webhook.js";
+import { WebhookEventVerifier } from "@onfido/api";
+
+export const initWebhookEventVerifier = async () => {
+  const serverUrl = `${process.env.EXTERNAL_SERVER_URL}/send-check-result`;
+  const webhook = await Webhook.findOne({ serverUrl });
+  if (webhook) {
+    return new WebhookEventVerifier(webhook.token);
+  }
+  throw new Error('WebhookEventVerifier not initialized');
+}
+
+'''
+'''--- src/helpers/loggingRequestAndResponse.js ---
+export const loggingRequestAndResponse = (req, res, next) => {
+  let resWrite = res.write;
+  let resEnd = res.end;
+  let chunks = [];
+
+  res.write = function (chunk) {
+    chunks.push(chunk);
+    resWrite.apply(res, arguments);
+  };
+
+  res.end = function (chunk) {
+    if (chunk) {
+      chunks.push(chunk);
+    }
+    let body = chunks.join();
+
+    console.log("Url: " + req.path);
+    console.log("Request:");
+    console.log(req.rawBody);
+    console.log("Response:");
+    console.log(body);
+
+    resEnd.apply(res, arguments);
+  };
+  next();
+}
+
+'''
+'''--- src/helpers/randomValueHex.js ---
+import { randomBytes } from "crypto";
+
+export const randomValueHex = (len) => {
+  return randomBytes(Math.ceil(len / 2))
+    .toString('hex')
+    .slice(0, len).toUpperCase();
+}
+
+'''
+'''--- src/helpers/verifySignature.js ---
+import { PublicKey } from "near-api-js/lib/utils/index.js";
+import bs58 from 'bs58';
+
+export const verifySignature = (signature, publicKey, message) => {
+  try {
+    const sign = bs58.decode(signature);
+    const msg = Buffer.from(message);
+    const pk = PublicKey.fromString(publicKey);
+    return pk.verify(msg, sign);
+
+  } catch (e) {
+    console.log(e);
+    return false;
+  }
+}
+
+'''
+'''--- src/index.js ---
+import bodyParser from "express";
+import cors from 'cors';
+import express from 'express';
+import { initNear } from "./helpers/initNear.js";
+import { initOnfido } from "./helpers/initOnfido.js";
+import { initWebhookEventVerifier } from "./helpers/initWebhookEventVerifier.js";
+import { loggingRequestAndResponse } from "./helpers/loggingRequestAndResponse.js";
+import mongoose from 'mongoose';
+import { registerWebhook } from "./services/registerWebhook/registerWebhook.js";
+import { routes } from './routes/collector.routes.js';
+
+await mongoose.connect(process.env.MONGO);
+
+const app = express();
+app.use(cors());
+app.use(loggingRequestAndResponse);
+app.use(bodyParser.json({
+  verify: function(req, res, buf) {
+    req.rawBody = buf.toString();
+  }
+}));
+
+app.set('near', await initNear());
+app.set('onfido', await initOnfido());
+await registerWebhook(app);
+app.set('eventVerifier', await initWebhookEventVerifier());
+
+routes(app);
+app.listen(process.env.PORT);
+
+'''
+'''--- src/models/Account.js ---
+import mongoose from 'mongoose';
+const { Schema, model } = mongoose;
+
+const schema = new Schema({
+  accountId: {
+    type: String,
+    index: true,
+    unique: true,
+    required: true,
+  },
+  sessionToken: String,
+  sessionTokenTimestamp: Date,
+  publicKey: String,
+  status: String,
+  applicantId: String,
+  sdkToken: String,
+  sdkTokenTimestamp: Date,
+  checkId: String,
+  checkResult: String,
+  checkStartTimestamp: Date,
+  checkFinishTimestamp: Date,
+  email: String,
+  firstName: String,
+  lastName: String,
+  dob: String,
+  buildingName: String,
+  buildingNumber: String,
+  country: String,
+  flatNumber: String,
+  line1: String,
+  line2: String,
+  line3: String,
+  postcode: String,
+  state: String,
+  street: String,
+  subStreet: String,
+  town: String,
+});
+schema.index({applicantId: 1, checkId: 1}, {unique: false});
+
+export const Account = model('Account', schema);
+
+'''
+'''--- src/models/Event.js ---
+import mongoose from 'mongoose';
+const { Schema, model } = mongoose;
+
+const schema = new Schema({
+  checkId: {
+    type: String,
+    index: true,
+    unique: true,
+    required: true,
+  },
+  event: String,
+  eventTimestamp: Date,
+  processed: Boolean,
+});
+
+export const Event = model('Event', schema);
+
+'''
+'''--- src/models/Webhook.js ---
+import mongoose from 'mongoose';
+const { Schema, model } = mongoose;
+
+const schema = new Schema({
+  url: {
+    type: String,
+    index: true,
+    unique: true,
+    required: true,
+  },
+  id: String,
+  token: String,
+  webhookTimestamp: Date,
+});
+
+export const Webhook = model('Webhook', schema);
+
+'''
+'''--- src/routes/collector.routes.js ---
+import { createCheck } from "../services/createCheck/createCheck.js";
+import { generateSdkToken } from "../services/generateSdkToken/generateSdkToken.js";
+import { getApplicantCountries } from "../services/getApplicantCountries/getApplicantCountries.js";
+import { getCheckStatus } from "../services/getCheckStatus/getCheckStatus.js";
+import { registerApplicant } from "../services/registerApplicant/registerApplicant.js";
+import { registerSession } from "../services/registerSession/registerSession.js";
+import { sendCheckResult } from "../services/sendCheckResult/sendCheckResult.js";
+
+export const routes = app => {
+  app.post('/register-session', registerSession);
+  app.post('/register-applicant', registerApplicant);
+  app.post('/generate-sdk-token', generateSdkToken);
+  app.post('/create-check', createCheck);
+  app.post('/send-check-result', sendCheckResult);
+  app.get('/get-check-status', getCheckStatus);
+  app.get('/supported-applicant-countries', getApplicantCountries);
+}
+
+'''
+'''--- src/services/createCheck/createCheck.js ---
+import { checkParameters } from "../../helpers/checkParameters.js";
+
+export const createCheck = async (req, res) => {
+  try {
+    const onfido = req.app.get('onfido')
+    const { account, message } = await checkParameters(req, res);
+    if (!message) {
+      if (account.status !== 'registered_token') {
+        return res
+          .status(400)
+          .send({error: 'Verification cannot be performed at this stage'});
+      }
+
+      const applicantId = account.applicantId;
+      const newCheck = await onfido.check.create({
+        applicantId,
+        reportNames: ["document", "facial_similarity_photo"]
+      });
+
+      account.status = "verification_in_progress";
+      account.checkId = newCheck.id;
+      account.checkStartTimestamp = new Date();
+      await account.save();
+      console.log(`Check ID ${account.checkId}`)
+
+      res.send({});
+    }
+
+  } catch (e) {
+    console.log(e);
+    res
+      .status(500)
+      .send({ error: 'Verification not started. Please try again later' });
+  }
+}
+
+'''
+'''--- src/services/generateSdkToken/generateSdkToken.js ---
+import { checkParameters } from "../../helpers/checkParameters.js";
+
+export const generateSdkToken = async (req, res) => {
+  try {
+    const onfido = req.app.get('onfido')
+    const { account, message } = await checkParameters(req, res);
+    if (!message) {
+      if (account.status !== 'registered' && account.status !== 'registered_token') {
+        return res
+          .status(400)
+          .send({ error: 'SDK token cannot be generated at this stage' });
+      }
+
+      const sdkToken = await onfido.sdkToken.generate({
+        applicantId: account.applicantId,
+        referrer: process.env.ONFIDO_REFERRER,
+      });
+
+      account.status = "registered_token";
+      account.sdkToken = sdkToken;
+      account.sdkTokenTimestamp = new Date();
+      await account.save();
+      console.log(`SDK token ${account.sdkToken}`)
+
+      res.send({ sdk_token: account.sdkToken });
+    }
+
+  } catch (e) {
+    console.log(e);
+    res
+      .status(500)
+      .send({ error: 'STK token not created. Please try again later' });
+  }
+}
+
+'''
+'''--- src/services/getApplicantCountries/getApplicantCountries.js ---
+import axios from 'axios';
+
+export const getApplicantCountries = async (req, res) => {
+  try {
+    const response = await axios.get('https://documentation.onfido.com/supported-applicant-countries.json');
+    res.send(response.data);
+
+  } catch (e) {
+    console.log(e);
+    res
+      .status(500)
+      .send({ error: 'The list of applicant countries cannot be obtained. Please try again' });
+  }
+}
+
+'''
+'''--- src/services/getCheckStatus/getCheckStatus.js ---
+import { checkParameters } from "../../helpers/checkParameters.js";
+
+export const getCheckStatus = async (req, res) => {
+  try {
+    const { account, message } = await checkParameters(req, res, false);
+    if (!message) {
+      let status = account.status;
+      if (status !== 'verification_in_progress') {
+        return res
+          .status(400)
+          .send({error: 'Status cannot be requested at this stage'});
+      }
+      res.send({ status });
+    }
+
+  } catch (e) {
+    console.log(e);
+    res
+      .status(500)
+      .send({ error: 'Unable to get verification status. Please try again' });
+  }
+}
+
+'''
+'''--- src/services/registerApplicant/checkPersonalData.js ---
+export const checkPersonalData = (req, res) => {
+  const firstName = req.body["first_name"];
+  const lastName = req.body["last_name"];
+  const { email, dob, address } = req.body;
+
+  console.log(`First Name: ${firstName}`);
+  console.log(`Last Name: ${lastName}`);
+  console.log(`Email: ${email}`);
+  console.log(`Date of birth: ${dob}`);
+  console.log(`Address:`);
+  console.log(address);
+
+  let message = null;
+  let addressChecked = null;
+
+  if (!firstName) {
+    message = 'First name not specified';
+  } else if (!lastName) {
+    message = 'Last name not specified';
+  } else if (!dob) {
+    message = 'Date of birth not specified';
+  } else if (address) {
+    if (address instanceof Object) {
+      addressChecked = {
+        buildingName: address.buildingName,
+        buildingNumber: address.buildingNumber,
+        country: address.country,
+        flatNumber: address.flatNumber,
+        line1: address.line1,
+        line2: address.line2,
+        line3: address.line3,
+        postcode: address.postcode,
+        state: address.state,
+        street: address.street,
+        subStreet: address.subStreet,
+        town: address.town,
+      };
+    } else {
+      message = 'Incorrect address format';
+    }
+  }
+
+  if (message) {
+    res.status(400).send({ error: message });
+  }
+  return { firstName, lastName, email, dob, address: addressChecked, message };
+}
+
+'''
+'''--- src/services/registerApplicant/getStoredPerson.js ---
+export const getStoredPerson = (account) => {
+  let storedPerson = null;
+
+  if (account.status === 'registered' || account.status === 'registered_token' ||
+    account.status === 'account_is_whitelisted' || account.status === 'applicant_was_rejected')
+  {
+    storedPerson = {
+      firstName: account.firstName,
+      lastName: account.lastName,
+      email: account.email,
+      dob: account.dob,
+      address: {
+        buildingName: account.buildingName,
+        buildingNumber: account.buildingNumber,
+        country: account.country,
+        flatNumber: account.flatNumber,
+        line1: account.line1,
+        line2: account.line2,
+        line3: account.line3,
+        postcode: account.postcode,
+        state: account.state,
+        street: account.street,
+        subStreet: account.subStreet,
+        town: account.town,
+      },
+      message: null
+    };
+  }
+
+  return storedPerson;
+}
+
+'''
+'''--- src/services/registerApplicant/registerApplicant.js ---
+import { checkParameters } from "../../helpers/checkParameters.js";
+import { checkPersonalData } from "./checkPersonalData.js";
+import { getStoredPerson } from "./getStoredPerson.js";
+import { removeAccountFromWhitelist } from "./removeAccountFromWhitelist.js";
+import { updateAccountWithPersonalData } from "./updateAccountWithPersonalData.js";
+
+export const registerApplicant = async (req, res) => {
+  try {
+    const near = req.app.get('near');
+    const onfido = req.app.get('onfido')
+    const { account, message } = await checkParameters(req, res);
+
+    if (!message) {
+      if (account.status === 'verification_in_progress') {
+        return res
+          .status(400)
+          .send({ error: 'At this stage, registration of the applicant is not possible' });
+      }
+
+      const person = checkPersonalData(req, res);
+
+      if (!person.message) {
+        let applicantId;
+        let status = "registered";
+        const storedPerson = getStoredPerson(account);
+
+        if (!storedPerson || JSON.stringify(storedPerson) !== JSON.stringify(person)) {
+          const newApplicant = await onfido.applicant.create({
+            firstName: person.firstName,
+            lastName: person.lastName,
+            dob: person.dob,
+            email: person.email,
+            address: person.address
+          });
+          applicantId = newApplicant.id;
+
+        } else {
+          applicantId = account.applicantId;
+          if (account.status === 'registered_token') {
+            status = 'registered_token';
+          }
+        }
+
+        if (account.status === 'account_is_whitelisted') {
+          await removeAccountFromWhitelist(account.accountId, near);
+        }
+
+        account.status = status;
+        account.applicantId = applicantId;
+        await updateAccountWithPersonalData(account, person);
+
+        console.log(`Applicant ID ${account.applicantId}`)
+        res.send({});
+      }
+    }
+
+  } catch (e) {
+    console.log(e);
+    res
+      .status(500)
+      .send({ error: 'Applicant not registered. Please try again later' });
+  }
+}
+
+'''
+'''--- src/services/registerApplicant/removeAccountFromWhitelist.js ---
+import { getSmartWhitelistContract } from "../../helpers/getSmartWhitelistContract.js";
+
+export const removeAccountFromWhitelist = async (accountId, near) => {
+  const smartWhitelistContract = getSmartWhitelistContract(near);
+  return await smartWhitelistContract.remove_account({ args: { account_id: accountId } });
+}
+
+'''
+'''--- src/services/registerApplicant/updateAccountWithPersonalData.js ---
+export const updateAccountWithPersonalData = async (account, person) => {
+  account.email = person.email;
+  account.firstName = person.firstName;
+  account.lastName = person.lastName;
+  account.dob = person.dob;
+  account.buildingName = person.address.buildingName;
+  account.buildingNumber = person.address.buildingNumber;
+  account.country = person.address.country;
+  account.flatNumber = person.address.flatNumber;
+  account.line1 = person.address.line1;
+  account.line2 = person.address.line2;
+  account.line3 = person.address.line3;
+  account.postcode = person.address.postcode;
+  account.state = person.address.state;
+  account.street = person.address.street;
+  account.subStreet = person.address.subStreet;
+  account.town = person.address.town;
+
+  await account.save();
+}
+
+'''
+'''--- src/services/registerSession/registerSession.js ---
+import { Account } from '../../models/Account.js';
+import { checkSessionToken } from "../../helpers/checkSessionToken.js";
+import { getApplicantPk } from "../../helpers/getApplicantPk.js";
+import { randomValueHex } from "../../helpers/randomValueHex.js";
+import { verifySignature } from "../../helpers/verifySignature.js";
+
+export const registerSession = async (req, res) => {
+  try {
+    let publicKey, sessionToken, status;
+    let signatureCheckRequired = true;
+
+    const accountId = req.body["account_id"];
+    if (!accountId) {
+      return res.status(400).send({ error: 'No account_id specified' });
+    }
+
+    const account = await Account.findOne({ accountId });
+    if (account && account.status === 'account_is_whitelisted') {
+      signatureCheckRequired = false;
+    } else {
+      publicKey = await getApplicantPk(accountId, req.app.get('near'));
+      if (!publicKey) {
+        return res.status(400).send({ error: 'Unknown applicant' });
+      }
+      console.log(`PublicKey: ${publicKey}`);
+    }
+
+    if (signatureCheckRequired) {
+      const signature = `${req.body["signature"]}`;
+
+      const message = `${accountId}-${new Date().toISOString().substring(0, 10)}`;
+      if (!verifySignature(signature, publicKey, message)) {
+        return res.status(401).send({ error: 'Incorrect signature' });
+      }
+      console.log(`Signature is ok`);
+    }
+
+    if (account) {
+      status = account.status;
+      if (signatureCheckRequired && account.publicKey !== publicKey) {
+        account.publicKey = publicKey;
+      }
+      if (!checkSessionToken(account)) {
+        sessionToken = randomValueHex(32);
+        account.sessionToken = sessionToken;
+        account.sessionTokenTimestamp = new Date();
+      } else {
+        sessionToken = account.sessionToken;
+      }
+      await account.save();
+
+    } else {
+      sessionToken = randomValueHex(32);
+      status = 'new';
+      await Account.create({
+        accountId,
+        sessionToken,
+        sessionTokenTimestamp: new Date(),
+        publicKey: publicKey,
+        status,
+        applicantId: null,
+        sdkToken: null,
+        sdkTokenTimestamp: null,
+        checkId: null,
+        checkResult: null,
+        checkStartTimestamp: null,
+        checkFinishTimestamp: null,
+      });
+    }
+    console.log('Session registered');
+    res.send({ session_token: sessionToken, status });
+
+  } catch (e) {
+    console.log(e);
+    res
+      .status(500)
+      .send({ error: 'Session not registered. Please try again later' });
+  }
+}
+
+'''
+'''--- src/services/registerWebhook/registerWebhook.js ---
+import { Webhook } from "../../models/Webhook.js";
+
+export const registerWebhook = async (app) => {
+  const serverUrl = `${process.env.EXTERNAL_SERVER_URL}/send-check-result`;
+  try {
+    const onfido = app.get('onfido')
+    const webhook = await Webhook.findOne({ serverUrl });
+
+    if (!webhook) {
+      const webhookObj = await onfido.webhook.create({
+        url: serverUrl,
+        events: ["check.completed"]
+      });
+
+      await Webhook.create({
+        url: serverUrl,
+        id: webhookObj.id,
+        token: webhookObj.token,
+        webhookTimestamp: new Date(),
+      });
+
+      console.log('Webhook registered');
+    }
+
+  } catch (e) {
+    console.log(e);
+    throw new Error('Webhook not registered, an error has occurred');
+  }
+}
+
+'''
+'''--- src/services/sendCheckResult/addAccountToWhitelist.js ---
+import { getSmartWhitelistContract } from "../../helpers/getSmartWhitelistContract.js";
+
+export const addAccountToWhitelist = async (accountId, near) => {
+  const smartWhitelistContract = getSmartWhitelistContract(near);
+  return await smartWhitelistContract.add_account({ args: { account_id: accountId } });
+}
+
+'''
+'''--- src/services/sendCheckResult/eventHandling.js ---
+import { Account } from "../../models/Account.js";
+import { addAccountToWhitelist } from "./addAccountToWhitelist.js";
+import { Event } from "../../models/Event.js";
+
+export const eventHandling = async (req, event) => {
+  try {
+    console.log('Handling event:');
+    console.log(event);
+
+    const near = req.app.get('near');
+    const onfido = req.app.get('onfido')
+
+    if (event && event.action === 'check.completed' && event.object && event.object.status === 'complete' &&
+      event.object.id)
+    {
+      const checkId = event.object.id;
+      const check = await onfido.check.find(checkId);
+
+      if (check.status === 'complete') {
+        const applicantId = check.applicantId;
+        const successResult = check.result === 'clear';
+        let account = await Account.findOne({ applicantId, checkId });
+        if (account && account.status === 'verification_in_progress') {
+          if (successResult) {
+            await addAccountToWhitelist(account.accountId, near);
+          }
+          account.status = successResult ? 'account_is_whitelisted' : 'applicant_was_rejected';
+          account.checkResult = check.result;
+          account.checkFinishTimestamp = new Date();
+          await account.save();
+
+          const eventObj = await Event.findOne({ checkId });
+          eventObj.processed = true;
+          await eventObj.save();
+
+          console.log(`The account has been given the status of '${account.status}'`);
+
+        } else {
+          console.log("Account must have 'verification_in_progress' status");
+        }
+      } else {
+        console.log('Verification is not yet complete');
+      }
+    } else {
+      console.log('Event missed');
+    }
+
+  } catch (e) {
+    console.log('Unknown error:');
+    console.log(e);
+  }
+}
+
+'''
+'''--- src/services/sendCheckResult/sendCheckResult.js ---
+import { Event } from '../../models/Event.js';
+import { eventHandling } from "./eventHandling.js";
+
+export const sendCheckResult = async (req, res) => {
+  try {
+    const eventVerifier = req.app.get('eventVerifier')
+    let event = null;
+    try {
+      console.log('Check event signature:')
+      event = eventVerifier.readPayload(req.rawBody, `${req.header('X-SHA2-Signature')}`);
+    } catch (e) {
+      console.log(e);
+    }
+
+    if (!event) {
+      return res
+        .status(400)
+        .send({error: 'Invalid signature for webhook event'});
+    }
+    console.log(`Event signature is ok`);
+    console.log('Incoming event:');
+    console.log(event);
+
+    if (event.object && event.object.id && event.action === 'check.completed') {
+      const checkId = event.object.id;
+      const eventObj = await Event.findOne({ checkId });
+
+      if (eventObj) {
+        console.log('The event for this check ID has already been processed');
+        return res.send({});
+
+      } else {
+        await Event.create({
+          checkId,
+          event: JSON.stringify(event),
+          eventTimestamp: new Date(),
+          processed: false,
+        });
+      }
+
+      // Asynchronous event processing
+      eventHandling(req, event).then();
+
+    } else {
+      console.log('This event is being ignored');
+    }
+
+    res.send({});
+
+  } catch (e) {
+    console.log('Webhook error:');
+    console.log(e);
+    res
+      .status(500)
+      .send({ error: 'Internal server error. Please try again later' });
+  }
+}
+
+'''

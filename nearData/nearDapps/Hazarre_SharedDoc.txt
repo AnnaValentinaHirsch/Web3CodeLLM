@@ -1,0 +1,962 @@
+*GitHub Repository "Hazarre/SharedDoc"*
+
+'''--- .eslintrc.json ---
+{
+  "parser": "@typescript-eslint/parser",
+  "parserOptions": {
+    "ecmaVersion": 2018,
+    "sourceType": "module"
+  },
+  "plugins": [
+    "@typescript-eslint",
+    "react-hooks"
+  ],
+  "extends": [
+    "plugin:react/recommended",
+    "plugin:@typescript-eslint/recommended"
+  ],
+  "rules": {
+    "react-hooks/rules-of-hooks": "error",
+    "react-hooks/exhaustive-deps": "warn",
+    "react/prop-types": "off"
+  },
+  "settings": {
+    "react": {
+      "pragma": "React",
+      "version": "detect"
+    }
+  }
+}
+'''
+'''--- README.md ---
+# SharedDoc with Fluence and Self.ID
+Create a shared document app with [Fluence services](https://doc.fluence.dev/docs/), [Self.ID](https://developers.ceramic.network/reference/self-id/classes/web.SelfID/#authenticate) and React. Users can create, share and share files as well as adjust editing permission. A GUI in the browser can be used for ease of access.
+
+### Youtube Demo
+https://youtu.be/IpWqufnPs58
+
+![alt text](https://github.com/Hazarre/SharedDoc/blob/main/demo.png)
+
+### Client 
+The clients of this app have two roles: the owner and editors. 
+
+The owner (deployer identified by self.ID) of a SharedDoc service instance can create documents, add editors to them and share them with others. The owner shares a file to editors using their self.ID. 
+
+Once a file is shared with a self.ID. It becomes a editor with power to read/write the document as well as share it with other self.IDs. First the verify their identity with self.ID in their browser. Then they use their self.ID to authenticate their permission to read/write/share files. 
+
+### Running the App 
+Download this directory. Inside this directory, [connect to a ceramic node](https://developers.ceramic.network/run/nodes/community-nodes/) and run ```npm install``` then```npm start```. You also need a metamask account for easy of use.
+To deploy your own version of the app, see sections below. 
+
+### Fluence services 
+Deployed at:
+```
+peer id 
+12D3KooWEFFCZnar1cUJQ3rMWjvPQg6yMV2aXWs2DkJNSRbduBWn
+
+service id
+829128d8-3641-49eb-8f77-e3df5d04f808
+```
+
+```rust 
+service SharedDoc:
+  add_editor(doc: string, editor: string, self_id: string) -> bool
+  am_i_owner() -> bool
+  authenticate(filename: string, self_id: string) -> bool
+  create_doc(filename: string, self_id: string) -> bool
+  del_editor(doc: string, editor: string, self_id: string) -> bool
+  read_file(filename: string, editor: string) -> string
+  write_file(filename: string, editor: string, content: string) -> string
+```
+
+Aqua services can be found at ```aqua/shared_doc.aqua```. 
+
+Marine implementations can be found at ```marine/shared_doc```. Run ```./deploy.sh``` to deplot to a Fluence node. 
+
+React app have config files in the main directory and files in ```src/```
+
+#### Future functoinalities: 
+ - Sharing with fine grained permission. 
+ - Better UI and UX. 
+ - Neater marine/rust code. 
+
+'''
+'''--- marine/shared_doc/Cargo.toml ---
+[package]
+name = "shared_doc"
+version = "0.1.0"
+authors = ["Fluence Labs"]
+edition = "2018"
+publish = false
+
+[[bin]]
+name = "shared_doc"
+path = "src/main.rs"
+
+[dependencies]
+marine-rs-sdk = { version = "0.6.14", features = ["logger"] }
+wasm-tracing-allocator = "0.1.1"
+log = "0.4.8"
+
+[dev-dependencies]
+marine-rs-sdk-test = "0.3.0"
+'''
+'''--- marine/shared_doc/Config.toml ---
+modules_dir = "artifacts/"
+
+[[module]]
+    name = "shared_doc"
+    mem_pages_count = 1     
+    logger_enabled = true
+
+    [module.wasi]
+    preopened_files = ["./sites"]
+    # this is where files will be stored
+    mapped_dirs = { "sites" = "./sites" }
+
+'''
+'''--- marine/shared_doc/build.sh ---
+#!/usr/bin/env bash
+set -o errexit -o nounset -o pipefail
+
+# This script builds all subprojects and puts all created Wasm modules in one dir
+(
+  cargo update --aggressive
+  marine build --release
+)
+
+mkdir -p sites
+mkdir -p artifacts
+rm -f artifacts/*.wasm
+cp target/wasm32-wasi/release/shared_doc.wasm artifacts/
+
+'''
+'''--- marine/shared_doc/cfg.json ---
+{
+    "logger_enabled": true,
+    "mem_pages_count": 1,
+    "name": "shared_doc",
+    "module": {
+      "wasi": {
+        "preopened_files": [
+          "./sites"
+        ],
+        "mapped_dirs": {
+          "sites": "./sites"
+        }
+      }
+    }
+  }
+'''
+'''--- marine/shared_doc/deploy.sh ---
+#!/usr/bin/env bash
+set -o errexit -o nounset -o pipefail
+
+# build wasms
+./build.sh
+
+(
+  fldist new_service --node-id 12D3KooWEFFCZnar1cUJQ3rMWjvPQg6yMV2aXWs2DkJNSRbduBWn \
+         --ms artifacts/shared_doc.wasm:cfg.json \
+         --name shared-doc-service
+)
+
+'''
+'''--- marine/shared_doc/src/main.rs ---
+/*
+ * Copyright 2021 Li-Heng Henry Chang
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// for authentication 
+use std::collections::HashMap;
+
+// marine 
+use marine_rs_sdk::{marine, get_call_parameters};
+use marine_rs_sdk::module_manifest;
+use marine_rs_sdk::WasmLoggerBuilder;
+
+use std::fs;
+use std::path::PathBuf;
+
+module_manifest!();
+const SITES_DIR: &str = "/sites/";
+
+/// Log level can be changed by `RUST_LOG` env as well.
+pub fn main() {
+    WasmLoggerBuilder::new().build().unwrap();
+}
+
+/// You can read or write files from the file system if there is permission to use directories described in `Config.toml`.
+pub fn put(name: String, file_content: String) -> String {
+    log::info!("put called with file name {}\n", name);
+    let rpc_tmp_filepath = format!("{}{}", SITES_DIR, name);
+    let result = fs::write(PathBuf::from(rpc_tmp_filepath), file_content.into_bytes());
+    if let Err(e) = result {
+        return format!("file can't be written: {}", e);
+    }
+    String::from("Ok")
+}
+
+pub fn get(file_name: String) -> String{
+    log::info!("get called with file name: {}\n", file_name);
+    let tmp_filepath = format!("{}{}", SITES_DIR, file_name);
+    fs::read_to_string(tmp_filepath).unwrap_or_else(|_| String::from("") )
+}
+
+pub fn add(name: String, mut file_content: String) -> String {
+    log::info!("put called with file name {}\n", name);
+    let rpc_tmp_filepath = format!("{}{}", SITES_DIR, name);
+    file_content.push_str(&get(name));
+    let result = fs::write(PathBuf::from(rpc_tmp_filepath.clone()), file_content.into_bytes());
+    if let Err(e) = result {
+        return format!("file can't be written: {}", e);
+    }
+    String::from("Ok")
+}
+
+pub fn is_owner() -> bool {
+    let meta = get_call_parameters();
+    let caller = meta.init_peer_id;
+    let owner = meta.service_creator_peer_id;
+    caller == owner
+}
+
+#[marine]
+pub fn am_i_owner() -> bool {
+    is_owner()
+}
+
+fn pwdstr2hashmap(pwdstr_str: String)-> HashMap::<String, Vec<String>>{
+    let mut hm = HashMap::<String, Vec<String>>::new();
+    let docs_perm = pwdstr_str.split(";");
+
+    for doc_perm in docs_perm{
+        if !doc_perm.is_empty(){
+            let mut split = doc_perm.split("-");
+            let doc_title = split.next().unwrap_or("");
+            let hashstr = split.next().unwrap_or("");
+            let keys: Vec<String> = hashstr.split(",").map(|s| s.to_string()).collect();
+            hm.insert(
+                doc_title.to_string(), 
+                keys
+            );   
+        }
+    }
+    hm
+}
+
+fn hashmap2pwdstr(hm: HashMap::<String, Vec<String>> )-> String {
+    let mut output = "".to_string() ;
+    for (doc, editors) in &hm {
+        let mut doc_str = doc.to_string();
+        doc_str.push_str("-");
+        for e in editors{
+            doc_str.push_str(e);
+            doc_str.push_str(",");
+        }
+        doc_str = doc_str.to_string().split_at(doc_str.len() - 1).0.to_string();
+        output.push_str(&doc_str);
+        output.push_str(";");
+    };
+    output
+}
+
+fn pairin_hm(doc: String, editor: String, hm: HashMap::<String, Vec<String>> ) -> bool {
+    if hm.contains_key(&doc) {
+        let vec =  hm.get(&doc).unwrap();
+        return vec.contains(&editor);
+    }
+    false
+}
+
+fn get_pwd_hm() -> HashMap::<String, Vec<String>>{
+    let pwdstr = get("pwd.pwd".to_string());
+    pwdstr2hashmap(pwdstr)
+}
+
+#[marine]
+fn authenticate(filename: String, self_id: String) -> bool{
+    let hm = get_pwd_hm();
+    pairin_hm(filename, self_id, hm)
+}
+
+// create a document, this is a service that only the owner, or the deployer of the service is allowed to call
+#[marine]
+fn create_doc(filename: String, self_id: String) -> bool {
+    // only the creator of the service can create a document 
+    // true if file created 
+    // false if the file already exists or if self_id is not the owners 
+
+    if am_i_owner() {
+        let hm = get_pwd_hm();
+        if hm.contains_key(&filename) { // if the file exists
+             return false 
+        }
+        else{ // if the file doens't exist 
+            // create an empty file 
+            let fname = filename.clone();
+            put(filename, "".to_string());
+            let mut pwdstr = fname;
+            pwdstr.push_str("-");
+            pwdstr.push_str(&self_id);
+            pwdstr.push_str(";");
+            add("pwd.pwd".to_string(), pwdstr);
+            return true
+
+        }
+    }
+    return false
+}
+
+// add editor 
+#[marine]
+fn add_editor(doc:String, editor: String,  self_id: String) ->bool {
+    /*
+    args: 
+     - self_id: the self.id already with editor access 
+     - editor: the self.id to be granted access
+     - doc: the file name of the document
+
+    out: 
+     - true if document exists, editing permission will be granted to editor
+     - false if doc doesn't exist!  => create a document first 
+    */
+    
+    let mut hm = get_pwd_hm();
+    if hm.contains_key(&doc) { // if document exists, grant editor permission 
+        let mut vec = hm.get(&doc).unwrap().to_vec();
+        if vec.contains(&self_id) { // check wether self_id has sharing abilty
+            if !vec.contains(&editor) {
+                vec.push(editor);
+                hm.insert(doc, vec);
+            }
+            put("pwd.pwd".to_string(), hashmap2pwdstr(hm));
+            return true
+        }
+    }
+    return false //false
+}
+
+// delete editor 
+#[marine]
+fn del_editor(doc:String, editor: String,   self_id: String) -> bool {
+       /*
+    args: 
+     - self_id: the self.id of already with editor access 
+     - editor: the self.id to be granted access
+     - doc: the file name of the document
+
+    out: 
+     - true if document exists, editing permission will be granted to editor
+     - false if doc doesn't exist!  => create a document first 
+    */
+    let mut hm = get_pwd_hm();
+    if hm.contains_key(&doc) { // if document exists, grant editor permission 
+        let mut vec = hm.get(&doc).unwrap().to_vec();
+        if vec.contains(&self_id) { // check wether self_id has sharing abilty
+            if let Some(pos) = vec.iter().position(|x| *x == editor) {
+                vec.remove(pos);
+                hm.insert(doc, vec);
+                put("pwd.pwd".to_string(), hashmap2pwdstr(hm));
+            }
+            return true
+        }
+    }
+    return false //false
+}
+
+#[marine]
+fn read_file(filename: String, editor: String) -> String {
+    let fname = filename.clone();
+    if authenticate(fname, editor){
+        return get(filename.clone());
+    }
+    String::from("No access to read file or filed doesn't exits.")
+}
+
+#[marine]
+fn write_file(filename: String, editor: String, content: String) -> String {
+    let fname = filename.clone();
+    if authenticate(fname, editor){
+        put(filename, content);
+        return String::from("File written");
+    }
+    String::from("No access to write file or file doesn't exist.")
+}
+
+#[cfg(test)]
+mod tests {
+    use marine_rs_sdk_test::marine_test;
+    
+
+    #[marine_test(config_path = "../Config.toml", modules_dir = "../artifacts")] 
+    fn test_create_doc(shared_doc: marine_test_env::shared_doc::ModuleInterface) {  
+        // test creating document 
+        let doc1 = "doc1.txt".to_string();
+        let doc2 = "doc2.txt".to_string();
+        let doc3 = "doc3.txt".to_string();
+        let owner = "o1".to_string();
+        let editor1 = "e1".to_string();
+        let editor2 = "e2".to_string();
+        let editor3 = "e3".to_string();
+        assert_eq!( shared_doc.am_i_owner()     , true);
+        let ownercp = owner.clone();
+        assert_eq!( shared_doc.create_doc("doc1".to_string(), "o1".to_string()) , true);
+        assert_eq!( shared_doc.create_doc("doc1".to_string(), "o1".to_string()) , false);
+        // assert_eq!( shared_doc.create_doc(doc2, owner),  true);
+        // assert_eq!( shared_doc.create_doc(doc2, owner), false);
+
+        // test permission 
+
+        // assert_eq!( shared_doc.add_editor(doc1, editor1, owner), true) ;
+        // assert_eq!( shared_doc.add_editor(doc2, editor2, owner), true) ;
+
+        // //non-exisiting doc 
+        // assert_eq!( shared_doc.add_editor(doc3, editor3, owner), false);
+        // // no permission
+        // assert_eq!( shared_doc.add_editor(doc1, editor1, editor2), false) ;
+        // // no 
+        // assert_eq!( shared_doc.add_editor(doc1, editor3, editor1), true) ;
+        // assert_eq!( shared_doc.add_editor(doc1, editor2, editor3), true) ;
+
+        // test read/write
+    }
+
+}
+
+'''
+'''--- marine/shared_doc/test.sh ---
+#!/usr/bin/env bash
+set -o errexit -o nounset -o pipefail
+
+# This script builds all subprojects and puts all created Wasm modules in one dir
+(
+  cargo update --aggressive
+  marine build --release
+  cargo +nightly test -- --test-threads=1 --release 
+)
+
+'''
+'''--- package.json ---
+{
+    "name": "shared_doc",
+    "version": "0.0.1",
+    "scripts": {
+        "start": "webpack serve --config webpack.dev.config.ts"
+    },
+    "dependencies": {
+        "@ceramicnetwork/http-client": "^1.4.1",
+        "bootstrap": "^5.1.3",
+        "react": "^17.0.2",
+        "react-bootstrap": "^2.0.0",
+        "react-dom": "^17.0.2"
+    },
+    "devDependencies": {
+        "@babel/core": "^7.15.8",
+        "@babel/plugin-transform-runtime": "^7.15.8",
+        "@babel/preset-env": "^7.15.8",
+        "@babel/preset-react": "^7.14.5",
+        "@babel/preset-typescript": "^7.15.0",
+        "@babel/runtime": "^7.15.4",
+        "@ceramicnetwork/3id-did-resolver": "^1.4.5",
+        "@ceramicnetwork/blockchain-utils-linking": "^1.3.0",
+        "@self.id/web": "^0.1.0",
+        "@types/react": "^17.0.31",
+        "@types/react-dom": "^17.0.10",
+        "@types/webpack-dev-server": "^4.3.1",
+        "@typescript-eslint/eslint-plugin": "^5.1.0",
+        "@typescript-eslint/parser": "^5.1.0",
+        "babel-loader": "^8.2.3",
+        "crypto": "^1.0.1",
+        "crypto-browserify": "^3.12.0",
+        "eslint": "^7.32.0",
+        "eslint-plugin-react": "^7.26.1",
+        "eslint-plugin-react-hooks": "^4.2.0",
+        "html-webpack-plugin": "^5.4.0",
+        "key-did-resolver": "^1.4.0",
+        "near-api-js": "^0.43.1",
+        "react-native": "^0.66.1",
+        "sass": "^1.43.2",
+        "sass-loader": "^12.2.0",
+        "ts-node": "^10.3.0",
+        "typescript": "^4.4.4",
+        "webpack": "^5.59.1",
+        "webpack-cli": "^4.9.1",
+        "webpack-dev-server": "^4.3.1"
+    }
+}
+
+'''
+'''--- sample.txt ---
+i 
+c shared_doc create_doc ["doc.txt", "id1"]
+c shared_doc read_file  ["doc.txt", "id2"]
+c shared_doc add_editor ["doc.txt", "id2", "id1"]
+c shared_doc read_file  ["doc.txt", "id2"]
+c shared_doc del_editor ["doc.txt", "id2", "id1"]
+c shared_doc read_file  ["doc.txt", "id2"]
+'''
+'''--- src/_aqua/getting-started.ts ---
+/**
+ *
+ * This file is auto-generated. Do not edit manually: changes may be erased.
+ * Generated by Aqua compiler: https://github.com/fluencelabs/aqua/. 
+ * If you find any bugs, please write an issue on GitHub: https://github.com/fluencelabs/aqua/issues
+ * Aqua version: 0.3.0-226
+ *
+ */
+ import { Fluence, FluencePeer } from '@fluencelabs/fluence';
+ import {
+     ResultCodes,
+     RequestFlow,
+     RequestFlowBuilder,
+     CallParams,
+ } from '@fluencelabs/fluence/dist/internal/compilerSupport/v1';
+ 
+ 
+ // Services
+ 
+  export interface HelloWorldDef {
+      hello: (from: string, callParams: CallParams<'from'>) => {msg:string;reply:string};
+  }
+ 
+  export function registerHelloWorld(serviceId: string, service: HelloWorldDef): void;
+ export function registerHelloWorld(peer: FluencePeer, serviceId: string, service: HelloWorldDef): void;
+  export function registerHelloWorld(...args: any) {
+     let peer: FluencePeer;
+     let serviceId: any;
+     let service: any;
+     if (FluencePeer.isInstance(args[0])) {
+         peer = args[0];
+     } else {
+         peer = Fluence.getPeer();
+     }
+ 
+     if (typeof args[0] === 'string') {
+         serviceId = args[0];
+     } else if (typeof args[1] === 'string') {
+         serviceId = args[1];
+     } 
+ 
+     // Figuring out which overload is the service.
+     // If the first argument is not Fluence Peer and it is an object, then it can only be the service def
+     // If the first argument is peer, we are checking further. The second argument might either be
+     // an object, that it must be the service object
+     // or a string, which is the service id. In that case the service is the third argument
+     if (!(FluencePeer.isInstance(args[0])) && typeof args[0] === 'object') {
+         service = args[0];
+     } else if (typeof args[1] === 'object') {
+         service = args[1];
+     } else {
+         service = args[2];
+     }
+ 
+       peer.internals.callServiceHandler.use((req, resp, next) => {
+           if (req.serviceId !== serviceId) {
+               next();
+               return;
+           }
+   
+           
+  if (req.fnName === 'hello') {
+      
+  const callParams = {
+      ...req.particleContext,
+      tetraplets: {
+          from: req.tetraplets[0]
+      },
+  };
+  resp.retCode = ResultCodes.success;
+  resp.result = service.hello(req.args[0], callParams)
+ 
+  }
+     
+   
+           next();
+       });
+  }
+       
+ 
+ 
+  export interface HelloPeerDef {
+      hello: (message: string, callParams: CallParams<'message'>) => string;
+  }
+ 
+  export function registerHelloPeer(service: HelloPeerDef): void;
+ export function registerHelloPeer(serviceId: string, service: HelloPeerDef): void;
+ export function registerHelloPeer(peer: FluencePeer, service: HelloPeerDef): void;
+ export function registerHelloPeer(peer: FluencePeer, serviceId: string, service: HelloPeerDef): void;
+  export function registerHelloPeer(...args: any) {
+     let peer: FluencePeer;
+     let serviceId: any;
+     let service: any;
+     if (FluencePeer.isInstance(args[0])) {
+         peer = args[0];
+     } else {
+         peer = Fluence.getPeer();
+     }
+ 
+     if (typeof args[0] === 'string') {
+         serviceId = args[0];
+     } else if (typeof args[1] === 'string') {
+         serviceId = args[1];
+     }  
+  else {
+      serviceId = "HelloPeer"
+ }
+ 
+     // Figuring out which overload is the service.
+     // If the first argument is not Fluence Peer and it is an object, then it can only be the service def
+     // If the first argument is peer, we are checking further. The second argument might either be
+     // an object, that it must be the service object
+     // or a string, which is the service id. In that case the service is the third argument
+     if (!(FluencePeer.isInstance(args[0])) && typeof args[0] === 'object') {
+         service = args[0];
+     } else if (typeof args[1] === 'object') {
+         service = args[1];
+     } else {
+         service = args[2];
+     }
+ 
+       peer.internals.callServiceHandler.use((req, resp, next) => {
+           if (req.serviceId !== serviceId) {
+               next();
+               return;
+           }
+   
+           
+  if (req.fnName === 'hello') {
+      
+  const callParams = {
+      ...req.particleContext,
+      tetraplets: {
+          message: req.tetraplets[0]
+      },
+  };
+  resp.retCode = ResultCodes.success;
+  resp.result = service.hello(req.args[0], callParams)
+ 
+  }
+     
+   
+           next();
+       });
+  }
+       
+ 
+ // Functions
+ 
+  export function sayHello(targetPeerId: string, targetRelayPeerId: string, config?: {ttl?: number}) : Promise<string>;
+  export function sayHello(peer: FluencePeer, targetPeerId: string, targetRelayPeerId: string, config?: {ttl?: number}) : Promise<string>;
+  export function sayHello(...args: any) {
+      let peer: FluencePeer;
+      let targetPeerId: any;
+ let targetRelayPeerId: any;
+      let config: any;
+      if (FluencePeer.isInstance(args[0])) {
+          peer = args[0];
+          targetPeerId = args[1];
+ targetRelayPeerId = args[2];
+ config = args[3];
+      } else {
+          peer = Fluence.getPeer();
+          targetPeerId = args[0];
+ targetRelayPeerId = args[1];
+ config = args[2];
+      }
+     
+      let request: RequestFlow;
+      const promise = new Promise<string>((resolve, reject) => {
+          const r = new RequestFlowBuilder()
+                  .disableInjections()
+                  .withRawScript(
+                      `
+      (xor
+  (seq
+   (seq
+    (seq
+     (seq
+      (seq
+       (seq
+        (seq
+         (call %init_peer_id% ("getDataSrv" "-relay-") [] -relay-)
+         (call %init_peer_id% ("getDataSrv" "targetPeerId") [] targetPeerId)
+        )
+        (call %init_peer_id% ("getDataSrv" "targetRelayPeerId") [] targetRelayPeerId)
+       )
+       (call -relay- ("op" "noop") [])
+      )
+      (xor
+       (seq
+        (call -relay- ("op" "noop") [])
+        (call "12D3KooWFEwNWcHqi9rtsmDhsYcDbRUCDXH84RC4FW6UfsFWaoHi" ("1e740ce4-81f6-4dd4-9bed-8d86e9c2fa50" "hello") [%init_peer_id%] comp)
+       )
+       (seq
+        (call -relay- ("op" "noop") [])
+        (call %init_peer_id% ("errorHandlingSrv" "error") [%last_error% 1])
+       )
+      )
+     )
+     (call -relay- ("op" "noop") [])
+    )
+    (par
+     (seq
+      (call targetRelayPeerId ("op" "noop") [])
+      (xor
+       (call targetPeerId ("HelloPeer" "hello") [%init_peer_id%] res)
+       (seq
+        (seq
+         (call targetRelayPeerId ("op" "noop") [])
+         (call -relay- ("op" "noop") [])
+        )
+        (call %init_peer_id% ("errorHandlingSrv" "error") [%last_error% 2])
+       )
+      )
+     )
+     (null)
+    )
+   )
+   (xor
+    (call %init_peer_id% ("callbackSrv" "response") [comp.$.reply!])
+    (call %init_peer_id% ("errorHandlingSrv" "error") [%last_error% 3])
+   )
+  )
+  (call %init_peer_id% ("errorHandlingSrv" "error") [%last_error% 4])
+ )
+ 
+                  `,
+                  )
+                  .configHandler((h) => {
+                      h.on('getDataSrv', '-relay-', () => {
+                     return peer.getStatus().relayPeerId;
+                 });
+                 h.on('getDataSrv', 'targetPeerId', () => {return targetPeerId;});
+ h.on('getDataSrv', 'targetRelayPeerId', () => {return targetRelayPeerId;});
+                 h.onEvent('callbackSrv', 'response', (args) => {
+     const [res] = args;
+   resolve(res);
+ });
+ 
+                 h.onEvent('errorHandlingSrv', 'error', (args) => {
+                     const [err] = args;
+                     reject(err);
+                 });
+             })
+             .handleScriptError(reject)
+             .handleTimeout(() => {
+                 reject('Request timed out for sayHello');
+             })
+         if(config && config.ttl) {
+             r.withTTL(config.ttl)
+         }
+         request = r.build();
+     });
+     peer.internals.initiateFlow(request!);
+     return promise;
+ }
+       
+ 
+'''
+'''--- src/components/EssayForm.js ---
+import React from 'react';
+
+class EssayForm extends React.Component {
+    constructor(props) {
+      super(props);
+      this.state = {
+        value: ''
+      };
+  
+      this.handleChange = this.handleChange.bind(this);
+      this.handleSubmit = this.handleSubmit.bind(this);
+    }
+  
+    handleChange(event) {
+      this.setState({value: event.target.value});
+    }
+  
+    handleSubmit(event) {
+      console.log(this.state.value);
+      
+      alert('An essay was submitted: ' + this.state.value);
+      event.preventDefault();
+    }
+
+    // function showTextFile(){
+
+    // }
+
+    render() {
+      return (
+        <form onSubmit={this.handleSubmit} className={"essayForm"}   >
+    
+            <textarea value={this.state.value} onChange={this.handleChange} 
+              style={{height: "400px"}}/>
+          
+          <input type="submit" value="Save File" />
+          <input type="submit" value="Read File" />
+        </form>
+      );
+    }
+  }
+
+  export default EssayForm;
+'''
+'''--- src/components/NameForm.js ---
+import React from "react";
+class NameForm extends React.Component {
+    constructor(props) {
+      super(props);
+      this.state = {value: ''};
+  
+      this.handleChange = this.handleChange.bind(this);
+      this.handleSubmit = this.handleSubmit.bind(this);
+    }
+  
+    handleChange(event) {
+      this.setState({value: event.target.value});
+    }
+  
+    handleSubmit(event) {
+      alert('A name was submitted: ' + this.state.value);
+      event.preventDefault();
+    }
+  
+    render() {
+      return (
+        <form onSubmit={this.handleSubmit}>
+          <label>Filename/Editorname
+            <input type="text" value={this.state.value} onChange={this.handleChange} />
+          </label> 
+          
+
+          <input type="submit" value="read" />
+          <input type="submit" value="save" />
+          <input type="submit" value="add editor" />
+          <input type="submit" value="remove editor" />
+        </form>
+      );
+    }
+  }
+
+  export default NameForm;
+'''
+'''--- src/index.css ---
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+code {
+  font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
+    monospace;
+}
+
+'''
+'''--- src/index.html ---
+<!DOCTYPE html>
+<html>
+  <head>
+    <link
+  rel="stylesheet"
+  href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css"
+  integrity="sha384-1BmE4kWBq78iYhFldvKuhfTAU6auU8tT94WrHftjDbrCEXSU1oBoqyl2QvZ6jIW3"
+  crossorigin="anonymous"
+/>
+    <meta charset="utf-8" />
+    <title>My app</title>
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>
+'''
+'''--- tsconfig.json ---
+{
+  "compilerOptions": {
+    "lib": ["dom", "dom.iterable", "esnext"],
+    "allowJs": true,
+    "allowSyntheticDefaultImports": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "strict": true,
+    "forceConsistentCasingInFileNames": true,
+    "moduleResolution": "node",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react"
+  },
+  "include": ["src", "webpack.dev.config.ts"]
+}
+'''
+'''--- webpack.dev.config.ts ---
+import path from "path";
+import { Configuration, HotModuleReplacementPlugin } from "webpack";
+import HtmlWebpackPlugin from "html-webpack-plugin";
+
+const config: Configuration = {
+  mode: "development",
+  output: {
+    publicPath: "/",
+  },
+  entry: "./src/index.tsx",
+  module: {
+    rules: [
+      {
+        test: /\.(ts|js)x?$/i,
+        exclude: /node_modules/,
+        use: {
+          loader: "babel-loader",
+          options: {
+            presets: [
+              "@babel/preset-env",
+              "@babel/preset-react",
+              "@babel/preset-typescript",
+            ],
+          },
+        },
+      },
+    ],
+  },
+  resolve: {
+    extensions: [".tsx", ".ts", ".js"],
+    fallback: {
+      "crypto-browserify": require.resolve('crypto-browserify'),
+      "crypto": false, 
+    },
+  },
+  plugins: [
+    new HtmlWebpackPlugin({
+      template: "src/index.html",
+    }),
+    new HotModuleReplacementPlugin(),
+  ],
+  devtool: "inline-source-map",
+  devServer: {
+    static: path.join(__dirname, "build"),
+    historyApiFallback: true,
+    port: 4000,
+    open: true,
+    hot: true
+  },
+};
+
+export default config;
+'''

@@ -1,0 +1,947 @@
+*GitHub Repository "jakmeier/near-teller"*
+
+'''--- Cargo.toml ---
+[package]
+edition = "2021"
+name = "near-teller"
+version = "0.1.0"
+
+[dependencies]
+near-sdk = "4.0.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+codegen-units = 1
+debug = false
+lto = true
+opt-level = "z"
+overflow-checks = true
+panic = "abort"
+
+[dev-dependencies]
+anyhow = "1.0"
+near-primitives = "0.15.0"
+near-sdk = "4.0.0"
+near-units = "0.2.0"
+serde_json = "1.0"
+tokio = {version = "1.14", features = ["full"]}
+workspaces = "0.6.0"
+
+'''
+'''--- readme.md ---
+# NEAR Teller
+
+NEAR Teller keeps the bulk of your tokens safe behind a full access key which
+you should store in a cold wallet. You can then add a function access key that
+allows unlimited staking and limited withdrawals from a hot wallet.
+
+## Overview
+
+Teller has the concept of hot and cold balance.
+- The hot balance can be transferred out of the account using a function access key. This could be to one of your other accounts, or directly to a foreign account.
+- The cold balance is only accessible for transfer using a full access key.
+
+The purpose of this setup is that someone who gained access to your function access key could only access the hot balance.
+
+![Graphic showing token flow in and out of teller](./res/in-and-out-flow.png)
+
+You might notice staking, unstaking, and withdrawal operations performed on a
+staking pool. This is done by calling methods on a [staking pool
+contract](https://github.com/near/core-contracts/tree/master/staking-pool). This
+will transfer tokens to the pool and stake with them.
+
+One attack vector here is that someone could deploy fake staking pools. Only use
+staking pools deployed through the
+[factory](https://github.com/near/core-contracts/tree/master/staking-pool-factory)
+which will be visible by the account being a subaccount of `poolv1.near`. If you
+stake with another account, this will send your cold balance tokens there. If
+the account is malicious, your tokens are lost and unrecoverable.
+
+To prevent someone who got hold of your function access key to abuse the `stake`
+method to transfer cold balance tokens to an account controlled by them, the
+list of staking pools is statically compiled into the contract. It cannot be
+changed without redeploying the contract. Redeploying of course requires a full
+access key, which gives access to all tokens anyway.
+
+### Moving between hot and cold balance
+
+Cold balance is converted to hot balance at a constant rate. The exact rate can
+be configured before deploying the contract.
+
+If the hot balance is getting too large for your taste, manually call `lock` to
+convert it back.
+
+![Graphic showing flow between cold and hot balance](./res/hot-and-cold.png)
+
+### Example use case
+
+The intention here is for someone who receives NEAR token regularly (for example
+salary or donations). One can then define how much they want to spend over a
+period of time while saving the rest. And of course, while saving, the tokens
+can be used for staking.
+
+The tokens available to spend are called the hot balance and it increases
+steadily. It can even go above the actual token balance. Of course transactions
+that try to access more than available will fail. However, when more funds are
+added to the account, they will immediately available if the hot balance was
+already on that level.
+
+This rest is called the cold balance. It is steadily decreasing and will
+eventually reach zero unless more funds are added. Therefore, even if you
+somehow lose access to the full access key, you will eventually gain have access
+to all your tokens. How long it takes depends on the rate you defined and how
+many tokens are stored inside near-teller.
+
+## Contract Methods
+
+- `hot()` is a view call that returns the balance in yocto Near currently
+  available to access from a hot wallet.
+- `pay(n: Near, a: AccountId)` and `pay_yocto(yocto: String, a: AccountId)` send
+  tokens to an account and reduces the amount accessible from your hot wallet.
+- `lock(n: Near)` and `lock_yocto(yocto: String)` reduce the amount accessible
+  from your hot wallet.
+- `stake(i: u32, n: Near)` and `stake_yocto(i: u32, yocto: String)` stake
+  tokens with a staking pool without changing the amount accessible from your
+  hot wallet.
+- `unstake(i: u32)` unstakes all staked deposit at a staking pool, which will be
+  available for withdrawal after a delay.
+- `withdraw(i: u32)` claims unstaked deposit at a staking pool and makes it
+  available for staking by teller once again. Does not change the hot token
+  amount.
+
+## Usage
+
+1. Configure, compile and deploy this contract.
+2. Add a function call key to your account that has itself as the receiver.
+3. Store you full access key away safely in a cold wallet.
+4. Use the function call key to manage tokens sent to your account.
+    - Stake arbitrary amounts of tokens.
+    - Retrieve a limited amount of tokens. The amount increases at a constant rate over time.
+
+### Configure, compile, and deploy
+
+Set parameters in [`config.ron`](./src/config.ron):
+
+```rust
+Config {
+    // Set how many yocto NEAR per second should be available through function calls.
+    nano_near_per_second: 100_000_000_000_000_000,
+    // pick staking pools you trust
+    // https://explorer.near.org/nodes/validators
+    staking_pools: [
+        "YOUR-FAVOURITE-VALIADTOR-0.poolv1.near",
+        "YOUR-FAVOURITE-VALIADTOR-1.poolv1.near",
+        "YOUR-FAVOURITE-VALIADTOR-2.poolv1.near",
+        "YOUR-FAVOURITE-VALIADTOR-3.poolv1.near",
+        "YOUR-FAVOURITE-VALIADTOR-4.poolv1.near",
+        "YOUR-FAVOURITE-VALIADTOR-5.poolv1.near",
+        "YOUR-FAVOURITE-VALIADTOR-6.poolv1.near",
+        "YOUR-FAVOURITE-VALIADTOR-7.poolv1.near",
+        "YOUR-FAVOURITE-VALIADTOR-8.poolv1.near",
+        "YOUR-FAVOURITE-VALIADTOR-9.poolv1.near",
+    ],
+}
+```
+
+Then compile it using `make res/near_teller.wasm`.
+
+The configuration options are now fixed inside the WASM.
+They can only be changed by recompiling and redeploying.
+
+Now simply deploy the WASM to you account.
+
+```bash
+# replace `teller.alice.testnet` with your account ID
+ACCOUNT="teller.alice.testnet"
+near deploy ${ACCOUNT} res/near_teller.wasm --initFunction "init" --initArgs '{}'
+```
+
+### Add a function call key
+
+The key should be configured as function call access key with contract ID set to
+the account itself and the methods argument left empty to signal that all
+methods are allowed.
+
+```bash
+# replace `teller.alice.testnet` with your account ID
+ACCOUNT="teller.alice.testnet"
+# use a public key you control
+#  - for example generated using `near generate-key`
+#  - or maybe use an existing key, like one stored in your hardware wallet
+KEY=ed25519:5UtgSAe72iuKzMYz9sXY9AqVnE16PiYmQKkRfCpsqJKw
+# Actually add the key
+near add-key ${ACCOUNT} --contract-id ${ACCOUNT} ${KEY}
+```
+
+### Note for developers
+
+#### Code Architecture
+
+```bash
+src
+├── lib.rs              # definition of smart contract state and API
+├── implementation.rs   # business logic
+├── error.rs            # error codes returned by `implementation.rs`
+├── config.ron          # configuration of parameters assumed to change per user
+└── unit_tests.rs       # tests only
+```
+
+To understand the code, have a look at `src/lib.rs` and `src/implementation.rs`.
+The comments in the code modules are usually more up tp date than the readme. Be
+sure to check the top of the files for a high-level summary of the module
+design. But in essence, the split is that parsing happens in `lib.rs` and state
+manipulation happens in `implementation.rs`.
+
+#### Building
+
+```bash
+# basic compilation
+cargo build -r -p near-teller --target wasm32-unknown-unknown
+```
+
+```bash
+# compilation with extra binary size optimizations
+# may require extra tools:
+# - wasm-opt (`apt install binaryen` or https://github.com/WebAssembly/binaryen)
+# - wasm-strip (`apt install wabt` or  https://github.com/WebAssembly/wabt)
+make res/near_teller.wasm
+```
+
+#### Testing
+
+To run tests, please use:
+```bash
+# this will rebuild the WASM and run tests on it
+make test
+```
+
+The test code is split into
+- unit tests (`src/unit_tests.rs`)
+- integration tests (`tests/integration-tests.rs`)
+
+Neither of those has full test coverage. Contributions are welcome!
+
+### Limitations
+
+This contract, on purpose, does now allow:
+- staking with staking pools not listed in config
+- changing configs without redeploying the entire contract
+
+It would be possible to add such functionality in a fork, feel free to do so.
+But this repository contains a minimal contract by design.
+
+## Disclaimers
+
+This is a private project by me, jakmeier, to learn and build a simple but useful
+smart contract. It is not endorsed by any companies or organizations that I am
+or was associated with. The code was not audited, either.
+
+This is the first real smart contract I implemented. Hence I do not have the
+necessary experience or expertise to write contracts that move large amounts of
+money. Use with discretion and please don't put all your life savings in a
+near-teller contract.
+
+Under no circumstances shall contributors to this codebase be liable for
+damages caused direct or indirect by the code provided.
+
+## License
+
+Anyone is allowed to use this code as permitted by MIT license or the Apache
+License (Version 2.0).
+
+In layman's terms, do with this code anything you like. **But at your own risk.**
+'''
+'''--- src/error.rs ---
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
+pub(crate) enum Error {
+    NotEnoughHot,
+    ForeignAccountNotAllowed,
+}
+
+impl Error {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Error::NotEnoughHot => "not enough hot tokens",
+            Error::ForeignAccountNotAllowed => "must be called by contract account",
+        }
+    }
+
+    /// Panic using the NEAR environment, no expensive string formatting going on.
+    pub(crate) fn panic(&self) -> ! {
+        near_sdk::env::panic_str(self.as_str());
+    }
+}
+
+'''
+'''--- src/implementation.rs ---
+//! This module contains all the core implementation of each method.
+//!
+//! All the interesting code, a.k.a. business logic, happens in this module.
+//! Type checks and unit conversion happen before calling into the core
+//! implementations, so the code in this module can focus on the logical
+//! components.
+//!
+//! Access permission checks are done in this module as well. This makes it easy
+//! to check that any method that changes internal state does have access check
+//! in place.
+
+use crate::error::Error;
+use crate::{Teller, TellerExt};
+use near_sdk::{env, near_bindgen, AccountId, Balance, Gas, GasWeight};
+
+type Result<T> = std::result::Result<T, Error>;
+
+#[near_bindgen]
+impl Teller {
+    /// Called after deployment, if redeployed, delete account first.
+    #[init]
+    pub fn init() -> Self {
+        Self {
+            t0: env::block_timestamp(),
+            locked: 0,
+        }
+    }
+}
+
+impl Teller {
+    pub(crate) fn pay_impl(&mut self, yocto: Balance, receiver: &AccountId) -> Result<()> {
+        Self::check_access()?;
+        self.try_lock(yocto)?;
+
+        let index: u64 = env::promise_batch_create(receiver);
+        env::promise_batch_action_transfer(index, yocto);
+
+        Ok(())
+    }
+
+    pub(crate) fn lock_impl(&mut self, n: Balance) -> Result<()> {
+        Self::check_access()?;
+        self.try_lock(n)?;
+        Ok(())
+    }
+
+    pub(crate) fn stake_impl(&mut self, yocto: Balance, staking_pool: &AccountId) -> Result<()> {
+        Self::check_access()?;
+        let index: u64 = env::promise_batch_create(&staking_pool);
+        env::promise_batch_action_function_call_weight(
+            index,
+            "deposit_and_stake",
+            &[],
+            yocto,
+            Gas(0),
+            GasWeight(1),
+        );
+        Ok(())
+    }
+
+    pub(crate) fn unstake_impl(&mut self, staking_pool: &AccountId) -> Result<()> {
+        Self::check_access()?;
+        let index: u64 = env::promise_batch_create(&staking_pool);
+        let attached_balance = 0;
+        env::promise_batch_action_function_call_weight(
+            index,
+            "unstake_all",
+            &[],
+            attached_balance,
+            Gas(0),
+            GasWeight(1),
+        );
+        Ok(())
+    }
+
+    pub(crate) fn withdraw_impl(&mut self, staking_pool: &AccountId) -> Result<()> {
+        Self::check_access()?;
+        let index: u64 = env::promise_batch_create(&staking_pool);
+        let attached_balance = 0;
+        env::promise_batch_action_function_call_weight(
+            index,
+            "withdraw_all",
+            &[],
+            attached_balance,
+            Gas(0),
+            GasWeight(1),
+        );
+        Ok(())
+    }
+
+    /// Only allow functions to be called directly, not via cross function call.
+    ///
+    /// This is very important to check, as otherwise anyone could call into
+    /// teller's methods without any access permission checks!
+    fn check_access() -> Result<()> {
+        if env::current_account_id() == env::predecessor_account_id() {
+            Ok(())
+        } else {
+            Err(Error::ForeignAccountNotAllowed)
+        }
+    }
+
+    fn try_lock(&mut self, yocto: Balance) -> Result<()> {
+        if self.hot() < yocto {
+            Err(Error::NotEnoughHot)
+        } else {
+            self.locked += yocto;
+            Ok(())
+        }
+    }
+}
+
+'''
+'''--- src/lib.rs ---
+//! A token guarding contract for an account with a cold full access key and hot function call access keys.
+//!
+//! The features are simple and few by design. Configuration changes are only possible by redeploying.
+//!
+//! Possible actions are:
+//!
+//! 1. Pay: Send `arg.N` tokens to `arg.account`.
+//! 2. Lock: Forgo `arg.N` tokens that can no longer be retrieved by 1.
+//! 3. Stake: Call `deposit_and_stake` on `CONFIG.staking_pools[arg.staking_pool]` and attach `arg.N` tokens.
+//! 4. Unstake: Call `unstake_all` on `CONFIG.staking_pools[arg.staking_pool]`.
+//! 5. Unstake: Call `withdraw_all` on `CONFIG.staking_pools[arg.staking_pool]`.
+//!
+//! Pay and lock are limited by how many tokens are unlocked for hot wallet access.
+//! Staking is unlimited. (Besides the external limit of actual tokens in the account.)
+//!
+//! Rationale:
+//!
+//! - No dynamic staking: Calling a method with the name `deposit_and_stake` on an arbitrary account makes it possible to retrieve all tokens with hot key.
+//! - No dynamic rate change: Necessary allowance computation makes code more complicated.
+
+mod error;
+mod implementation;
+#[cfg(test)]
+mod unit_tests;
+
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::{env, near_bindgen, AccountId, Balance};
+
+type Near = u32;
+
+struct Config {
+    nano_near_per_second: u128,
+    staking_pools: [&'static str; 10],
+}
+
+const CONFIG: Config = include!("config.ron");
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, near_sdk::PanicOnDefault)]
+pub struct Teller {
+    /// Initial timestamp (ns) from which the allowance is computed from.
+    t0: u64,
+    /// yocto NEAR either retrieved or forgone.
+    locked: u128,
+}
+
+// Public API of the contract.
+//
+// Everything in here operates in an untrusted environment and we must not
+// update Teller's state from here. Always delegate to the `implementation`
+// module for that.
+//
+// The code in here is basically just parsing the input arguments and converting
+// them to convenient types.
+#[near_bindgen]
+impl Teller {
+    /// Send Near tokens to an account. Only whole Near values are supported.
+    pub fn pay(&mut self, n: Near, a: AccountId) {
+        let yocto = n as u128 * 10u128.pow(24);
+        let receiver = &a;
+        if let Err(e) = self.pay_impl(yocto, receiver) {
+            e.panic()
+        }
+    }
+
+    /// Send Near tokens to an account. Amount is specified in yocto Near.
+    pub fn pay_yocto(&mut self, yocto: &String, a: AccountId) {
+        let yocto: u128 = yocto.parse().expect("could not parse input yocto");
+        let receiver = &a;
+        if let Err(e) = self.pay_impl(yocto, receiver) {
+            e.panic()
+        }
+    }
+
+    /// Make Near tokens unavailable for retrieval from hot wallet. Only whole Near values.
+    pub fn lock(&mut self, n: Near) {
+        let yocto = n as u128 * 10u128.pow(24);
+        if let Err(e) = self.lock_impl(yocto) {
+            e.panic()
+        }
+    }
+
+    /// Make Near tokens unavailable for retrieval from hot wallet. Amount is specified in yocto Near.
+    pub fn lock_yocto(&mut self, yocto: &String) {
+        let yocto: u128 = yocto.parse().expect("could not parse input yocto");
+        if let Err(e) = self.lock_impl(yocto) {
+            e.panic()
+        }
+    }
+
+    /// Available balance in yocto Near.
+    pub fn hot(&self) -> Balance {
+        let ns = env::block_timestamp() - self.t0;
+        // nano = e-9, yocto = e-24
+        // ns * nNEAR/s = n^2NEAR = NEAR * e-18
+        // need to multiply with e+6 to return in yocto
+        let available_ever = ns as u128 * CONFIG.nano_near_per_second * 10u128.pow(6);
+        available_ever - self.locked
+    }
+
+    /// Stake with validator[i].
+    pub fn stake(&mut self, i: u32, n: Near) {
+        let staking_pool = select_staking_pool(i as usize);
+        let yocto = n as u128 * 10u128.pow(24);
+
+        if let Err(e) = self.stake_impl(yocto, &staking_pool) {
+            e.panic()
+        }
+    }
+
+    /// Stake with validator[i].Amount is specified in yocto Near.
+    pub fn stake_yocto(&mut self, i: u32, yocto: &String) {
+        let staking_pool = select_staking_pool(i as usize);
+        let yocto: u128 = yocto.parse().expect("could not parse input yocto");
+
+        if let Err(e) = self.stake_impl(yocto, &staking_pool) {
+            e.panic()
+        }
+    }
+
+    /// Unstake and withdraw all balance staked with validator[i].
+    pub fn unstake(&mut self, i: u32) {
+        let staking_pool = select_staking_pool(i as usize);
+
+        if let Err(e) = self.unstake_impl(&staking_pool) {
+            e.panic()
+        }
+    }
+
+    /// Withdraw all balance staked with validator[i].
+    pub fn withdraw(&mut self, i: u32) {
+        let staking_pool = select_staking_pool(i as usize);
+
+        if let Err(e) = self.withdraw_impl(&staking_pool) {
+            e.panic()
+        }
+    }
+}
+
+fn select_staking_pool(i: usize) -> AccountId {
+    // safety: rust will panic on out-of-bound access
+    let staking_pool_str = CONFIG.staking_pools[i];
+    let Ok(staking_pool) = staking_pool_str.parse() else {
+        env::panic_str("invalid pre-installed account");
+    };
+    staking_pool
+}
+
+'''
+'''--- src/unit_tests.rs ---
+use crate::error::Error;
+use crate::{env, AccountId, Balance, Near, Teller};
+use near_sdk::test_utils::VMContextBuilder;
+use near_sdk::{testing_env, VMContext};
+
+#[test]
+fn test_balance() {
+    let app = install();
+    assert_eq!(app.hot(), 0);
+
+    fast_forward(10, 13);
+
+    let expected = seconds_to_yocto(13);
+    assert_eq!(expected, app.hot());
+}
+
+#[test]
+fn test_pay() {
+    let mut app = install();
+    let giga = 1_000_000_000; // to avoid Near fractions
+    fast_forward(10 * giga, 13 * giga);
+    let tokens = seconds_to_near(giga);
+
+    for _ in 0..5 {
+        app.pay(tokens, "max.near".parse().unwrap());
+    }
+
+    let expected = seconds_to_yocto(8 * giga);
+    assert_eq!(expected, app.hot());
+
+    for _ in 0..8 {
+        app.pay(tokens, "max.near".parse().unwrap());
+    }
+    let expected = 0;
+    assert_eq!(expected, app.hot());
+}
+
+#[test]
+fn test_pay_yocto() {
+    let mut app = install();
+    fast_forward(10, 13);
+    let tokens = seconds_to_yocto(1);
+    let token_string = format!("{tokens}");
+
+    for _ in 0..5 {
+        app.pay_yocto(&token_string, "max.near".parse().unwrap());
+    }
+
+    let expected = seconds_to_yocto(8);
+    assert_eq!(expected, app.hot());
+
+    for _ in 0..8 {
+        app.pay_yocto(&token_string, "max.near".parse().unwrap());
+    }
+    let expected = 0;
+    assert_eq!(expected, app.hot());
+}
+
+#[test]
+#[should_panic]
+fn test_pay_too_much() {
+    let mut app = install();
+    fast_forward(50, 65);
+    let tokens = seconds_to_near(65) + 1;
+    app.pay(tokens, "max.near".parse().unwrap());
+}
+
+#[test]
+#[should_panic]
+fn test_pay_foreign_account() {
+    let mut app = install();
+    fast_forward(10, 13);
+    set_predecessor_account("max.near", false);
+    let tokens = seconds_to_near(2);
+    app.pay(tokens, "max.near".parse().unwrap());
+}
+
+#[test]
+fn test_lock() {
+    let mut app = install();
+    let giga = 1_000_000_000; // to avoid Near fractions
+    fast_forward(10 * giga, 13 * giga);
+    let tokens = seconds_to_near(1 * giga);
+
+    for _ in 0..5 {
+        app.lock(tokens);
+    }
+
+    let expected = seconds_to_yocto(8 * giga);
+    assert_eq!(expected, app.hot());
+
+    for _ in 0..8 {
+        app.lock(tokens);
+    }
+    let expected = 0;
+    assert_eq!(expected, app.hot());
+}
+
+#[test]
+fn test_lock_yocto() {
+    let mut app = install();
+    fast_forward(10, 13);
+    let tokens = seconds_to_yocto(1);
+    let token_string = format!("{tokens}");
+
+    for _ in 0..5 {
+        app.lock_yocto(&token_string);
+    }
+
+    let expected = seconds_to_yocto(8);
+    assert_eq!(expected, app.hot());
+
+    for _ in 0..8 {
+        app.lock_yocto(&token_string);
+    }
+    let expected = 0;
+    assert_eq!(expected, app.hot());
+}
+
+#[test]
+#[should_panic]
+fn test_lock_too_much() {
+    let mut app = install();
+    fast_forward(50, 65);
+    let tokens = seconds_to_near(65) + 1;
+    app.lock(tokens);
+}
+
+#[test]
+#[should_panic]
+fn test_lock_foreign_account() {
+    let mut app = install();
+    fast_forward(10, 13);
+    set_predecessor_account("max.near", false);
+    let tokens = seconds_to_yocto(2);
+    app.lock(yocto_to_near(tokens));
+}
+
+#[test]
+fn test_scenario() {
+    let mut app = install();
+    let receiver = "max.near".parse().unwrap();
+
+    fast_forward(100, 100);
+    let tokens = seconds_to_yocto(30);
+    app.pay_impl(tokens, &receiver).expect("access should work");
+    app.assert_hot(70);
+    app.pay_impl(tokens, &receiver).expect("access should work");
+    app.assert_hot(40);
+
+    fast_forward(100, 100);
+    set_predecessor_account("max.near", false);
+    app.assert_hot(140);
+    let err = app.pay_impl(tokens, &receiver).expect_err("should fail");
+    assert_eq!(err, Error::ForeignAccountNotAllowed);
+    app.assert_hot(140);
+    let err = app
+        .pay_impl(seconds_to_yocto(500), &receiver)
+        .expect_err("should fail");
+    assert_eq!(err, Error::ForeignAccountNotAllowed);
+
+    set_predecessor_account("teller.near", false);
+    app.pay_impl(tokens, &receiver).expect("access should work");
+    app.assert_hot(110);
+
+    let err = app
+        .pay_impl(seconds_to_yocto(500), &receiver)
+        .expect_err("should fail");
+    assert_eq!(err, Error::NotEnoughHot);
+    app.assert_hot(110);
+
+    app.pay_impl(seconds_to_yocto(110), &receiver)
+        .expect("access should work");
+    app.assert_hot(0);
+}
+
+fn get_context(is_view: bool) -> VMContext {
+    let account_id: AccountId = "teller.near".parse().unwrap();
+    VMContextBuilder::new()
+        .signer_account_id(account_id.clone())
+        .current_account_id(account_id.clone())
+        .predecessor_account_id(account_id)
+        .account_balance(13000 * 10u128.pow(24))
+        .is_view(is_view)
+        .build()
+}
+
+fn install() -> Teller {
+    let context = get_context(false);
+    testing_env!(context.clone());
+    Teller::init()
+}
+
+fn seconds_to_yocto(seconds: u64) -> u128 {
+    seconds as u128 * super::CONFIG.nano_near_per_second * 10u128.pow(15)
+}
+
+fn yocto_to_near(yocto: Balance) -> Near {
+    (yocto / 10u128.pow(24)) as u32
+}
+
+fn seconds_to_near(seconds: u64) -> Near {
+    yocto_to_near(seconds_to_yocto(seconds))
+}
+
+fn fast_forward(blocks: u64, seconds: u64) {
+    let is_view = false;
+    let mut context = get_context(is_view);
+    context.block_timestamp = env::block_timestamp() + seconds * 1_000_000_000;
+    context.block_index = env::block_height() + blocks;
+    testing_env!(context);
+}
+
+fn set_predecessor_account(account_id: &str, is_view: bool) {
+    let mut context = get_context(is_view);
+    context.block_timestamp = env::block_timestamp();
+    context.block_index = env::block_height();
+    context.predecessor_account_id = account_id.parse().unwrap();
+    testing_env!(context);
+}
+
+impl Teller {
+    #[track_caller]
+    fn assert_hot(&self, seconds: u64) {
+        assert_eq!(self.hot(), seconds_to_yocto(seconds));
+    }
+}
+
+'''
+'''--- tests/integration-tests.rs ---
+use serde_json::json;
+use workspaces::result::{ExecutionFinalResult, ViewResultDetails};
+use workspaces::types::{KeyType, SecretKey};
+use workspaces::{AccountId, Contract, DevNetwork, Worker};
+
+async fn init(worker: &Worker<impl DevNetwork>) -> anyhow::Result<Contract> {
+    let teller_contract = worker
+        .dev_deploy(include_bytes!("../res/near_teller.wasm"))
+        .await?;
+
+    let res = teller_contract.call("init").max_gas().transact().await?;
+    assert!(res.is_success(), "{res:?}");
+
+    return Ok(teller_contract);
+}
+
+/// optional: clean up dev-account contract
+///
+/// The main motivation is to cleanup the testnet on-chain state. We don't want
+/// it to grow for no reason, so let's just cleanup as good practice. When
+/// deleting an account, send tokens to my account because why not.
+async fn cleanup_account(contract: Contract) {
+    _ = contract
+        .delete_contract(&"jakmeier.testnet".parse().unwrap())
+        .await;
+}
+
+/// Read the receiver ID from a cross contract call result.
+fn cross_contract_call_receiver(result: &ExecutionFinalResult) -> AccountId {
+    let receipts = result.receipt_outcomes();
+    assert!(receipts.len() > 2, "{result:?}");
+    let stake_call_receipt = &receipts[1];
+    stake_call_receipt.executor_id.clone()
+}
+
+/// On a staking pool contract, look up the staked balance for an account.
+async fn view_staked_account_balance(
+    worker: &Worker<impl DevNetwork>,
+    pool: AccountId,
+    account_id: &AccountId,
+) -> ViewResultDetails {
+    let arg = json!({ "account_id": account_id });
+    view_call(worker, pool, arg, "get_account_staked_balance").await
+}
+
+/// On a staking pool contract, look up the unstaked balance for an account.
+async fn view_unstaked_account_balance(
+    worker: &Worker<impl DevNetwork>,
+    pool: AccountId,
+    account_id: &AccountId,
+) -> ViewResultDetails {
+    let arg = json!({ "account_id": account_id });
+    view_call(worker, pool, arg, "get_account_unstaked_balance").await
+}
+
+async fn view_call(
+    worker: &Worker<impl DevNetwork>,
+    pool: AccountId,
+    arg: serde_json::Value,
+    method: &str,
+) -> ViewResultDetails {
+    // create dummy `Contract` for pool to make a view call on
+    let pool = Contract::from_secret_key(
+        pool,
+        SecretKey::from_seed(KeyType::ED25519, "no-key-require-for-view-call"),
+        &worker,
+    );
+
+    pool.view(method, arg.to_string().into_bytes())
+        .await
+        .expect("view call failed")
+}
+
+#[tokio::test]
+async fn test_init() -> anyhow::Result<()> {
+    let worker = workspaces::sandbox().await?;
+    let contract = init(&worker).await?;
+
+    let res = contract.call("hot").view().await?;
+    let res_str = std::str::from_utf8(&res.result)?;
+    let yocto: u128 = res_str.parse()?;
+    // between init and this call, there must have been multiple blocks, so
+    // there should be something available
+    assert!(yocto > 0, "{res:?}");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_stake() -> anyhow::Result<()> {
+    let worker = workspaces::testnet_archival().await?;
+    let contract = init(&worker).await?;
+    let contract_account_id = contract.id().clone();
+
+    // do the stake call under test
+    let stake_res = contract
+        .call("stake")
+        .args_json(json!({
+            "i": 0,
+            "n": 1,
+        }))
+        .max_gas()
+        .transact()
+        .await?;
+    assert!(stake_res.is_success(), "{stake_res:?}");
+
+    // lookup account that the staking function call went to
+    let stake_pool_id = cross_contract_call_receiver(&stake_res);
+
+    // check that staked value is what was sent before - 3 yocto NEAR
+    let view_res = view_staked_account_balance(&worker, stake_pool_id, &contract_account_id).await;
+    assert_eq!(
+        view_res.result, b"\"999999999999999999999997\"",
+        "{stake_res:?}\n {view_res:?}"
+    );
+
+    cleanup_account(contract).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_stake_unstake() -> anyhow::Result<()> {
+    let worker = workspaces::testnet_archival().await?;
+    let contract = init(&worker).await?;
+    let contract_account_id = contract.id().clone();
+    let pool_id = 0;
+
+    // prepare with a stake call
+    let stake_res = contract
+        .call("stake")
+        .args_json(json!({
+            "i": pool_id,
+            "n": 1,
+        }))
+        .max_gas()
+        .transact()
+        .await?;
+    assert!(stake_res.is_success(), "{stake_res:?}");
+
+    // do the unstake call
+    let unstake_res = contract
+        .call("unstake")
+        .args_json(json!({
+            "i": pool_id,
+        }))
+        .max_gas()
+        .transact()
+        .await?;
+    assert!(unstake_res.is_success(), "{unstake_res:?}");
+
+    // lookup account that the unstaking function call went to
+    let stake_pool_id = cross_contract_call_receiver(&unstake_res);
+
+    // ensure nothing is staked after unstaking
+    let view_res =
+        view_staked_account_balance(&worker, stake_pool_id.clone(), &contract_account_id).await;
+    assert_eq!(view_res.result, b"\"0\"", "{unstake_res:?}\n {view_res:?}");
+
+    // ensure unstaked balance is still available
+    let view_res =
+        view_unstaked_account_balance(&worker, stake_pool_id.clone(), &contract_account_id).await;
+    assert_eq!(
+        // I don't understand why it is + 1 yocto NEAR but that's what I
+        // observed and I expect it to be consistent.
+        view_res.result,
+        b"\"1000000000000000000000001\"",
+        "{unstake_res:?}\n {view_res:?}"
+    );
+
+    cleanup_account(contract).await;
+    Ok(())
+}
+
+'''

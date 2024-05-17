@@ -1,0 +1,3979 @@
+*GitHub Repository "gadillacer/babylon-contracts"*
+
+'''--- Cargo.toml ---
+[workspace]
+members = [
+    "./babylon-finance",
+    "./test-token"
+]
+
+[profile.release]
+codegen-units = 1
+# s = optimize for binary size ("z" would additionally turn off loop vectorization)
+opt-level = "z"
+# link time optimization
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+
+'''
+'''--- README.md ---
+# Babylon Swap
+Concentrated AMM Protocol on Near Blockchain
+
+Comming soon!
+
+##
+Developed by yoshitoke
+'''
+'''--- _rust_setup.sh ---
+#/bin/bash
+VER=2021-11-01
+rustup toolchain install stable-$VER
+rustup default stable-$VER
+rustup target add wasm32-unknown-unknown
+cargo build -p babylon-finance --target wasm32-unknown-unknown --release
+
+'''
+'''--- babylon-finance/Cargo.toml ---
+[package]
+name = "babylon-finance"
+version = "1.6.2"
+authors = ["gadillac<lenin2732372@gmail.com>"]
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+uint = { version = "0.9.3", default-features = false }
+near-sdk = "3.1.0"
+near-contract-standards = "3.1.0"
+once_cell = "=1.8.0"
+
+[dev-dependencies]
+near-sdk-sim = "3.1.0"
+test-token = { path = "../test-token" }
+rand = "0.8"
+rand_pcg = "0.3"
+'''
+'''--- babylon-finance/src/account_deposit.rs ---
+//! Account deposit is information per user about their balances in the exchange.
+
+use std::collections::HashMap;
+use near_sdk::collections::UnorderedMap;
+
+use near_contract_standards::fungible_token::core_impl::ext_fungible_token;
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::json_types::{ValidAccountId, U128};
+use near_sdk::{
+    assert_one_yocto, env, near_bindgen, 
+    AccountId, Balance, PromiseResult, StorageUsage,
+};
+use crate::legacy::AccountV1;
+use crate::utils::{ext_self, GAS_FOR_FT_TRANSFER, GAS_FOR_RESOLVE_TRANSFER};
+use crate::*;
+
+// [AUDIT_01]
+// const MAX_ACCOUNT_LENGTH: u128 = 64;
+// const MAX_ACCOUNT_BYTES: u128 = MAX_ACCOUNT_LENGTH + 4;
+// const MIN_ACCOUNT_DEPOSIT_LENGTH: u128 = 1 + MAX_ACCOUNT_BYTES + 16 + 4;
+
+const U128_STORAGE: StorageUsage = 16;
+const U64_STORAGE: StorageUsage = 8;
+const U32_STORAGE: StorageUsage = 4;
+/// max length of account id is 64 bytes. We charge per byte.
+const ACC_ID_STORAGE: StorageUsage = 64;
+/// As a key, 4 bytes length would be added to the head
+const ACC_ID_AS_KEY_STORAGE: StorageUsage = ACC_ID_STORAGE + 4;
+const KEY_PREFIX_ACC: StorageUsage = 64;
+/// As a near_sdk::collection key, 1 byte for prefiex
+const ACC_ID_AS_CLT_KEY_STORAGE: StorageUsage = ACC_ID_AS_KEY_STORAGE + 1;
+
+// ACC_ID: the Contract accounts map key length
+// + VAccount enum: 1 byte
+// + U128_STORAGE: near_amount storage
+// + U32_STORAGE: legacy_tokens HashMap length
+// + U32_STORAGE: tokens HashMap length
+// + U64_STORAGE: storage_used
+pub const INIT_ACCOUNT_STORAGE: StorageUsage =
+    ACC_ID_AS_CLT_KEY_STORAGE + 1 + U128_STORAGE + U32_STORAGE + U32_STORAGE + U64_STORAGE;
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub enum VAccount {
+    V1(AccountV1),
+    Current(Account),
+}
+
+impl VAccount {
+    /// Upgrades from other versions to the currently used version.
+    pub fn into_current(self, account_id: &AccountId) -> Account {
+        match self {
+            VAccount::Current(account) => account,
+            VAccount::V1(account) => account.into_current(account_id),
+        }
+    }
+}
+
+impl From<Account> for VAccount {
+    fn from(account: Account) -> Self {
+        VAccount::Current(account)
+    }
+}
+
+/// Account deposits information and storage cost.
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct Account {
+    /// Native NEAR amount sent to the exchange.
+    /// Used for storage right now, but in future can be used for trading as well.
+    pub near_amount: Balance,
+    /// Amounts of various tokens deposited to this account.
+    pub legacy_tokens: HashMap<AccountId, Balance>,
+    pub tokens: UnorderedMap<AccountId, Balance>,
+    pub storage_used: StorageUsage,
+}
+
+impl Account {
+    pub fn new(account_id: &AccountId) -> Self {
+        Account {
+            near_amount: 0,
+            legacy_tokens: HashMap::new(),
+            tokens: UnorderedMap::new(StorageKey::AccountTokens {
+                account_id: account_id.clone(),
+            }),
+            storage_used: 0,
+        }
+    }
+
+    pub fn get_balance(&self, token_id: &AccountId) -> Option<Balance> {
+        if let Some(token_balance) = self.tokens.get(token_id) {
+            Some(token_balance)
+        } else if let Some(legacy_token_balance) = self.legacy_tokens.get(token_id) {
+            Some(*legacy_token_balance)
+        } else {
+            None
+        }
+    }
+
+    pub fn get_tokens(&self) -> Vec<AccountId> {
+        let mut a: Vec<AccountId> = self.tokens.keys().collect();
+        let b: Vec<AccountId> = self.legacy_tokens
+            .keys()
+            .cloned()
+            .collect();
+        a.extend(b);
+        a
+    }
+
+    /// Deposit amount to the balance of given token,
+    /// if given token not register and not enough storage, deposit fails 
+    pub(crate) fn deposit_with_storage_check(&mut self, token: &AccountId, amount: Balance) -> bool { 
+        if let Some(balance) = self.tokens.get(token) {
+            // token has been registered, just add without storage check, 
+            let new_balance = balance + amount;
+            self.tokens.insert(token, &new_balance);
+            true
+        } else if let Some(x) = self.legacy_tokens.get_mut(token) {
+            // token has been registered, just add without storage check
+            *x += amount;
+            true
+        } else {
+            // check storage after insert, if fail should unregister the token
+            self.tokens.insert(token, &(amount));
+            if self.storage_usage() <= self.near_amount {
+                true
+            } else {
+                self.tokens.remove(token);
+                false
+            }
+        }
+    }
+
+    /// Deposit amount to the balance of given token.
+    pub(crate) fn deposit(&mut self, token: &AccountId, amount: Balance) {
+        if amount > 0 {
+            if let Some(x) = self.legacy_tokens.remove(token) {
+                // need convert to tokens
+                self.tokens.insert(token, &(amount + x));
+            } else if let Some(x) = self.tokens.get(token) {
+                self.tokens.insert(token, &(amount + x));
+            } else {
+                self.tokens.insert(token, &amount);
+            }
+        }
+    }
+
+    /// Withdraw amount of `token` from the internal balance.
+    /// Panics if `amount` is bigger than the current balance.
+    pub(crate) fn withdraw(&mut self, token: &AccountId, amount: Balance) {
+        if amount > 0 {
+            if let Some(x) = self.legacy_tokens.remove(token) {
+                // need convert to 
+                assert!(x >= amount, "{}", ERR22_NOT_ENOUGH_TOKENS);
+                self.tokens.insert(token, &(x - amount));
+            } else if let Some(x) = self.tokens.get(token) {
+                assert!(x >= amount, "{}", ERR22_NOT_ENOUGH_TOKENS);
+                self.tokens.insert(token, &(x - amount));
+            } else {
+                env::panic(ERR21_TOKEN_NOT_REG.as_bytes());
+            }
+        }
+    }
+
+    // [AUDIT_01]
+    /// Returns amount of $NEAR necessary to cover storage used by this data structure.
+    pub fn storage_usage(&self) -> Balance {
+        (INIT_ACCOUNT_STORAGE + 
+            self.legacy_tokens.len() as u64 * (ACC_ID_AS_KEY_STORAGE + U128_STORAGE) + 
+            self.tokens.len() as u64 * (KEY_PREFIX_ACC + ACC_ID_AS_KEY_STORAGE + U128_STORAGE)
+        ) as u128
+            * env::storage_byte_cost()
+    }
+
+    /// Returns how much NEAR is available for storage.
+    pub fn storage_available(&self) -> Balance {
+        // [AUDIT_01] avoid math overflow
+        let locked = self.storage_usage();
+        if self.near_amount > locked {
+            self.near_amount - locked
+        } else {
+            0
+        }
+    }
+
+    /// Asserts there is sufficient amount of $NEAR to cover storage usage.
+    pub fn assert_storage_usage(&self) {
+        assert!(
+            self.storage_usage() <= self.near_amount,
+            "{}",
+            ERR11_INSUFFICIENT_STORAGE
+        );
+    }
+
+    /// Returns minimal account deposit storage usage possible.
+    pub fn min_storage_usage() -> Balance {
+        INIT_ACCOUNT_STORAGE as Balance * env::storage_byte_cost()
+    }
+
+    /// Registers given token and set balance to 0.
+    pub(crate) fn register(&mut self, token_ids: &Vec<ValidAccountId>) {
+        for token_id in token_ids {
+            let t = token_id.as_ref();
+            if self.get_balance(t).is_none() {
+                self.tokens.insert(t, &0);
+            }
+        }
+    }
+
+    /// Unregisters `token_id` from this account balance.
+    /// Panics if the `token_id` balance is not 0.
+    pub(crate) fn unregister(&mut self, token_id: &AccountId) {
+        let amount = self.legacy_tokens.remove(token_id).unwrap_or_default();
+        assert_eq!(amount, 0, "{}", ERR24_NON_ZERO_TOKEN_BALANCE);
+        let amount = self.tokens.remove(token_id).unwrap_or_default();
+        assert_eq!(amount, 0, "{}", ERR24_NON_ZERO_TOKEN_BALANCE);
+    }
+}
+
+#[near_bindgen]
+impl Contract {
+    /// Registers given token in the user's account deposit.
+    /// Fails if not enough balance on this account to cover storage.
+    #[payable]
+    pub fn register_tokens(&mut self, token_ids: Vec<ValidAccountId>) {
+        assert_one_yocto();
+        self.assert_contract_running();
+        let sender_id = env::predecessor_account_id();
+        let mut account = self.internal_unwrap_account(&sender_id);
+        account.register(&token_ids);
+        self.internal_save_account(&sender_id, account);
+    }
+
+    /// Unregister given token from user's account deposit.
+    /// Panics if the balance of any given token is non 0.
+    #[payable]
+    pub fn unregister_tokens(&mut self, token_ids: Vec<ValidAccountId>) {
+        assert_one_yocto();
+        self.assert_contract_running();
+        let sender_id = env::predecessor_account_id();
+        let mut account = self.internal_unwrap_account(&sender_id);
+        for token_id in token_ids {
+            account.unregister(token_id.as_ref());
+        }
+        self.internal_save_account(&sender_id, account);
+    }
+
+    pub fn token_register_of(&self, account_id: ValidAccountId, token_id: ValidAccountId) -> bool {
+        let account_id: AccountId = account_id.into();
+        let token_id: AccountId = token_id.into();
+        let account = self.internal_unwrap_or_default_account(&account_id);
+        account.get_balance(&token_id).is_some()
+    }
+
+    /// Withdraws given token from the deposits of given user.
+    /// a zero amount means to withdraw all in user's inner account.
+    /// Optional unregister will try to remove record of this token from AccountDeposit for given user.
+    /// Unregister will fail if the left over balance is non 0.
+    #[payable]
+    pub fn withdraw(
+        &mut self,
+        token_id: ValidAccountId,
+        amount: U128,
+        unregister: Option<bool>,
+    ) -> Promise {
+        assert_one_yocto();
+        self.assert_contract_running();
+        let token_id: AccountId = token_id.into();
+        // feature frozenlist
+        self.assert_no_frozen_tokens(&[token_id.clone()]);
+        let sender_id = env::predecessor_account_id();
+        let mut account = self.internal_unwrap_account(&sender_id);
+        
+        // get full amount if amount param is 0
+        let mut amount: u128 = amount.into();
+        if amount == 0 {
+            amount = account.get_balance(&token_id).expect(ERR21_TOKEN_NOT_REG);
+        }
+        assert!(amount > 0, "{}", ERR29_ILLEGAL_WITHDRAW_AMOUNT);
+        
+        // Note: subtraction and deregistration will be reverted if the promise fails.
+        account.withdraw(&token_id, amount);
+        if unregister == Some(true) {
+            account.unregister(&token_id);
+        }
+        self.internal_save_account(&sender_id, account);
+        self.internal_send_tokens(&sender_id, &token_id, amount)
+    }
+
+    #[private]
+    pub fn exchange_callback_post_withdraw(
+        &mut self,
+        token_id: AccountId,
+        sender_id: AccountId,
+        amount: U128,
+    ) -> U128 {
+        assert_eq!(
+            env::promise_results_count(),
+            1,
+            "{}",
+            ERR25_CALLBACK_POST_WITHDRAW_INVALID
+        );
+        match env::promise_result(0) {
+            PromiseResult::NotReady => unreachable!(),
+            PromiseResult::Successful(_) => amount,
+            PromiseResult::Failed => {
+                // This reverts the changes from withdraw function.
+                // If account doesn't exit, deposits to the owner's account as lostfound.
+                let mut failed = false;
+                if let Some(mut account) = self.internal_get_account(&sender_id) {
+                    if account.deposit_with_storage_check(&token_id, amount.0) {
+                        // cause storage already checked, here can directly save
+                        self.accounts.insert(&sender_id, &account.into());
+                    } else {
+                        // we can ensure that internal_get_account here would NOT cause a version upgrade, 
+                        // cause it is callback, the account must be the current version or non-exist,
+                        // so, here we can just leave it without insert, won't cause storage collection inconsistency.
+                        env::log(
+                            format!(
+                                "Account {} has not enough storage. Depositing to owner.",
+                                sender_id
+                            )
+                            .as_bytes(),
+                        );
+                        failed = true;
+                    }
+                } else {
+                    env::log(
+                        format!(
+                            "Account {} is not registered. Depositing to owner.",
+                            sender_id
+                        )
+                        .as_bytes(),
+                    );
+                    failed = true;
+                }
+                if failed {
+                    self.internal_lostfound(&token_id, amount.0);
+                }
+                0.into()
+            }
+        }
+    }
+}
+
+impl Contract {
+
+    /// Checks that account has enough storage to be stored and saves it into collection.
+    /// This should be only place to directly use `self.accounts`.
+    pub(crate) fn internal_save_account(&mut self, account_id: &AccountId, account: Account) {
+        account.assert_storage_usage();
+        self.accounts.insert(&account_id, &account.into());
+    }
+
+    /// save token to owner account as lostfound, no need to care about storage
+    /// only global whitelisted token can be stored in lost-found
+    pub(crate) fn internal_lostfound(&mut self, token_id: &AccountId, amount: u128) {
+        if self.whitelisted_tokens.contains(token_id) {
+            let mut lostfound = self.internal_unwrap_or_default_account(&self.owner_id);
+            lostfound.deposit(token_id, amount);
+            self.accounts.insert(&self.owner_id, &lostfound.into());
+        } else {
+            log!("Deposit {} {} failed due to non global whitelisted token", amount, token_id);
+        }
+        
+    }
+    
+
+    /// Registers account in deposited amounts with given amount of $NEAR.
+    /// If account already exists, adds amount to it.
+    /// This should be used when it's known that storage is prepaid.
+    pub(crate) fn internal_register_account(&mut self, account_id: &AccountId, amount: Balance) {
+        let mut account = self.internal_unwrap_or_default_account(&account_id);
+        account.near_amount += amount;
+        self.internal_save_account(&account_id, account);
+    }
+
+    /// storage withdraw
+    pub(crate) fn internal_storage_withdraw(&mut self, account_id: &AccountId, amount: Balance) -> u128 {
+        let mut account = self.internal_unwrap_account(&account_id);
+        let available = account.storage_available();
+        assert!(available > 0, "{}", ERR15_NO_STORAGE_CAN_WITHDRAW);
+        let mut withdraw_amount = amount;
+        if amount == 0 {
+            withdraw_amount = available;
+        }
+        assert!(withdraw_amount <= available, "{}", ERR16_STORAGE_WITHDRAW_TOO_MUCH);
+        account.near_amount -= withdraw_amount;
+        self.internal_save_account(&account_id, account);
+        withdraw_amount
+    }
+
+    /// Record deposit of some number of tokens to this contract.
+    /// Fails if account is not registered or if token isn't whitelisted.
+    pub(crate) fn internal_deposit(
+        &mut self,
+        sender_id: &AccountId,
+        token_id: &AccountId,
+        amount: Balance,
+    ) {
+        let mut account = self.internal_unwrap_account(sender_id);
+        assert!(
+            self.whitelisted_tokens.contains(token_id) 
+                || account.get_balance(token_id).is_some(),
+            "{}",
+            ERR12_TOKEN_NOT_WHITELISTED
+        );
+        account.deposit(token_id, amount);
+        self.internal_save_account(&sender_id, account);
+    }
+
+    pub fn internal_get_account(&self, account_id: &AccountId) -> Option<Account> {
+        self.accounts
+            .get(account_id)
+            .map(|va| va.into_current(account_id))
+    }
+
+    pub fn internal_unwrap_account(&self, account_id: &AccountId) -> Account {
+        self.internal_get_account(account_id)
+            .expect(errors::ERR10_ACC_NOT_REGISTERED)
+    }
+
+    pub fn internal_unwrap_or_default_account(&self, account_id: &AccountId) -> Account {
+        self.internal_get_account(account_id)
+            .unwrap_or_else(|| Account::new(account_id))
+    }
+
+    /// Returns current balance of given token for given user. If there is nothing recorded, returns 0.
+    pub(crate) fn internal_get_deposit(
+        &self,
+        sender_id: &AccountId,
+        token_id: &AccountId,
+    ) -> Balance {
+        self.internal_get_account(sender_id)
+            .and_then(|x| x.get_balance(token_id))
+            .unwrap_or(0)
+    }
+
+    /// Sends given amount to given user and if it fails, returns it back to user's balance.
+    /// Tokens must already be subtracted from internal balance.
+    pub(crate) fn internal_send_tokens(
+        &self,
+        sender_id: &AccountId,
+        token_id: &AccountId,
+        amount: Balance,
+    ) -> Promise {
+        ext_fungible_token::ft_transfer(
+            sender_id.clone(),
+            U128(amount),
+            None,
+            token_id,
+            1,
+            GAS_FOR_FT_TRANSFER,
+        )
+        .then(ext_self::exchange_callback_post_withdraw(
+            token_id.clone(),
+            sender_id.clone(),
+            U128(amount),
+            &env::current_account_id(),
+            0,
+            GAS_FOR_RESOLVE_TRANSFER,
+        ))
+    }
+}
+
+'''
+'''--- babylon-finance/src/action.rs ---
+use crate::errors::ERR41_WRONG_ACTION_RESULT;
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{env, json_types::U128, AccountId, Balance};
+
+/// Single swap action.
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct SwapAction {
+    /// Pool which should be used for swapping.
+    pub pool_id: u64,
+    /// Token to swap from.
+    pub token_in: AccountId,
+    /// Amount to exchange.
+    /// If amount_in is None, it will take amount_out from previous step.
+    /// Will fail if amount_in is None on the first step.
+    pub amount_in: Option<U128>,
+    /// Token to swap into.
+    pub token_out: AccountId,
+    /// Required minimum amount of token_out.
+    pub min_amount_out: U128,
+}
+
+/// Single action. Allows to execute sequence of various actions initiated by an account.
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+#[serde(untagged)]
+pub enum Action {
+    Swap(SwapAction),
+}
+
+impl Action {
+    /// Returns involved tokens in this action. Useful for checking permissions and storage.
+    pub fn tokens(&self) -> Vec<AccountId> {
+        match self {
+            Action::Swap(swap_action) => {
+                vec![swap_action.token_in.clone(), swap_action.token_out.clone()]
+            }
+        }
+    }
+}
+
+/// Result from action execution.
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub enum ActionResult {
+    /// No result.
+    None,
+    /// Amount of token was received.
+    /// [AUDIT_02]
+    Amount(U128),
+}
+
+impl ActionResult {
+    pub fn to_amount(self) -> Balance {
+        match self {
+            // [AUDIT_02]
+            ActionResult::Amount(result) => result.0,
+            _ => env::panic(ERR41_WRONG_ACTION_RESULT.as_bytes()),
+        }
+    }
+}
+
+'''
+'''--- babylon-finance/src/admin_fee.rs ---
+use near_sdk::{env, AccountId};
+
+/// Maintain information about fees.
+pub struct AdminFees {
+    /// Basis points of the fee for exchange.
+    pub exchange_fee: u32,
+    /// Basis points of the fee for referrer.
+    pub referral_fee: u32,
+    pub exchange_id: AccountId,
+    pub referral_id: Option<AccountId>,
+}
+
+impl AdminFees {
+    pub fn new(exchange_fee: u32) -> Self {
+        AdminFees {
+            exchange_fee,
+            exchange_id: env::current_account_id(),
+            referral_fee: 0,
+            referral_id: None,
+        }
+    }
+
+    pub fn zero() -> Self {
+        Self::new(0)
+    }
+}
+
+'''
+'''--- babylon-finance/src/custom_keys.rs ---
+// Key for rated token info
+pub const RATE_STORAGE_KEY: &str = "custom_rate_key";
+'''
+'''--- babylon-finance/src/errors.rs ---
+// Storage errors.
+
+pub const ERR10_ACC_NOT_REGISTERED: &str = "E10: account not registered";
+pub const ERR11_INSUFFICIENT_STORAGE: &str = "E11: insufficient $NEAR storage deposit";
+pub const ERR12_TOKEN_NOT_WHITELISTED: &str = "E12: token not whitelisted";
+pub const ERR13_LP_NOT_REGISTERED: &str = "E13: LP not registered";
+pub const ERR14_LP_ALREADY_REGISTERED: &str = "E14: LP already registered";
+pub const ERR15_NO_STORAGE_CAN_WITHDRAW: &str = "E15: no storage can withdraw";
+pub const ERR16_STORAGE_WITHDRAW_TOO_MUCH: &str = "E16: storage withdraw too much";
+pub const ERR17_DEPOSIT_LESS_THAN_MIN_STORAGE: &str = "E17: deposit less than min storage";
+pub const ERR18_TOKENS_NOT_EMPTY: &str = "E18: storage unregister tokens not empty";
+
+// Accounts.
+
+pub const ERR21_TOKEN_NOT_REG: &str = "E21: token not registered";
+pub const ERR22_NOT_ENOUGH_TOKENS: &str = "E22: not enough tokens in deposit";
+// pub const ERR23_NOT_ENOUGH_NEAR: &str = "E23: not enough NEAR in deposit";
+pub const ERR24_NON_ZERO_TOKEN_BALANCE: &str = "E24: non-zero token balance";
+pub const ERR25_CALLBACK_POST_WITHDRAW_INVALID: &str =
+    "E25: expected 1 promise result from withdraw";
+// [AUDIT_05]
+// pub const ERR26_ACCESS_KEY_NOT_ALLOWED: &str = "E26: access key not allowed";
+pub const ERR27_DEPOSIT_NEEDED: &str = 
+    "E27: attach 1yN to swap tokens not in whitelist";
+pub const ERR28_WRONG_MSG_FORMAT: &str = "E28: Illegal msg in ft_transfer_call";
+pub const ERR29_ILLEGAL_WITHDRAW_AMOUNT: &str = "E29: Illegal withdraw amount";
+
+// Liquidity operations.
+
+pub const ERR31_ZERO_AMOUNT: &str = "E31: adding zero amount";
+pub const ERR32_ZERO_SHARES: &str = "E32: minting zero shares";
+// [AUDIT_07]
+pub const ERR33_TRANSFER_TO_SELF: &str = "E33: transfer to self";
+pub const ERR34_INSUFFICIENT_LP_SHARES: &str = "E34: insufficient lp shares";
+pub const ERR35_AT_LEAST_ONE_YOCTO: &str = "E35: requires attached deposit of at least 1 yoctoNEAR";
+pub const ERR36_SHARES_TOTAL_SUPPLY_OVERFLOW: &str = "E36: shares_total_supply overflow";
+
+// Action result.
+
+pub const ERR41_WRONG_ACTION_RESULT: &str = "E41: wrong action result type";
+
+// Contract Level
+pub const ERR51_CONTRACT_PAUSED: &str = "E51: contract paused";
+pub const ERR52_FROZEN_TOKEN: &str = "E52: token frozen";
+pub const ERR53_TOKEN_NOT_IN_LIST: &str = "E53: token not in list";
+
+// Swap
+pub const ERR60_DECIMAL_ILLEGAL: &str = "E60: illegal decimal";
+pub const ERR61_AMP_ILLEGAL: &str = "E61: illegal amp";
+pub const ERR62_FEE_ILLEGAL: &str = "E62: illegal fee";
+pub const ERR63_MISSING_TOKEN: &str = "E63: missing token";
+pub const ERR64_TOKENS_COUNT_ILLEGAL: &str = "E64: illegal tokens count";
+pub const ERR65_INIT_TOKEN_BALANCE: &str = "E65: init token balance should be non-zero";
+pub const ERR66_INVARIANT_CALC_ERR: &str = "E66: encounter err when calc invariant D";
+pub const ERR67_LPSHARE_CALC_ERR: &str = "E67: encounter err when calc lp shares";
+pub const ERR68_SLIPPAGE: &str = "E68: slippage error";
+pub const ERR69_MIN_RESERVE: &str = "E69: pool reserved token balance less than MIN_RESERVE";
+pub const ERR70_SWAP_OUT_CALC_ERR: &str = "E70: encounter err when calc swap out";
+pub const ERR71_SWAP_DUP_TOKENS: &str = "E71: illegal swap with duplicated tokens";
+pub const ERR72_AT_LEAST_ONE_SWAP: &str = "E72: at least one swap";
+pub const ERR73_SAME_TOKEN: &str = "E73: same token swap";
+pub const ERR75_INVARIANT_REDUCE: &str = "E75: invariant can not reduce ";
+pub const ERR76_INVALID_PARAMS: &str = "E76: invalid params";
+
+// pool manage
+pub const ERR81_AMP_IN_LOCK: &str = "E81: amp is currently in lock";
+pub const ERR82_INSUFFICIENT_RAMP_TIME: &str = "E82: insufficient ramp time";
+pub const ERR83_INVALID_AMP_FACTOR: &str = "E83: invalid amp factor";
+pub const ERR84_AMP_LARGE_CHANGE: &str = "E84: amp factor change is too large";
+pub const ERR85_NO_POOL: &str = "E85: invalid pool id";
+pub const ERR86_MIN_AMOUNT: &str = "E86: amount need above min amount";
+pub const ERR87_ILLEGAL_POOL_ID: &str = "E87: illegal pool id";
+pub const ERR88_NOT_STABLE_POOL: &str = "E88: not stable pool";
+pub const ERR89_WRONG_TOKEN_COUNT: &str = "E89: wrong token count";
+pub const ERR90_FEE_TOO_LARGE: &str = "E90: fee too large";
+pub const ERR91_NOT_ENOUGH_SHARES: &str = "E91: not enough shares";
+pub const ERR92_TOKEN_DUPLICATES: &str = "E92: token duplicated";
+pub const ERR89_WRONG_AMOUNT_COUNT: &str = "E89: wrong amount count";
+
+// owner
+pub const ERR100_NOT_ALLOWED: &str = "E100: no permission to invoke this";
+pub const ERR101_ILLEGAL_FEE: &str = "E101: illegal fee";
+pub const ERR102_INVALID_TOKEN_ID: &str = "E102: invalid token id";
+pub const ERR103_NOT_INITIALIZED: &str = "E103: contract is not initialized";
+
+//mft
+pub const ERR110_INVALID_REGISTER: &str = "E110: Invalid register";
+
+// rated pool
+pub const ERR120_RATES_EXPIRED: &str = "E120: Rates expired";
+// pub const ERR122_FAILED_TO_UPDATE_RATES: &str = "E122: Failed to update rates";
+pub const ERR123_ONE_PROMISE_RESULT: &str = "E123: Cross-contract call should have exactly one promise result";
+pub const ERR124_CROSS_CALL_FAILED: &str = "E124: Cross-contract call failed";
+// pub const ERR125_FAILED_TO_APPLY_RATES: &str = "E125: Failed to apply new rates";
+pub const ERR126_FAILED_TO_PARSE_RESULT: &str = "E126: Failed to parse cross-contract call result";
+pub const ERR127_INVALID_RATE_TYPE: &str = "E127: Invalid rate type";
+
+'''
+'''--- babylon-finance/src/legacy.rs ---
+//! This module captures all the code needed to migrate from previous version.
+use std::collections::HashMap;
+use near_sdk::collections::{UnorderedMap, Vector, LookupMap, UnorderedSet};
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::{AccountId, Balance, StorageUsage};
+use crate::account_deposit::{Account, VAccount};
+use crate::StorageKey;
+use crate::pool::Pool;
+use crate::RunningState;
+
+/// Account deposits information and storage cost.
+#[derive(BorshSerialize, BorshDeserialize, Default, Clone)]
+pub struct AccountV1 {
+    /// Native NEAR amount sent to the exchange.
+    /// Used for storage right now, but in future can be used for trading as well.
+    pub near_amount: Balance,
+    /// Amounts of various tokens deposited to this account.
+    pub tokens: HashMap<AccountId, Balance>,
+    pub storage_used: StorageUsage,
+}
+
+impl AccountV1 {
+    pub fn into_current(&self, account_id: &AccountId) -> Account {
+        Account {
+            near_amount: self.near_amount,
+            legacy_tokens: self.tokens.clone(),
+            tokens: UnorderedMap::new(StorageKey::AccountTokens {
+                account_id: account_id.clone(),
+            }),
+            storage_used: self.storage_used,
+        }
+    }
+}
+
+#[derive(BorshDeserialize)]
+pub struct ContractV1 {
+    /// Account of the owner.
+    pub owner_id: AccountId,
+    /// Exchange fee, that goes to exchange itself (managed by governance).
+    pub exchange_fee: u32,
+    /// Referral fee, that goes to referrer in the call.
+    pub referral_fee: u32,
+    /// List of all the pools.
+    pub pools: Vector<Pool>,
+    /// Accounts registered, keeping track all the amounts deposited, storage and more.
+    pub accounts: LookupMap<AccountId, VAccount>,
+    /// Set of whitelisted tokens by "owner".
+    pub whitelisted_tokens: UnorderedSet<AccountId>,
+    /// Set of guardians.
+    pub guardians: UnorderedSet<AccountId>,
+    /// Running state
+    pub state: RunningState,
+}
+
+'''
+'''--- babylon-finance/src/lib.rs ---
+use std::convert::TryInto;
+use std::fmt;
+
+use near_contract_standards::storage_management::{
+    StorageBalance, StorageBalanceBounds, StorageManagement,
+};
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::{LookupMap, UnorderedSet, Vector};
+use near_sdk::json_types::{ValidAccountId, U128};
+use near_sdk::{
+    assert_one_yocto, env, log, near_bindgen, AccountId, Balance, PanicOnDefault, Promise,
+    PromiseResult, StorageUsage, BorshStorageKey, PromiseOrValue, ext_contract
+};
+use utils::{NO_DEPOSIT, GAS_FOR_BASIC_OP};
+
+use crate::account_deposit::{VAccount, Account};
+pub use crate::action::SwapAction;
+pub use crate::action::Action;
+use crate::action::ActionResult;
+use crate::errors::*;
+use crate::admin_fee::AdminFees;
+use crate::pool::Pool;
+use crate::simple_pool::SimplePool;
+use crate::utils::check_token_duplicates;
+pub use crate::custom_keys::*;
+pub use crate::views::{PoolInfo, ContractMetadata};
+
+mod account_deposit;
+mod action;
+mod errors;
+mod admin_fee;
+mod legacy;
+mod multi_fungible_token;
+mod owner;
+mod pool;
+mod simple_pool;
+mod storage_impl;
+mod token_receiver;
+mod utils;
+mod views;
+mod custom_keys;
+
+near_sdk::setup_alloc!();
+
+#[derive(BorshStorageKey, BorshSerialize)]
+pub(crate) enum StorageKey {
+    Pools,
+    Accounts,
+    Shares { pool_id: u32 },
+    Whitelist,
+    Guardian,
+    AccountTokens {account_id: AccountId},
+    Frozenlist,
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Eq, PartialEq, Clone)]
+#[serde(crate = "near_sdk::serde")]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Debug))]
+pub enum RunningState {
+    Running, Paused
+}
+
+impl fmt::Display for RunningState {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            RunningState::Running => write!(f, "Running"),
+            RunningState::Paused => write!(f, "Paused"),
+        }
+    }
+}
+
+#[ext_contract(ext_self)]
+pub trait SelfCallbacks {
+    fn update_token_rate_callback(&mut self, token_id: AccountId);
+}
+
+#[near_bindgen]
+#[derive(BorshSerialize, BorshDeserialize, PanicOnDefault)]
+pub struct Contract {
+    /// Account of the owner.
+    owner_id: AccountId,
+    /// Exchange fee, that goes to exchange itself (managed by governance).
+    exchange_fee: u32,
+    /// Referral fee, that goes to referrer in the call.
+    referral_fee: u32,
+    /// List of all the pools.
+    pools: Vector<Pool>,
+    /// Accounts registered, keeping track all the amounts deposited, storage and more.
+    accounts: LookupMap<AccountId, VAccount>,
+    /// Set of whitelisted tokens by "owner".
+    whitelisted_tokens: UnorderedSet<AccountId>,
+    /// Set of guardians.
+    guardians: UnorderedSet<AccountId>,
+    /// Running state
+    state: RunningState,
+    /// Set of frozenlist tokens
+    frozen_tokens: UnorderedSet<AccountId>,
+}
+
+#[near_bindgen]
+impl Contract {
+    #[init]
+    pub fn new(owner_id: ValidAccountId, exchange_fee: u32, referral_fee: u32) -> Self {
+        Self {
+            owner_id: owner_id.as_ref().clone(),
+            exchange_fee,
+            referral_fee,
+            pools: Vector::new(StorageKey::Pools),
+            accounts: LookupMap::new(StorageKey::Accounts),
+            whitelisted_tokens: UnorderedSet::new(StorageKey::Whitelist),
+            guardians: UnorderedSet::new(StorageKey::Guardian),
+            state: RunningState::Running,
+            frozen_tokens: UnorderedSet::new(StorageKey::Frozenlist),
+        }
+    }
+
+    /// Adds new "Simple Pool" with given tokens and given fee.
+    /// Attached NEAR should be enough to cover the added storage.
+    #[payable]
+    pub fn add_simple_pool(&mut self, tokens: Vec<ValidAccountId>, fee: u32) -> u64 {
+        self.assert_contract_running();
+        check_token_duplicates(&tokens);
+        self.internal_add_pool(Pool::SimplePool(SimplePool::new(
+            self.pools.len() as u32,
+            tokens,
+            fee,
+            0,
+            0,
+        )))
+    }
+
+    /// [AUDIT_03_reject(NOPE action is allowed by design)]
+    /// [AUDIT_04]
+    /// Executes generic set of actions.
+    /// If referrer provided, pays referral_fee to it.
+    /// If no attached deposit, outgoing tokens used in swaps must be whitelisted.
+    #[payable]
+    pub fn execute_actions(
+        &mut self,
+        actions: Vec<Action>,
+        referral_id: Option<ValidAccountId>,
+    ) -> ActionResult {
+        self.assert_contract_running();
+        let sender_id = env::predecessor_account_id();
+        let mut account = self.internal_unwrap_account(&sender_id);
+        // Validate that all tokens are whitelisted if no deposit (e.g. trade with access key).
+        if env::attached_deposit() == 0 {
+            for action in &actions {
+                for token in action.tokens() {
+                    assert!(
+                        account.get_balance(&token).is_some() 
+                            || self.whitelisted_tokens.contains(&token),
+                        "{}",
+                        // [AUDIT_05]
+                        ERR27_DEPOSIT_NEEDED
+                    );
+                }
+            }
+        }
+        let referral_id = referral_id.map(|r| r.into());
+        let result =
+            self.internal_execute_actions(&mut account, &referral_id, &actions, ActionResult::None);
+        self.internal_save_account(&sender_id, account);
+        result
+    }
+
+    /// Execute set of swap actions between pools.
+    /// If referrer provided, pays referral_fee to it.
+    /// If no attached deposit, outgoing tokens used in swaps must be whitelisted.
+    #[payable]
+    pub fn swap(&mut self, actions: Vec<SwapAction>, referral_id: Option<ValidAccountId>) -> U128 {
+        self.assert_contract_running();
+        assert_ne!(actions.len(), 0, "{}", ERR72_AT_LEAST_ONE_SWAP);
+        U128(
+            self.execute_actions(
+                actions
+                    .into_iter()
+                    .map(|swap_action| Action::Swap(swap_action))
+                    .collect(),
+                referral_id,
+            )
+            .to_amount(),
+        )
+    }
+
+    /// Add liquidity from already deposited amounts to given pool.
+    #[payable]
+    pub fn add_liquidity(
+        &mut self,
+        pool_id: u64,
+        amounts: Vec<U128>,
+        min_amounts: Option<Vec<U128>>,
+    ) -> U128 {
+        self.assert_contract_running();
+        assert!(
+            env::attached_deposit() > 0,
+            "{}", ERR35_AT_LEAST_ONE_YOCTO
+        );
+        let prev_storage = env::storage_usage();
+        let sender_id = env::predecessor_account_id();
+        let mut amounts: Vec<u128> = amounts.into_iter().map(|amount| amount.into()).collect();
+        let mut pool = self.pools.get(pool_id).expect(ERR85_NO_POOL);
+        // feature frozenlist
+        self.assert_no_frozen_tokens(pool.tokens());
+        // Add amounts given to liquidity first. It will return the balanced amounts.
+        let shares = pool.add_liquidity(
+            &sender_id,
+            &mut amounts,
+        );
+        if let Some(min_amounts) = min_amounts {
+            // Check that all amounts are above request min amounts in case of front running that changes the exchange rate.
+            for (amount, min_amount) in amounts.iter().zip(min_amounts.iter()) {
+                assert!(amount >= &min_amount.0, "{}", ERR86_MIN_AMOUNT);
+            }
+        }
+        let mut deposits = self.internal_unwrap_or_default_account(&sender_id);
+        let tokens = pool.tokens();
+        // Subtract updated amounts from deposits. This will fail if there is not enough funds for any of the tokens.
+        for i in 0..tokens.len() {
+            deposits.withdraw(&tokens[i], amounts[i]);
+        }
+        self.internal_save_account(&sender_id, deposits);
+        self.pools.replace(pool_id, &pool);
+        self.internal_check_storage(prev_storage);
+
+        U128(shares)
+    }
+
+    /// Remove liquidity from the pool into general pool of liquidity.
+    #[payable]
+    pub fn remove_liquidity(&mut self, pool_id: u64, shares: U128, min_amounts: Vec<U128>) -> Vec<U128> {
+        assert_one_yocto();
+        self.assert_contract_running();
+        let prev_storage = env::storage_usage();
+        let sender_id = env::predecessor_account_id();
+        let mut pool = self.pools.get(pool_id).expect(ERR85_NO_POOL);
+        // feature frozenlist
+        self.assert_no_frozen_tokens(pool.tokens());
+        let amounts = pool.remove_liquidity(
+            &sender_id,
+            shares.into(),
+            min_amounts
+                .into_iter()
+                .map(|amount| amount.into())
+                .collect(),
+        );
+        self.pools.replace(pool_id, &pool);
+        let tokens = pool.tokens();
+        // [AUDITION_AMENDMENT] 2.3.7 Code Optimization (I)
+        let mut deposits = self.internal_unwrap_account(&sender_id);
+        for i in 0..tokens.len() {
+            deposits.deposit(&tokens[i], amounts[i]);
+        }
+        // Freed up storage balance from LP tokens will be returned to near_balance.
+        if prev_storage > env::storage_usage() {
+            deposits.near_amount +=
+                (prev_storage - env::storage_usage()) as Balance * env::storage_byte_cost();
+        }
+        self.internal_save_account(&sender_id, deposits);
+
+        amounts
+            .into_iter()
+            .map(|amount| amount.into())
+            .collect()
+    }
+
+    // #[payable]
+    // pub fn add_rated_liquidity(
+    //     &mut self,
+    //     pool_id: u64,
+    //     amounts: Vec<U128>,
+    //     min_shares: U128,
+    // ) -> U128 {
+    //     self.add_stable_liquidity(pool_id, amounts, min_shares)
+    // }
+
+    /// For stable swap pool, LP can use it to remove liquidity with given token amount and distribution.
+    /// pool_id: the stable swap pool id. If simple pool is given, panic with Unimplement.
+    /// amounts: Each tokens (in pool tokens sequence) amounts user want get, a 0 means user don't want to get that token back.
+    /// max_burn_shares: This is slippage protection, if user request would burn shares more than it, panic with ERR68_SLIPPAGE
+    #[payable]
+    pub fn remove_liquidity_by_tokens(
+        &mut self, pool_id: u64, 
+        amounts: Vec<U128>, 
+        max_burn_shares: U128
+    ) -> U128 {
+        assert_one_yocto();
+        self.assert_contract_running();
+        let prev_storage = env::storage_usage();
+        let sender_id = env::predecessor_account_id();
+        let mut pool = self.pools.get(pool_id).expect(ERR85_NO_POOL);
+        // feature frozenlist
+        self.assert_no_frozen_tokens(pool.tokens());
+        let burn_shares = pool.remove_liquidity_by_tokens(
+            &sender_id,
+            amounts
+                .clone()
+                .into_iter()
+                .map(|amount| amount.into())
+                .collect(),
+            max_burn_shares.into(),
+            AdminFees::new(self.exchange_fee),
+        );
+        self.pools.replace(pool_id, &pool);
+        let tokens = pool.tokens();
+        let mut deposits = self.internal_unwrap_or_default_account(&sender_id);
+        for i in 0..tokens.len() {
+            deposits.deposit(&tokens[i], amounts[i].into());
+        }
+        // Freed up storage balance from LP tokens will be returned to near_balance.
+        if prev_storage > env::storage_usage() {
+            deposits.near_amount +=
+                (prev_storage - env::storage_usage()) as Balance * env::storage_byte_cost();
+        }
+        self.internal_save_account(&sender_id, deposits);
+
+        burn_shares.into()
+    }
+}
+
+/// Internal methods implementation.
+impl Contract {
+
+    fn assert_contract_running(&self) {
+        match self.state {
+            RunningState::Running => (),
+            _ => env::panic(ERR51_CONTRACT_PAUSED.as_bytes()),
+        };
+    }
+
+    fn assert_no_frozen_tokens(&self, tokens: &[AccountId]) {
+        let frozens: Vec<&String> = tokens.iter()
+        .filter(
+            |token| self.frozen_tokens.contains(*token)
+        )
+        .collect();
+        assert_eq!(frozens.len(), 0, "{}", ERR52_FROZEN_TOKEN);
+    }
+
+    /// Check how much storage taken costs and refund the left over back.
+    fn internal_check_storage(&self, prev_storage: StorageUsage) {
+        let storage_cost = env::storage_usage()
+            .checked_sub(prev_storage)
+            .unwrap_or_default() as Balance
+            * env::storage_byte_cost();
+
+        let refund = env::attached_deposit()
+            .checked_sub(storage_cost)
+            .expect(
+                format!(
+                    "ERR_STORAGE_DEPOSIT need {}, attatched {}", 
+                    storage_cost, env::attached_deposit()
+                ).as_str()
+            );
+        if refund > 0 {
+            Promise::new(env::predecessor_account_id()).transfer(refund);
+        }
+    }
+
+    /// Adds given pool to the list and returns it's id.
+    /// If there is not enough attached balance to cover storage, fails.
+    /// If too much attached - refunds it back.
+    fn internal_add_pool(&mut self, mut pool: Pool) -> u64 {
+        let prev_storage = env::storage_usage();
+        let id = self.pools.len() as u64;
+        // exchange share was registered at creation time
+        pool.share_register(&env::current_account_id());
+        self.pools.push(&pool);
+        self.internal_check_storage(prev_storage);
+        id
+    }
+
+    /// Execute sequence of actions on given account. Modifies passed account.
+    /// Returns result of the last action.
+    fn internal_execute_actions(
+        &mut self,
+        account: &mut Account,
+        referral_id: &Option<AccountId>,
+        actions: &[Action],
+        prev_result: ActionResult,
+    ) -> ActionResult {
+        let mut result = prev_result;
+        for action in actions {
+            result = self.internal_execute_action(account, referral_id, action, result);
+        }
+        result
+    }
+
+    /// Executes single action on given account. Modifies passed account. Returns a result based on type of action.
+    fn internal_execute_action(
+        &mut self,
+        account: &mut Account,
+        referral_id: &Option<AccountId>,
+        action: &Action,
+        prev_result: ActionResult,
+    ) -> ActionResult {
+        match action {
+            Action::Swap(swap_action) => {
+                // feature frozenlist
+                self.assert_no_frozen_tokens(&[swap_action.token_in.clone(), swap_action.token_out.clone()]);
+                let amount_in = swap_action
+                    .amount_in
+                    .map(|value| value.0)
+                    .unwrap_or_else(|| prev_result.to_amount());
+                account.withdraw(&swap_action.token_in, amount_in);
+                let amount_out = self.internal_pool_swap(
+                    swap_action.pool_id,
+                    &swap_action.token_in,
+                    amount_in,
+                    &swap_action.token_out,
+                    swap_action.min_amount_out.0,
+                    referral_id,
+                );
+                account.deposit(&swap_action.token_out, amount_out);
+                // [AUDIT_02]
+                ActionResult::Amount(U128(amount_out))
+            }
+        }
+    }
+
+    /// Swaps given amount_in of token_in into token_out via given pool.
+    /// Should be at least min_amount_out or swap will fail (prevents front running and other slippage issues).
+    fn internal_pool_swap(
+        &mut self,
+        pool_id: u64,
+        token_in: &AccountId,
+        amount_in: u128,
+        token_out: &AccountId,
+        min_amount_out: u128,
+        referral_id: &Option<AccountId>,
+    ) -> u128 {
+        let mut pool = self.pools.get(pool_id).expect(ERR85_NO_POOL);
+        let amount_out = pool.swap(
+            token_in,
+            amount_in,
+            token_out,
+            min_amount_out,
+            AdminFees {
+                exchange_fee: self.exchange_fee,
+                exchange_id: env::current_account_id(),
+                referral_fee: self.referral_fee,
+                referral_id: referral_id.clone(),
+            },
+        );
+        self.pools.replace(pool_id, &pool);
+        amount_out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::convert::TryFrom;
+
+    use near_contract_standards::fungible_token::receiver::FungibleTokenReceiver;
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::{testing_env, Balance, MockedBlockchain};
+    use near_sdk_sim::to_yocto;
+
+    use super::*;
+
+    /// Creates contract and a pool with tokens with 0.3% of total fee.
+    fn setup_contract() -> (VMContextBuilder, Contract) {
+        let mut context = VMContextBuilder::new();
+        testing_env!(context.predecessor_account_id(accounts(0)).build());
+        let contract = Contract::new(accounts(0), 1600, 400);
+        (context, contract)
+    }
+
+    fn deposit_tokens(
+        context: &mut VMContextBuilder,
+        contract: &mut Contract,
+        account_id: ValidAccountId,
+        token_amounts: Vec<(ValidAccountId, Balance)>,
+    ) {
+        if contract.storage_balance_of(account_id.clone()).is_none() {
+            testing_env!(context
+                .predecessor_account_id(account_id.clone())
+                .attached_deposit(to_yocto("1"))
+                .build());
+            contract.storage_deposit(None, None);
+        }
+        testing_env!(context
+            .predecessor_account_id(account_id.clone())
+            .attached_deposit(to_yocto("1"))
+            .build());
+        let tokens = token_amounts
+            .iter()
+            .map(|(token_id, _)| token_id.clone().into())
+            .collect();
+        testing_env!(context.attached_deposit(1).build());
+        contract.register_tokens(tokens);
+        for (token_id, amount) in token_amounts {
+            testing_env!(context
+                .predecessor_account_id(token_id)
+                .attached_deposit(1)
+                .build());
+            contract.ft_on_transfer(account_id.clone(), U128(amount), "".to_string());
+        }
+    }
+
+    fn create_pool_with_liquidity(
+        context: &mut VMContextBuilder,
+        contract: &mut Contract,
+        account_id: ValidAccountId,
+        token_amounts: Vec<(ValidAccountId, Balance)>,
+    ) -> u64 {
+        let tokens = token_amounts
+            .iter()
+            .map(|(x, _)| x.clone())
+            .collect::<Vec<_>>();
+        testing_env!(context.predecessor_account_id(accounts(0)).attached_deposit(1).build());
+        contract.extend_whitelisted_tokens(tokens.clone());
+        testing_env!(context
+            .predecessor_account_id(account_id.clone())
+            .attached_deposit(env::storage_byte_cost() * 300)
+            .build());
+        let pool_id = contract.add_simple_pool(tokens, 25);
+        testing_env!(context
+            .predecessor_account_id(account_id.clone())
+            .attached_deposit(to_yocto("0.03"))
+            .build());
+        contract.storage_deposit(None, None);
+        deposit_tokens(context, contract, accounts(3), token_amounts.clone());
+        testing_env!(context
+            .predecessor_account_id(account_id.clone())
+            .attached_deposit(to_yocto("0.0007"))
+            .build());
+        contract.add_liquidity(
+            pool_id,
+            token_amounts.into_iter().map(|(_, x)| U128(x)).collect(),
+            None,
+        );
+        pool_id
+    }
+
+    fn swap(
+        contract: &mut Contract,
+        pool_id: u64,
+        token_in: ValidAccountId,
+        amount_in: Balance,
+        token_out: ValidAccountId,
+    ) -> Balance {
+        contract
+            .swap(
+                vec![SwapAction {
+                    pool_id,
+                    token_in: token_in.into(),
+                    amount_in: Some(U128(amount_in)),
+                    token_out: token_out.into(),
+                    min_amount_out: U128(1),
+                }],
+                None,
+            )
+            .0
+    }
+
+    #[test]
+    fn test_basics() {
+        let one_near = 10u128.pow(24);
+        let (mut context, mut contract) = setup_contract();
+        // add liquidity of (1,2) tokens
+        create_pool_with_liquidity(
+            &mut context,
+            &mut contract,
+            accounts(3),
+            vec![(accounts(1), to_yocto("5")), (accounts(2), to_yocto("10"))],
+        );
+        deposit_tokens(
+            &mut context,
+            &mut contract,
+            accounts(3),
+            vec![
+                (accounts(1), to_yocto("100")),
+                (accounts(2), to_yocto("100")),
+            ],
+        );
+        deposit_tokens(&mut context, &mut contract, accounts(1), vec![]);
+
+        assert_eq!(
+            contract.get_deposit(accounts(3), accounts(1)),
+            to_yocto("100").into()
+        );
+        assert_eq!(
+            contract.get_deposit(accounts(3), accounts(2)),
+            to_yocto("100").into()
+        );
+        assert_eq!(
+            contract.get_pool_total_shares(0).0,
+            crate::utils::INIT_SHARES_SUPPLY
+        );
+
+        // Get price from pool :0 1 -> 2 tokens.
+        let expected_out = contract.get_return(0, accounts(1), one_near.into(), accounts(2));
+        assert_eq!(expected_out.0, 1663192997082117548978741);
+
+        testing_env!(context
+            .predecessor_account_id(accounts(3))
+            .attached_deposit(1)
+            .build());
+        let amount_out = swap(&mut contract, 0, accounts(1), one_near, accounts(2));
+        assert_eq!(amount_out, expected_out.0);
+        assert_eq!(
+            contract.get_deposit(accounts(3), accounts(1)).0,
+            99 * one_near
+        );
+        // transfer some of token_id 2 from acc 3 to acc 1.
+        testing_env!(context.predecessor_account_id(accounts(3)).build());
+        contract.mft_transfer(accounts(2).to_string(), accounts(1), U128(one_near), None);
+        assert_eq!(
+            contract.get_deposit(accounts(3), accounts(2)).0,
+            99 * one_near + amount_out
+        );
+        assert_eq!(contract.get_deposit(accounts(1), accounts(2)).0, one_near);
+
+        testing_env!(context
+            .predecessor_account_id(accounts(3))
+            .attached_deposit(to_yocto("0.0067"))
+            .build());
+        contract.mft_register(":0".to_string(), accounts(1));
+        testing_env!(context
+            .predecessor_account_id(accounts(3))
+            .attached_deposit(1)
+            .build());
+        // transfer 1m shares in pool 0 to acc 1.
+        contract.mft_transfer(":0".to_string(), accounts(1), U128(1_000_000), None);
+
+        testing_env!(context.predecessor_account_id(accounts(3)).build());
+        contract.remove_liquidity(
+            0,
+            contract.get_pool_shares(0, accounts(3)),
+            vec![1.into(), 2.into()],
+        );
+        // Exchange fees left in the pool as liquidity + 1m from transfer.
+        assert_eq!(
+            contract.get_pool_total_shares(0).0,
+            33336806279123620258 + 1_000_000
+        );
+
+        contract.withdraw(
+            accounts(1),
+            contract.get_deposit(accounts(3), accounts(1)),
+            None,
+        );
+        assert_eq!(contract.get_deposit(accounts(3), accounts(1)).0, 0);
+    }
+
+    /// Test liquidity management.
+    #[test]
+    fn test_liquidity() {
+        let (mut context, mut contract) = setup_contract();
+        deposit_tokens(
+            &mut context,
+            &mut contract,
+            accounts(3),
+            vec![
+                (accounts(1), to_yocto("100")),
+                (accounts(2), to_yocto("100")),
+            ],
+        );
+        testing_env!(context
+            .predecessor_account_id(accounts(3))
+            .attached_deposit(to_yocto("1"))
+            .build());
+        let id = contract.add_simple_pool(vec![accounts(1), accounts(2)], 25);
+        testing_env!(context.attached_deposit(to_yocto("0.0007")).build());
+        contract.add_liquidity(id, vec![U128(to_yocto("50")), U128(to_yocto("10"))], None);
+        contract.add_liquidity(id, vec![U128(to_yocto("50")), U128(to_yocto("50"))], None);
+        testing_env!(context.attached_deposit(1).build());
+        contract.remove_liquidity(id, U128(to_yocto("1")), vec![U128(1), U128(1)]);
+
+        // Check that amounts add up to deposits.
+        let amounts = contract.get_pool(id).amounts;
+        let deposit1 = contract.get_deposit(accounts(3), accounts(1)).0;
+        let deposit2 = contract.get_deposit(accounts(3), accounts(2)).0;
+        assert_eq!(amounts[0].0 + deposit1, to_yocto("100"));
+        assert_eq!(amounts[1].0 + deposit2, to_yocto("100"));
+    }
+
+    #[test]
+    fn test_add_liquidity_rounding() {
+        let (mut context, mut contract) = setup_contract();
+        deposit_tokens(
+            &mut context,
+            &mut contract,
+            accounts(3),
+            vec![
+                (accounts(1), to_yocto("100")),
+                (accounts(2), to_yocto("100")),
+            ],
+        );
+        testing_env!(context
+            .predecessor_account_id(accounts(3))
+            .attached_deposit(to_yocto("1"))
+            .build());
+        let id = contract.add_simple_pool(vec![accounts(1), accounts(2)], 25);
+        testing_env!(context.attached_deposit(to_yocto("0.0007")).build());
+        contract.add_liquidity(id, vec![U128(1000), U128(1000)], None);
+        assert_eq!(1000000000000000000000000u128, contract.get_pool(id).shares_total_supply.0);
+
+        deposit_tokens(
+            &mut context,
+            &mut contract,
+            accounts(4),
+            vec![
+                (accounts(1), to_yocto("100")),
+                (accounts(2), to_yocto("100")),
+            ],
+        );
+        testing_env!(context
+            .predecessor_account_id(accounts(4))
+            .attached_deposit(to_yocto("1"))
+            .build());
+        contract.add_liquidity(id, vec![U128(2), U128(2)], None);
+        assert_eq!(1000000000000000000000u128, contract.get_pool_shares(id, accounts(4)).0);
+
+        let pool_info = contract.get_pool(id);
+        assert_eq!(1001000000000000000000000u128, pool_info.shares_total_supply.0);
+        assert_eq!(vec![U128(1002), U128(1002)], pool_info.amounts);
+
+        testing_env!(context
+            .attached_deposit(1)
+            .build());
+        let remvoe_tokens = contract.remove_liquidity(id, U128(1000000000000000000000u128 - 1), vec![U128(0), U128(0)]);
+        assert_eq!(vec![U128(1), U128(1)], remvoe_tokens);
+
+        let pool_info = contract.get_pool(id);
+        assert_eq!(1000000000000000000000001u128, pool_info.shares_total_supply.0);
+        assert_eq!(vec![U128(1001), U128(1001)], pool_info.amounts);
+
+        testing_env!(context
+            .attached_deposit(to_yocto("1"))
+            .build());
+
+        contract.add_liquidity(id, vec![U128(50), U128(50)], None);
+        assert_eq!(48951048951048951048952u128, contract.get_pool_shares(id, accounts(4)).0);
+
+        let pool_info = contract.get_pool(id);
+        assert_eq!(vec![U128(1050), U128(1050)], pool_info.amounts);
+
+        testing_env!(context
+            .attached_deposit(1)
+            .build());
+        let remvoe_tokens = contract.remove_liquidity(id, U128(48951048951048951048952u128 - 1), vec![U128(0), U128(0)]);
+        assert_eq!(vec![U128(48), U128(48)], remvoe_tokens);
+
+        let pool_info = contract.get_pool(id);
+        assert_eq!(1000000000000000000000001u128, pool_info.shares_total_supply.0);
+        assert_eq!(vec![U128(1002), U128(1002)], pool_info.amounts);
+    }
+    
+    #[test]
+    #[should_panic(expected = "E31: adding zero amount")]
+    fn test_init_zero_liquidity() {
+        let (mut context, mut contract) = setup_contract();
+        deposit_tokens(
+            &mut context,
+            &mut contract,
+            accounts(3),
+            vec![
+                (accounts(1), to_yocto("1000000")),
+                (accounts(2), to_yocto("1000000")),
+            ],
+        );
+        testing_env!(context
+            .predecessor_account_id(accounts(3))
+            .attached_deposit(to_yocto("1"))
+            .build());
+        let id0 = contract.add_simple_pool(vec![accounts(1), accounts(2)], 1);
+        testing_env!(context.attached_deposit(to_yocto("0.0007")).build());
+        contract.add_liquidity(id0, vec![U128(0), U128(0)], None);
+    }
+
+    #[test]
+    #[should_panic(expected = "E36: shares_total_supply overflow")]
+    fn test_shares_total_supply_overflow() {
+        let (mut context, mut contract) = setup_contract();
+        deposit_tokens(
+            &mut context,
+            &mut contract,
+            accounts(3),
+            vec![
+                (accounts(1), to_yocto("1000000")),
+                (accounts(2), to_yocto("1000000")),
+            ],
+        );
+        testing_env!(context
+            .predecessor_account_id(accounts(3))
+            .attached_deposit(to_yocto("1"))
+            .build());
+        let id0 = contract.add_simple_pool(vec![accounts(1), accounts(2)], 1);
+        testing_env!(context.attached_deposit(to_yocto("0.0007")).build());
+        contract.add_liquidity(id0, vec![U128(4801823983302), U128(14399)], None);
+        testing_env!(context.attached_deposit(to_yocto("0.0007")).build());
+        contract.add_liquidity(id0, vec![U128(340282366920167 * 4801823983302), U128(340282366920167 * 14399)], None);
+        contract.swap(
+            vec![SwapAction {
+                pool_id: 0,
+                token_in: accounts(1).into(),
+                amount_in: Some(U128(12446461932933863316530306u128)),
+                token_out: accounts(2).into(),
+                min_amount_out: U128(0),
+            }],
+            None,
+        );
+    }
+
+    /// Should deny creating a pool with duplicate tokens.
+    #[test]
+    #[should_panic(expected = "E92: token duplicated")]
+    fn test_deny_duplicate_tokens_pool() {
+        let (mut context, mut contract) = setup_contract();
+        create_pool_with_liquidity(
+            &mut context,
+            &mut contract,
+            accounts(3),
+            vec![(accounts(1), to_yocto("5")), (accounts(1), to_yocto("10"))],
+        );
+    }
+
+    /// Deny pool with a single token
+    #[test]
+    #[should_panic(expected = "E89: wrong token count")]
+    fn test_deny_single_token_pool() {
+        let (mut context, mut contract) = setup_contract();
+        create_pool_with_liquidity(
+            &mut context,
+            &mut contract,
+            accounts(3),
+            vec![(accounts(1), to_yocto("5"))],
+        );
+    }
+
+    /// Deny pool with a single token
+    #[test]
+    #[should_panic(expected = "E89: wrong token count")]
+    fn test_deny_too_many_tokens_pool() {
+        let (mut context, mut contract) = setup_contract();
+        create_pool_with_liquidity(
+            &mut context,
+            &mut contract,
+            accounts(3),
+            vec![
+                (accounts(1), to_yocto("5")),
+                (accounts(2), to_yocto("10")),
+                (accounts(3), to_yocto("10")),
+            ],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "E12: token not whitelisted")]
+    fn test_deny_send_malicious_token() {
+        let (mut context, mut contract) = setup_contract();
+        let acc = ValidAccountId::try_from("test_user").unwrap();
+        testing_env!(context
+            .predecessor_account_id(acc.clone())
+            .attached_deposit(to_yocto("1"))
+            .build());
+        contract.storage_deposit(Some(acc.clone()), None);
+        testing_env!(context
+            .predecessor_account_id(ValidAccountId::try_from("malicious").unwrap())
+            .build());
+        contract.ft_on_transfer(acc, U128(1_000), "".to_string());
+    }
+
+    #[test]
+    fn test_send_user_specific_token() {
+        let (mut context, mut contract) = setup_contract();
+        let acc = ValidAccountId::try_from("test_user").unwrap();
+        let custom_token = ValidAccountId::try_from("custom").unwrap();
+        testing_env!(context
+            .predecessor_account_id(acc.clone())
+            .attached_deposit(to_yocto("1"))
+            .build());
+        contract.storage_deposit(None, None);
+        testing_env!(context.attached_deposit(1).build());
+        contract.register_tokens(vec![custom_token.clone()]);
+        testing_env!(context.predecessor_account_id(custom_token.clone()).build());
+        contract.ft_on_transfer(acc.clone(), U128(1_000), "".to_string());
+        let prev = contract.storage_balance_of(acc.clone()).unwrap();
+        testing_env!(context
+            .predecessor_account_id(acc.clone())
+            .attached_deposit(1)
+            .build());
+        contract.withdraw(custom_token, U128(1_000), Some(true));
+        let new = contract.storage_balance_of(acc.clone()).unwrap();
+        // More available storage after withdrawing & unregistering the token.
+        assert!(new.available.0 > prev.available.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "E68: slippage error")]
+    fn test_deny_min_amount() {
+        let (mut context, mut contract) = setup_contract();
+        create_pool_with_liquidity(
+            &mut context,
+            &mut contract,
+            accounts(3),
+            vec![(accounts(1), to_yocto("1")), (accounts(2), to_yocto("1"))],
+        );
+        let acc = ValidAccountId::try_from("test_user").unwrap();
+
+        deposit_tokens(
+            &mut context,
+            &mut contract,
+            acc.clone(),
+            vec![(accounts(1), 1_000_000)],
+        );
+
+        testing_env!(context
+            .predecessor_account_id(acc.clone())
+            .attached_deposit(1)
+            .build());
+        contract.swap(
+            vec![SwapAction {
+                pool_id: 0,
+                token_in: accounts(1).into(),
+                amount_in: Some(U128(1_000_000)),
+                token_out: accounts(2).into(),
+                min_amount_out: U128(1_000_000),
+            }],
+            None,
+        );
+    }
+
+    #[test]
+    fn test_second_storage_deposit_works() {
+        let (mut context, mut contract) = setup_contract();
+        testing_env!(context.attached_deposit(to_yocto("1")).build());
+        contract.storage_deposit(None, None);
+        testing_env!(context.attached_deposit(to_yocto("0.001")).build());
+        contract.storage_deposit(None, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "E72: at least one swap")]
+    fn test_fail_swap_no_actions() {
+        let (mut context, mut contract) = setup_contract();
+        testing_env!(context.attached_deposit(to_yocto("1")).build());
+        contract.storage_deposit(None, None);
+        testing_env!(context.attached_deposit(1).build());
+        contract.swap(vec![], None);
+    }
+
+    /// Check that can not swap non whitelisted tokens when attaching 0 deposit (access key).
+    #[test]
+    #[should_panic(expected = "E27: attach 1yN to swap tokens not in whitelist")]
+    fn test_fail_swap_not_whitelisted() {
+        let (mut context, mut contract) = setup_contract();
+        deposit_tokens(
+            &mut context,
+            &mut contract,
+            accounts(0),
+            vec![(accounts(1), 2_000_000), (accounts(2), 1_000_000)],
+        );
+        create_pool_with_liquidity(
+            &mut context,
+            &mut contract,
+            accounts(0),
+            vec![(accounts(1), 1_000_000), (accounts(2), 1_000_000)],
+        );
+        testing_env!(context.attached_deposit(1).build());
+        contract.remove_whitelisted_tokens(vec![accounts(2)]);
+        testing_env!(context.attached_deposit(1).build());
+        contract.unregister_tokens(vec![accounts(2)]);
+        testing_env!(context.attached_deposit(0).build());
+        swap(&mut contract, 0, accounts(1), 10, accounts(2));
+    }
+
+    #[test]
+    fn test_roundtrip_swap() {
+        let (mut context, mut contract) = setup_contract();
+        create_pool_with_liquidity(
+            &mut context,
+            &mut contract,
+            accounts(3),
+            vec![(accounts(1), to_yocto("5")), (accounts(2), to_yocto("10"))],
+        );
+        let acc = ValidAccountId::try_from("test_user").unwrap();
+        deposit_tokens(
+            &mut context,
+            &mut contract,
+            acc.clone(),
+            vec![(accounts(1), 1_000_000)],
+        );
+        testing_env!(context
+            .predecessor_account_id(acc.clone())
+            .attached_deposit(1)
+            .build());
+        contract.swap(
+            vec![
+                SwapAction {
+                    pool_id: 0,
+                    token_in: accounts(1).into(),
+                    amount_in: Some(U128(1_000)),
+                    token_out: accounts(2).into(),
+                    min_amount_out: U128(1),
+                },
+                SwapAction {
+                    pool_id: 0,
+                    token_in: accounts(2).into(),
+                    amount_in: None,
+                    token_out: accounts(1).into(),
+                    min_amount_out: U128(1),
+                },
+            ],
+            None,
+        );
+        // Roundtrip returns almost everything except 0.25% fee.
+        assert_eq!(contract.get_deposit(acc, accounts(1)).0, 1_000_000 - 6);
+    }
+
+    #[test]
+    #[should_panic(expected = "E14: LP already registered")]
+    fn test_lpt_transfer() {
+        // account(0) -- swap contract
+        // account(1) -- token0 contract
+        // account(2) -- token1 contract
+        // account(3) -- user account
+        // account(4) -- another user account
+        let (mut context, mut contract) = setup_contract();
+        deposit_tokens(
+            &mut context,
+            &mut contract,
+            accounts(3),
+            vec![
+                (accounts(1), to_yocto("100")),
+                (accounts(2), to_yocto("100")),
+            ],
+        );
+        testing_env!(context
+            .predecessor_account_id(accounts(3))
+            .attached_deposit(to_yocto("1"))
+            .build());
+        let id = contract.add_simple_pool(vec![accounts(1), accounts(2)], 25);
+        testing_env!(context.attached_deposit(to_yocto("0.0007")).build());
+        contract.add_liquidity(id, vec![U128(to_yocto("50")), U128(to_yocto("10"))], None);
+        assert_eq!(
+            contract.mft_balance_of(":0".to_string(), accounts(3)).0,
+            to_yocto("1")
+        );
+        assert_eq!(contract.mft_total_supply(":0".to_string()).0, to_yocto("1"));
+        testing_env!(context.attached_deposit(1).build());
+        contract.add_liquidity(id, vec![U128(to_yocto("50")), U128(to_yocto("50"))], None);
+        assert_eq!(
+            contract.mft_balance_of(":0".to_string(), accounts(3)).0,
+            to_yocto("2") - 1
+        );
+        assert_eq!(contract.mft_total_supply(":0".to_string()).0, to_yocto("2") - 1);
+
+        // register another user
+        testing_env!(context
+            .predecessor_account_id(accounts(4))
+            .attached_deposit(to_yocto("0.00071"))
+            .build());
+        contract.mft_register(":0".to_string(), accounts(4));
+        // make transfer to him
+        testing_env!(context
+            .predecessor_account_id(accounts(3))
+            .attached_deposit(1)
+            .build());
+        contract.mft_transfer(":0".to_string(), accounts(4), U128(to_yocto("1")), None);
+        assert_eq!(
+            contract.mft_balance_of(":0".to_string(), accounts(3)).0,
+            to_yocto("1") - 1
+        );
+        assert_eq!(
+            contract.mft_balance_of(":0".to_string(), accounts(4)).0,
+            to_yocto("1")
+        );
+        assert_eq!(contract.mft_total_supply(":0".to_string()).0, to_yocto("2") - 1);
+        // remove lpt for account 3
+        testing_env!(context
+            .predecessor_account_id(accounts(3))
+            .attached_deposit(1)
+            .build());
+        contract.remove_liquidity(id, U128(to_yocto("0.6")), vec![U128(1), U128(1)]);
+        assert_eq!(
+            contract.mft_balance_of(":0".to_string(), accounts(3)).0,
+            to_yocto("0.4") - 1
+        );
+        assert_eq!(
+            contract.mft_total_supply(":0".to_string()).0,
+            to_yocto("1.4") - 1
+        );
+        // remove lpt for account 4 who got lpt from others
+        if contract.storage_balance_of(accounts(4)).is_none() {
+            testing_env!(context
+                .predecessor_account_id(accounts(4))
+                .attached_deposit(to_yocto("1"))
+                .build());
+            contract.storage_deposit(None, None);
+        }
+        testing_env!(context
+            .predecessor_account_id(accounts(4))
+            .attached_deposit(1)
+            .build());
+        contract.remove_liquidity(id, U128(to_yocto("1")), vec![U128(1), U128(1)]);
+        assert_eq!(
+            contract.mft_balance_of(":0".to_string(), accounts(4)).0,
+            to_yocto("0")
+        );
+        assert_eq!(
+            contract.mft_total_supply(":0".to_string()).0,
+            to_yocto("0.4") - 1
+        );
+
+        // [AUDIT_13]
+        // should panic cause accounts(4) not removed by a full remove liquidity
+        testing_env!(context
+            .predecessor_account_id(accounts(4))
+            .attached_deposit(to_yocto("0.00071"))
+            .build());
+        contract.mft_register(":0".to_string(), accounts(4));
+    }
+
+    #[test]
+    #[should_panic(expected = "E33: transfer to self")]
+    fn test_lpt_transfer_self() {
+        // [AUDIT_07]
+        // account(0) -- swap contract
+        // account(1) -- token0 contract
+        // account(2) -- token1 contract
+        // account(3) -- user account
+        let (mut context, mut contract) = setup_contract();
+        deposit_tokens(
+            &mut context,
+            &mut contract,
+            accounts(3),
+            vec![
+                (accounts(1), to_yocto("100")),
+                (accounts(2), to_yocto("100")),
+            ],
+        );
+        testing_env!(context
+            .predecessor_account_id(accounts(3))
+            .attached_deposit(to_yocto("1"))
+            .build());
+        let id = contract.add_simple_pool(vec![accounts(1), accounts(2)], 25);
+        testing_env!(context.attached_deposit(to_yocto("0.0007")).build());
+        contract.add_liquidity(id, vec![U128(to_yocto("50")), U128(to_yocto("10"))], None);
+        assert_eq!(
+            contract.mft_balance_of(":0".to_string(), accounts(3)).0,
+            to_yocto("1")
+        );
+        testing_env!(context.attached_deposit(1).build());
+        contract.add_liquidity(id, vec![U128(to_yocto("50")), U128(to_yocto("50"))], None);
+        assert_eq!(
+            contract.mft_balance_of(":0".to_string(), accounts(3)).0,
+            to_yocto("2") - 1
+        );
+
+        // make transfer to self
+        testing_env!(context
+            .predecessor_account_id(accounts(3))
+            .attached_deposit(1)
+            .build());
+        contract.mft_transfer(":0".to_string(), accounts(3), U128(to_yocto("1")), None);
+    }
+
+    #[test]
+    fn test_storage() {
+        let (mut context, mut contract) = setup_contract();
+        testing_env!(context
+            .predecessor_account_id(accounts(1))
+            .attached_deposit(to_yocto("1"))
+            .build());
+        contract.storage_deposit(Some(accounts(1)), None);
+        testing_env!(context
+            .predecessor_account_id(accounts(1))
+            .attached_deposit(1)
+            .build());
+        assert_eq!(contract.storage_withdraw(None).available.0, 0);
+        testing_env!(context
+            .predecessor_account_id(accounts(1))
+            .attached_deposit(1)
+            .build());
+        assert!(contract.storage_unregister(None));
+    }
+
+    #[test]
+    fn test_storage_registration_only() {
+        let (mut context, mut contract) = setup_contract();
+        testing_env!(context
+            .predecessor_account_id(accounts(1))
+            .attached_deposit(to_yocto("1"))
+            .build());
+        let deposit1 = contract.storage_deposit(Some(accounts(1)), Some(true));
+        testing_env!(context
+            .predecessor_account_id(accounts(1))
+            .attached_deposit(to_yocto("1"))
+            .build());
+        let deposit2 = contract.storage_deposit(Some(accounts(1)), Some(true));
+        assert_eq!(deposit1.total, deposit2.total);
+    }
+
+    #[test]
+    #[should_panic(expected = "E17: deposit less than min storage")]
+    fn test_storage_deposit_less_then_min_storage() {
+        let (mut context, mut contract) = setup_contract();
+        testing_env!(context
+            .predecessor_account_id(accounts(1))
+            .attached_deposit(1)
+            .build());
+        contract.storage_deposit(Some(accounts(1)), Some(true));
+    }
+
+    #[test]
+    fn test_instant_swap() {
+        let (mut context, mut contract) = setup_contract();
+        // add liquidity of (1,2) tokens
+        create_pool_with_liquidity(
+            &mut context,
+            &mut contract,
+            accounts(3),
+            vec![(accounts(1), to_yocto("5")), (accounts(2), to_yocto("10"))],
+        );
+        deposit_tokens(
+            &mut context,
+            &mut contract,
+            accounts(3),
+            vec![
+                (accounts(1), to_yocto("100")),
+                (accounts(2), to_yocto("100")),
+            ],
+        );
+
+        assert_eq!(
+            contract.get_deposit(accounts(3), accounts(1)),
+            to_yocto("100").into()
+        );
+        assert_eq!(
+            contract.get_deposit(accounts(3), accounts(2)),
+            to_yocto("100").into()
+        );
+        assert_eq!(
+            contract.get_pool_total_shares(0).0,
+            crate::utils::INIT_SHARES_SUPPLY
+        );
+
+        // Get price from pool :0 1 -> 2 tokens.
+        let expected_out = contract.get_return(0, accounts(1), to_yocto("1").into(), accounts(2));
+        assert_eq!(expected_out.0, 1663192997082117548978741);
+
+        let actions_str = format!(
+            "{{\"pool_id\": {}, \"token_in\": \"{}\", \"token_out\": \"{}\", \"min_amount_out\": \"{}\"}}",
+            0, accounts(1), accounts(2), 1
+        );
+
+        let msg_str = format!("{{\"actions\": [{}]}}", actions_str);
+        testing_env!(context
+            .predecessor_account_id(accounts(1))
+            .attached_deposit(1)
+            .build());
+        contract.ft_on_transfer(accounts(3), to_yocto("1").into(), msg_str);
+    }
+
+    #[test]
+    fn test_mft_transfer_call() {
+        let one_near = 10u128.pow(24);
+        let (mut context, mut contract) = setup_contract();
+        // add liquidity of (1,2) tokens
+        create_pool_with_liquidity(
+            &mut context,
+            &mut contract,
+            accounts(3),
+            vec![(accounts(1), to_yocto("5")), (accounts(2), to_yocto("10"))],
+        );
+        println!("{:?}", contract.get_pools(0, 100));
+        println!("{:?}", contract.get_pool(0));
+        deposit_tokens(
+            &mut context,
+            &mut contract,
+            accounts(3),
+            vec![
+                (accounts(1), to_yocto("100")),
+                (accounts(2), to_yocto("100")),
+            ],
+        );
+        deposit_tokens(&mut context, &mut contract, accounts(1), vec![]);
+
+        assert_eq!(
+            contract.get_deposit(accounts(3), accounts(1)),
+            to_yocto("100").into()
+        );
+        assert_eq!(
+            contract.get_deposit(accounts(3), accounts(2)),
+            to_yocto("100").into()
+        );
+        assert_eq!(
+            contract.get_pool_total_shares(0).0,
+            crate::utils::INIT_SHARES_SUPPLY
+        );
+
+        // Get price from pool :0 1 -> 2 tokens.
+        let expected_out = contract.get_return(0, accounts(1), one_near.into(), accounts(2));
+        assert_eq!(expected_out.0, 1663192997082117548978741);
+
+        testing_env!(context
+            .predecessor_account_id(accounts(3))
+            .attached_deposit(1)
+            .build());
+        let amount_out = swap(&mut contract, 0, accounts(1), one_near, accounts(2));
+        assert_eq!(amount_out, expected_out.0);
+        assert_eq!(
+            contract.get_deposit(accounts(3), accounts(1)).0,
+            99 * one_near
+        );
+        assert_eq!("bbl-pool-0".to_string(), contract.mft_metadata(":0".to_string()).name);
+        // transfer some of token_id 2 from acc 3 to acc 1.
+        testing_env!(context.predecessor_account_id(accounts(3)).build());
+        contract.mft_transfer_call(accounts(2).to_string(), accounts(1), U128(one_near), Some("mft".to_string()), "".to_string());
+        assert_eq!(
+            contract.get_deposit(accounts(3), accounts(2)).0,
+            99 * one_near + amount_out
+        );
+    }
+
+    #[test]
+    fn test_owner(){
+        let (mut context, mut contract) = setup_contract();
+        testing_env!(context.predecessor_account_id(accounts(0)).attached_deposit(1).build());
+        contract.set_owner(accounts(1));
+        assert_eq!(accounts(1).to_string(), contract.get_owner());
+        testing_env!(context.predecessor_account_id(accounts(1)).attached_deposit(1).build());
+        contract.retrieve_unmanaged_token(accounts(2), U128(1));
+        testing_env!(context.predecessor_account_id(accounts(1)).attached_deposit(1).build());
+        contract.extend_guardians(vec![accounts(2)]);
+        assert_eq!(vec![accounts(2).to_string()], contract.get_guardians());
+        testing_env!(context.predecessor_account_id(accounts(1)).attached_deposit(1).build());
+        contract.remove_guardians(vec![accounts(2)]);
+        assert_eq!(0, contract.get_guardians().len());
+        assert_eq!(RunningState::Running, contract.metadata().state);
+        testing_env!(context.predecessor_account_id(accounts(1)).attached_deposit(1).build());
+        contract.change_state(RunningState::Paused);
+        assert_eq!(RunningState::Paused, contract.metadata().state);
+        assert_eq!(1600, contract.metadata().exchange_fee);
+        assert_eq!(400, contract.metadata().referral_fee);
+        testing_env!(context.predecessor_account_id(accounts(1)).attached_deposit(1).build());
+        contract.modify_admin_fee(20, 50);
+        assert_eq!(20, contract.metadata().exchange_fee);
+        assert_eq!(50, contract.metadata().referral_fee);
+    }
+
+    #[test]
+    fn test_view_pool() {
+        let (mut context, mut contract) = setup_contract();
+        // add liquidity of (1,2) tokens
+        create_pool_with_liquidity(
+            &mut context,
+            &mut contract,
+            accounts(3),
+            vec![(accounts(1), to_yocto("5")), (accounts(2), to_yocto("10"))],
+        );
+        testing_env!(context
+            .predecessor_account_id(accounts(0))
+            .attached_deposit(env::storage_byte_cost() * 335)
+            .build());
+        // contract.add_stable_swap_pool(vec![accounts(4), accounts(5)], vec![18, 18], 25, 240);
+        // testing_env!(context
+        //     .predecessor_account_id(accounts(0))
+        //     .attached_deposit(env::storage_byte_cost() * 389) // required storage depends on contract_id length
+        //     .build());
+        // contract.add_rated_swap_pool(vec![accounts(4), accounts(5)], vec![18, 18], 25, 240);
+
+        // println!("{:?}", contract.get_pools(0, 100));
+        // println!("{:?}", contract.get_pool(0));
+        // println!("{:?}", contract.get_pool_by_ids(vec![0,2]));
+    }
+}
+
+'''
+'''--- babylon-finance/src/multi_fungible_token.rs ---
+use near_contract_standards::fungible_token::metadata::FungibleTokenMetadata;
+use near_sdk::json_types::{ValidAccountId, U128};
+use near_sdk::{ext_contract, near_bindgen, Balance, PromiseOrValue};
+
+use crate::utils::{GAS_FOR_FT_TRANSFER_CALL, GAS_FOR_RESOLVE_TRANSFER, NO_DEPOSIT};
+use crate::*;
+
+#[ext_contract(ext_self)]
+trait MFTTokenResolver {
+    fn mft_resolve_transfer(
+        &mut self,
+        token_id: String,
+        sender_id: AccountId,
+        receiver_id: AccountId,
+        amount: U128,
+    ) -> U128;
+}
+
+#[ext_contract(ext_share_token_receiver)]
+pub trait MFTTokenReceiver {
+    fn mft_on_transfer(
+        &mut self,
+        token_id: String,
+        sender_id: AccountId,
+        amount: U128,
+        msg: String,
+    ) -> PromiseOrValue<U128>;
+}
+
+enum TokenOrPool {
+    Token(AccountId),
+    Pool(u64),
+}
+
+/// [AUDIT_06]
+/// This is used to parse token_id fields in mft protocol used in ref,
+/// So, if we choose #nn as a partern, should announce it in mft protocol.
+/// cause : is not allowed in a normal account id, it can be a partern leading char
+fn try_identify_pool_id(token_id: &String) -> Result<u64, &'static str> {
+    if token_id.starts_with(":") {
+        if let Ok(pool_id) = str::parse::<u64>(&token_id[1..token_id.len()]) {
+            Ok(pool_id)
+        } else {
+            Err(ERR87_ILLEGAL_POOL_ID)
+        }
+    } else {
+        Err(ERR87_ILLEGAL_POOL_ID)
+    }
+}
+
+fn parse_token_id(token_id: String) -> TokenOrPool {
+    if let Ok(pool_id) = try_identify_pool_id(&token_id) {
+        TokenOrPool::Pool(pool_id)
+    } else {
+        TokenOrPool::Token(token_id)
+    }
+}
+
+#[near_bindgen]
+impl Contract {
+    fn internal_mft_transfer(
+        &mut self,
+        token_id: String,
+        sender_id: &AccountId,
+        receiver_id: &AccountId,
+        amount: u128,
+        memo: Option<String>,
+    ) {
+        // [AUDIT_07]
+        assert_ne!(sender_id, receiver_id, "{}", ERR33_TRANSFER_TO_SELF);
+        match parse_token_id(token_id) {
+            TokenOrPool::Pool(pool_id) => {
+                let mut pool = self.pools.get(pool_id).expect(ERR85_NO_POOL);
+                pool.share_transfer(sender_id, receiver_id, amount);
+                self.pools.replace(pool_id, &pool);
+                log!(
+                    "Transfer shares {} pool: {} from {} to {}",
+                    pool_id,
+                    amount,
+                    sender_id,
+                    receiver_id
+                );
+            }
+            TokenOrPool::Token(token_id) => {
+                let mut sender_account: Account = self.internal_unwrap_account(&sender_id);
+                let mut receiver_account: Account = self.internal_unwrap_account(&receiver_id);
+                
+                sender_account.withdraw(&token_id, amount);
+                receiver_account.deposit(&token_id, amount);
+                self.internal_save_account(&sender_id, sender_account);
+                self.internal_save_account(&receiver_id, receiver_account);
+                log!(
+                    "Transfer {}: {} from {} to {}",
+                    token_id,
+                    amount,
+                    sender_id,
+                    receiver_id
+                );
+            }
+        }
+        if let Some(memo) = memo {
+            log!("Memo: {}", memo);
+        }
+    }
+
+    fn internal_mft_balance(&self, token_id: String, account_id: &AccountId) -> Balance {
+        match parse_token_id(token_id) {
+            TokenOrPool::Pool(pool_id) => {
+                let pool = self.pools.get(pool_id).expect(ERR85_NO_POOL);
+                pool.share_balances(account_id)
+            }
+            TokenOrPool::Token(token_id) => self.internal_get_deposit(account_id, &token_id),
+        }
+    }
+
+    /// Returns the balance of the given account. If the account doesn't exist will return `"0"`.
+    pub fn mft_balance_of(&self, token_id: String, account_id: ValidAccountId) -> U128 {
+        self.internal_mft_balance(token_id, account_id.as_ref())
+            .into()
+    }
+
+    /// Returns the total supply of the given token, if the token is one of the pools.
+    /// If token references external token - fails with unimplemented.
+    pub fn mft_total_supply(&self, token_id: String) -> U128 {
+        match parse_token_id(token_id) {
+            TokenOrPool::Pool(pool_id) => {
+                let pool = self.pools.get(pool_id).expect(ERR85_NO_POOL);
+                U128(pool.share_total_balance())
+            }
+            TokenOrPool::Token(_token_id) => unimplemented!(),
+        }
+    }
+
+    /// Register LP token of given pool for given account.
+    /// Fails if token_id is not a pool.
+    #[payable]
+    pub fn mft_register(&mut self, token_id: String, account_id: ValidAccountId) {
+        self.assert_contract_running();
+        let prev_storage = env::storage_usage();
+        match parse_token_id(token_id) {
+            TokenOrPool::Token(_) => env::panic(ERR110_INVALID_REGISTER.as_bytes()),
+            TokenOrPool::Pool(pool_id) => {
+                let mut pool = self.pools.get(pool_id).expect(ERR85_NO_POOL);
+                pool.share_register(account_id.as_ref());
+                self.pools.replace(pool_id, &pool);
+                self.internal_check_storage(prev_storage);
+            }
+        }
+    }
+
+    /// Transfer one of internal tokens: LP or balances.
+    /// `token_id` can either by account of the token or pool number.
+    #[payable]
+    pub fn mft_transfer(
+        &mut self,
+        token_id: String,
+        receiver_id: ValidAccountId,
+        amount: U128,
+        memo: Option<String>,
+    ) {
+        assert_one_yocto();
+        self.assert_contract_running();
+        self.internal_mft_transfer(
+            token_id,
+            &env::predecessor_account_id(),
+            receiver_id.as_ref(),
+            amount.0,
+            memo,
+        );
+    }
+
+    #[payable]
+    pub fn mft_transfer_call(
+        &mut self,
+        token_id: String,
+        receiver_id: ValidAccountId,
+        amount: U128,
+        memo: Option<String>,
+        msg: String,
+    ) -> PromiseOrValue<U128> {
+        assert_one_yocto();
+        self.assert_contract_running();
+        let sender_id = env::predecessor_account_id();
+        self.internal_mft_transfer(
+            token_id.clone(),
+            &sender_id,
+            receiver_id.as_ref(),
+            amount.0,
+            memo,
+        );
+        ext_share_token_receiver::mft_on_transfer(
+            token_id.clone(),
+            sender_id.clone(),
+            amount,
+            msg,
+            receiver_id.as_ref(),
+            NO_DEPOSIT,
+            env::prepaid_gas() - GAS_FOR_FT_TRANSFER_CALL,
+        )
+        .then(ext_self::mft_resolve_transfer(
+            token_id,
+            sender_id,
+            receiver_id.into(),
+            amount,
+            &env::current_account_id(),
+            NO_DEPOSIT,
+            GAS_FOR_RESOLVE_TRANSFER,
+        ))
+        .into()
+    }
+
+    /// Returns how much was refunded back to the sender.
+    /// If sender removed account in the meantime, the tokens are sent to the contract account.
+    /// Tokens are never burnt.
+    #[private]
+    pub fn mft_resolve_transfer(
+        &mut self,
+        token_id: String,
+        sender_id: AccountId,
+        receiver_id: &AccountId,
+        amount: U128,
+    ) -> U128 {
+        let unused_amount = match env::promise_result(0) {
+            PromiseResult::NotReady => unreachable!(),
+            PromiseResult::Successful(value) => {
+                if let Ok(unused_amount) = near_sdk::serde_json::from_slice::<U128>(&value) {
+                    std::cmp::min(amount.0, unused_amount.0)
+                } else {
+                    amount.0
+                }
+            }
+            PromiseResult::Failed => amount.0,
+        };
+        if unused_amount > 0 {
+            let receiver_balance = self.internal_mft_balance(token_id.clone(), &receiver_id);
+            if receiver_balance > 0 {
+                let refund_amount = std::cmp::min(receiver_balance, unused_amount);
+                
+                let refund_to = if self.accounts.get(&sender_id).is_some() {
+                    sender_id
+                } else {
+                    // If sender's account was deleted, we assume that they have also withdrew all the liquidity from pools.
+                    // Funds are sent to the contract account.
+                    env::current_account_id()
+                };
+                self.internal_mft_transfer(token_id, &receiver_id, &refund_to, refund_amount, None);
+            }
+        }
+        U128(unused_amount)
+    }
+
+    pub fn mft_metadata(&self, token_id: String) -> FungibleTokenMetadata {
+        match parse_token_id(token_id) {
+            TokenOrPool::Pool(pool_id) => {
+                let pool = self.pools.get(pool_id).expect(ERR85_NO_POOL);
+                let decimals = pool.get_share_decimal();
+                FungibleTokenMetadata {
+                    // [AUDIT_08]
+                    spec: "mft-1.0.0".to_string(),
+                    name: format!("bbl-pool-{}", pool_id),
+                    symbol: format!("BBL-POOL-{}", pool_id),
+                    icon: None,
+                    reference: None,
+                    reference_hash: None,
+                    decimals,
+                }
+            },
+            TokenOrPool::Token(_token_id) => unimplemented!(),
+        }
+    }
+}
+
+'''
+'''--- babylon-finance/src/owner.rs ---
+//! Implement all the relevant logic for owner of this contract.
+
+use near_sdk::json_types::WrappedTimestamp;
+use near_contract_standards::fungible_token::core_impl::ext_fungible_token;
+
+use crate::*;
+use crate::utils::{FEE_DIVISOR, GAS_FOR_BASIC_OP};
+use crate::legacy::ContractV1;
+
+#[near_bindgen]
+impl Contract {
+    /// Change owner. Only can be called by owner.
+    #[payable]
+    pub fn set_owner(&mut self, owner_id: ValidAccountId) {
+        assert_one_yocto();
+        self.assert_owner();
+        self.owner_id = owner_id.as_ref().clone();
+    }
+
+    /// Get the owner of this account.
+    pub fn get_owner(&self) -> AccountId {
+        self.owner_id.clone()
+    }
+
+    /// Retrieve NEP-141 tokens that not mananged by contract to owner,
+    /// Caution: Must check that `amount <= total_amount_in_account - amount_managed_by_contract` before calling !!!
+    /// Returns promise of ft_transfer action.
+    #[payable]
+    pub fn retrieve_unmanaged_token(&mut self, token_id: ValidAccountId, amount: U128) -> Promise {
+        self.assert_owner();
+        assert_one_yocto();
+        let token_id: AccountId = token_id.into();
+        let amount: u128 = amount.into();
+        assert!(amount > 0, "{}", ERR29_ILLEGAL_WITHDRAW_AMOUNT);
+        env::log(
+            format!(
+                "Going to retrieve token {} to owner, amount: {}",
+                &token_id, amount
+            )
+            .as_bytes(),
+        ); 
+        ext_fungible_token::ft_transfer(
+            self.owner_id.clone(),
+            U128(amount),
+            None,
+            &token_id,
+            1,
+            env::prepaid_gas() - GAS_FOR_BASIC_OP,
+        )
+    }
+
+    /// Extend guardians. Only can be called by owner.
+    #[payable]
+    pub fn extend_guardians(&mut self, guardians: Vec<ValidAccountId>) {
+        assert_one_yocto();
+        self.assert_owner();
+        for guardian in guardians {
+            self.guardians.insert(guardian.as_ref());
+        }
+    }
+
+    /// Remove guardians. Only can be called by owner.
+    #[payable]
+    pub fn remove_guardians(&mut self, guardians: Vec<ValidAccountId>) {
+        assert_one_yocto();
+        self.assert_owner();
+        for guardian in guardians {
+            self.guardians.remove(guardian.as_ref());
+        }
+    }
+
+    /// Change state of contract, Only can be called by owner or guardians.
+    #[payable]
+    pub fn change_state(&mut self, state: RunningState) {
+        assert_one_yocto();
+        assert!(self.is_owner_or_guardians(), "{}", ERR100_NOT_ALLOWED);
+
+        if self.state != state {
+            if state == RunningState::Running {
+                // only owner can resume the contract
+                self.assert_owner();
+            }
+            env::log(
+                format!(
+                    "Contract state changed from {} to {} by {}",
+                    self.state, state, env::predecessor_account_id()
+                )
+                .as_bytes(),
+            );       
+            self.state = state;
+        }
+    }
+
+    /// Extend whitelisted tokens with new tokens. Only can be called by owner.
+    #[payable]
+    pub fn extend_whitelisted_tokens(&mut self, tokens: Vec<ValidAccountId>) {
+        assert_one_yocto();
+        assert!(self.is_owner_or_guardians(), "{}", ERR100_NOT_ALLOWED);
+        for token in tokens {
+            self.whitelisted_tokens.insert(token.as_ref());
+        }
+    }
+
+    /// Remove whitelisted token. Only can be called by owner.
+    #[payable]
+    pub fn remove_whitelisted_tokens(&mut self, tokens: Vec<ValidAccountId>) {
+        assert_one_yocto();
+        assert!(self.is_owner_or_guardians(), "{}", ERR100_NOT_ALLOWED);
+        for token in tokens {
+            let exist = self.whitelisted_tokens.remove(token.as_ref());
+            assert!(exist, "{}", ERR53_TOKEN_NOT_IN_LIST);
+        }
+    }
+
+    /// Extend frozenlist tokens with new tokens.
+    #[payable]
+    pub fn extend_frozenlist_tokens(&mut self, tokens: Vec<ValidAccountId>) {
+        assert_one_yocto();
+        assert!(self.is_owner_or_guardians(), "{}", ERR100_NOT_ALLOWED);
+        for token in tokens {
+            self.frozen_tokens.insert(token.as_ref());
+        }
+    }
+
+    /// Remove frozenlist token.
+    #[payable]
+    pub fn remove_frozenlist_tokens(&mut self, tokens: Vec<ValidAccountId>) {
+        assert_one_yocto();
+        assert!(self.is_owner_or_guardians(), "{}", ERR100_NOT_ALLOWED);
+        for token in tokens {
+            let exist = self.frozen_tokens.remove(token.as_ref());
+            assert!(exist, "{}", ERR53_TOKEN_NOT_IN_LIST);
+        }
+    }
+
+    #[payable]
+    pub fn modify_admin_fee(&mut self, exchange_fee: u32, referral_fee: u32) {
+        assert_one_yocto();
+        self.assert_owner();
+        assert!(exchange_fee + referral_fee <= FEE_DIVISOR, "{}", ERR101_ILLEGAL_FEE);
+        self.exchange_fee = exchange_fee;
+        self.referral_fee = referral_fee;
+    }
+
+    /// Remove exchange fee liquidity to owner's inner account.
+    /// Owner's inner account storage should be prepared in advance.
+    #[payable]
+    pub fn remove_exchange_fee_liquidity(&mut self, pool_id: u64, shares: U128, min_amounts: Vec<U128>) {
+        assert_one_yocto();
+        assert!(self.is_owner_or_guardians(), "{}", ERR100_NOT_ALLOWED);
+        self.assert_contract_running();
+        let ex_id = env::current_account_id();
+        let owner_id = self.owner_id.clone();
+        let mut pool = self.pools.get(pool_id).expect(ERR85_NO_POOL);
+        let amounts = pool.remove_liquidity(
+            &ex_id,
+            shares.into(),
+            min_amounts
+                .into_iter()
+                .map(|amount| amount.into())
+                .collect(),
+        );
+        self.pools.replace(pool_id, &pool);
+        let tokens = pool.tokens();
+        let mut deposits = self.internal_unwrap_account(&owner_id);
+        for i in 0..tokens.len() {
+            deposits.deposit(&tokens[i], amounts[i]);
+        }
+        self.internal_save_account(&owner_id, deposits);
+    }
+
+    /// Withdraw owner inner account token to owner wallet.
+    /// Owner inner account should be prepared in advance.
+    #[payable]
+    pub fn withdraw_owner_token(
+        &mut self,
+        token_id: ValidAccountId,
+        amount: U128,
+    ) -> Promise {
+        assert_one_yocto();
+        assert!(self.is_owner_or_guardians(), "{}", ERR100_NOT_ALLOWED);
+        self.assert_contract_running();
+        let token_id: AccountId = token_id.into();
+        let amount: u128 = amount.into();
+        assert!(amount > 0, "{}", ERR29_ILLEGAL_WITHDRAW_AMOUNT);
+        let owner_id = self.owner_id.clone();
+        let mut account = self.internal_unwrap_account(&owner_id);
+        // Note: subtraction and deregistration will be reverted if the promise fails.
+        account.withdraw(&token_id, amount);
+        self.internal_save_account(&owner_id, account);
+        self.internal_send_tokens(&owner_id, &token_id, amount)
+    }
+
+    /// to eventually change a stable pool's amp factor
+    /// pool_id: the target stable pool;
+    /// future_amp_factor: the target amp factor, could be less or more than current one;
+    /// future_amp_time: the endtime of the increasing or decreasing process;
+
+    pub(crate) fn assert_owner(&self) {
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.owner_id,
+            "{}", ERR100_NOT_ALLOWED
+        );
+    }
+
+    pub(crate) fn is_owner_or_guardians(&self) -> bool {
+        env::predecessor_account_id() == self.owner_id 
+            || self.guardians.contains(&env::predecessor_account_id())
+    }
+
+    /// Migration function from v1.5.x to v1.6.0.
+    /// For next version upgrades, change this function.
+    #[init(ignore_state)]
+    // [AUDIT_09]
+    #[private]
+    pub fn migrate() -> Self {
+        let contract: Contract = env::state_read().expect(ERR103_NOT_INITIALIZED);
+        contract
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+mod upgrade {
+    use near_sdk::env::BLOCKCHAIN_INTERFACE;
+    use near_sdk::Gas;
+
+    use super::*;
+
+    const BLOCKCHAIN_INTERFACE_NOT_SET_ERR: &str = "Blockchain interface not set.";
+
+    /// Gas for calling migration call.
+    pub const GAS_FOR_MIGRATE_CALL: Gas = 5_000_000_000_000;
+
+    /// Self upgrade and call migrate, optimizes gas by not loading into memory the code.
+    /// Takes as input non serialized set of bytes of the code.
+    #[no_mangle]
+    pub extern "C" fn upgrade() {
+        env::setup_panic_hook();
+        env::set_blockchain_interface(Box::new(near_blockchain::NearBlockchain {}));
+        let contract: Contract = env::state_read().expect(ERR103_NOT_INITIALIZED);
+        contract.assert_owner();
+        let current_id = env::current_account_id().into_bytes();
+        let method_name = "migrate".as_bytes().to_vec();
+        unsafe {
+            BLOCKCHAIN_INTERFACE.with(|b| {
+                // Load input into register 0.
+                b.borrow()
+                    .as_ref()
+                    .expect(BLOCKCHAIN_INTERFACE_NOT_SET_ERR)
+                    .input(0);
+                let promise_id = b
+                    .borrow()
+                    .as_ref()
+                    .expect(BLOCKCHAIN_INTERFACE_NOT_SET_ERR)
+                    .promise_batch_create(current_id.len() as _, current_id.as_ptr() as _);
+                b.borrow()
+                    .as_ref()
+                    .expect(BLOCKCHAIN_INTERFACE_NOT_SET_ERR)
+                    .promise_batch_action_deploy_contract(promise_id, u64::MAX as _, 0);
+                let attached_gas = env::prepaid_gas() - env::used_gas() - GAS_FOR_MIGRATE_CALL;
+                b.borrow()
+                    .as_ref()
+                    .expect(BLOCKCHAIN_INTERFACE_NOT_SET_ERR)
+                    .promise_batch_action_function_call(
+                        promise_id,
+                        method_name.len() as _,
+                        method_name.as_ptr() as _,
+                        0 as _,
+                        0 as _,
+                        0 as _,
+                        attached_gas,
+                    );
+            });
+        }
+    }
+
+}
+
+'''
+'''--- babylon-finance/src/pool.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::{AccountId, Balance};
+
+use crate::admin_fee::AdminFees;
+use crate::simple_pool::SimplePool;
+use crate::utils::SwapVolume;
+
+/// Generic Pool, providing wrapper around different implementations of swap pools.
+/// Allows to add new types of pools just by adding extra item in the enum without needing to migrate the storage.
+#[derive(BorshSerialize, BorshDeserialize)]
+pub enum Pool {
+    SimplePool(SimplePool)
+}
+
+impl Pool {
+    /// Returns pool kind.
+    pub fn kind(&self) -> String {
+        match self {
+            Pool::SimplePool(_) => "SIMPLE_POOL".to_string()
+        }
+    }
+
+    /// Returns which tokens are in the underlying pool.
+    pub fn tokens(&self) -> &[AccountId] {
+        match self {
+            Pool::SimplePool(pool) => pool.tokens()
+        }
+    }
+
+    /// Adds liquidity into underlying pool.
+    /// Updates amounts to amount kept in the pool.
+    pub fn add_liquidity(
+        &mut self,
+        sender_id: &AccountId,
+        amounts: &mut Vec<Balance>,
+    ) -> Balance {
+        match self {
+            Pool::SimplePool(pool) => pool.add_liquidity(sender_id, amounts)
+        }
+    }
+
+    /// Removes liquidity from underlying pool.
+    pub fn remove_liquidity(
+        &mut self,
+        sender_id: &AccountId,
+        shares: Balance,
+        min_amounts: Vec<Balance>,
+    ) -> Vec<Balance> {
+        match self {
+            Pool::SimplePool(pool) => pool.remove_liquidity(sender_id, shares, min_amounts)
+        }
+    }
+
+    /// Removes liquidity from underlying pool.
+    pub fn remove_liquidity_by_tokens(
+        &mut self,
+        sender_id: &AccountId,
+        amounts: Vec<Balance>,
+        max_burn_shares: Balance,
+        admin_fee: AdminFees,
+    ) -> Balance {
+        match self {
+            Pool::SimplePool(_) => unimplemented!()
+        }
+    }
+
+    /// Returns how many tokens will one receive swapping given amount of token_in for token_out.
+    pub fn get_return(
+        &self,
+        token_in: &AccountId,
+        amount_in: Balance,
+        token_out: &AccountId,
+        fees: &AdminFees,
+    ) -> Balance {
+        match self {
+            Pool::SimplePool(pool) => pool.get_return(token_in, amount_in, token_out)
+        }
+    }
+
+    /// Return share decimal.
+    pub fn get_share_decimal(&self) -> u8 {
+        match self {
+            Pool::SimplePool(_) => 24
+        }
+    }
+
+    /// Returns given pool's total fee.
+    pub fn get_fee(&self) -> u32 {
+        match self {
+            Pool::SimplePool(pool) => pool.get_fee()
+        }
+    }
+
+    /// Returns volumes of the given pool.
+    pub fn get_volumes(&self) -> Vec<SwapVolume> {
+        match self {
+            Pool::SimplePool(pool) => pool.get_volumes()
+        }
+    }
+
+    /// Returns given pool's share price in precision 1e8.
+    pub fn get_share_price(&self) -> u128 {
+        match self {
+            Pool::SimplePool(_) => unimplemented!()
+        }
+    }
+
+    /// Swaps given number of token_in for token_out and returns received amount.
+    pub fn swap(
+        &mut self,
+        token_in: &AccountId,
+        amount_in: Balance,
+        token_out: &AccountId,
+        min_amount_out: Balance,
+        admin_fee: AdminFees,
+    ) -> Balance {
+        match self {
+            Pool::SimplePool(pool) => {
+                pool.swap(token_in, amount_in, token_out, min_amount_out, &admin_fee)
+            }
+        }
+    }
+
+    pub fn share_total_balance(&self) -> Balance {
+        match self {
+            Pool::SimplePool(pool) => pool.share_total_balance()
+        }
+    }
+
+    pub fn share_balances(&self, account_id: &AccountId) -> Balance {
+        match self {
+            Pool::SimplePool(pool) => pool.share_balance_of(account_id)
+        }
+    }
+
+    pub fn share_transfer(&mut self, sender_id: &AccountId, receiver_id: &AccountId, amount: u128) {
+        match self {
+            Pool::SimplePool(pool) => pool.share_transfer(sender_id, receiver_id, amount)
+        }
+    }
+
+    pub fn share_register(&mut self, account_id: &AccountId) {
+        match self {
+            Pool::SimplePool(pool) => pool.share_register(account_id)
+        }
+    }
+}
+'''
+'''--- babylon-finance/src/simple_pool.rs ---
+use std::cmp::min;
+
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::LookupMap;
+use near_sdk::json_types::ValidAccountId;
+use near_sdk::{env, AccountId, Balance};
+use crate::StorageKey;
+use crate::admin_fee::AdminFees;
+
+use crate::errors::*;
+use crate::utils::{
+    add_to_collection, integer_sqrt, SwapVolume, FEE_DIVISOR, INIT_SHARES_SUPPLY, U256,
+};
+
+const NUM_TOKENS: usize = 2;
+
+/// Implementation of simple pool, that maintains constant product between balances of all the tokens.
+/// Similar in design to "Uniswap".
+/// Liquidity providers when depositing receive shares, that can be later burnt to withdraw pool's tokens in proportion.
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct SimplePool {
+    /// List of tokens in the pool.
+    pub token_account_ids: Vec<AccountId>,
+    /// How much NEAR this contract has.
+    pub amounts: Vec<Balance>,
+    /// Volumes accumulated by this pool.
+    pub volumes: Vec<SwapVolume>,
+    /// Fee charged for swap (gets divided by FEE_DIVISOR).
+    pub total_fee: u32,
+    /// Obsolete, reserve to simplify upgrade.
+    pub exchange_fee: u32,
+    /// Obsolete, reserve to simplify upgrade.
+    pub referral_fee: u32,
+    /// Shares of the pool by liquidity providers.
+    pub shares: LookupMap<AccountId, Balance>,
+    /// Total number of shares.
+    pub shares_total_supply: Balance,
+}
+
+impl SimplePool {
+    pub fn new(
+        id: u32,
+        token_account_ids: Vec<ValidAccountId>,
+        total_fee: u32,
+        exchange_fee: u32,
+        referral_fee: u32,
+    ) -> Self {
+        assert!(
+            total_fee < FEE_DIVISOR,
+            "{}", ERR90_FEE_TOO_LARGE
+        );
+        // [AUDIT_10]
+        assert_eq!(token_account_ids.len(), NUM_TOKENS, "{}", ERR89_WRONG_TOKEN_COUNT);
+        Self {
+            token_account_ids: token_account_ids.iter().map(|a| a.clone().into()).collect(),
+            amounts: vec![0u128; NUM_TOKENS],
+            volumes: vec![SwapVolume::default(); NUM_TOKENS],
+            total_fee,
+            exchange_fee,
+            referral_fee,
+            // [AUDIT_11]
+            shares: LookupMap::new(StorageKey::Shares {
+                pool_id: id,
+            }),
+            shares_total_supply: 0,
+        }
+    }
+
+    /// Register given account with 0 balance in shares.
+    /// Storage payment should be checked by caller.
+    pub fn share_register(&mut self, account_id: &AccountId) {
+        if self.shares.contains_key(account_id) {
+            env::panic(ERR14_LP_ALREADY_REGISTERED.as_bytes());
+        }
+        self.shares.insert(account_id, &0);
+    }
+
+    /// Transfers shares from predecessor to receiver.
+    pub fn share_transfer(&mut self, sender_id: &AccountId, receiver_id: &AccountId, amount: u128) {
+        let balance = self.shares.get(&sender_id).expect(ERR13_LP_NOT_REGISTERED);
+        if let Some(new_balance) = balance.checked_sub(amount) {
+            self.shares.insert(&sender_id, &new_balance);
+        } else {
+            env::panic(ERR91_NOT_ENOUGH_SHARES.as_bytes());
+        }
+        let balance_out = self
+            .shares
+            .get(&receiver_id)
+            .expect(ERR13_LP_NOT_REGISTERED);
+        self.shares.insert(&receiver_id, &(balance_out + amount));
+    }
+
+    /// Returns balance of shares for given user.
+    pub fn share_balance_of(&self, account_id: &AccountId) -> Balance {
+        self.shares.get(account_id).unwrap_or_default()
+    }
+
+    /// Returns total number of shares in this pool.
+    pub fn share_total_balance(&self) -> Balance {
+        self.shares_total_supply
+    }
+
+    /// Returns list of tokens in this pool.
+    pub fn tokens(&self) -> &[AccountId] {
+        &self.token_account_ids
+    }
+
+    /// Adds the amounts of tokens to liquidity pool and returns number of shares that this user receives.
+    /// Updates amount to amount kept in the pool.
+    pub fn add_liquidity(&mut self, sender_id: &AccountId, amounts: &mut Vec<Balance>) -> Balance {
+        assert_eq!(
+            amounts.len(),
+            NUM_TOKENS,
+            "{}", ERR89_WRONG_AMOUNT_COUNT
+        );
+        let shares = if self.shares_total_supply > 0 {
+            let mut fair_supply = U256::max_value();
+            for i in 0..self.token_account_ids.len() {
+                assert!(amounts[i] > 0, "{}", ERR31_ZERO_AMOUNT);
+                fair_supply = min(
+                    fair_supply,
+                    U256::from(amounts[i] - 1) * U256::from(self.shares_total_supply) / self.amounts[i],
+                );
+            }
+            for i in 0..self.token_account_ids.len() {
+                let amount = (U256::from(self.amounts[i]) * fair_supply
+                    / U256::from(self.shares_total_supply))
+                .as_u128() + 1;
+                assert!(amount > 0, "{}", ERR31_ZERO_AMOUNT);
+                self.amounts[i] += amount;
+                amounts[i] = amount;
+            }
+            fair_supply.as_u128()
+        } else {
+            for i in 0..self.token_account_ids.len() {
+                assert!(amounts[i] > 0, "{}", ERR31_ZERO_AMOUNT);
+                self.amounts[i] += amounts[i];
+            }
+            INIT_SHARES_SUPPLY
+        };
+        self.mint_shares(&sender_id, shares);
+        assert!(shares > 0, "{}", ERR32_ZERO_SHARES);
+        env::log(
+            format!(
+                "Liquidity added {:?}, minted {} shares",
+                amounts
+                    .iter()
+                    .zip(self.token_account_ids.iter())
+                    .map(|(amount, token_id)| format!("{} {}", amount, token_id))
+                    .collect::<Vec<String>>(),
+                shares
+            )
+            .as_bytes(),
+        );
+        shares
+    }
+
+    /// Mint new shares for given user.
+    fn mint_shares(&mut self, account_id: &AccountId, shares: Balance) {
+        if shares == 0 {
+            return;
+        }
+        self.shares_total_supply = self.shares_total_supply.checked_add(shares).expect(ERR36_SHARES_TOTAL_SUPPLY_OVERFLOW);
+        add_to_collection(&mut self.shares, &account_id, shares);
+    }
+
+    /// Removes given number of shares from the pool and returns amounts to the parent.
+    pub fn remove_liquidity(
+        &mut self,
+        sender_id: &AccountId,
+        shares: Balance,
+        min_amounts: Vec<Balance>,
+    ) -> Vec<Balance> {
+        assert_eq!(
+            min_amounts.len(),
+            NUM_TOKENS,
+            "{}", ERR89_WRONG_AMOUNT_COUNT
+        );
+        let prev_shares_amount = self.shares.get(&sender_id).expect(ERR13_LP_NOT_REGISTERED);
+        assert!(prev_shares_amount >= shares, "{}", ERR91_NOT_ENOUGH_SHARES);
+        let mut result = vec![];
+        for i in 0..self.token_account_ids.len() {
+            let amount = (U256::from(self.amounts[i]) * U256::from(shares)
+                / U256::from(self.shares_total_supply))
+            .as_u128();
+            assert!(amount >= min_amounts[i], "{}", ERR68_SLIPPAGE);
+            self.amounts[i] -= amount;
+            result.push(amount);
+        }
+        if prev_shares_amount == shares {
+            // [AUDIT_13] Never unregister a LP when he removed all his liquidity.
+            self.shares.insert(&sender_id, &0);
+        } else {
+            self.shares
+                .insert(&sender_id, &(prev_shares_amount - shares));
+        }
+        env::log(
+            format!(
+                "{} shares of liquidity removed: receive back {:?}",
+                shares,
+                result
+                    .iter()
+                    .zip(self.token_account_ids.iter())
+                    .map(|(amount, token_id)| format!("{} {}", amount, token_id))
+                    .collect::<Vec<String>>(),
+            )
+            .as_bytes(),
+        );
+        self.shares_total_supply -= shares;
+        result
+    }
+
+    /// Returns token index for given pool.
+    fn token_index(&self, token_id: &AccountId) -> usize {
+        self.token_account_ids
+            .iter()
+            .position(|id| id == token_id)
+            .expect(ERR102_INVALID_TOKEN_ID)
+    }
+
+    /// Returns number of tokens in outcome, given amount.
+    /// Tokens are provided as indexes into token list for given pool.
+    fn internal_get_return(
+        &self,
+        token_in: usize,
+        amount_in: Balance,
+        token_out: usize,
+    ) -> Balance {
+        let in_balance = U256::from(self.amounts[token_in]);
+        let out_balance = U256::from(self.amounts[token_out]);
+        assert!(
+            in_balance > U256::zero()
+                && out_balance > U256::zero()
+                && token_in != token_out
+                && amount_in > 0,
+            "{}", ERR76_INVALID_PARAMS
+        );
+        let amount_with_fee = U256::from(amount_in) * U256::from(FEE_DIVISOR - self.total_fee);
+        (amount_with_fee * out_balance / (U256::from(FEE_DIVISOR) * in_balance + amount_with_fee))
+            .as_u128()
+    }
+
+    /// Returns how much token you will receive if swap `token_amount_in` of `token_in` for `token_out`.
+    pub fn get_return(
+        &self,
+        token_in: &AccountId,
+        amount_in: Balance,
+        token_out: &AccountId,
+    ) -> Balance {
+        self.internal_get_return(
+            self.token_index(token_in),
+            amount_in,
+            self.token_index(token_out),
+        )
+    }
+
+    /// Returns given pool's total fee.
+    pub fn get_fee(&self) -> u32 {
+        self.total_fee
+    }
+
+    /// Returns volumes of the given pool.
+    pub fn get_volumes(&self) -> Vec<SwapVolume> {
+        self.volumes.clone()
+    }
+
+    /// Swap `token_amount_in` of `token_in` token into `token_out` and return how much was received.
+    /// Assuming that `token_amount_in` was already received from `sender_id`.
+    pub fn swap(
+        &mut self,
+        token_in: &AccountId,
+        amount_in: Balance,
+        token_out: &AccountId,
+        min_amount_out: Balance,
+        admin_fee: &AdminFees,
+    ) -> Balance {
+        assert_ne!(token_in, token_out, "{}", ERR73_SAME_TOKEN);
+        let in_idx = self.token_index(token_in);
+        let out_idx = self.token_index(token_out);
+        let amount_out = self.internal_get_return(in_idx, amount_in, out_idx);
+        assert!(amount_out >= min_amount_out, "{}", ERR68_SLIPPAGE);
+        env::log(
+            format!(
+                "Swapped {} {} for {} {}",
+                amount_in, token_in, amount_out, token_out
+            )
+            .as_bytes(),
+        );
+
+        let prev_invariant =
+            integer_sqrt(U256::from(self.amounts[in_idx]) * U256::from(self.amounts[out_idx]));
+
+        self.amounts[in_idx] += amount_in;
+        self.amounts[out_idx] -= amount_out;
+
+        // "Invariant" is by how much the dot product of amounts increased due to fees.
+        let new_invariant =
+            integer_sqrt(U256::from(self.amounts[in_idx]) * U256::from(self.amounts[out_idx]));
+
+        // Invariant can not reduce (otherwise loosing balance of the pool and something it broken).
+        assert!(new_invariant >= prev_invariant, "{}", ERR75_INVARIANT_REDUCE);
+        let numerator = (new_invariant - prev_invariant) * U256::from(self.shares_total_supply);
+
+        // Allocate exchange fee as fraction of total fee by issuing LP shares proportionally.
+        if admin_fee.exchange_fee > 0 && numerator > U256::zero() {
+            let denominator = new_invariant * FEE_DIVISOR / admin_fee.exchange_fee;
+            self.mint_shares(&admin_fee.exchange_id, (numerator / denominator).as_u128());
+        }
+
+        // If there is referral provided and the account already registered LP, allocate it % of LP rewards.
+        if let Some(referral_id) = &admin_fee.referral_id {
+            if admin_fee.referral_fee > 0
+                && numerator > U256::zero()
+                && self.shares.contains_key(referral_id)
+            {
+                let denominator = new_invariant * FEE_DIVISOR / admin_fee.referral_fee;
+                self.mint_shares(referral_id, (numerator / denominator).as_u128());
+            }
+        }
+
+        // Keeping track of volume per each input traded separately.
+        // Reported volume with fees will be sum of `input`, without fees will be sum of `output`.
+        self.volumes[in_idx].input.0 += amount_in;
+        self.volumes[in_idx].output.0 += amount_out;
+
+        amount_out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::{testing_env, MockedBlockchain};
+    use near_sdk_sim::to_yocto;
+
+    use super::*;
+
+    #[test]
+    fn test_pool_swap() {
+        let one_near = 10u128.pow(24);
+        let mut context = VMContextBuilder::new();
+        context.predecessor_account_id(accounts(0));
+        testing_env!(context.build());
+        let mut pool = SimplePool::new(0, vec![accounts(1), accounts(2)], 30, 0, 0);
+        let mut amounts = vec![to_yocto("5"), to_yocto("10")];
+        let num_shares = pool.add_liquidity(accounts(0).as_ref(), &mut amounts);
+        assert_eq!(amounts, vec![to_yocto("5"), to_yocto("10")]);
+        assert_eq!(
+            pool.share_balance_of(accounts(0).as_ref()),
+            INIT_SHARES_SUPPLY
+        );
+        let out = pool.swap(
+            accounts(1).as_ref(),
+            one_near,
+            accounts(2).as_ref(),
+            1,
+            &AdminFees {
+                exchange_fee: 0,
+                exchange_id: accounts(3).as_ref().clone(),
+                referral_fee: 0,
+                referral_id: None,
+            },
+        );
+        assert_eq!(
+            pool.share_balance_of(accounts(0).as_ref()),
+            INIT_SHARES_SUPPLY
+        );
+        pool.share_register(accounts(1).as_ref());
+        pool.share_transfer(
+            accounts(0).as_ref(),
+            accounts(1).as_ref(),
+            INIT_SHARES_SUPPLY / 2,
+        );
+        assert_eq!(
+            pool.share_balance_of(accounts(0).as_ref()),
+            INIT_SHARES_SUPPLY / 2
+        );
+        assert_eq!(
+            pool.share_balance_of(accounts(1).as_ref()),
+            INIT_SHARES_SUPPLY / 2
+        );
+        assert_eq!(
+            pool.remove_liquidity(accounts(0).as_ref(), num_shares / 2, vec![1, 1]),
+            [3 * one_near, 5 * one_near - out / 2]
+        );
+    }
+
+    #[test]
+    fn test_pool_swap_with_fees() {
+        let one_near = 10u128.pow(24);
+        let mut context = VMContextBuilder::new();
+        context.predecessor_account_id(accounts(0));
+        testing_env!(context.build());
+        let mut pool = SimplePool::new(0, vec![accounts(1), accounts(2)], 100, 100, 0);
+        let mut amounts = vec![to_yocto("5"), to_yocto("10")];
+        let num_shares = pool.add_liquidity(accounts(0).as_ref(), &mut amounts);
+        assert_eq!(amounts, vec![to_yocto("5"), to_yocto("10")]);
+        assert_eq!(
+            pool.share_balance_of(accounts(0).as_ref()),
+            INIT_SHARES_SUPPLY
+        );
+        let out = pool.swap(
+            accounts(1).as_ref(),
+            one_near,
+            accounts(2).as_ref(),
+            1,
+            &AdminFees {
+                exchange_fee: 100,
+                exchange_id: accounts(3).as_ref().clone(),
+                referral_fee: 0,
+                referral_id: None,
+            },
+        );
+        assert_eq!(
+            pool.share_balance_of(accounts(0).as_ref()),
+            INIT_SHARES_SUPPLY
+        );
+        let liq1 = pool.remove_liquidity(accounts(0).as_ref(), num_shares, vec![1, 1]);
+        let num_shares2 = pool.share_balance_of(accounts(3).as_ref());
+        let liq2 = pool.remove_liquidity(accounts(3).as_ref(), num_shares2, vec![1, 1]);
+        assert_eq!(liq1[0] + liq2[0], to_yocto("6"));
+        assert_eq!(liq1[1] + liq2[1], to_yocto("10") - out);
+    }
+
+    #[test]
+    #[should_panic(expected = "E32: minting zero shares")]
+    fn test_rounding() {
+        testing_env!(VMContextBuilder::new().build());
+        let mut pool = SimplePool {
+            token_account_ids: vec![accounts(0).to_string(), accounts(1).to_string()],
+            amounts: vec![367701466208080431008668441, 2267116519548219219535],
+            volumes: vec![SwapVolume::default(), SwapVolume::default()],
+            total_fee: 30,
+            exchange_fee: 5,
+            referral_fee: 1,
+            shares_total_supply: 35967818779820559673547466,
+            shares: LookupMap::new(StorageKey::Shares {
+                pool_id: 0,
+            }),
+        };
+        let mut amounts = vec![145782, 1];
+        let _ = pool.add_liquidity(&accounts(2).to_string(), &mut amounts);
+    }
+}
+
+'''
+'''--- babylon-finance/src/storage_impl.rs ---
+use crate::*;
+
+/// Implements users storage management for the pool.
+#[near_bindgen]
+impl StorageManagement for Contract {
+    #[payable]
+    fn storage_deposit(
+        &mut self,
+        account_id: Option<ValidAccountId>,
+        registration_only: Option<bool>,
+    ) -> StorageBalance {
+        self.assert_contract_running();
+        let amount = env::attached_deposit();
+        let account_id = account_id
+            .map(|a| a.into())
+            .unwrap_or_else(|| env::predecessor_account_id());
+        let registration_only = registration_only.unwrap_or(false);
+        let min_balance = self.storage_balance_bounds().min.0;
+        let already_registered = self.accounts.contains_key(&account_id);
+        if amount < min_balance && !already_registered {
+            env::panic(ERR17_DEPOSIT_LESS_THAN_MIN_STORAGE.as_bytes());
+        }
+        if registration_only {
+            // Registration only setups the account but doesn't leave space for tokens.
+            if already_registered {
+                log!("ERR_ACC_REGISTERED");
+                if amount > 0 {
+                    Promise::new(env::predecessor_account_id()).transfer(amount);
+                }
+            } else {
+                self.internal_register_account(&account_id, min_balance);
+                let refund = amount - min_balance;
+                if refund > 0 {
+                    Promise::new(env::predecessor_account_id()).transfer(refund);
+                }
+            }
+        } else {
+            self.internal_register_account(&account_id, amount);
+        }
+        self.storage_balance_of(account_id.try_into().unwrap())
+            .unwrap()
+    }
+
+    #[payable]
+    fn storage_withdraw(&mut self, amount: Option<U128>) -> StorageBalance {
+        assert_one_yocto();
+        self.assert_contract_running();
+        let account_id = env::predecessor_account_id();
+        let amount = amount.unwrap_or(U128(0)).0;
+        let withdraw_amount = self.internal_storage_withdraw(&account_id, amount);
+        Promise::new(account_id.clone()).transfer(withdraw_amount);
+        self.storage_balance_of(account_id.try_into().unwrap())
+            .unwrap()
+    }
+
+    #[allow(unused_variables)]
+    #[payable]
+    fn storage_unregister(&mut self, force: Option<bool>) -> bool {
+        assert_one_yocto();
+        self.assert_contract_running();
+        let account_id = env::predecessor_account_id();
+        if let Some(account_deposit) = self.internal_get_account(&account_id) {
+            // TODO: figure out force option logic.
+            assert!(
+                account_deposit.tokens.is_empty(),
+                "{}", ERR18_TOKENS_NOT_EMPTY
+            );
+            self.accounts.remove(&account_id);
+            Promise::new(account_id.clone()).transfer(account_deposit.near_amount);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn storage_balance_bounds(&self) -> StorageBalanceBounds {
+        StorageBalanceBounds {
+            min: Account::min_storage_usage().into(),
+            max: None,
+        }
+    }
+
+    fn storage_balance_of(&self, account_id: ValidAccountId) -> Option<StorageBalance> {
+        self.internal_get_account(account_id.as_ref())
+            .map(|account| 
+                { 
+                    StorageBalance {
+                        total: U128(account.near_amount),
+                        available: U128(account.storage_available()),
+                    } 
+                })
+    }
+}
+
+'''
+'''--- babylon-finance/src/token_receiver.rs ---
+
+use near_contract_standards::fungible_token::receiver::FungibleTokenReceiver;
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{serde_json, PromiseOrValue};
+
+use crate::*;
+
+pub const VIRTUAL_ACC: &str = "@";
+
+/// Message parameters to receive via token function call.
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+#[serde(untagged)]
+enum TokenReceiverMessage {
+    /// Alternative to deposit + execute actions call.
+    Execute {
+        referral_id: Option<ValidAccountId>,
+        /// List of sequential actions.
+        actions: Vec<Action>,
+    },
+}
+
+impl Contract {
+    /// Executes set of actions on virtual account.
+    /// Returns amounts to send to the sender directly.
+    fn internal_direct_actions(
+        &mut self,
+        token_in: AccountId,
+        amount_in: Balance,
+        referral_id: Option<AccountId>,
+        actions: &[Action],
+    ) -> Vec<(AccountId, Balance)> {
+
+        // let @ be the virtual account
+        let mut account: Account = Account::new(&String::from(VIRTUAL_ACC));
+
+        account.deposit(&token_in, amount_in);
+        let _ = self.internal_execute_actions(
+            &mut account,
+            &referral_id,
+            &actions,
+            ActionResult::Amount(U128(amount_in)),
+        );
+
+        let mut result = vec![];
+        for (token, amount) in account.tokens.to_vec() {
+            if amount > 0 {
+                result.push((token.clone(), amount));
+            }
+        }
+        account.tokens.clear();
+
+        result
+    }
+
+}
+
+#[near_bindgen]
+impl FungibleTokenReceiver for Contract {
+    /// Callback on receiving tokens by this contract.
+    /// `msg` format is either "" for deposit or `TokenReceiverMessage`.
+    #[allow(unreachable_code)]
+    fn ft_on_transfer(
+        &mut self,
+        sender_id: ValidAccountId,
+        amount: U128,
+        msg: String,
+    ) -> PromiseOrValue<U128> {
+        self.assert_contract_running();
+        let token_in = env::predecessor_account_id();
+        // feature frozenlist
+        self.assert_no_frozen_tokens(&[token_in.clone()]);
+        if msg.is_empty() {
+            // Simple deposit.
+            self.internal_deposit(sender_id.as_ref(), &token_in, amount.into());
+            PromiseOrValue::Value(U128(0))
+        } else {
+            // instant swap
+            let message =
+                serde_json::from_str::<TokenReceiverMessage>(&msg).expect(ERR28_WRONG_MSG_FORMAT);
+            match message {
+                TokenReceiverMessage::Execute {
+                    referral_id,
+                    actions,
+                } => {
+                    let referral_id = referral_id.map(|x| x.to_string());
+                    let out_amounts = self.internal_direct_actions(
+                        token_in,
+                        amount.0,
+                        referral_id,
+                        &actions,
+                    );
+                    for (token_out, amount_out) in out_amounts.into_iter() {
+                        self.internal_send_tokens(sender_id.as_ref(), &token_out, amount_out);
+                    }
+                    // Even if send tokens fails, we don't return funds back to sender.
+                    PromiseOrValue::Value(U128(0))
+                }
+            }
+        }
+    }
+}
+'''
+'''--- babylon-finance/src/utils.rs ---
+use std::collections::HashSet;
+
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::LookupMap;
+use near_sdk::json_types::{ValidAccountId, U128};
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{ext_contract, AccountId, Balance, Gas};
+use uint::construct_uint;
+use crate::errors::*;
+
+/// Attach no deposit.
+pub const NO_DEPOSIT: u128 = 0;
+
+/// 10T gas for basic operation
+pub const GAS_FOR_BASIC_OP: Gas = 10_000_000_000_000;
+
+/// hotfix_insuffient_gas_for_mft_resolve_transfer.
+pub const GAS_FOR_RESOLVE_TRANSFER: Gas = 20_000_000_000_000;
+
+pub const GAS_FOR_FT_TRANSFER_CALL: Gas = 25_000_000_000_000 + GAS_FOR_RESOLVE_TRANSFER;
+
+/// Amount of gas for fungible token transfers, increased to 20T to support AS token contracts.
+pub const GAS_FOR_FT_TRANSFER: Gas = 20_000_000_000_000;
+
+/// Fee divisor, allowing to provide fee in bps.
+pub const FEE_DIVISOR: u32 = 10_000;
+
+/// Initial shares supply on deposit of liquidity.
+pub const INIT_SHARES_SUPPLY: u128 = 1_000_000_000_000_000_000_000_000;
+
+construct_uint! {
+    /// 256-bit unsigned integer.
+    pub struct U256(4);
+}
+
+construct_uint! {
+    /// 384-bit unsigned integer.
+    pub struct U384(6);
+}
+
+/// Volume of swap on the given token.
+#[derive(Clone, BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct SwapVolume {
+    pub input: U128,
+    pub output: U128,
+}
+
+impl Default for SwapVolume {
+    fn default() -> Self {
+        Self {
+            input: U128(0),
+            output: U128(0),
+        }
+    }
+}
+
+#[ext_contract(ext_self)]
+pub trait BabylonExchange {
+    fn exchange_callback_post_withdraw(
+        &mut self,
+        token_id: AccountId,
+        sender_id: AccountId,
+        amount: U128,
+    );
+}
+
+/// Adds given value to item stored in the given key in the LookupMap collection.
+pub fn add_to_collection(c: &mut LookupMap<AccountId, Balance>, key: &String, value: Balance) {
+    let prev_value = c.get(key).unwrap_or(0);
+    c.insert(key, &(prev_value + value));
+}
+
+/// Checks if there are any duplicates in the given list of tokens.
+pub fn check_token_duplicates(tokens: &[ValidAccountId]) {
+    let token_set: HashSet<_> = tokens.iter().map(|a| a.as_ref()).collect();
+    assert_eq!(token_set.len(), tokens.len(), "{}", ERR92_TOKEN_DUPLICATES);
+}
+
+/// Newton's method of integer square root.
+pub fn integer_sqrt(value: U256) -> U256 {
+    let mut guess: U256 = (value + U256::one()) >> 1;
+    let mut res = value;
+    while guess < res {
+        res = guess;
+        guess = (value / guess + guess) >> 1;
+    }
+    res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sqrt() {
+        assert_eq!(integer_sqrt(U256::from(0)), 0.into());
+        assert_eq!(integer_sqrt(U256::from(4)), 2.into());
+        assert_eq!(
+            integer_sqrt(U256::from(1_516_156_330_329u128)),
+            U256::from(1_231_323)
+        );
+    }
+}
+
+'''
+'''--- babylon-finance/src/views.rs ---
+//! View functions for the contract.
+
+use std::collections::HashMap;
+
+use near_sdk::json_types::{ValidAccountId, U128, U64};
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{near_bindgen, AccountId};
+use crate::utils::SwapVolume;
+use crate::*;
+
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Deserialize, Debug))]
+pub struct ContractMetadata {
+    pub version: String,
+    pub owner: AccountId,
+    pub guardians: Vec<AccountId>,
+    pub pool_count: u64,
+    pub state: RunningState,
+    pub exchange_fee: u32,
+    pub referral_fee: u32,
+}
+
+#[derive(Serialize, Deserialize, PartialEq)]
+#[serde(crate = "near_sdk::serde")]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Debug))]
+pub struct StorageState {
+    pub deposit: U128,
+    pub usage: U128,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Debug, PartialEq))]
+pub struct PoolInfo {
+    /// Pool kind.
+    pub pool_kind: String,
+    /// List of tokens in the pool.
+    pub token_account_ids: Vec<AccountId>,
+    /// How much NEAR this contract has.
+    pub amounts: Vec<U128>,
+    /// Fee charged for swap.
+    pub total_fee: u32,
+    /// Total number of shares.
+    pub shares_total_supply: U128,
+    pub amp: u64,
+}
+
+impl From<Pool> for PoolInfo {
+    fn from(pool: Pool) -> Self {
+        let pool_kind = pool.kind();
+        match pool {
+            Pool::SimplePool(pool) => Self {
+                pool_kind,
+                amp: 0,
+                token_account_ids: pool.token_account_ids,
+                amounts: pool.amounts.into_iter().map(|a| U128(a)).collect(),
+                total_fee: pool.total_fee,
+                shares_total_supply: U128(pool.shares_total_supply),
+            }
+        }
+    }
+}
+
+#[near_bindgen]
+impl Contract {
+
+    /// Return contract basic info
+    pub fn metadata(&self) -> ContractMetadata {
+        ContractMetadata {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            owner: self.owner_id.clone(),
+            guardians: self.guardians.to_vec(),
+            pool_count: self.pools.len(),
+            state: self.state.clone(),
+            exchange_fee: self.exchange_fee,
+            referral_fee: self.referral_fee,
+        }
+    }
+
+    /// Only get guardians info
+    pub fn get_guardians(&self) -> Vec<AccountId> {
+        self.guardians.to_vec()
+    }
+    
+    /// Returns semver of this contract.
+    pub fn version(&self) -> String {
+        env!("CARGO_PKG_VERSION").to_string()
+    }
+
+    /// Returns number of pools.
+    pub fn get_number_of_pools(&self) -> u64 {
+        self.pools.len()
+    }
+
+    /// Returns list of pools of given length from given start index.
+    pub fn get_pools(&self, from_index: u64, limit: u64) -> Vec<PoolInfo> {
+        (from_index..std::cmp::min(from_index + limit, self.pools.len()))
+            .map(|index| self.get_pool(index))
+            .collect()
+    }
+
+    /// Returns information about specified pool.
+    pub fn get_pool(&self, pool_id: u64) -> PoolInfo {
+        self.pools.get(pool_id).expect(ERR85_NO_POOL).into()
+    }
+
+    /// Returns list of pools of given pool ids.
+    pub fn get_pool_by_ids(&self, pool_ids: Vec<u64>) -> Vec<PoolInfo> {
+        pool_ids.iter()
+            .map(|index| self.get_pool(*index))
+            .collect()
+    }
+
+    /// Return total fee of the given pool.
+    pub fn get_pool_fee(&self, pool_id: u64) -> u32 {
+        self.pools.get(pool_id).expect(ERR85_NO_POOL).get_fee()
+    }
+
+    /// Return volumes of the given pool.
+    pub fn get_pool_volumes(&self, pool_id: u64) -> Vec<SwapVolume> {
+        self.pools.get(pool_id).expect(ERR85_NO_POOL).get_volumes()
+    }
+
+    pub fn get_pool_share_price(&self, pool_id: u64) -> U128 {
+        self.pools.get(pool_id).expect(ERR85_NO_POOL).get_share_price().into()
+    }
+
+    /// Returns number of shares given account has in given pool.
+    pub fn get_pool_shares(&self, pool_id: u64, account_id: ValidAccountId) -> U128 {
+        self.pools
+            .get(pool_id)
+            .expect(ERR85_NO_POOL)
+            .share_balances(account_id.as_ref())
+            .into()
+    }
+
+    /// Returns total number of shares in the given pool.
+    pub fn get_pool_total_shares(&self, pool_id: u64) -> U128 {
+        self.pools
+            .get(pool_id)
+            .expect(ERR85_NO_POOL)
+            .share_total_balance()
+            .into()
+    }
+
+    /// Returns balances of the deposits for given user outside of any pools.
+    /// Returns empty list if no tokens deposited.
+    pub fn get_deposits(&self, account_id: ValidAccountId) -> HashMap<AccountId, U128> {
+        let wrapped_account = self.internal_get_account(account_id.as_ref());
+        if let Some(account) = wrapped_account {
+            account.get_tokens()
+                .iter()
+                .map(|token| (token.clone(), U128(account.get_balance(token).unwrap())))
+                .collect()
+        } else {
+            HashMap::new()
+        }
+    }
+
+    /// Returns balance of the deposit for given user outside of any pools.
+    pub fn get_deposit(&self, account_id: ValidAccountId, token_id: ValidAccountId) -> U128 {
+        self.internal_get_deposit(account_id.as_ref(), token_id.as_ref())
+            .into()
+    }
+
+    /// Given specific pool, returns amount of token_out recevied swapping amount_in of token_in.
+    pub fn get_return(
+        &self,
+        pool_id: u64,
+        token_in: ValidAccountId,
+        amount_in: U128,
+        token_out: ValidAccountId,
+    ) -> U128 {
+        let pool = self.pools.get(pool_id).expect(ERR85_NO_POOL);
+        pool.get_return(token_in.as_ref(), amount_in.into(), token_out.as_ref(), &AdminFees::new(self.exchange_fee))
+            .into()
+    }
+
+    /// Get frozenlist tokens.
+    pub fn get_frozenlist_tokens(&self) -> Vec<AccountId> {
+        self.frozen_tokens.to_vec()
+    }
+
+    /// Get contract level whitelisted tokens.
+    pub fn get_whitelisted_tokens(&self) -> Vec<AccountId> {
+        self.whitelisted_tokens.to_vec()
+    }
+
+    /// Get specific user whitelisted tokens.
+    pub fn get_user_whitelisted_tokens(&self, account_id: ValidAccountId) -> Vec<AccountId> {
+        self.internal_get_account(account_id.as_ref())
+            .map(|x| x.get_tokens())
+            .unwrap_or_default()
+    }
+
+    /// Get user's storage deposit and needed in the account of current version
+    pub fn get_user_storage_state(&self, account_id: ValidAccountId) -> Option<StorageState> {
+        let acc = self.internal_get_account(account_id.as_ref());
+        if let Some(account) = acc {
+            Some(
+                StorageState {
+                    deposit: U128(account.near_amount),
+                    usage: U128(account.storage_usage()),
+                }
+            )           
+        } else {
+            None
+        }
+    }
+}
+
+'''
+'''--- instructions.txt ---
+EXCHANGE=babylon.yoshitoke.testnet
+ACCOUNT=yoshitoke.testnet
+near call $EXCHANGE extend_whitelisted_tokens '{"tokens": ["v2-nearx.staderlabs.testnet", "oct.fakes.testnet"]}' --accountId $ACCOUNT --depositYocto=1
+near call $EXCHANGE add_simple_pool '{"tokens": ["hapi.fakes.testnet", "pulse.fakes.testnet"], "fee": 25}' --accountId $ACCOUNT --amount=0.05
+near call $EXCHANGE storage_deposit '{"account_id": "yoshitoke.testnet"}' --accountId $ACCOUNT --amount=1
+near call $EXCHANGE register_tokens '{"token_ids": ["v2-nearx.staderlabs.testnet", "pulse.fakes.testnet"]}' --accountId $ACCOUNT --depositYocto=1
+near call $EXCHANGE add_liquidity '{"pool_id": 6, "amounts": ["1000000000000000000", "1000000000000000000"]}' --accountId $ACCOUNT --depositYocto=7000000000000000000000 --gas=300000000000000
+near call oct.fakes.testnet ft_transfer_call '{"receiver_id": "babylon.yoshitoke.testnet", "amount": "1000000000000000000", "msg": ""}' --accountId $ACCOUNT --depositYocto=1 --gas=300000000000000
+near call oct.fakes.testnet storage_deposit '{"registration_only": true, "account_id": "babylon.yoshitoke.testnet"}' --accountId $ACCOUNT --amount=1
+near call v2-nearx.staderlabs.testnet storage_deposit '{"registration_only": true, "account_id": "babylon.yoshitoke.testnet"}' --accountId $ACCOUNT --amount=1
+near call pulse.fakes.testnet ft_transfer_call '{"receiver_id": "babylon.yoshitoke.testnet", "amount": "1000000000000000000", "msg": ""}' --accountId $ACCOUNT --depositYocto=1 --gas=300000000000000
+near call pulse.fakes.testnet ft_transfer '{"receiver_id": "babylon.yoshitoke.testnet", "amount": "1000000000000000000000000"}' --accountId $ACCOUNT --depositYocto=1 --gas=300000000000000
+
+// need to understand pool_fee, all of fungible ft_transfer
+// need two test successfully with two different tokens
+'''
+'''--- scripts/codehash.py ---
+import hashlib
+import base58
+
+def CalcFileSha256(filname):
+    ''' calculate file sha256 '''
+    with open(filname, "rb") as f:
+        sha256obj = hashlib.sha256()
+        sha256obj.update(f.read())
+        bvalue = sha256obj.digest()
+        # hash_value = sha256obj.hexdigest()
+        return bvalue
+
+if __name__ == '__main__':
+    import sys
+    release_file = sys.argv[1]
+    build_file = sys.argv[2]
+    
+    code_hash_release = bytes.decode(base58.b58encode(CalcFileSha256(release_file)))
+    print("In release, code hash:", code_hash_release)
+    import os
+    if os.path.exists(build_file):
+        code_hash_build = bytes.decode(base58.b58encode(CalcFileSha256(release_file)))
+        print("In res,     code hash:", code_hash_release)
+        if code_hash_release == code_hash_build:
+            print("OK, Code hash are identical.")
+        else:
+            print("Err!!! Two code hash are diffrent.")
+'''
+'''--- test-token/Cargo.toml ---
+[package]
+name = "test-token"
+version = "0.1.0"
+authors = ["Illia Polosukhin <illia.polosukhin@gmail.com>"]
+edition = "2018"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# near-sdk = { git = "https://github.com/near/near-sdk-rs", rev = "9d99077" }
+# near-contract-standards = { git = "https://github.com/near/near-sdk-rs", rev = "9d99077" }
+near-sdk = "3.1.0"
+near-contract-standards = "3.1.0"
+'''
+'''--- test-token/build.sh ---
+#!/bin/bash
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo +stable build --target wasm32-unknown-unknown --release
+cd ..
+cp target/wasm32-unknown-unknown/release/test_token.wasm res/
+
+'''
+'''--- test-token/src/lib.rs ---
+use near_contract_standards::fungible_token::metadata::{
+    FungibleTokenMetadata, FungibleTokenMetadataProvider,
+};
+use near_contract_standards::fungible_token::FungibleToken;
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::json_types::{ValidAccountId, U128};
+use near_sdk::{env, near_bindgen, AccountId, PanicOnDefault, PromiseOrValue};
+
+near_sdk::setup_alloc!();
+
+#[near_bindgen]
+#[derive(BorshSerialize, BorshDeserialize, PanicOnDefault)]
+pub struct Contract {
+    token: FungibleToken,
+}
+
+#[near_bindgen]
+impl Contract {
+    #[init]
+    pub fn new() -> Self {
+        Self {
+            token: FungibleToken::new(b"t".to_vec()),
+        }
+    }
+
+    pub fn mint(&mut self, account_id: ValidAccountId, amount: U128) {
+        self.token.internal_register_account(account_id.as_ref());
+        self.token
+            .internal_deposit(account_id.as_ref(), amount.into());
+    }
+
+    pub fn burn(&mut self, account_id: ValidAccountId, amount: U128) {
+        self.token
+            .internal_withdraw(account_id.as_ref(), amount.into());
+    }
+}
+
+near_contract_standards::impl_fungible_token_core!(Contract, token);
+near_contract_standards::impl_fungible_token_storage!(Contract, token);
+
+#[near_bindgen]
+impl FungibleTokenMetadataProvider for Contract {
+    fn ft_metadata(&self) -> FungibleTokenMetadata {
+        unimplemented!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::{env, testing_env, MockedBlockchain};
+
+    use super::*;
+
+    #[test]
+    fn test_basics() {
+        let mut context = VMContextBuilder::new();
+        testing_env!(context.build());
+        let mut contract = Contract::new();
+        testing_env!(context
+            .attached_deposit(125 * env::storage_byte_cost())
+            .build());
+        contract.mint(accounts(0), 1_000_000.into());
+        assert_eq!(contract.ft_balance_of(accounts(0)), 1_000_000.into());
+
+        testing_env!(context
+            .attached_deposit(125 * env::storage_byte_cost())
+            .build());
+        contract.storage_deposit(Some(accounts(1)), None);
+        testing_env!(context
+            .attached_deposit(1)
+            .predecessor_account_id(accounts(0))
+            .build());
+        contract.ft_transfer(accounts(1), 1_000.into(), None);
+        assert_eq!(contract.ft_balance_of(accounts(1)), 1_000.into());
+
+        contract.burn(accounts(1), 500.into());
+        assert_eq!(contract.ft_balance_of(accounts(1)), 500.into());
+    }
+}
+
+'''

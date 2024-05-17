@@ -1,0 +1,541 @@
+*GitHub Repository "lightsea90/token-deployer"*
+
+'''--- README.md ---
+Token Sale
+==================
+
+This is a smart contract running on NEAR Protocol. It could be used to run a token sale.
+
+# Sale rules
+* There are 2 periods: Sale and Grace.
+* In Sale period: users can deposit and withdraw.
+* In Grace period: users can only withdraw.
+* At any point of time, the price is calculated by the total deposit divided by the total number of tokens for sale.
+* After the grace period ends, the sale finishes and the price is finalized.
+* At that point, tokens are allocated to users based on their deposit. Users can redeem to their wallets.
+
+'''
+'''--- contract/Cargo.toml ---
+[package]
+name = "token_deployer"
+version = "0.0.1"
+authors = ["Hai Minh Nguyen"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "3.1.0"
+near-contract-standards = "3.1.1"
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+# Opt into extra safety checks on arithmetic operations https://stackoverflow.com/a/64136471/249801
+overflow-checks = true
+
+'''
+'''--- contract/compile.js ---
+// This file does two things:
+//
+// 1. Compile the Rust contract using cargo (see buildCmd below). This will
+//    create a wasm file in the 'build' folder.
+// 2. Create a symbolic link (symlink) to the generated wasm file in the root
+//    project's `out` folder, for easy use with near-cli.
+//
+// First, import some helper libraries. `shelljs` is included in the
+// devDependencies of the root project, which is why it's available here. It
+// makes it easy to use *NIX-style scripting (which works on Linux distros,
+// macOS, and Unix systems) on Windows as well.
+const sh = require('shelljs')
+
+// Figure out which directory the user called this script from, which we'll use
+// later to set up the symlink.
+const calledFromDir = sh.pwd().toString()
+
+// For the duration of this script, we want to operate from within the
+// Rust project's folder. Let's change into that directory.
+sh.cd(__dirname)
+
+// You can call this script with `node compile.js` or `node compile.js
+// --debug`. Let's set a variable to track whether `--debug` was used.
+const debug = process.argv.pop() === '--debug'
+
+// You can call this script with `node compile.js` or `node compile.js --debug`.
+// Let's set a variable to track whether `--debug` was used.
+// Note: see other flags in ./cargo/config. Unfortunately, you cannot set the
+// `--target option` in Cargo.toml.
+const buildCmd = debug
+  ? 'cargo build --target wasm32-unknown-unknown'
+  : 'cargo build --target wasm32-unknown-unknown --release'
+
+// Execute the build command, storing exit code for later use
+const { code } = sh.exec(buildCmd)
+
+// Assuming this is compiled from the root project directory, link the compiled
+// contract to the `out` folder –
+// When running commands like `near deploy`, near-cli looks for a contract at
+// <CURRENT_DIRECTORY>/out/main.wasm
+if (code === 0 && calledFromDir !== __dirname) {
+  const linkDir = `${calledFromDir}/out`
+  const link = `${calledFromDir}/out/main.wasm`
+  const packageName = require('fs').readFileSync(`${__dirname}/Cargo.toml`).toString().match(/name = "([^"]+)"/)[1]
+  const outFile = `./target/wasm32-unknown-unknown/${debug ? 'debug' : 'release'}/${packageName}.wasm`
+  sh.mkdir('-p', linkDir)
+  sh.rm('-f', link)
+  //fixes #831: copy-update instead of linking .- sometimes sh.ln does not work on Windows
+  sh.cp('-u',outFile,link)
+}
+
+// exit script with the same code as the build command
+process.exit(code)
+
+'''
+'''--- contract/src/lib.rs ---
+/*
+Functions:
+
+ */
+
+// To conserve gas, efficient serialization is achieved through Borsh (http://borsh.io/)
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::UnorderedMap;
+use near_sdk::json_types::{WrappedBalance, WrappedDuration, WrappedTimestamp};
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::serde_json::{json, Value};
+use near_sdk::{env, ext_contract, near_bindgen, PanicOnDefault};
+use near_sdk::{AccountId, Balance, Duration, Gas, Timestamp};
+use near_sdk::{Promise, PromiseResult};
+// use chrono::prelude::{Utc, DateTime};
+use std::collections::HashMap;
+
+near_sdk::setup_alloc!();
+
+const DEFAULT_GAS_FEE: Gas = 20_000_000_000_000;
+const TOKEN_FACTORY_ACCOUNT: &str = "factory.tokenhub.testnet";
+const MAX_SUPPLY_PERCENT: u64 = 10000; // Decimal: 2
+
+#[derive(BorshDeserialize, BorshSerialize, Clone, Deserialize, Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct TokenAllocation {
+    allocated_percent: u64,
+    initial_release: u64,
+    vesting_start_time: Timestamp,
+    vesting_end_time: Timestamp,
+    vesting_interval: Duration,
+    claimed: u128,
+}
+
+impl Default for TokenAllocation {
+    fn default() -> Self {
+        Self {
+            allocated_percent: 0,
+            initial_release: 0,
+            vesting_start_time: 0,
+            vesting_end_time: 0,
+            vesting_interval: 0,
+            claimed: 1,
+        }
+    }
+}
+
+#[ext_contract(ext_self)]
+pub trait ExtTokenAllocation {
+    fn on_claim_finished(&mut self, predecessor_account_id: AccountId, amount: Balance) -> bool;
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Clone, Deserialize, Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct WrappedTokenAllocation {
+    allocated_percent: u64,
+    initial_release: u64,
+    vesting_start_time: WrappedTimestamp,
+    vesting_end_time: WrappedTimestamp,
+    vesting_interval: WrappedDuration,
+}
+
+pub type TokenAllocationInput = HashMap<AccountId, WrappedTokenAllocation>;
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct TokenDeployer {
+    ft_contract_name: AccountId,
+    total_supply: Balance,
+    allocations: UnorderedMap<AccountId, TokenAllocation>,
+}
+
+#[near_bindgen]
+impl TokenDeployer {
+    #[init]
+    pub fn new(
+        ft_contract_name: String,
+        total_supply: WrappedBalance,
+        allocations: TokenAllocationInput,
+    ) -> Self {
+        assert!(!env::state_exists(), "The contract is already initialized",);
+        assert!(
+            env::predecessor_account_id() == TOKEN_FACTORY_ACCOUNT,
+            "Only token factory is allowed to execute the function env {} const {}",
+            env::predecessor_account_id(),
+            TOKEN_FACTORY_ACCOUNT
+        );
+
+        let mut s = Self {
+            ft_contract_name,
+            total_supply: total_supply.into(),
+            allocations: UnorderedMap::new(b"alloc".to_vec()),
+        };
+        let mut total_allocs: u64 = 0;
+        for (account_id, alloc) in &allocations {
+            let a = TokenAllocation {
+                allocated_percent: alloc.allocated_percent,
+                initial_release: alloc.initial_release,
+                vesting_start_time: alloc.vesting_start_time.into(),
+                vesting_end_time: alloc.vesting_end_time.into(),
+                vesting_interval: alloc.vesting_interval.into(),
+                claimed: 0,
+            };
+            s.assert_invalid_allocation(a.clone());
+            total_allocs += a.allocated_percent;
+            assert!(
+                total_allocs <= MAX_SUPPLY_PERCENT,
+                "Total allocations is greater than total supply"
+            );
+
+            s.allocations.insert(account_id, &a);
+        }
+        assert!(
+            total_allocs == MAX_SUPPLY_PERCENT,
+            "Total allocations is not equal to total supply"
+        );
+        return s;
+    }
+
+    pub fn get_allocation_list(self) -> Value {
+        let mut result = json!({});
+        let account_list = self.allocations.keys_as_vector();
+        let allocation_list = self.allocations.values_as_vector();
+        for (i, account_id) in account_list.iter().enumerate() {
+            let alloc = allocation_list.get(i as u64).unwrap();
+            result.as_object_mut().unwrap().insert(
+                account_id,
+                json!({
+                    "allocated_percent": alloc.allocated_percent,
+                    "initial_release": alloc.initial_release,
+                    "vesting_start_time": WrappedTimestamp::from(alloc.vesting_start_time),
+                    "vesting_end_time": WrappedTimestamp::from(alloc.vesting_end_time),
+                    "vesting_interval": WrappedDuration::from(alloc.vesting_interval),
+                    "claimed": WrappedBalance::from(alloc.claimed),
+                }),
+            );
+        }
+        return json!(result);
+    }
+
+    pub fn check_account(&self, account_id: AccountId) -> Value {
+        let alloc = self.allocations.get(&account_id).unwrap_or_default();
+        self.assert_invalid_allocation(alloc.clone());
+
+        let claimable_amount: Balance = self.get_claimable_amount(&alloc);
+        let response_json = json!({
+            "allocated_percent": alloc.allocated_percent,
+            "initial_release": alloc.initial_release,
+            "vesting_start_time": WrappedTimestamp::from(alloc.vesting_start_time),
+            "vesting_end_time": WrappedTimestamp::from(alloc.vesting_end_time),
+            "vesting_interval": WrappedDuration::from(alloc.vesting_interval),
+            "claimed": WrappedBalance::from(alloc.claimed),
+            "claimable_amount": WrappedBalance::from(claimable_amount),
+        });
+
+        response_json
+    }
+    fn get_claimable_amount(&self, alloc: &TokenAllocation) -> Balance {
+        let currrent_ts = env::block_timestamp();
+        let claimable_num = {
+            if currrent_ts < alloc.vesting_start_time {
+                0
+            } else if currrent_ts >= alloc.vesting_end_time {
+                self.num_tokens_from_percent(alloc.allocated_percent - alloc.initial_release)
+            } else {
+                let intervals: u64 =
+                    (currrent_ts - alloc.vesting_start_time) / alloc.vesting_interval;
+                let total_intervals: u64 =
+                    (alloc.vesting_end_time - alloc.vesting_start_time) / alloc.vesting_interval;
+                // result
+                self.num_tokens_from_percent(alloc.allocated_percent - alloc.initial_release)
+                    / total_intervals as Balance
+                    * intervals as Balance
+            }
+        };
+        let amount_to_claim: Balance =
+            claimable_num + self.num_tokens_from_percent(alloc.initial_release) - alloc.claimed;
+        return amount_to_claim;
+    }
+
+    #[payable]
+    pub fn claim(&mut self) -> Promise {
+        assert!(
+            env::attached_deposit() >= 1,
+            "Need at least 1 yoctoNEAR to execute",
+        );
+        let account_id = env::signer_account_id();
+        let alloc = self.allocations.get(&account_id).unwrap_or_default();
+        self.assert_invalid_allocation(alloc.clone());
+
+        let amount_to_claim: Balance = self.get_claimable_amount(&alloc);
+        env::log(format!("amount to claim = {}", amount_to_claim).as_bytes());
+        assert!(
+            amount_to_claim > 0,
+            "There is nothing to claim at the moment",
+        );
+
+        let transfer_promise: Promise;
+        if env::attached_deposit() > 1 {
+            transfer_promise = Promise::new(self.ft_contract_name.clone())
+                .function_call(
+                    b"storage_deposit".to_vec(),
+                    json!({
+                        "account_id": account_id,
+                    })
+                    .to_string()
+                    .as_bytes()
+                    .to_vec(),
+                    env::attached_deposit(),
+                    DEFAULT_GAS_FEE,
+                )
+                .then(
+                    Promise::new(self.ft_contract_name.clone()).function_call(
+                        b"ft_transfer".to_vec(),
+                        json!({
+                            "receiver_id": account_id,
+                            "amount": WrappedBalance::from(amount_to_claim),
+                        })
+                        .to_string()
+                        .as_bytes()
+                        .to_vec(),
+                        1,
+                        DEFAULT_GAS_FEE,
+                    ),
+                );
+        } else {
+            transfer_promise = Promise::new(self.ft_contract_name.clone()).function_call(
+                b"ft_transfer".to_vec(),
+                json!({
+                    "receiver_id": account_id,
+                    "amount": WrappedBalance::from(amount_to_claim),
+                })
+                .to_string()
+                .as_bytes()
+                .to_vec(),
+                1,
+                DEFAULT_GAS_FEE,
+            );
+        }
+
+        return transfer_promise.then(ext_self::on_claim_finished(
+            account_id,
+            amount_to_claim,
+            &env::current_account_id(),
+            0,
+            DEFAULT_GAS_FEE,
+        ));
+    }
+
+    #[private]
+    pub fn on_claim_finished(
+        &mut self,
+        predecessor_account_id: AccountId,
+        amount: Balance,
+    ) -> bool {
+        assert!(
+            env::promise_results_count() == 1,
+            "Function called not as a callback",
+        );
+        match env::promise_result(0) {
+            PromiseResult::Successful(_) => {
+                let mut alloc = self
+                    .allocations
+                    .remove(&predecessor_account_id)
+                    .unwrap_or_default();
+                self.assert_invalid_allocation(alloc.clone());
+                assert!(
+                    alloc.claimed + amount <= self.num_tokens_from_percent(alloc.allocated_percent),
+                    "Something wrong. Total claimed is greater than allocated_num",
+                );
+                alloc.claimed += amount;
+                self.allocations.insert(&predecessor_account_id, &alloc);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    // Utils
+    fn num_tokens_from_percent(&self, percent: u64) -> Balance {
+        percent as u128 * self.total_supply / MAX_SUPPLY_PERCENT as u128
+    }
+
+    fn assert_invalid_allocation(&self, allocation: TokenAllocation) {
+        println!(
+            "{} >= {} + {}",
+            self.num_tokens_from_percent(allocation.allocated_percent),
+            self.num_tokens_from_percent(allocation.initial_release),
+            allocation.claimed
+        );
+        assert!(
+            self.num_tokens_from_percent(allocation.allocated_percent) >= allocation.claimed,
+            "Allocation is smaller than the total claimable",
+        );
+        assert!(
+            allocation.vesting_interval
+                <= allocation.vesting_end_time - allocation.vesting_start_time,
+            "Vesting interval is larger than vesting time",
+        );
+
+        assert!(allocation.vesting_end_time > 0, "Not a valid allocation",);
+    }
+}
+
+/*
+ * The rest of this file holds the inline tests for the code above
+ * Learn more about Rust tests: https://doc.rust-lang.org/book/ch11-01-writing-tests.html
+ *
+ * To run from contract directory:
+ * cargo test -- --nocapture
+ *
+ * From project root, to run in combination with frontend tests:
+ * yarn test
+ *
+ */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use near_sdk::MockedBlockchain;
+    use near_sdk::{testing_env, VMContext};
+
+    // mock the context for testing, notice "signer_account_id" that was accessed above from env::
+    fn get_context(input: Vec<u8>, is_view: bool) -> VMContext {
+        VMContext {
+            current_account_id: "tokensale_near".to_string(),
+            signer_account_id: "harrynguyen_near".to_string(),
+            signer_account_pk: vec![0, 1, 2],
+            predecessor_account_id: "harrynguyen_near".to_string(),
+            input,
+            block_index: 0,
+            block_timestamp: 0,
+            account_balance: 0,
+            account_locked_balance: 0,
+            storage_usage: 0,
+            attached_deposit: 1_000_000_000_000_000_000_000_000,
+            prepaid_gas: 10u64.pow(18),
+            random_seed: vec![0, 1, 2],
+            is_view,
+            output_data_receivers: vec![],
+            epoch_height: 19,
+        }
+    }
+}
+
+'''
+'''--- contract/src/types.rs ---
+use crate::*;
+
+#[derive(BorshDeserialize, BorshSerialize, Clone, Deserialize, Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct TokenAllocation {
+    pub allocated_percent: u64,
+    pub initial_release: u64,
+    pub vesting_start_time: Timestamp,
+    pub vesting_end_time: Timestamp,
+    pub vesting_interval: Duration,
+    pub claimed: u64,
+}
+
+impl Default for TokenAllocation {
+    fn default() -> Self {
+        Self {
+            allocated_percent: 0,
+            initial_release: 0,
+            vesting_start_time: 0,
+            vesting_end_time: 0,
+            vesting_interval: 0,
+            claimed: 1,
+        }
+    }
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Clone, Deserialize, Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct WrappedTokenAllocation {
+    pub allocated_percent: u64,
+    pub initial_release: u64,
+    pub vesting_start_time: WrappedTimestamp,
+    pub vesting_end_time: WrappedTimestamp,
+    pub vesting_interval: WrappedDuration,
+}
+
+impl From<TokenAllocation> for WrappedTokenAllocation {
+    fn from(allocs: TokenAllocation) -> Self {
+        WrappedTokenAllocation {
+            allocated_percent: allocs.allocated_percent,
+            initial_release: allocs.initial_release,
+            vesting_start_time: WrappedTimestamp::from(allocs.vesting_start_time),
+            vesting_end_time: WrappedTimestamp::from(allocs.vesting_end_time),
+            vesting_interval: WrappedDuration::from(allocs.vesting_interval),
+        }
+    }
+}
+
+pub type TokenAllocationInput = HashMap<AccountId, WrappedTokenAllocation>;
+
+'''
+'''--- package.json ---
+{
+  "name": "token-sale-001",
+  "version": "0.0.1",
+  "license": "CC0 1.0 Universal",
+  "scripts": {
+    "build": "npm run build:contract && npm run build:web",
+    "build:contract": "node contract/compile.js",
+    "build:contract:debug": "node contract/compile.js --debug",
+    "build:web": "parcel build src/index.html --public-url ./",
+    "dev:deploy:contract": "near dev-deploy",
+    "deploy:contract": "near deploy",
+    "deploy:pages": "gh-pages -d dist/",
+    "deploy": "npm run build && npm run deploy:contract && npm run deploy:pages",
+    "prestart": "npm run build:contract:debug && npm run dev:deploy:contract",
+    "start": "echo The app is starting! It will automatically open in your browser when ready && env-cmd -f ./neardev/dev-account.env parcel src/index.html --open",
+    "dev": "nodemon --watch contract/src -e rs --exec \"npm run start\"",
+    "test": "npm run build:contract:debug && cd contract && cargo test -- --nocapture && cd .. && jest test --runInBand"
+  },
+  "devDependencies": {
+    "env-cmd": "~10.1.0",
+    "gh-pages": "~3.1.0",
+    "jest": "~26.6.2",
+    "jest-environment-node": "~26.6.2",
+    "near-cli": "~1.6.0",
+    "nodemon": "~2.0.3",
+    "parcel-bundler": "~1.12.4",
+    "shelljs": "~0.8.4"
+  },
+  "dependencies": {
+    "moment": "^2.29.1",
+    "near-api-js": "~0.41.0",
+    "regenerator-runtime": "^0.13.9"
+  },
+  "jest": {
+    "testEnvironment": "near-cli/test_environment",
+    "testPathIgnorePatterns": [
+      "<rootDir>/contract/",
+      "<rootDir>/node_modules/"
+    ]
+  }
+}
+
+'''

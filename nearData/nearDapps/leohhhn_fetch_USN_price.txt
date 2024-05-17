@@ -1,0 +1,1180 @@
+*GitHub Repository "leohhhn/fetch_USN_price"*
+
+'''--- .gitpod.yml ---
+image:
+  file: .gitpod.Dockerfile
+# Options to prebuild the image after github events and set notifications/badges
+github:
+  prebuilds:
+    # enable for the master/default branch (defaults to true)
+    master: true
+    # enable for all branches in this repo (defaults to false)
+    branches: true
+    # enable for pull requests coming from this repo (defaults to true)
+    pullRequests: true
+    # enable for pull requests coming from forks (defaults to false)
+    pullRequestsFromForks: true
+    # add a check to pull requests (defaults to true)
+    addCheck: true
+    # add a "Review in Gitpod" button as a comment to pull requests (defaults to false)
+    addComment: true
+    # add a "Review in Gitpod" button to the pull request's description (defaults to false)
+    addBadge: false
+    # add a label once the prebuild is ready to pull requests (defaults to false)
+    addLabel: false
+
+# List the start up tasks. You can start them in parallel in multiple terminals. See https://www.gitpod.io/docs/config-start-tasks/
+tasks:
+  - before: echo "nvm use 14.19.3" >> ~/.bashrc && npm install -g near-cli && nvm use 14.19.3
+    init: yarn
+    command: source ~/.bashrc; gp open README-Gitpod.md && yarn dev
+
+ports:
+  - port: 1234
+    onOpen: open-browser
+  - port: 5000
+    onOpen: ignore
+
+'''
+'''--- .theia/settings.json ---
+{
+    "editor.wordWrap": "on",
+    "editor.fontSize": 19,
+    "terminal.integrated.fontSize": 17,
+    "editor.suggestFontSize": 16
+}
+
+'''
+'''--- .travis.yml ---
+language: rust
+rust:
+  - stable
+os:
+  - linux
+  - osx
+  - windows
+env:
+  - NODE_ENV=ci YARN_GPG=no
+cache: cargo
+before_install:
+  - rustup target add wasm32-unknown-unknown
+  - if [[ "$TRAVIS_OS_NAME" == "windows" ]]; then HOME="/c/Users/travis" && export NVS_HOME=$ProgramData/nvs && git clone --single-branch https://github.com/jasongin/nvs $NVS_HOME && source $NVS_HOME/nvs.sh && nvs --version && nvs add 12 && nvs use 12; fi
+  - if [[ ! "$TRAVIS_OS_NAME" == "windows" ]]; then nvm install 12 && nvm use 12; fi
+  - npm install -g yarn
+  - yarn
+git:
+  autocrlf: false
+script:
+  - yarn test
+'''
+'''--- README-Gitpod.md ---
+Counter example in Rust - Gitpod version
+==================================================
+
+This README is specific to Gitpod and this example. For local development, please see [README.md](README.md).
+
+## Description
+
+In Gitpod, the counter will start automatically. Please look in the terminal for a link to follow.
+
+This contract implements simple counter backed by storage on blockchain.
+Contract in `contract/src/lib.rs` provides methods to increment / decrement counter and get it's current value or reset.
+
+Plus and minus buttons increase and decrease value correspondingly. When button L is toggled, a little light turns on, just for fun. RS button is for reset. LE and RE buttons to let the robot wink at you.
+
+## To Test
+
+```
+cd contract
+cargo test -- --nocapture
+```
+
+## To Explore
+
+- `contract/src/lib.rs` for the contract code
+- `src/index.html` for the front-end HTML
+- `src/main.js` for the JavaScript front-end code and how to integrate contracts
+- `src/test.js` for the JS tests for the contract
+
+## Data collection
+
+By using Gitpod in this project, you agree to opt-in to basic, anonymous analytics. No personal information is transmitted. Instead, these usage statistics aid in discovering potential bugs and user flow information.
+
+'''
+'''--- README.md ---
+Smart Contract for fetching USN's price via priceoracle.near
+=================================
+
+'''
+'''--- contract/Cargo.toml ---
+[package]
+name = "counter_contract"
+version = "1.0.0"
+authors = ["Near Inc <hello@near.org>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "4.0.0"
+uint = { version = "0.9.3", default-features = false }
+
+[dev-dependencies]
+near-sdk-sim = "3.2.0"
+
+[profile.release]
+codegen-units = 1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+'''
+'''--- contract/src/lib.rs ---
+//! This contract implements simple counter backed by storage on blockchain.
+//!
+//! The contract provides methods to [increment] / [decrement] counter and
+//! get it's current value [get_num] or [reset].
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::{env, log, near_bindgen, AccountId, Gas, Promise, PromiseError, PanicOnDefault, Timestamp};
+use near_sdk::serde::{Serialize, Deserialize};
+use near_sdk::json_types::{U64, U128};
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct PriceFetcher {
+    val: i8,
+    pub usn_contract: AccountId,
+}
+
+use near_sdk::{ext_contract};
+
+pub const TGAS: u64 = 1_000_000_000_000;
+pub const NO_DEPOSIT: u128 = 0;
+pub const XCC_SUCCESS: u64 = 1;
+
+pub type DurationSec = u32;
+
+#[derive(BorshSerialize, BorshDeserialize, Deserialize, Clone, Copy, Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Price {
+    pub multiplier: U128,
+    pub decimals: u8,
+}
+
+// From https://github.com/NearDeFi/price-oracle/blob/main/src/asset.rs
+#[derive(BorshSerialize, BorshDeserialize, Deserialize, Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct AssetOptionalPrice {
+    pub asset_id: AccountId,
+    pub price: Option<Price>,
+}
+
+// From https://github.com/NearDeFi/price-oracle/blob/main/src/lib.rs
+#[derive(BorshSerialize, BorshDeserialize, Deserialize, Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct PriceData {
+    timestamp: U64,
+    recency_duration_sec: DurationSec,
+    prices: Vec<AssetOptionalPrice>,
+}
+
+// Interface of this contract, for callbacks
+#[ext_contract(this_contract)]
+trait Callbacks {
+  fn query_price_callback(&mut self) -> bool;
+}
+
+// Validator interface, for cross-contract calls
+#[ext_contract(usn_contract)]
+trait PriceOracle {
+  fn get_price_data(&self, asset_ids: Option<Vec<AccountId>>) -> PriceData;
+}
+
+impl Default  for PriceFetcher {
+    fn default() -> Self {
+       Self {
+            val: 8,
+            usn_contract: "priceoracle.testnet".parse().unwrap(),
+       }
+    }
+}
+
+#[near_bindgen]
+impl PriceFetcher {
+
+     #[init]
+      #[private] // Public - but only callable by env::current_account_id()
+      pub fn new() -> Self {
+        assert!(!env::state_exists(), "Already initialized");
+        Self {
+        val: 8,
+          usn_contract: "priceoracle.testnet".parse().unwrap(),
+        }
+      }
+
+      // Public - query external greeting
+      pub fn query_price(&self) -> Promise {
+       let mut assets: Vec<AccountId> = Vec::new();
+       assets.push("usdn.testnet".parse().unwrap());
+
+        // Create a promise to call HelloNEAR.get_greeting()
+        let promise = usn_contract::ext(self.usn_contract.clone())
+          .with_static_gas(Gas(5*TGAS))
+          .get_price_data(Some(assets));
+
+        return promise.then( // Create a promise to callback query_greeting_callback
+          Self::ext(env::current_account_id())
+          .with_static_gas(Gas(5*TGAS))
+          .query_price_callback()
+        )
+      }
+
+      #[private] // Public - but only callable by env::current_account_id()
+      pub fn query_price_callback(&self, #[callback_result] call_result: Result<PriceData, PromiseError>) -> PriceData {
+        // Check if the promise succeeded by calling the method outlined in external.rs
+        if call_result.is_err() {
+          log!("There was an error contacting priceoracle");
+        }
+
+        // Return the greeting
+        let data: PriceData = call_result.unwrap();
+        data
+      }
+}
+
+'''
+'''--- frontend/assets/css/global.css ---
+h1 {
+  margin-top: 1em !important;
+  margin-bottom: 1em !important;
+  text-align: center;
+}
+
+.scene {
+  height: 350px;
+}
+.face {
+  margin: auto;
+  width: 66%;
+  height: 72%;
+  background-color: #fffaf2;
+}
+.number {
+  text-align: center;
+  margin:auto;
+  width: 66%;
+  height: 28%;
+  background-color: #ffd9f8;
+  border-top: 5px dotted #82174d;
+  font-size:1.5rem;
+}
+.eyes-row {
+  display: flex;
+  justify-content: space-around;
+  margin-top: 24%;
+  padding: 0 8px;
+}
+.closed {
+  width: 22px;
+  height: 13px;
+  border-top-left-radius: 100px;
+  border-top-right-radius: 100px;
+  border-left: 2px solid #ffa4b1;
+  border-right: 2px solid #ffa4b1;
+  border-top: 2px solid #ffa4b1;
+  margin-bottom: 12px;
+}
+.eye {
+  width: 26px;
+  height: 26px;
+  border-radius: 100px;
+  background-color: #ffa4b1;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  margin-bottom: 1px;
+}
+.eye .pupil {
+  position: relative;
+  width: 18px;
+  height: 18px;
+  border-radius: 100px;
+  background-color: #82174d;
+}
+.eye .pupil:before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  position: absolute;
+  background-color: #fff;
+  top: 4px;
+  left: 3px;
+  border-radius: 100px;
+}
+.eye .pupil:after {
+  content: "";
+  width: 3px;
+  height: 3px;
+  position: absolute;
+  background-color: #fff;
+  top: 9px;
+  left: 12px;
+  border-radius: 100px;
+}
+.mouth-row {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-around;
+  align-items: center;
+}
+.mouth-row .mouth {
+  margin-top: 3%;
+}
+.mouth-row .tongue {
+  position:absolute;
+  width: 10px;
+  height: 10px;
+  background-color: #FF585D;
+  border-radius: 50% 50% 30%;
+  margin: 5px 0;
+}
+.mouth-row .mouth.smile {
+  height: 16px;
+  width: 32px;
+  border-bottom-left-radius: 32px;
+  border-bottom-right-radius: 32px;
+  background-color: #82174d;
+  top: 120px;
+}
+.mouth-row .mouth.cry {
+  height: 16px;
+  width: 32px;
+  border-top-left-radius: 32px;
+  border-top-right-radius: 32px;
+  background-color: #82174d;
+  top: 120px;
+}
+.mouth-row .mouth:before {
+  content: "";
+  left: 43px;
+  margin-top: 1%;
+  border-radius: 100%;
+  height: 5%;
+  width: 11.5%;
+  background-color: #f56f79;
+  position: absolute;
+}
+.mouth-row .mouth:after {
+  content: "";
+  left: 106px;
+  margin-top: 1%;
+  border-radius: 100%;
+  height: 5%;
+  width: 11.5%;
+  background-color: #f56f79;
+  position: absolute;
+}
+.gameboy {
+  position: relative;
+  width: 400px;
+  margin: auto;
+}
+.body-shape {
+  position: absolute;
+  height: 300px;
+  width: 205px;
+  border-radius: 15px;
+}
+.body-shape .shadow {
+  height: 290px;
+}
+.body-shape .screen {
+  margin: 20px;
+  position: relative;
+  width: 168px;
+  height: 134px;
+  background-color: #82174d;
+  border-radius: 4px;
+  display: flex;
+  flex-direction: column;
+  justify-items: center;
+}
+.body-shape .dot {
+  content: "";
+  width: 8px;
+  height: 8px;
+  position: absolute;
+  background-color: #ffa4b1;
+  top: 40px;
+  left: 10px;
+  border-radius: 100px;
+}
+.body-shape .on {
+  background-color: #F0EC74;
+}
+.body-shape .buttons {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-around;
+  width: 100%;
+}
+.body-shape .buttons .row {
+  display: flex;
+}
+.body-shape .buttons .selects {
+  margin-top: 10px;
+  padding-left: 140px;
+}
+.body-shape .buttons .arrows {
+  position: relative;
+  height: 40px;
+  width: 40px;
+  border-radius: 100px;
+  background-color: #ffa4b1;
+  margin-left: 30px;
+  padding: 0;
+  cursor: grab;
+}
+.body-shape .buttons .arrows:disabled {
+  opacity: 0.8;
+  background-color: #d18892;
+}
+.body-shape .buttons .arrows .updown {
+  position: relative;
+  height: 35px;
+  width: 10px;
+  background-color: #82174d;
+  border-radius: 2px;
+  top: -8px;
+  left: 14px;
+}
+.body-shape .buttons .arrows .left {
+  position: relative;
+  width: 35px;
+  height: 10px;
+  background-color: #82174d;
+  border-radius: 2px;
+  top: 14px;
+  left: 2px;
+}
+.body-shape .buttons .arrows .right {
+  position: relative;
+  width: 35px;
+  height: 10px;
+  background-color: #82174d;
+  border-radius: 2px;
+  left: 2px;
+}
+.body-shape .buttons .ab {
+  width: 64px;
+  height: 64px;
+  background-color: #ffa4b1;
+  border-radius: 10px;
+  transform: rotate(45deg);
+  font-size: 0.6rem;
+  text-align: center;
+}
+.body-shape .buttons .ab .r {
+  width: 24px;
+  height: 24px;
+  border-radius: 100%;
+  background-color: #82174d;
+  position: absolute;
+  transform: rotate(-45deg);
+  padding: 5px;
+  color: #ffa4b1;
+  cursor:pointer;
+  box-shadow:-1px 0 1px #4B4F54;
+}
+.body-shape .buttons .ab .r:hover {
+  opacity: 0.8;
+}
+.body-shape .buttons .ab .r:active {
+  background-color: #F0EC74;
+  opacity: 1;
+}
+.body-shape .buttons .ab .a {
+  top: 4px;
+  left: 4px;
+}
+.body-shape .buttons .ab .b {
+  top: 4px;
+  left: 36px;
+}
+.body-shape .buttons .ab .c {
+  top: 36px;
+  left: 4px;
+}
+.body-shape .buttons .ab .d {
+  top: 36px;
+  left: 36px;
+}
+.shadow {
+  background-color: #888ad0;
+  z-index: 0;
+  left: -17px;
+  top: 26px;
+}
+.side {
+  background-color: #82174d;
+  z-index: 1;
+}
+.front {
+  background-color: #f56f79;
+  left: 26px;
+  z-index: 2;
+}
+.loader,
+.loader:before,
+.loader:after {
+  background: #f56f79;
+  -webkit-animation: load1 1s infinite ease-in-out;
+  animation: load1 1s infinite ease-in-out;
+  width: 0.4rem;
+  height: 4em;
+}
+.loader {
+  color: #f56f79;
+  margin: 2px auto;
+  font-size: 0.2rem;
+  -webkit-transform: translateZ(0);
+  -ms-transform: translateZ(0);
+  transform: translateZ(0);
+  -webkit-animation-delay: -0.16s;
+  animation-delay: -0.16s;
+}
+.loader:before,
+.loader:after {
+  position: absolute;
+  top: 0;
+  content: '';
+}
+.loader:before {
+  left: -1.5em;
+  -webkit-animation-delay: -0.32s;
+  animation-delay: -0.32s;
+}
+.loader:after {
+  left: 1.5em;
+}
+@-webkit-keyframes load1 {
+  0%,
+  80%,
+  100% {
+    box-shadow: 0 0;
+    height: 2em;
+  }
+  40% {
+    box-shadow: 0 -2em;
+    height: 3em;
+  }
+}
+@keyframes load1 {
+  0%,
+  80%,
+  100% {
+    box-shadow: 0 0;
+    height: 2em;
+  }
+  40% {
+    box-shadow: 0 -2em;
+    height: 3em;
+  }
+}
+'''
+'''--- frontend/assets/js/main.js ---
+import "regenerator-runtime/runtime";
+import {
+  initContract, login, logout, getCounter, counterIncrement,
+  counterDecrement, counterReset, getPriceData
+} from './near/utils'
+
+function resetUI(){
+  document.querySelector('#show').classList.replace('number','loader');
+  document.querySelector('#show').innerText = '';
+}
+
+// Animations
+document.querySelector('#c').addEventListener('click', () => {
+  document.querySelector('#left').classList.toggle('eye');
+});
+document.querySelector('#b').addEventListener('click', () => {
+  document.querySelector('#right').classList.toggle('eye');
+});
+document.querySelector('#d').addEventListener('click', () => {
+  document.querySelector('.dot').classList.toggle('on');
+});
+
+// Buttons - Interact with the Smart Contract
+document.querySelector('#plus').addEventListener('click', async () => {
+  resetUI();
+  await counterIncrement();
+  await updateUI();
+});
+
+document.querySelector('#minus').addEventListener('click', async  () => {
+  resetUI();
+  await counterDecrement();
+  await updateUI();
+});
+document.querySelector('#a').addEventListener('click', async  () => {
+  resetUI();
+  await counterReset();
+  await updateUI();
+});
+
+// Log in and log out users using NEAR Wallet
+document.querySelector('.sign-in .btn').onclick = login;
+document.querySelector('.sign-out .btn').onclick = logout;
+
+// `nearInitPromise` gets called on page load
+window.nearInitPromise = initContract()
+                    .then(flow)
+                    .catch(console.error)
+
+function flow(){
+  if (window.walletConnection.isSignedIn()){
+    signedInFlow()
+  }else{
+    signedOutFlow()
+  }
+  updateUI()
+}
+
+// Display the signed-out-flow container
+function signedOutFlow() {
+  document.querySelector('.sign-in').style.display = 'block';
+  document.querySelectorAll('.interact').forEach(button => button.disabled = true)
+}
+
+// Displaying the signed in flow container and display counter
+async function signedInFlow() {
+  document.querySelector('.sign-out').style.display = 'block';
+  document.querySelectorAll('.interact').forEach(button => button.disabled = false)
+}
+
+async function updateUI(){
+  let count = await getPriceData();
+  
+  document.querySelector('#show').classList.replace('loader','number');
+  document.querySelector('#show').innerText = count === undefined ? 'fetching...' : count;
+  document.querySelector('#left').classList.toggle('eye');
+
+  if (count >= 0) {
+    document.querySelector('.mouth').classList.replace('cry','smile');
+  } else {
+    document.querySelector('.mouth').classList.replace('smile','cry');
+  }
+
+  if (count > 20 || count < -20) {
+    document.querySelector('.tongue').style.display = 'block';
+  } else {
+    document.querySelector('.tongue').style.display = 'none';
+  }
+}
+'''
+'''--- frontend/assets/js/near/config.js ---
+// Once you deploy the contract to its final account, make sure to specify it here
+const CONTRACT_NAME = process.env.CONTRACT_NAME || 'leonh.testnet'; /* TODO: Change this to the deployed account */
+
+function getConfig (env) {
+  switch (env) {
+    case 'production':
+    case 'mainnet':
+      return {
+        networkId: 'mainnet',
+        nodeUrl: 'https://rpc.mainnet.near.org',
+        contractName: CONTRACT_NAME,
+        walletUrl: 'https://wallet.near.org',
+        helperUrl: 'https://helper.mainnet.near.org'
+      }
+    case 'development':
+    case 'testnet':
+      return {
+        networkId: 'testnet',
+        nodeUrl: 'https://rpc.testnet.near.org',
+        contractName: CONTRACT_NAME,
+        walletUrl: 'https://wallet.testnet.near.org',
+        helperUrl: 'https://helper.testnet.near.org'
+      }
+    case 'betanet':
+      return {
+        networkId: 'betanet',
+        nodeUrl: 'https://rpc.betanet.near.org',
+        contractName: CONTRACT_NAME,
+        walletUrl: 'https://wallet.betanet.near.org',
+        helperUrl: 'https://helper.betanet.near.org'
+      }
+    case 'local':
+      return {
+        networkId: 'local',
+        nodeUrl: 'http://localhost:3030',
+        keyPath: `${process.env.HOME}/.near/validator_key.json`,
+        walletUrl: 'http://localhost:4000/wallet',
+        contractName: CONTRACT_NAME
+      }
+    case 'test':
+    case 'ci':
+      return {
+        networkId: 'shared-test',
+        nodeUrl: 'https://rpc.ci-testnet.near.org',
+        contractName: CONTRACT_NAME,
+        masterAccount: 'test.near'
+      }
+    case 'ci-betanet':
+      return {
+        networkId: 'shared-test-staging',
+        nodeUrl: 'https://rpc.ci-betanet.near.org',
+        contractName: CONTRACT_NAME,
+        masterAccount: 'test.near'
+      }
+    default:
+      throw Error(`Unconfigured environment '${env}'. Can be configured in src/config.js.`)
+  }
+}
+
+module.exports = getConfig
+
+'''
+'''--- frontend/assets/js/near/utils.js ---
+import { connect, Contract, keyStores, WalletConnection } from 'near-api-js'
+import getConfig from './config'
+
+const nearConfig = getConfig(process.env.NODE_ENV || 'development')
+
+// Initialize contract & set global variables
+export async function initContract() {
+  // Initialize connection to the NEAR testnet
+  const near = await connect(Object.assign({ deps: { keyStore: new keyStores.BrowserLocalStorageKeyStore() } }, nearConfig))
+
+  // Initializing Wallet based Account. It can work with NEAR testnet wallet that
+  // is hosted at https://wallet.testnet.near.org
+  window.walletConnection = new WalletConnection(near)
+
+  // Getting the Account ID. If still unauthorized, it's just empty string
+  window.accountId = window.walletConnection.getAccountId()
+
+  // Initializing our contract APIs by contract name and configuration
+  window.contract = await new Contract(window.walletConnection.account(), nearConfig.contractName, {
+    // View methods are read only. They don't modify the state, but usually return some value.
+    viewMethods: ['get_num'],
+    // Change methods can modify the state. But you don't receive the returned value when called.
+    changeMethods: ['query_price'],
+  })
+}
+
+export function logout() {
+  window.walletConnection.signOut()
+  // reload page
+  window.location.replace(window.location.origin + window.location.pathname)
+}
+
+export function login() {
+  // Allow the current app to make calls to the specified contract on the
+  // user's behalf.
+  // This works by creating a new access key for the user's account and storing
+  // the private key in localStorage.
+  window.walletConnection.requestSignIn(nearConfig.contractName)
+}
+
+export async function getCounter(){
+  let count = await window.contract.get_num({args:{}})
+                                   .catch(err => errorHelper(err))
+  return count;
+}
+
+export async function getPriceData(){
+  let priceData = await window.contract.query_price({args:{}})
+      .catch(err => errorHelper(err))
+  return priceData;
+}
+
+export async function counterIncrement(){
+  await window.contract.increment({args:{}})
+}
+
+export async function counterDecrement(){
+  await window.contract.decrement({args:{}})
+}
+
+export async function counterReset(){
+  await window.contract.reset({args:{}})
+}
+
+function errorHelper(err) {
+  // if there's a cryptic error, provide more helpful feedback and instructions here
+  // TODO: as soon as we get the error codes propagating back, use those
+  if (err.message.includes('Cannot deserialize the contract state')) {
+    console.warn('NEAR Warning: the contract/account seems to have state that is not (or no longer) compatible.\n' +
+        'This may require deleting and recreating the NEAR account as shown here:\n' +
+        'https://stackoverflow.com/a/60767144/711863');
+  }
+  if (err.message.includes('Cannot deserialize the contract state')) {
+    console.warn('NEAR Warning: the contract/account seems to have state that is not (or no longer) compatible.\n' +
+        'This may require deleting and recreating the NEAR account as shown here:\n' +
+        'https://stackoverflow.com/a/60767144/711863');
+  }
+  console.error(err);
+}
+
+'''
+'''--- frontend/index.html ---
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="./assets/css/global.css">
+  <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.2.1/css/bootstrap.min.css" integrity="sha384-GJzZqFGwb1QTTN6wy59ffF1BuGJpLSa9DkKMp0DgiMDm4iYMj70gZWKYbI706tWS" crossorigin="anonymous">
+  <link href="https://fonts.googleapis.com/css?family=Arvo&display=swap" rel="stylesheet">
+
+</head>
+<body style="background: #eef2fe; font-family: 'Arvo', serif;">
+  <div class="container">
+    <h1>Read USN's price below!</h1>
+
+    <div class="scene">
+      <div class="gameboy">
+        <div class="body-shape shadow"></div>
+        <div class="body-shape side"></div>
+        <div class="body-shape front">
+          <div class="screen">
+            <div class="dot"></div>
+            <div class="face">
+              <div class="eyes-row">
+                <div id="left" class="closed">
+                  <div class="pupil"></div>
+                </div>
+                <div id="right" class="closed">
+                  <div class="pupil"></div>
+                </div>
+              </div>
+              <div class="mouth-row">
+                <div class="mouth smile"></div>
+                <div class="tongue"></div>
+              </div>
+            </div>
+            <div id="show" class="number"></div>
+          </div>
+          <div class="buttons">
+            <div class="row">
+              <button id="plus" class="interact arrows">
+                <div class="left">
+                </div>
+                <div class="updown">
+                </div>
+              </button>
+              <button id="minus" class="interact arrows">
+                <div class="right">
+                </div>
+              </button>
+              <button id="getPrice" class="interact arrows">
+                <div class="right">
+                </div>
+              </button>
+
+            </div>
+            <div class="selects row">
+              <div class="ab">
+                <button id="a" class="interact r a">RS</button>
+                <button id="b" class="r b">LE</button>
+                <button id="c" class="r c">RE</button>
+                <button id="d" class="r d">L</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="sign-out" style="display: none;">
+      <button class="btn btn-primary" style="background-color: #0072CE;">Sign Out</button>
+    </div>
+  
+    <div class="sign-in" style="display: none;">
+      <p>You'll need to sign in to interact with the counter:</p>
+      <button class="btn btn-primary" style="background-color: #0072CE;">Sign In</button>
+    </div>
+
+  </div>
+  <script src="./assets/js/main.js"></script>
+</body>
+</html>
+
+'''
+'''--- integration-tests/README.md ---
+
+'''
+'''--- integration-tests/rs/Cargo.toml ---
+[package]
+name = "integration-tests"
+version = "1.0.0"
+publish = false
+edition = "2018"
+
+[dev-dependencies]
+anyhow = "1.0"
+borsh = "0.9"
+maplit = "1.0"
+near-units = "0.2.0"
+# arbitrary_precision enabled for u128 types that workspaces requires for Balance types
+serde_json = { version = "1.0", features = ["arbitrary_precision"] }
+tokio = { version = "1.18.1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3.11", features = ["env-filter"] }
+workspaces = "0.4.0"
+pkg-config = "0.3.1"
+
+[[example]]
+name = "integration-tests"
+path = "src/tests.rs"
+'''
+'''--- integration-tests/rs/src/tests.rs ---
+use near_units::parse_near;
+use serde_json::json;
+use workspaces::prelude::*;
+use workspaces::{network::Sandbox, sandbox, Account, Contract, Worker};
+
+const WASM_FILEPATH: &str = "../../out/main.wasm";
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+  let sandbox = sandbox().await?;
+  let wasm = std::fs::read(WASM_FILEPATH)?;
+  let contract = sandbox.dev_deploy(&wasm).await?;
+
+  // create accounts
+  let owner = sandbox.root_account().unwrap();
+  let user = owner
+    .create_subaccount(&sandbox, "user")
+    .initial_balance(parse_near!("30 N"))
+    .transact()
+    .await?
+    .into_result()?;
+
+  test_increment(&user, &contract, &sandbox).await?;
+  test_decrement(&user, &contract, &sandbox).await?;
+  test_reset(&user, &contract, &sandbox).await?;
+
+  Ok(())
+}
+
+async fn test_increment(
+  user: &Account,
+  contract: &Contract,
+  sandbox: &Worker<Sandbox>,
+) -> anyhow::Result<()> {
+  let start_counter: u64 = user
+    .call(&sandbox, contract.id(), "get_num")
+    .args_json(json!({}))?
+    .transact()
+    .await?
+    .json()?;
+
+  user
+    .call(&sandbox, contract.id(), "increment")
+    .args_json(json!({}))?
+    .transact()
+    .await?;
+
+  let end_counter: u64 = user
+    .call(&sandbox, contract.id(), "get_num")
+    .args_json(json!({}))?
+    .transact()
+    .await?
+    .json()?;
+
+  assert_eq!(end_counter, start_counter + 1);
+  println!("Increment ✅");
+  Ok(())
+}
+
+async fn test_decrement(
+  user: &Account,
+  contract: &Contract,
+  sandbox: &Worker<Sandbox>,
+) -> anyhow::Result<()> {
+  user
+    .call(&sandbox, contract.id(), "increment")
+    .args_json(json!({}))?
+    .transact()
+    .await?;
+
+  let start_counter: u64 = user
+    .call(&sandbox, contract.id(), "get_num")
+    .args_json(json!({}))?
+    .transact()
+    .await?
+    .json()?;
+
+  user
+    .call(&sandbox, contract.id(), "decrement")
+    .args_json(json!({}))?
+    .transact()
+    .await?;
+
+  let end_counter: u64 = user
+    .call(&sandbox, contract.id(), "get_num")
+    .args_json(json!({}))?
+    .transact()
+    .await?
+    .json()?;
+
+  assert_eq!(end_counter, start_counter - 1);
+  println!("Decrement ✅");
+  Ok(())
+}
+
+async fn test_reset(
+  user: &Account,
+  contract: &Contract,
+  sandbox: &Worker<Sandbox>,
+) -> anyhow::Result<()> {
+  user
+    .call(&sandbox, contract.id(), "increment")
+    .args_json(json!({}))?
+    .transact()
+    .await?;
+
+  user
+    .call(&sandbox, contract.id(), "increment")
+    .args_json(json!({}))?
+    .transact()
+    .await?;
+
+  user
+    .call(&sandbox, contract.id(), "reset")
+    .args_json(json!({}))?
+    .transact()
+    .await?;
+
+  let end_counter: u64 = user
+    .call(&sandbox, contract.id(), "get_num")
+    .args_json(json!({}))?
+    .transact()
+    .await?
+    .json()?;
+
+  assert_eq!(end_counter, 0);
+  println!("Reset ✅");
+  Ok(())
+}
+
+'''
+'''--- integration-tests/ts/main.ava.ts ---
+import { Worker, NEAR, NearAccount } from "near-workspaces";
+import anyTest, { TestFn } from "ava";
+
+const test = anyTest as TestFn<{
+  worker: Worker;
+  accounts: Record<string, NearAccount>;
+}>;
+
+test.beforeEach(async (t) => {
+  // Init the worker and start a Sandbox server
+  const worker = await Worker.init();
+  const root = worker.rootAccount;
+
+  // deploy contract
+  const contract = await root.devDeploy(
+    "./out/main.wasm",
+    { initialBalance: NEAR.parse("30 N").toJSON() }
+  );
+
+  // some test accounts
+  const alice = await root.createSubAccount("alice", {
+    initialBalance: NEAR.parse("30 N").toJSON(),
+  });
+  const bob = await root.createSubAccount("bob", {
+    initialBalance: NEAR.parse("30 N").toJSON(),
+  });
+  const charlie = await root.createSubAccount("charlie", {
+    initialBalance: NEAR.parse("30 N").toJSON(),
+  });
+
+  // Save state for test runs, it is unique for each test
+  t.context.worker = worker;
+  t.context.accounts = { root, contract, alice, bob, charlie };
+});
+
+test.afterEach(async (t) => {
+  // Stop Sandbox server
+  await t.context.worker.tearDown().catch((error) => {
+    console.log("Failed to stop the Sandbox:", error);
+  });
+});
+
+test("can be incremented", async (t) => {
+  const { root, contract } = t.context.accounts;
+  const startCounter: number = await contract.view("get_num", {});
+  await root.call(contract, "increment", {});
+  const endCounter = await contract.view("get_num", {});
+  t.is(endCounter, startCounter + 1);
+});
+
+test("can be decremented", async (t) => {
+  const { root, contract } = t.context.accounts;
+  await root.call(contract, "increment", {});
+  const startCounter: number = await contract.view("get_num", {});
+  await root.call(contract, "decrement", {});
+  const endCounter = await contract.view("get_num", {});
+  t.is(endCounter, startCounter - 1);
+});
+
+test("can be reset", async (t) => {
+  const { root, contract } = t.context.accounts;
+  await root.call(contract, "increment", {});
+  await root.call(contract, "increment", {});
+  await root.call(contract, "reset", {});
+  const endCounter = await contract.view("get_num", {});
+  t.is(endCounter, 0);
+});
+
+'''
+'''--- neardev/dev-account.env ---
+CONTRACT_NAME=dev-1661607534516-95934603450286
+'''
+'''--- neardev/shared-test-staging/test.near.json ---
+{"account_id":"test.near","private_key":"ed25519:2wyRcSwSuHtRVmkMCGjPwnzZmQLeXLzLLyED1NDMt4BjnKgQL6tF85yBx6Jr26D2dUNeC716RBoTxntVHsegogYw"}
+
+'''
+'''--- neardev/shared-test/test.near.json ---
+{"account_id":"test.near","private_key":"ed25519:2wyRcSwSuHtRVmkMCGjPwnzZmQLeXLzLLyED1NDMt4BjnKgQL6tF85yBx6Jr26D2dUNeC716RBoTxntVHsegogYw"}
+
+'''
+'''--- package.json ---
+{
+  "name": "counter",
+  "description": "A Rust counter that lives in the NEAR blockchain.",
+  "version": "1.0.0",
+  "license": "(MIT AND Apache-2.0)",
+  "scripts": {
+    "build": "npm run build:rustup && npm run build:cpwasm",
+    "build:rustup": "cd contract && rustup target add wasm32-unknown-unknown && cargo build --all --target wasm32-unknown-unknown --release",
+    "build:cpwasm": "mkdir -p out && rm -f ./out/main.wasm && cp ./contract/target/wasm32-unknown-unknown/release/counter_contract.wasm ./out/main.wasm",
+    "deploy": "npm run build && printf 'y\n' | near dev-deploy",
+    "start": "npm run deploy && echo The app is starting! && env-cmd -f ./neardev/dev-account.env parcel frontend/index.html --open",
+    "dev": "nodemon --watch contract -e ts --exec \"npm run start\"",
+    "test": "npm run build && npm run test:unit && npm run test:integration",
+    "test:unit": "cd contract && cargo test",
+    "test:integration": "npm run test:integration:ts && npm run test:integration:rs",
+    "test:integration:ts": "ava --verbose",
+    "test:integration:rs": "cd integration-tests/rs && cargo run --example integration-tests"
+  },
+  "devDependencies": {
+    "ava": "^4.2.0",
+    "env-cmd": "^10.1.0",
+    "near-cli": "^3.4.2",
+    "near-workspaces": "^3.1.0",
+    "nodemon": "~2.0.15",
+    "parcel-bundler": "~1.12.5",
+    "ts-node": "^10.7.0",
+    "typescript": "^4.6.4"
+  },
+  "dependencies": {
+    "near-api-js": "^0.44.2",
+    "regenerator-runtime": "^0.13.9"
+  }
+}
+
+'''

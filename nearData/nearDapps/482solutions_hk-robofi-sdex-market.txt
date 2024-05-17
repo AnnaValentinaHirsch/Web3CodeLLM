@@ -1,0 +1,1162 @@
+*GitHub Repository "482solutions/hk-robofi-sdex-market"*
+
+'''--- client/babel.config.js ---
+module.exports = {
+  presets: ["@babel/preset-env", "@babel/preset-react"],
+};
+
+'''
+'''--- client/contract/compile.js ---
+// This file does two things:
+//
+// 1. Compile the Rust contract using cargo (see buildCmd below). This will
+//    create a wasm file in the 'build' folder.
+// 2. Create a symbolic link (symlink) to the generated wasm file in the root
+//    project's `out` folder, for easy use with near-cli.
+//
+// First, import some helper libraries. `shelljs` is included in the
+// devDependencies of the root project, which is why it's available here. It
+// makes it easy to use *NIX-style scripting (which works on Linux distros,
+// macOS, and Unix systems) on Windows as well.
+const sh = require('shelljs')
+
+// Figure out which directory the user called this script from, which we'll use
+// later to set up the symlink.
+const calledFromDir = sh.pwd().toString()
+
+// For the duration of this script, we want to operate from within the
+// Rust project's folder. Let's change into that directory.
+sh.cd(__dirname)
+
+// You can call this script with `node compile.js` or `node compile.js
+// --debug`. Let's set a variable to track whether `--debug` was used.
+const debug = process.argv.pop() === '--debug'
+
+// You can call this script with `node compile.js` or `node compile.js --debug`.
+// Let's set a variable to track whether `--debug` was used.
+// Note: see other flags in ./cargo/config. Unfortunately, you cannot set the
+// `--target option` in Cargo.toml.
+const buildCmd = debug
+  ? 'cargo build --target wasm32-unknown-unknown'
+  : 'cargo build --target wasm32-unknown-unknown --release'
+
+// Execute the build command, storing exit code for later use
+const { code } = sh.exec(buildCmd)
+
+// Assuming this is compiled from the root project directory, link the compiled
+// contract to the `out` folder –
+// When running commands like `near deploy`, near-cli looks for a contract at
+// <CURRENT_DIRECTORY>/out/main.wasm
+if (code === 0 && calledFromDir !== __dirname) {
+  const linkDir = `${calledFromDir}/out`
+  const link = `${calledFromDir}/out/main.wasm`
+  const packageName = require('fs').readFileSync(`${__dirname}/Cargo.toml`).toString().match(/name = "([^"]+)"/)[1]
+  const outFile = `./target/wasm32-unknown-unknown/${debug ? 'debug' : 'release'}/${packageName}.wasm`
+  sh.mkdir('-p', linkDir)
+  sh.rm('-f', link)
+  //fixes #831: copy-update instead of linking .- sometimes sh.ln does not work on Windows
+  sh.cp('-u',outFile,link)
+}
+
+// exit script with the same code as the build command
+process.exit(code)
+
+'''
+'''--- client/src/App.js ---
+import "regenerator-runtime/runtime";
+import React from "react";
+import "./global.css";
+
+import Router from "./router/Router";
+import { routes } from "./router/routing";
+import MainWrapper from "./components/Layout/main/MainWrapper";
+
+export default function App() {
+  return (
+    <MainWrapper>
+      <Router routes={routes} />
+    </MainWrapper>
+  );
+}
+
+'''
+'''--- client/src/__mocks__/fileMock.js ---
+// NOTE: This is used to mock resource imports in JSX for tests
+module.exports = '' 
+
+'''
+'''--- client/src/api/api.endpoints.js ---
+export const ORGANISATIONS = "/organisation";
+export const STATION = "/station";
+export const MEASURMENTS = "/measurements";
+export const NFT = "/nft";
+export const POLKANFT = "/nft/for_sale"
+'''
+'''--- client/src/api/api.service.js ---
+import { MEASURMENTS, NFT, ORGANISATIONS, STATION, POLKANFT } from "./api.endpoints";
+import { httpClient } from "./httpClient";
+import { httpClientPolkadot } from "./httpClientPolkadot";
+
+export const getOrganisations = async () => {
+  const res = await httpClient.get(ORGANISATIONS);
+  return res?.data;
+};
+
+export const createOrganisation = async (body) => {
+  const res = await httpClient.post(ORGANISATIONS, body);
+  return res?.data;
+};
+
+export const getStation = async () => {
+  const res = await httpClient.get(STATION);
+  return res?.data;
+};
+
+export const getStationByOrgAndStationName = async (organisation, station) => {
+  const res = await httpClient.get(`${STATION}/${organisation}/${station}`);
+  return res?.data;
+};
+
+export const createStation = async (body) => {
+  const res = await httpClient.post(STATION, body);
+  return res?.data;
+};
+
+export const createMeasurment = async (body) => {
+  const res = await httpClient.patch(MEASURMENTS, body);
+  return res?.data;
+};
+
+export const getMeasurments = async (org = null, station = null) => {
+  const res = await httpClient.get(`${MEASURMENTS}/${org}/${station}`);
+  return res?.data;
+};
+
+export const createNFT = async (body) => {
+  const res = await httpClient.post(NFT, body);
+  return res?.data;
+};
+
+export const getNFTs = async (owner) => {
+  const res = await httpClient.get(
+    `${NFT}${owner !== undefined ? `?owner=${owner}` : ""}`
+  );
+  return res?.data;
+};
+
+export const getNFTById = async (id) => {
+  const res = await httpClient.get(`${NFT}/${id}`);
+  return res?.data;
+};
+
+export const getPolkadotToken = async () => {
+  // const res = await httpClient.get(`${MEASURMENTS}/${org}/${station}`);
+  const res = await httpClientPolkadot.get(`${POLKANFT}`);
+  console.log(res)
+  return res?.data;
+};
+'''
+'''--- client/src/api/httpClient.js ---
+import axios from "axios";
+
+const StatusCode = {
+  Unauthorized: 401,
+  Forbidden: 403,
+  TooManyRequests: 429,
+  InternalServerError: 500,
+  BadRequest: 400,
+};
+
+const headers = {
+  "Content-Type": "application/json",
+};
+
+class HttpClient {
+  instance = null;
+
+  get http() {
+    return this.instance != null ? this.instance : this.initHttp();
+  }
+
+  initHttp() {
+    const http = axios.create({
+      baseURL: process.env.REACT_APP_BASE_URL,
+      headers,
+      withCredentials: true,
+    });
+
+    http.interceptors.response.use(
+      (response) => response,
+      (error) => {
+        const { response } = error;
+        return this.handleError(response);
+      }
+    );
+
+    this.instance = http;
+    return http;
+  }
+
+  request(config) {
+    return this.http.request(config);
+  }
+
+  get(url, config) {
+    return this.http.get(url, config);
+  }
+
+  post(url, data, config) {
+    return this.http.post(url, data, config);
+  }
+
+  put(url, data, config) {
+    return this.http.put(url, data, config);
+  }
+
+  patch(url, data, config) {
+    return this.http.patch(url, data, config);
+  }
+
+  delete(url, config) {
+    return this.http.delete(url, config);
+  }
+
+  async handleError(error) {
+    if (!error) return;
+    const { status } = error;
+
+    switch (status) {
+      case StatusCode.InternalServerError: {
+        break;
+      }
+      case StatusCode.Forbidden: {
+        break;
+      }
+      case StatusCode.Unauthorized: {
+        break;
+      }
+      case StatusCode.TooManyRequests: {
+        break;
+      }
+    }
+    return Promise.reject(error);
+  }
+}
+
+export const httpClient = new HttpClient();
+
+'''
+'''--- client/src/api/httpClientPolkadot.js ---
+import axios from "axios";
+
+const StatusCode = {
+  Unauthorized: 401,
+  Forbidden: 403,
+  TooManyRequests: 429,
+  InternalServerError: 500,
+  BadRequest: 400,
+};
+
+const headers = {
+  "Content-Type": "application/json",
+};
+
+class HttpClientPolkadot {
+  instance = null;
+
+  get http() {
+    return this.instance != null ? this.instance : this.initHttp();
+  }
+
+  initHttp() {
+    const http = axios.create({
+      baseURL: process.env.POLKADOT_BASE_URL,
+      headers,
+      withCredentials: true,
+    });
+
+    http.interceptors.response.use(
+      (response) => response,
+      (error) => {
+        const { response } = error;
+        return this.handleError(response);
+      }
+    );
+
+    this.instance = http;
+    return http;
+  }
+
+  request(config) {
+    return this.http.request(config);
+  }
+
+  get(url, config) {
+    return this.http.get(url, config);
+  }
+
+  post(url, data, config) {
+    return this.http.post(url, data, config);
+  }
+
+  put(url, data, config) {
+    return this.http.put(url, data, config);
+  }
+
+  patch(url, data, config) {
+    return this.http.patch(url, data, config);
+  }
+
+  delete(url, config) {
+    return this.http.delete(url, config);
+  }
+
+  async handleError(error) {
+    if (!error) return;
+    const { status } = error;
+
+    switch (status) {
+      case StatusCode.InternalServerError: {
+        break;
+      }
+      case StatusCode.Forbidden: {
+        break;
+      }
+      case StatusCode.Unauthorized: {
+        break;
+      }
+      case StatusCode.TooManyRequests: {
+        break;
+      }
+    }
+    return Promise.reject(error);
+  }
+}
+
+export const httpClientPolkadot = new HttpClientPolkadot();
+
+'''
+'''--- client/src/components/cards/component/constants.js ---
+import { allCountries } from "country-region-data";
+
+export const transformedToSelectCountries = allCountries.map((i, idx) => ({
+  value: idx,
+  label: i[0],
+}));
+
+export const InputsData = {
+  Station: [
+    {
+      title: "Facility name",
+      required: true,
+    },
+    {
+      title: "Device type",
+      isSelect: true,
+      options: [
+        "Solar",
+        "Wind",
+        "Liquid",
+        "Hydro - Electric head",
+        "Gaseous",
+        "Thermal",
+      ].map((i) => ({ label: i, value: i })),
+      required: true,
+    },
+    {
+      title: "Plant performance",
+      required: true,
+    },
+    {
+      title: "Governemnt support",
+      required: true,
+    },
+    {
+      title: "Investment support",
+      required: true,
+    },
+    {
+      title: "Date of starting commercial explotation",
+      type: "Date",
+      required: true,
+    },
+    {
+      title: "Date of creation",
+      type: "Date",
+      required: true,
+    },
+    {
+      title: "Country",
+      isSelect: true,
+      required: true,
+      options: transformedToSelectCountries,
+    },
+    {
+      title: "Region",
+      isSelect: true,
+      options: [],
+      required: true,
+      default: "",
+    },
+    {
+      title: "Manufacturer Country",
+      isSelect: true,
+      required: true,
+      options: transformedToSelectCountries,
+    },
+  ],
+  Company: [
+    {
+      title: "Organization Name",
+      required: true,
+    },
+    {
+      title: "Organization Address",
+      required: true,
+    },
+    {
+      title: "Business type",
+      required: true,
+      isSelect: true,
+      options: ["Private", "Public", "Holding and Subsidary", "Associate"].map(
+        (i) => ({ value: i, label: `${i} Companies` })
+      ),
+    },
+    {
+      title: "Trade Registry Company number",
+      required: true,
+    },
+    {
+      title: "Signatory Full Name",
+      required: true,
+    },
+    {
+      title: "Signatory Address",
+      required: true,
+    },
+    {
+      title: "Signatory Email",
+      required: true,
+    },
+    {
+      title: "Signatory Telephone",
+      required: true,
+    },
+  ],
+  EAC: [
+    {
+      title: "Start date of creation",
+      type: "Date",
+      required: true,
+      default: "",
+    },
+    {
+      title: "End date of creation",
+      type: "Date",
+      required: true,
+      default: "",
+    },
+    {
+      title: "Amount of energy in MWh",
+      required: true,
+      default: "",
+    },
+    {
+      title: "Stations",
+      options: [],
+      isSelect: true,
+      required: true,
+    },
+  ],
+};
+
+'''
+'''--- client/src/components/cards/component/modal.utils.js ---
+import { allCountries } from "country-region-data";
+import moment from "moment";
+import { Contract } from "near-api-js";
+import {
+  createMeasurment,
+  createNFT,
+  createOrganisation,
+  createStation,
+  getMeasurments,
+  getNFTs,
+  getStation,
+} from "../../../api/api.service";
+import { InputsData } from "./constants";
+
+let measurmentGlobal;
+let stationGlobal;
+
+function overlap(dateRanges) {
+  var sortedRanges = dateRanges.sort((previous, current) => {
+    // get the start date from previous and current
+    var previousTime = previous.start.getTime();
+    var currentTime = current.start.getTime();
+
+    // if the previous is earlier than the current
+    if (previousTime < currentTime) {
+      return -1;
+    }
+
+    // if the previous time is the same as the current time
+    if (previousTime === currentTime) {
+      return 0;
+    }
+
+    // if the previous time is later than the current time
+    return 1;
+  });
+
+  var result = sortedRanges.reduce(
+    (result, current, idx, arr) => {
+      // get the previous range
+      if (idx === 0) {
+        return result;
+      }
+      var previous = arr[idx - 1];
+
+      // check for any overlap
+      var previousEnd = previous.end.getTime();
+      var currentStart = current.start.getTime();
+      var overlap = previousEnd >= currentStart;
+
+      // store the result
+      if (overlap) {
+        // yes, there is overlap
+        result.overlap = true;
+        // store the specific ranges that overlap
+        result.ranges.push({
+          previous: previous,
+          current: current,
+        });
+      }
+
+      return result;
+
+      // seed the reduce
+    },
+    { overlap: false, ranges: [] }
+  );
+
+  // return the final results
+  return result;
+}
+
+// var r1 = {
+//   start: new Date("2/4/2001"),
+//   end: new Date("7/1/2002")
+// };
+
+// var r2 = {
+//   start: new Date("7/2/2002"),
+//   end: new Date("2/4/2003")
+// };
+
+// // start date overlaps with end date of previous
+// var r3 = {
+//   start: new Date("8/2/2002"),
+//   end: new Date("5/12/2002")
+// };
+
+// var ranges = [r1, r3, r2];
+
+// var output = overlap(ranges);
+// console.log(output);
+
+export const passUpValueCallback = async (
+  value,
+  currentIterable,
+  localDataRefereance,
+  keyWord,
+  setData,
+  eacMintType,
+  setDisableSubmitBtn,
+  clearDatas,
+  setMinDate
+) => {
+  const payload = {
+    [currentIterable.title]: value,
+  };
+  localDataRefereance.current = { ...localDataRefereance.current, ...payload };
+  if (currentIterable.title === "Start date of creation") {
+    setMinDate(value);
+  }
+  if (currentIterable.title === "Country") {
+    const idx = InputsData[keyWord].findIndex((i) => i.title === "Region");
+    InputsData[keyWord][idx].options = allCountries[value][2].map((i, idx) => ({
+      value: idx,
+      label: i[0],
+    }));
+    setData((prev) => ({ ...prev, ...InputsData }));
+  }
+  if (currentIterable.title === "Stations" && eacMintType === "Automatically") {
+    const res = await getMeasurments(
+      localStorage.getItem("organisation"),
+      value
+    );
+    measurmentGlobal = [...res];
+
+    if (res && !res.length) {
+      clearDatas();
+      return setDisableSubmitBtn(false);
+    }
+    if (res && res.length) {
+      setDisableSubmitBtn(false);
+      // clearDatas();
+      // const resMocka = [
+      //   {
+      //     id: 1,
+      //     stationName: "test",
+      //     stationOrganisationRegistryNumber: "43659632",
+      //     startDate: "",
+      //     endDate: "",
+      //     generatedEnergy: 0,
+      //     minted: false,
+      //   },
+      //   {
+      //     id: 2,
+      //     stationName: "test",
+      //     stationOrganisationRegistryNumber: "43659632",
+      //     startDate: "18.01.2021",
+      //     endDate: "20.02.2021",
+      //     generatedEnergy: 1444,
+      //     minted: false,
+      //   },
+      // ];
+      const filteredResponse = res.filter((i) => {
+        return i.startDate || i.endDate;
+      });
+      filteredResponse.forEach((i) => {
+        if (i.startDate) {
+          const splited = i.startDate.split(".");
+          i.startDate = new Date(+splited[2], splited[1] - 1, +splited[0]);
+        }
+        if (i.endDate) {
+          const splited = i.endDate.split(".");
+          i.endDate = new Date(+splited[2], splited[1] - 1, +splited[0]);
+        }
+      });
+
+      filteredResponse.sort((a, b) => {
+        return a.startDate - b.startDate;
+      });
+
+      const amountTotal = filteredResponse.reduce(
+        (acc, i) => (acc += i.generatedEnergy),
+        0
+      );
+      const startDate = filteredResponse[0].startDate
+        .toISOString()
+        .split("T")[0];
+      const endDate = filteredResponse[filteredResponse.length - 1].endDate
+        .toISOString()
+        .split("T")[0];
+      const EACTotal = {
+        "Start date of creation": startDate,
+        "End date of creation": endDate,
+        "Amount of energy in MWh": amountTotal,
+      };
+
+      localDataRefereance.current = {
+        ...localDataRefereance.current,
+        ...EACTotal,
+      };
+
+      const filtered = InputsData[keyWord].map((i) => {
+        if (i.default === "") {
+          return { ...i, default: EACTotal[i.title] };
+        }
+        return i;
+      });
+
+      setData((prev) => {
+        return {
+          ...prev,
+          [keyWord]: filtered,
+        };
+      });
+    }
+  }
+};
+
+export const handleSubmit = async (
+  data,
+  keyWord,
+  inputsData,
+  setError,
+  clientInstance,
+  setDisabled,
+  handleClose,
+  setInfoModalIsOpen,
+  setInfoType,
+  getAndTransformToSelectStations,
+  setLoading,
+  toggleValue,
+  stationData
+) => {
+  setLoading(true);
+
+  const requiredFilds = inputsData[keyWord]
+    .filter((i) => i.required)
+    .map((i) => i.title)
+    .filter((i) => data[i] === "");
+
+  if (requiredFilds.length) {
+    setError(requiredFilds.reduce((acc, i) => ({ ...acc, [i]: true }), {}));
+    setLoading(false);
+
+    return;
+  }
+
+  const mapOfBackendCalls = {
+    Station: createStation,
+    Company: createOrganisation,
+    EAC: createNFT,
+  };
+
+  const payload = {
+    Company: {
+      name: data["Organization Name"],
+      registryNumber: data["Trade Registry Company number"],
+      businessType: data["Business type"],
+      signatoryAddress: data["Signatory Address"],
+      signatoryTelephone: data["Signatory Telephone"],
+      organizationAddress: data["Organization Address"],
+      signatoryFullName: data["Signatory Full Name"],
+      signatoryEmail: data["Signatory Email"],
+    },
+    Station: {
+      name: data["Facility name"],
+      stationEnergyType: data["Device type"],
+      plantPerformance: data["Plant performance"],
+      governmentAid: data["Governemnt support"],
+      investmentAid: data["Investment support"],
+      manufactureDate: new Date(data["Date of creation"]),
+      placement: "asd",
+      exploitationStart: new Date(
+        data["Date of starting commercial explotation"]
+      ),
+      countryId: +data["Country"],
+      regionId: +data["Region"],
+      manufacturerCountryId: +data["Manufacturer Country"],
+      organisation: localStorage.organisation,
+    },
+    EAC: {
+      owner: window.walletConnection.getAccountId(),
+      metadata: {
+        title: "test",
+        extra: JSON.stringify({
+          startDate: new Date(data["Start date of creation"]),
+          endDate: new Date(data["End date of creation"]),
+          generatedEnergy: +data["Amount of energy in MWh"],
+          station: data["Stations"],
+          organisation: localStorage.organisation,
+        }),
+      },
+    },
+  };
+
+  console.log(payload.EAC)
+
+  if (keyWord === "EAC") {
+    const finded = stationData.current.find((i) => i.name === data["Stations"]);
+    if (finded) {
+      payload.EAC.metadata.extra = JSON.stringify({
+        startDate: new Date(data["Start date of creation"]),
+        endDate: new Date(data["End date of creation"]),
+        generatedEnergy: +data["Amount of energy in MWh"],
+        station: data["Stations"],
+        organisation: localStorage.organisation,
+        location: finded.countryId,
+        deviceType: finded.stationEnergyType,
+      });
+    }
+    const res = await getNFTs(window.accountId);
+    const deviceInfo = res.map((i) => {
+      const parsed = JSON.parse(i.metadata.extra);
+      return { ...i, metadata: { ...i.metadata, extra: parsed } };
+    });
+    const filteredNFT = deviceInfo.filter((i) => {
+      return i.metadata.extra.station === data["Stations"];
+    });
+
+    if (filteredNFT.length) {
+      const isOverlap = filteredNFT.some((i) => {
+        return (
+          moment(data["Start date of creation"]).isBetween(
+            i.metadata.extra.startDate.split("T")[0],
+            i.metadata.extra.endDate.split("T")[0],
+            null,
+            []
+          ) ||
+          moment(data["End date of creation"]).isBetween(
+            i.metadata.extra.startDate.split("T")[0],
+            i.metadata.extra.endDate.split("T")[0],
+            null,
+            []
+          ) ||
+          moment(i.metadata.extra.startDate.split("T")[0]).isBetween(
+            data["Start date of creation"],
+            data["End date of creation"],
+            null,
+            []
+          ) ||
+          moment(i.metadata.extra.endDate.split("T")[0]).isBetween(
+            data["Start date of creation"],
+            data["End date of creation"],
+            null,
+            []
+          )
+        );
+      });
+      if (isOverlap) {
+        setInfoType({
+          type: "error",
+          msg: "Dates are overalaped with already created EAC with this station",
+        });
+        handleClose();
+        setInfoModalIsOpen(true);
+        setLoading(false);
+        return;
+      }
+    }
+  }
+  try {
+    const res = await mapOfBackendCalls[keyWord](
+      payload[keyWord],
+      clientInstance
+    );
+    if (toggleValue === "Automatically") {
+      await createMeasurment({ measurements: measurmentGlobal });
+    }
+
+    if (res) {
+      if (keyWord === "Company") {
+        localStorage.setItem("organisation", res.registryNumber);
+        setDisabled(true);
+      }
+      if (keyWord === "Station") {
+        await getAndTransformToSelectStations();
+      }
+      setInfoType({ type: "success" });
+    }
+  } catch (e) {
+    let message = `Something went wrong during creation ${keyWord}`;
+    if (e.data?.statusCode === 422) {
+      message = `${keyWord} with the name ${payload[keyWord].name} is already exist`;
+    }
+    setInfoType({ type: "error", msg: message });
+  } finally {
+    handleClose();
+    setInfoModalIsOpen(true);
+    setLoading(false);
+  }
+};
+
+'''
+'''--- client/src/config.js ---
+const CONTRACT_NAME = "near-app-test-ui.testnet";
+
+function getConfig(env) {
+  switch (env) {
+    case "production":
+    case "mainnet":
+      return {
+        networkId: "mainnet",
+        nodeUrl: "https://rpc.mainnet.near.org",
+        contractName: CONTRACT_NAME,
+        walletUrl: "https://wallet.near.org",
+        helperUrl: "https://helper.mainnet.near.org",
+        explorerUrl: "https://explorer.mainnet.near.org",
+      };
+    case "development":
+    case "testnet":
+      return {
+        networkId: "testnet",
+        nodeUrl: "https://rpc.testnet.near.org",
+        contractName: CONTRACT_NAME,
+        walletUrl: "https://wallet.testnet.near.org",
+        helperUrl: "https://helper.testnet.near.org",
+        explorerUrl: "https://explorer.testnet.near.org",
+      };
+    case "betanet":
+      return {
+        networkId: "betanet",
+        nodeUrl: "https://rpc.betanet.near.org",
+        contractName: CONTRACT_NAME,
+        walletUrl: "https://wallet.betanet.near.org",
+        helperUrl: "https://helper.betanet.near.org",
+        explorerUrl: "https://explorer.betanet.near.org",
+      };
+    case "local":
+      return {
+        networkId: "local",
+        nodeUrl: "http://localhost:3030",
+        keyPath: `${process.env.HOME}/.near/validator_key.json`,
+        walletUrl: "http://localhost:4000/wallet",
+        contractName: CONTRACT_NAME,
+      };
+    case "test":
+    case "ci":
+      return {
+        networkId: "shared-test",
+        nodeUrl: "https://rpc.ci-testnet.near.org",
+        contractName: CONTRACT_NAME,
+        masterAccount: "test.near",
+      };
+    case "ci-betanet":
+      return {
+        networkId: "shared-test-staging",
+        nodeUrl: "https://rpc.ci-betanet.near.org",
+        contractName: CONTRACT_NAME,
+        masterAccount: "test.near",
+      };
+    default:
+      throw Error(
+        `Unconfigured environment '${env}'. Can be configured in src/config.js.`
+      );
+  }
+}
+
+module.exports = getConfig;
+
+'''
+'''--- client/src/hooks/useIpfs.hook.js ---
+import { create } from "ipfs-http-client";
+import { useEffect, useState } from "react";
+
+const ipfsConfig = {
+  host: "ipfs.infura.io",
+  port: 5001,
+  protocol: "https",
+};
+
+const useIpfs = () => {
+  const [client, setClient] = useState();
+  useEffect(() => {
+    const instance = create(ipfsConfig);
+    setClient(instance);
+  }, []);
+
+  return { client };
+};
+
+export default useIpfs;
+
+'''
+'''--- client/src/index.html ---
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="./assets/favicon.ico" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="apple-touch-icon" href="./assets/favicon.ico" />
+    <title>Welcome to RoboFi trading platform</title>
+  </head>
+  <body>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="root"></div>
+    <!--
+      This HTML file is a template.
+      If you open it directly in the browser, you will see an empty page.
+
+      You can add webfonts, meta tags, or analytics to this file.
+      The build step will place the bundled scripts into the <body> tag.
+
+      To begin the development, run `npm start` or `yarn start`.
+      To create a production bundle, use `npm run build` or `yarn build`.
+    -->
+    <script src="./index.js"></script>
+  </body>
+</html>
+
+'''
+'''--- client/src/index.js ---
+import React from "react";
+import ReactDOM from "react-dom";
+import App from "./App";
+import { initContract } from "./utils";
+import { BrowserRouter } from "react-router-dom";
+
+window.nearInitPromise = initContract()
+  .then(() => {
+    ReactDOM.render(
+      <BrowserRouter>
+        <App />
+      </BrowserRouter>,
+      document.querySelector("#root")
+    );
+  })
+  .catch(console.error);
+
+'''
+'''--- client/src/jest.init.js ---
+import 'regenerator-runtime/runtime'
+
+'''
+'''--- client/src/router/routing.js ---
+import App from "../App";
+import ComingSoon from "../pages/coming-soon/ComingSoon";
+import Dashboard from "../pages/dashboard/Dashboard";
+import EnergyMarket from "../pages/energy-market/EnergyMarket";
+import MyEacs from "../pages/my-eacs/MyEacs";
+import PolkadotNFT from "../pages/polkadot-nft/PolkadotNFT";
+
+export const routes = [
+  {
+    path: "/dashboard",
+    exact: true,
+    component: Dashboard,
+    fallback: null,
+    private: true,
+  },
+  {
+    path: "/my-eacs",
+    exact: true,
+    component: MyEacs,
+    fallback: null,
+    private: true,
+  },
+  {
+    path: "/",
+    exact: true,
+    component: EnergyMarket,
+    fallback: null,
+    private: true,
+  },
+  {
+    path: "/coming-soon",
+    exact: true,
+    component: ComingSoon,
+    fallback: null,
+    private: true,
+  },
+  {
+    path: "/polkadot-nft",
+    exact: true,
+    component: PolkadotNFT,
+    fallback: null,
+    private: true,
+  },
+];
+
+'''
+'''--- client/src/utils.js ---
+import { connect, Contract, keyStores, WalletConnection } from "near-api-js";
+import getConfig from "./config";
+
+const nearConfig = getConfig("development");
+
+// Initialize contract & set global variables
+export async function initContract() {
+  // Initialize connection to the NEAR testnet
+  const near = await connect(
+    Object.assign(
+      { deps: { keyStore: new keyStores.BrowserLocalStorageKeyStore() } },
+      nearConfig
+    )
+  );
+
+  // Initializing Wallet based Account. It can work with NEAR testnet wallet that
+  // is hosted at https://wallet.testnet.near.org
+  window.walletConnection = new WalletConnection(near);
+
+  // Getting the Account ID. If still unauthorized, it's just empty string
+  window.accountId = window.walletConnection.getAccountId();
+
+  // // Initializing our contract APIs by contract name and configuration
+  // window.contract = await new Contract(
+  //   window.walletConnection.account(),
+  //   nearConfig.contractName,
+  //   {
+  //     // View methods are read only. They don't modify the state, but usually return some value.
+  //     viewMethods: ["get_greeting"],
+  //     // Change methods can modify the state. But you don't receive the returned value when called.
+  //     changeMethods: ["set_greeting"],
+  //   }
+  // );
+}
+
+export function logout() {
+  window.walletConnection.signOut();
+  document.cookie = "privateKey=;expires=Thu, 01 Jan 1970 00:00:00 GMT";
+  document.cookie = "userId=;expires=Thu, 01 Jan 1970 00:00:00 GMT";
+
+  localStorage.clear();
+  // reload page
+  window.location.replace(window.location.origin + window.location.pathname);
+}
+
+export function login() {
+  // Allow the current app to make calls to the specified contract on the
+  // user's behalf.
+  // This works by creating a new access key for the user's account and storing
+  // the private key in localStorage.
+  window.walletConnection.requestSignIn(
+    nearConfig.contractName,
+    undefined,
+    `${window.location.href}dashboard`
+  );
+}
+
+'''
+'''--- client/src/wallet/login/index.html ---
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.2.1/css/bootstrap.min.css" integrity="sha384-GJzZqFGwb1QTTN6wy59ffF1BuGJpLSa9DkKMp0DgiMDm4iYMj70gZWKYbI706tWS" crossorigin="anonymous">
+</head>
+<body style="background: #fff; margin-top: 3em">
+  <div>For local account login, Please run the following command in NEAR CLI, then enter account id here.
+  </div>
+  <div>
+      <code id="shell-command"></code>
+  </div>
+  <input type="text" id="accountId" name="accountId" placeholder="Account id"></input>
+  <button type="button" onClick="done()">done</button>
+  <script>
+    const currentUrl = new URL(window.location.href);
+    const message = `NODE_ENV=local near create_account {newAccountId} --masterAccount {masterAccountId} --publicKey ${currentUrl.searchParams.get('public_key')} --initialAmount 10000000000000000000`;
+    document.getElementById('shell-command').innerText = message;
+
+    function done() {
+      const successUrl = new URL(currentUrl.searchParams.get('success_url'));
+      successUrl.searchParams.set('account_id', document.getElementById('accountId').value);
+      successUrl.searchParams.set('public_key', currentUrl.searchParams.get('public_key'));
+      window.location.assign(successUrl.toString());
+    }
+  </script>
+</body>
+</html>
+'''
+'''--- server/.eslintrc.js ---
+module.exports = {
+  parser: '@typescript-eslint/parser',
+  parserOptions: {
+    project: 'tsconfig.json',
+    sourceType: 'module',
+  },
+  plugins: ['@typescript-eslint/eslint-plugin', 'prettier'],
+  extends: [
+    'plugin:@typescript-eslint/recommended',
+    'prettier',
+  ],
+  root: true,
+  env: {
+    node: true,
+    jest: true,
+  },
+  ignorePatterns: ['.eslintrc.js'],
+  rules: {
+    '@typescript-eslint/interface-name-prefix': 'off',
+    '@typescript-eslint/explicit-function-return-type': 'off',
+    '@typescript-eslint/explicit-module-boundary-types': 'off',
+    '@typescript-eslint/no-explicit-any': 'off',
+  },
+};
+
+'''

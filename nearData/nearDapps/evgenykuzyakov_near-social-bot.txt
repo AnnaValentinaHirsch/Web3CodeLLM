@@ -1,0 +1,1033 @@
+*GitHub Repository "evgenykuzyakov/near-social-bot"*
+
+'''--- README.md ---
+# near-social-bot
+OpenAI based bot for NEAR Social
+
+Add `.env` file:
+```env
+OPENAI_ORG = "org-XXXXXXXXXXXXXXXXXXXXXXXX"
+OPENAI_API_KEY = "sk-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+AI_COMMAND = "Your name is Bob\nYour account ID is @bob.near\nYou're friendly. Please reply to the thread.\n"
+STOP_SEQ = "<BLA>"
+NEAR_ACCOUNT_ID = "bob.near"
+NEAR_PRIVATE_KEY = "ed25519:5FF83vFDQQzzidoN1a1HaUsosBTyhFvLyzwCPhNUBkeRSYnZYnYpZaakHASwNWLLk2iZvMmXzebrSyb6ggi4CWrU"
+MAX_TOKENS = "1024"
+MAX_TOKENS_PER_PROMPT = "256"
+MAX_PROMPT_TOKENS = "512"
+DAILY_PROMPT = "Tell me what important events happened on ${dateText}."
+MODEL = "gpt-3.5-turbo"
+```
+
+'''
+'''--- index.js ---
+require("dotenv").config();
+
+const winston = require("winston");
+
+const { loadJson, saveJson } = require("./src/utils");
+const OpenAI = require("./src/openai");
+const { initNear } = require("./src/near");
+const Social = require("./src/social");
+const Bot = require("./src/bot");
+
+const StateFilename = "res/" + (process.env.STATE_FILENAME || "state.json");
+const DefaultState = {
+  accountReplies: {},
+  postHistory: [],
+  replyHistory: [],
+  notifications: [],
+  todoNotifications: [],
+};
+
+(async () => {
+  const logger = winston.createLogger({
+    level: "info",
+    format: winston.format.combine(
+      winston.format.errors({ stack: true }),
+      winston.format.timestamp(),
+      winston.format.json()
+    ),
+    transports: [
+      new winston.transports.File({
+        filename: `logs/${process.env.LOG_PREFIX}error.log`,
+        level: "error",
+      }),
+      new winston.transports.File({
+        filename: `logs/${process.env.LOG_PREFIX}combined.log`,
+      }),
+    ],
+  });
+
+  if (process.env.NODE_ENV !== "production") {
+    logger.add(
+      new winston.transports.Console({
+        format: winston.format.simple(),
+      })
+    );
+  }
+
+  const near = await initNear(logger.child({ type: "near" }));
+  const social = new Social(logger.child({ type: "social" }), near);
+  const openai = new OpenAI(logger.child({ type: "openai" }));
+  const state = Object.assign(DefaultState, loadJson(StateFilename, true));
+  const bot = new Bot({ logger, near, social, openai, state });
+
+  // await social.post("Hello world!");
+  // const dailyPrompt = logger.info(`Daily prompt`, { prompt: dailyPrompt });
+  // console.log(
+  //   await openai.reply("Tell me what important events happened on April 20th")
+  // );
+  // return;
+
+  try {
+    await bot.run();
+  } catch (error) {
+    logger.error(error);
+  } finally {
+    saveJson(state, StateFilename);
+  }
+})();
+
+'''
+'''--- package.json ---
+{
+  "name": "near-social-bot",
+  "version": "0.5.0",
+  "main": "index.js",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "axios": "^0.26.1",
+    "big.js": "^6.2.1",
+    "gpt-3-encoder": "^1.1.4",
+    "openai": "^3.2.1",
+    "winston": "^3.8.2"
+  },
+  "scripts": {
+    "start": "node index",
+    "dev": "nodemon -r dotenv/config index"
+  },
+  "devDependencies": {
+    "dotenv": "^8.2.0",
+    "near-api-js": "^0.45.0",
+    "node-fetch": "^2.6.1",
+    "nodemon": "^2.0.6",
+    "prettier": "^2.2.1"
+  }
+}
+
+'''
+'''--- run.sh ---
+#!/bin/bash
+# set -e
+
+cd $(dirname "$0")
+mkdir -p logs/raw
+
+while :
+do
+  DATE=$(date "+%Y_%m_%d")
+  date | tee -a logs/raw/$DATE.txt
+  yarn start 2>&1 | tee -a logs/raw/$DATE.txt
+  sleep 5
+done
+
+'''
+'''--- src/bot.js ---
+const Status = {
+  Preparing: "Preparing",
+  Posting: "Posting",
+  OK: "OK",
+};
+
+const postToPrompt = (post) => {
+  return post ? `@${post.accountId}: ${post.data?.text || ""}\n` : "";
+};
+
+class Bot {
+  constructor({ logger, near, social, openai, state }) {
+    this.logger = logger;
+    this.near = near;
+    this.social = social;
+    this.openai = openai;
+    this.state = state;
+  }
+
+  async daylyPost(date) {
+    date = date || new Date();
+    // Creating a new post
+    const post = {
+      time: date.getTime(),
+      status: Status.Preparing,
+    };
+    this.state.postHistory.push(post);
+    const dateText = date.toLocaleDateString("en-US", {
+      month: "long",
+      day: "numeric",
+    });
+    post.prompt =
+      process.env.DAILY_PROMPT?.replaceAll("${dateText}", dateText) ||
+      `Tell me what important events happened on ${dateText}.`;
+    this.logger.info(`Generating text for daily prompt`, {
+      prompt: post.prompt,
+      date,
+    });
+    post.openaiText = await this.openai.reply(post.prompt);
+    post.text = `### ${dateText}\n\n${post.openaiText}`;
+    post.status = Status.Posting;
+    this.logger.info(`Posting`, {
+      post,
+    });
+    await this.social.post(post.text);
+    post.status = Status.OK;
+  }
+
+  async maybePost() {
+    const lastPost =
+      this.state.postHistory?.[this.state.postHistory.length - 1];
+    const date = new Date();
+    if (!lastPost || new Date(lastPost.time).getDay() !== date.getDay()) {
+      await this.daylyPost(date);
+    }
+  }
+
+  async fetchNotifications() {
+    let from =
+      this.state.notifications.length > 0
+        ? this.state.notifications[this.state.notifications.length - 1]
+            .blockHeight + 1
+        : 0;
+    const lastCommentBlockHeight = await this.social.keysInner(
+      `${this.near.accountId}/post/comment`,
+      "optimistic",
+      {
+        return_type: "BlockHeight",
+      }
+    );
+    if (lastCommentBlockHeight) {
+      from = Math.max(from, lastCommentBlockHeight - 60);
+    }
+
+    const newNotifications = await this.social.index(
+      "notify",
+      this.near.accountId,
+      {
+        order: "asc",
+        limit: 10000,
+        from,
+      }
+    );
+    if (newNotifications.length > 0) {
+      this.logger.info("fetchNotifications", {
+        count: newNotifications.length,
+        last: newNotifications[newNotifications.length - 1],
+      });
+      this.state.notifications.push(...newNotifications);
+      this.state.todoNotifications.push(...newNotifications);
+    }
+  }
+
+  async reply({ notification, item, post, blockHeight, accountId }) {
+    const lastReplies = (this.state.accountReplies[accountId] =
+      this.state.accountReplies[accountId] || []);
+    const lastThreeReplies = lastReplies.slice(-3);
+    if (
+      lastThreeReplies.length === 3 &&
+      lastThreeReplies[0].time > Date.now() - 5 * 60 * 1000
+    ) {
+      // Don't reply more than 3 times 5 minutes
+      this.logger.info("Ignoring reply because of rate limit");
+      return;
+    }
+    const postText = postToPrompt(post);
+    // Get last comments before this notifications
+    const commentsIndex =
+      (await this.social.index("comment", item, {
+        order: "desc",
+        limit: 3,
+        from: blockHeight,
+      })) || [];
+    const comments = await Promise.all(
+      commentsIndex
+        .reverse()
+        .map((item) => this.social.getCommentFromIndex(item))
+    );
+    this.logger.info("comments", { comments });
+    const commentTexts = comments.map((comment) => postToPrompt(comment));
+    const prompts = [postText, ...commentTexts].filter((text) => text);
+    this.logger.info("prompts", { prompts });
+    if (prompts.length === 0) {
+      return;
+    }
+    prompts.push(`@${accountId}, `);
+
+    const stateReply = {
+      time: new Date().getTime(),
+      item,
+      accountId,
+      notification,
+      prompts,
+      postAccountId: post?.accountId,
+    };
+    lastReplies.push(stateReply);
+    this.state.replyHistory.push(stateReply);
+    let reply = await this.openai.reply(prompts);
+    stateReply.reply = reply;
+    this.logger.info("reply", { reply });
+    if (!reply) {
+      return;
+    }
+    reply = reply.replaceAll("\n", "  \n");
+    await this.social.comment(
+      item,
+      `@${accountId}, ${reply}`,
+      [],
+      post?.accountId
+    );
+  }
+
+  async processNotification(notification) {
+    this.logger.info("processNotification", { notification });
+    const { accountId, blockHeight, value } = notification;
+    if (accountId === this.near.accountId) {
+      // Ignore self notifications
+      return;
+    }
+    const replies = this.state.accountReplies[accountId] || [];
+    const lastReply = replies[replies.length - 1];
+    if (lastReply && lastReply.notification.blockHeight === blockHeight) {
+      // Ignore duplicate notifications
+      return;
+    }
+    if (value.type === "follow") {
+      // Check if they are following us, and we don't follow them yet
+      if (
+        (await this.social.isFollowing(accountId, this.near.accountId)) &&
+        !(await this.social.isFollowing(this.near.accountId, accountId))
+      ) {
+        this.logger.info("Going to follow back", { accountId });
+        await this.social.follow(accountId);
+      }
+    } else if (value.type === "like") {
+      // ignore
+    } else if (value.type === "poke") {
+      // poke back
+      await this.social.poke(accountId);
+    } else if (value.type === "comment") {
+      const item = value.item;
+      // Extract context
+      const post = await this.social.getPost(item);
+      this.logger.info("comment for post", { post });
+      await this.reply({ notification, item, post, blockHeight, accountId });
+    } else if (value.type === "mention") {
+      const item = value.item;
+      let postItem = Object.assign({ blockHeight }, item);
+      // Extract context
+      let post = await this.social.getPost(postItem);
+      if (!post) {
+        const comment = await this.social.getComment(postItem);
+        if (comment) {
+          this.logger.info("mention in a comment", { comment });
+          postItem = comment.data?.item;
+          post = await this.social.getPost(postItem);
+        } else {
+          this.logger.info("unknown mention", { item });
+          return;
+        }
+      } else {
+        this.logger.info("mention in a post", { post });
+      }
+      if (!postItem) {
+        this.logger.info("unknown post item", { postItem });
+        return;
+      }
+      await this.reply({
+        notification,
+        item: postItem,
+        post,
+        blockHeight,
+        accountId,
+      });
+    }
+  }
+
+  async processNotifications() {
+    while (true) {
+      const notification = this.state.todoNotifications.shift();
+      if (!notification) {
+        return;
+      }
+      this.state.notifications.push(notification);
+      await this.processNotification(notification);
+    }
+  }
+
+  async run() {
+    // await this.daylyPost();
+    await this.maybePost();
+    await this.fetchNotifications();
+    await this.processNotifications();
+
+    // this.state.todoNotifications.shift();
+    // this.logger.info("test", {
+    //   notification: this.state.todoNotifications[0],
+    // });
+    // this.state.notifications.map((n, i) => console.log(i, JSON.stringify(n)));
+    // await this.processNotification(this.state.notifications.slice(-1)[0]);
+  }
+}
+
+module.exports = Bot;
+
+'''
+'''--- src/near.js ---
+const nearAPI = require("near-api-js");
+const Big = require("big.js");
+
+const TGas = Big(10).pow(12);
+const MaxGasPerTransaction = TGas.mul(250);
+const StorageCostPerByte = Big(10).pow(19);
+
+const MainnetContract = "social.near";
+const MainNearConfig = {
+  networkId: "mainnet",
+  nodeUrl: process.env.NEAR_NODE_URL || "https://rpc.mainnet.near.org",
+  archivalNodeUrl: "https://rpc.mainnet.internal.near.org",
+  contractName: MainnetContract,
+  walletUrl: "https://wallet.near.org",
+  storageCostPerByte: StorageCostPerByte,
+  apiUrl: "https://api.near.social",
+  finalSynchronizationDelayMs: 3000,
+};
+
+const NearConfig = MainNearConfig;
+
+const ApiEnabled = true;
+const SupportedApiMethods = {
+  get: true,
+  keys: true,
+};
+
+const apiCall = async (methodName, args, blockId, fallback) => {
+  if (!ApiEnabled || !(methodName in SupportedApiMethods)) {
+    return fallback();
+  }
+  args = args || {};
+
+  if (blockId) {
+    args.blockHeight = blockId;
+  }
+
+  try {
+    return await (
+      await fetch(`${NearConfig.apiUrl}/${methodName}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(args),
+      })
+    ).json();
+  } catch (e) {
+    console.log("API call failed", methodName, args);
+    console.error(e);
+    return fallback();
+  }
+};
+
+async function functionCall(
+  near,
+  contractName,
+  methodName,
+  args,
+  gas,
+  deposit
+) {
+  console.log(
+    "functionCall",
+    contractName,
+    methodName,
+    JSON.stringify(args, null, 2),
+    gas,
+    deposit
+  );
+  near.logger.info("functionCall", {
+    contractName,
+    methodName,
+    args,
+    gas,
+    deposit,
+  });
+
+  const txResult = await near.account.functionCall({
+    contractId: contractName,
+    methodName,
+    args,
+    gas: gas ?? TGas.mul(30).toFixed(0),
+    attachedDeposit: deposit ?? "0",
+  });
+  near.logger.info("functionCallResult", { txResult });
+  if (
+    typeof txResult.status === "object" &&
+    typeof txResult.status.SuccessValue === "string"
+  ) {
+    const value = Buffer.from(
+      txResult.status.SuccessValue,
+      "base64"
+    ).toString();
+    try {
+      return JSON.parse(value);
+    } catch (e) {
+      return value;
+    }
+  }
+  return null;
+}
+
+async function accountState(near, accountId) {
+  const account = new nearAPI.Account(
+    near.nearConnection.connection,
+    accountId
+  );
+  return await account.state();
+}
+
+function setupContract(near, contractId, options) {
+  const { viewMethods = [], changeMethods = [] } = options;
+  const contract = {
+    near,
+    contractId,
+  };
+  viewMethods.forEach((methodName) => {
+    contract[methodName] = (args) =>
+      near.viewCall(contractId, methodName, args);
+  });
+  changeMethods.forEach((methodName) => {
+    contract[methodName] = (args, gas, deposit) =>
+      near.functionCall(contractId, methodName, args, gas, deposit);
+  });
+  return contract;
+}
+
+async function viewCall(
+  provider,
+  blockId,
+  contractId,
+  methodName,
+  args,
+  finality
+) {
+  args = args || {};
+  const result = await provider.query({
+    request_type: "call_function",
+    account_id: contractId,
+    method_name: methodName,
+    args_base64: Buffer.from(JSON.stringify(args)).toString("base64"),
+    block_id: blockId,
+    finality,
+  });
+
+  return (
+    result.result &&
+    result.result.length > 0 &&
+    JSON.parse(Buffer.from(result.result).toString())
+  );
+}
+
+async function initNear(logger) {
+  const _near = { logger };
+  _near.accountId = process.env.NEAR_ACCOUNT_ID;
+
+  const keyStore = new nearAPI.keyStores.InMemoryKeyStore();
+  keyStore.setKey(
+    NearConfig.networkId,
+    _near.accountId,
+    nearAPI.utils.KeyPair.fromString(process.env.NEAR_PRIVATE_KEY)
+  );
+
+  const nearConnection = await nearAPI.connect(
+    Object.assign({ deps: { keyStore } }, NearConfig)
+  );
+
+  _near.account = new nearAPI.Account(
+    nearConnection.connection,
+    _near.accountId
+  );
+
+  _near.nearArchivalConnection = nearAPI.Connection.fromConfig({
+    networkId: NearConfig.networkId,
+    provider: {
+      type: "JsonRpcProvider",
+      args: { url: NearConfig.archivalNodeUrl },
+    },
+    signer: { type: "InMemorySigner", keyStore },
+  });
+
+  _near.keyStore = keyStore;
+  _near.nearConnection = nearConnection;
+
+  const transformBlockId = (blockId) =>
+    blockId === "optimistic" || blockId === "final"
+      ? {
+          finality: blockId,
+          blockId: undefined,
+        }
+      : blockId !== undefined && blockId !== null
+      ? {
+          finality: undefined,
+          blockId: parseInt(blockId),
+        }
+      : {
+          finality: "optimistic",
+          blockId: undefined,
+        };
+
+  _near.viewCall = (contractId, methodName, args, blockHeightOrFinality) => {
+    const { blockId, finality } = transformBlockId(blockHeightOrFinality);
+    const nearViewCall = () =>
+      viewCall(
+        blockId
+          ? _near.nearArchivalConnection.provider
+          : _near.nearConnection.connection.provider,
+        blockId ?? undefined,
+        contractId,
+        methodName,
+        args,
+        finality
+      );
+
+    return contractId === NearConfig.contractName && finality === "final"
+      ? apiCall(methodName, args, blockId, nearViewCall)
+      : nearViewCall();
+  };
+
+  _near.block = (blockHeightOrFinality) => {
+    const blockQuery = transformBlockId(blockHeightOrFinality);
+    const provider = blockQuery.blockId
+      ? _near.nearArchivalConnection.provider
+      : _near.nearConnection.connection.provider;
+    return provider.block(blockQuery);
+  };
+  _near.functionCall = (contractName, methodName, args, gas, deposit) =>
+    functionCall(_near, contractName, methodName, args, gas, deposit);
+  _near.sendTransactions = (transactions) =>
+    sendTransactions(_near, transactions);
+
+  _near.contract = setupContract(_near, NearConfig.contractName, {
+    viewMethods: [
+      "storage_balance_of",
+      "get",
+      "get_num_accounts",
+      "get_accounts_paged",
+      "is_write_permission_granted",
+      "keys",
+    ],
+    changeMethods: [
+      "set",
+      "grant_write_permission",
+      "storage_deposit",
+      "storage_withdraw",
+    ],
+  });
+
+  _near.accountState = (accountId) => accountState(_near, accountId);
+
+  return _near;
+}
+
+module.exports = { initNear, NearConfig, TGas, StorageCostPerByte };
+
+'''
+'''--- src/openai.js ---
+const { Configuration, OpenAIApi } = require("openai");
+const { encode, decode } = require("gpt-3-encoder");
+
+class OpenAI {
+  constructor(logger) {
+    this.logger = logger;
+    const configuration = new Configuration({
+      organization: process.env.OPENAI_ORG,
+      apiKey: process.env.OPENAI_API_KEY,
+    });
+    this.openai = new OpenAIApi(configuration);
+  }
+
+  limitPromptsTokens(prompts, maxPerPrompt, maxTokens) {
+    let remainingTokens = maxTokens;
+    return [
+      ...prompts
+        .slice(0)
+        .reverse()
+        .map((prompt) => {
+          try {
+            const tokens = encode(prompt);
+            maxPerPrompt = Math.min(maxPerPrompt, remainingTokens);
+            if (tokens.length > maxPerPrompt) {
+              prompt = decode(tokens.slice(0, maxPerPrompt));
+            }
+            remainingTokens -= Math.min(tokens.length, remainingTokens);
+          } catch (e) {
+            this.logger.error("Error truncating prompt", { prompt, e });
+            prompt = "";
+          }
+          return prompt;
+        })
+        .filter(Boolean)
+        .reverse(),
+    ];
+  }
+
+  async reply(prompts) {
+    prompts = Array.isArray(prompts) ? prompts : [prompts];
+    prompts.unshift(process.env.AI_COMMAND);
+    const maxPromptTokens = parseInt(process.env.MAX_PROMPT_TOKENS) || 512;
+    const maxPerPrompt = parseInt(process.env.MAX_TOKENS_PER_PROMPT) || 256;
+    prompts = this.limitPromptsTokens(prompts, maxPerPrompt, maxPromptTokens);
+    const request = {
+      model: process.env.MODEL ?? "gpt-3.5-turbo",
+      messages: prompts.map((prompt, i) => ({
+        role: i ? "user" : "system",
+        content: prompt,
+      })),
+      max_tokens: parseInt(process.env.MAX_TOKENS) || 512,
+      temperature: 0.9,
+      n: 1,
+      presence_penalty: 0.6,
+    };
+    this.logger.info("request", { request });
+    const response = await this.openai.createChatCompletion(request);
+    this.logger.info("response", { data: response.data });
+
+    return response.data.choices[0].message.content.trim();
+  }
+}
+
+module.exports = OpenAI;
+
+'''
+'''--- src/social.js ---
+const { NearConfig } = require("./near");
+
+const innerValue = (key, data) => {
+  if (data) {
+    const parts = key.split("/");
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+      if (part === "*" || part === "**") {
+        break;
+      }
+      data = data?.[part];
+    }
+  }
+  return data;
+};
+
+class Social {
+  constructor(logger, near) {
+    this.logger = logger;
+    this.near = near;
+  }
+
+  async set(data) {
+    return this.near.functionCall(
+      NearConfig.contractName,
+      "set",
+      {
+        data: {
+          [this.near.accountId]: data,
+        },
+      },
+      undefined,
+      "1"
+    );
+  }
+
+  async post(text) {
+    const notifications = this.extractMentionNotifications(text, {
+      type: "social",
+      path: `${this.near.accountId}/post/main`,
+    });
+
+    const data = {
+      post: {
+        main: JSON.stringify({ type: "md", text }),
+      },
+      index: {
+        post: JSON.stringify({
+          key: "main",
+          value: {
+            type: "md",
+          },
+        }),
+      },
+    };
+
+    if (notifications.length) {
+      data.index.notify = JSON.stringify(
+        notifications.length > 1 ? notifications : notifications[0]
+      );
+    }
+
+    return this.set(data);
+  }
+
+  async comment(item, text, extraMentions, notifyAccountId) {
+    const notifications = this.extractMentionNotifications(
+      text,
+      {
+        type: "social",
+        path: `${this.near.accountId}/post/comment`,
+      },
+      extraMentions
+    );
+
+    if (notifyAccountId && notifyAccountId !== this.near.accountId) {
+      notifications.push({
+        key: notifyAccountId,
+        value: {
+          type: "comment",
+          item,
+        },
+      });
+    }
+
+    const data = {
+      post: {
+        comment: JSON.stringify({ item, text, type: "md" }),
+      },
+      index: {
+        comment: JSON.stringify({
+          key: item,
+          value: {
+            type: "md",
+          },
+        }),
+      },
+    };
+
+    if (notifications.length) {
+      data.index.notify = JSON.stringify(
+        notifications.length > 1 ? notifications : notifications[0]
+      );
+    }
+
+    return this.set(data);
+  }
+
+  async index(action, key, options) {
+    const response = await fetch(`${NearConfig.apiUrl}/index`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        action,
+        key,
+        options,
+      }),
+    });
+    const ok = response.ok;
+    return ok ? await response.json() : undefined;
+  }
+
+  async get(keys, blockId) {
+    return this.near.viewCall(
+      NearConfig.contractName,
+      "get",
+      {
+        keys: Array.isArray(keys) ? keys : [keys],
+      },
+      blockId
+    );
+  }
+
+  async keys(keys, blockId, options) {
+    return this.near.viewCall(
+      NearConfig.contractName,
+      "keys",
+      {
+        keys: Array.isArray(keys) ? keys : [keys],
+        options,
+      },
+      blockId
+    );
+  }
+
+  async keysInner(key, blockId, options) {
+    return innerValue(key, await this.keys(key, blockId, options));
+  }
+
+  async getInner(key, blockId) {
+    return innerValue(key, await this.get(key, blockId));
+  }
+
+  async isFollowing(accountId, targetId) {
+    return (
+      Object.keys(
+        (await this.get(`${accountId}/graph/follow/${targetId}`)) || {}
+      ).length > 0
+    );
+  }
+
+  async follow(accountId) {
+    this.logger.info("follow", { accountId });
+    return this.set({
+      graph: {
+        follow: {
+          [accountId]: "",
+        },
+      },
+      index: {
+        notify: JSON.stringify({
+          key: accountId,
+          value: {
+            type: "follow",
+          },
+        }),
+      },
+    });
+  }
+
+  async poke(accountId) {
+    this.logger.info("poke", { accountId });
+    return this.set({
+      index: {
+        graph: JSON.stringify({
+          key: "poke",
+          value: {
+            accountId: accountId,
+          },
+        }),
+        notify: JSON.stringify({
+          key: accountId,
+          value: {
+            type: "poke",
+          },
+        }),
+      },
+    });
+  }
+
+  async getPost(item, type = "main") {
+    try {
+      if (!item || item?.type !== "social") {
+        return null;
+      }
+      let { blockHeight, path } = item;
+      if (!blockHeight || !path) {
+        return null;
+      }
+      blockHeight = parseInt(blockHeight);
+      if (!blockHeight) {
+        return null;
+      }
+      const accountId = path.split("/")[0];
+      if (`${accountId}/post/${type}` !== path) {
+        return null;
+      }
+      let data = await this.getInner(path, blockHeight);
+      if (!data) {
+        return null;
+      }
+      data = JSON.parse(data);
+      return {
+        accountId,
+        blockHeight,
+        path,
+        data,
+        type,
+      };
+    } catch (error) {
+      this.logger.debug("getPost", { error });
+      return null;
+    }
+  }
+
+  async getComment(item) {
+    return this.getPost(item, "comment");
+  }
+
+  async getCommentFromIndex(item) {
+    try {
+      const { blockHeight, accountId } = item;
+      const path = `${accountId}/post/comment`;
+      let data = await this.getInner(path, blockHeight);
+      if (!data) {
+        return null;
+      }
+      data = JSON.parse(data);
+      return {
+        accountId,
+        blockHeight,
+        path,
+        data,
+      };
+    } catch (error) {
+      this.logger.debug("getCommentFromIndex", { error });
+      return null;
+    }
+  }
+
+  extractMentions(text, extraMentions) {
+    const mentionRegex =
+      /@((?:(?:[a-z\d]+[-_])*[a-z\d]+\.)*(?:[a-z\d]+[-_])*[a-z\d]+)/gi;
+    mentionRegex.lastIndex = 0;
+    const accountIds = new Set(extraMentions || []);
+    for (const match of text.matchAll(mentionRegex)) {
+      if (
+        !/[\w`]/.test(match.input.charAt(match.index - 1)) &&
+        !/[/\w`]/.test(match.input.charAt(match.index + match[0].length)) &&
+        match[1].length >= 2 &&
+        match[1].length <= 64
+      ) {
+        accountIds.add(match[1].toLowerCase());
+      }
+    }
+    return [...accountIds];
+  }
+
+  extractMentionNotifications(text, item, extraMentions) {
+    const mentions = this.extractMentions(text, extraMentions);
+
+    return mentions
+      .filter((accountId) => accountId !== this.near.accountId)
+      .map((accountId) => ({
+        key: accountId,
+        value: {
+          type: "mention",
+          item,
+        },
+      }));
+  }
+}
+
+module.exports = Social;
+
+'''
+'''--- src/utils.js ---
+const fs = require("fs");
+
+function saveJson(json, filename) {
+  try {
+    const data = JSON.stringify(json);
+    fs.writeFileSync(filename, data);
+  } catch (e) {
+    console.error("Failed to save JSON:", filename, e);
+  }
+}
+
+function loadJson(filename, ignore) {
+  try {
+    let rawData = fs.readFileSync(filename);
+    return JSON.parse(rawData);
+  } catch (e) {
+    if (!ignore) {
+      console.error("Failed to load JSON:", filename, e);
+    }
+  }
+  return null;
+}
+
+module.exports = { saveJson, loadJson };
+
+'''

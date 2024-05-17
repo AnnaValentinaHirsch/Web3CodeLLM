@@ -1,0 +1,2436 @@
+*GitHub Repository "kelonye/downtown-stimulus"*
+
+'''--- README.md ---
+![](https://downtown-stimulus.surge.sh/shot.png)
+
+### 🚧 Work in Progress
+
+An attempt at simple quadratic funding using crypto (NEAR) for downtown businesses affected by covid-19; while learning some [rust](https://www.rust-lang.org) ;).
+
+### Idea
+
+The dapp has 3 users:
+
+- Major donors, philanthropists, local governments etc willing to offer stimulus
+- Business owners seeking funding
+- Individual donors willing to donate to their local favorite businesses
+
+The dapps utilizes quadratic funding, [first described by Vitalik](https://vitalik.ca/general/2019/12/07/quadratic.html), to realize fairer disbursement of a large sum of aid to a select set of businesses (affected by covid-19). Quadratic funding lets the public vote (by also donating) on the allocation of these funds where, the payout for each of these businesses is proportional to the square of the sum of the square roots of the individual public contributions.
+
+For example, here is a breakdown of the allocation of \$100k pledged by a donor to a group of 3 businesses in a funding round:
+
+| Business | Funding from public             | Total Public Funding | Matched | Total Public + Matched | Total   |
+| -------- | ------------------------------- | -------------------- | ------- | ---------------------- | ------- |
+| A        | 2200, 800, 400                  | 3,400                | 9,060   | 12,460                 | 30,156  |
+| B        | 10000                           | 10,000               | 10,000  | 20,000                 | 48,405  |
+| C        | 100, 300, 50, 100, 300, 70, 300 | 1,220                | 7,638   | 8,858                  | 21,438  |
+|          |                                 |                      |         | Total                  | 100,000 |
+
+We can see that business C did get the best allocation ratio due to having more interest from the public in terms of the number of contributors.
+[Gitcoin](https://gitcoin.co/grants/) uses a [similar matching](https://ethgasstation.info/blog/quadratic-funding-in-a-nutshell/) to allocate funds provided by Ethereum Foundation and ConsenSys to sponsor awesome open source projects.
+
+### Tools
+
+The dapp is a Near Platform dapp that allows users to vote on these businesses using their Near Tokens. The demo can be accessed at https://downtown-stimulus.surge.sh.
+
+- [React](https://reactjs.org/) - frontend
+- [Near Protocol](https://near.org/) - dapp backend
+
+### Todos
+
+- [ ] Create funding round
+- [ ] Allow philanthropists to fund the round
+- [ ] Allow business application
+- [x] Allow funding a business
+- [ ] Implement donation and CLR matching
+- [ ] Donation social media share
+- [ ] Funding window closure and payout to businesses
+
+### Icebox
+
+- [ ] Switch to Gitcoin's CLR matching to prevent sybil attacks 🤔
+
+### Resources
+
+- [Spec](https://docs.google.com/document/d/1KQsdEImDiK12bmMhNV_AXLkJyv3PWZ5nODTRL5_R-Gw)
+- [Gitcoin Downtown Stimulus Bounty](https://gitcoin.co/issue/gitcoinco/downtownstimulus/1/4358)
+- [Quadratic funding in a nutshell](https://ethgasstation.info/blog/quadratic-funding-in-a-nutshell/)
+- [Simulator](https://docs.google.com/spreadsheets/d/1zHYlMdEXuUYZeWWsVwA21EIMC7B-k2OBY7HFqDudCvk)
+- [Gitcoin/near-protocol](https://gitcoin.co/issue/nearprotocol/ready-layer-one-hackathon/1/4262) bounty
+- [Gitcoin/downtown-stimulus](https://gitcoin.co/issue/gitcoinco/downtownstimulus/1/4358) bounty
+- [Vitalik.ca/quadratic](https://vitalik.ca/general/2019/12/07/quadratic.html)
+- [Vitalik: Quadratic Funding](https://www.youtube.com/watch?v=ssr0CHg6YSE)
+- [Sybil and Collusion Resistance](https://www.youtube.com/watch?v=XY77Hrfxlpg)
+- [Quadratic Funding in Local Communities](https://www.youtube.com/watch?v=F868Yox_lSs)
+
+'''
+'''--- contract/Cargo.toml ---
+[package]
+name = "downtown-stimulus"
+version = "0.1.0"
+authors = ["vb <vbstreetz@gmail.com>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde = { version = "*", features = ["derive"] }
+serde_json = "*"
+near-sdk = "*"
+borsh = "*"
+wee_alloc = { version = "0.4.5", default-features = false, features = [] }
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+
+[workspace]
+members = []
+
+'''
+'''--- contract/src/lib.rs ---
+use borsh::{BorshDeserialize, BorshSerialize};
+use near_sdk::collections::{Map, Vector};
+use near_sdk::{env, near_bindgen, AccountId, Balance};
+use serde::Serialize;
+use std::collections::HashMap;
+
+const MIN_DONATION: Balance = 1_000_000_000_000_000_000_000_000; // 1 N
+
+#[global_allocator]
+static ALLOC: wee_alloc::WeeAlloc = wee_alloc::WeeAlloc::INIT;
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Business {
+    name: String,
+    image: String,
+    description: String,
+    donations: Vector<Balance>,
+    // total_donations: Balance,
+}
+
+#[derive(Default, Serialize)]
+pub struct BusinessResponse {
+    name: String,
+    image: String,
+    description: String,
+    donations: Vec<u128>,
+    // total_donations: Balance,
+}
+
+impl Business {
+    fn export(&self) -> BusinessResponse {
+        let mut br = BusinessResponse::default();
+        br.name = self.name.clone();
+        br.image = self.image.clone();
+        br.description = self.description.clone();
+        br.donations = Vec::new();
+        for donation in self.donations.iter() {
+            br.donations.push(donation as u128);
+        }
+        return br;
+    }
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct User {
+    donations: Vector<Balance>,
+    // total_donations: Balance,
+}
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct DowntownStimulus {
+    businesses: Map<u64, Business>,
+    users: Map<AccountId, User>,
+    total_donations: Balance,
+}
+
+impl Default for DowntownStimulus {
+    fn default() -> Self {
+        Self {
+            businesses: Map::new(b"businesses".to_vec()),
+            users: Map::new(b"users".to_vec()),
+            total_donations: 0,
+        }
+    }
+}
+
+#[near_bindgen]
+impl DowntownStimulus {
+    // Donate N to `business_id`
+    #[payable]
+    pub fn donate(&mut self, business_id: u64) {
+        let amount = env::attached_deposit();
+        env::log(format!("donating({}) to business({})", amount, business_id).as_bytes());
+        println!("donating({}) to business({})", amount, business_id);
+        assert!(amount >= MIN_DONATION, "not enough donation");
+
+        match self.businesses.get(&business_id) {
+            Some(mut business) => {
+                env::log(
+                    format!("recording business donation {} {}", business_id, amount).as_bytes(),
+                );
+                println!("recording business donation {} {}", business_id, amount);
+                business.donations.push(&amount);
+                self.businesses.insert(&business_id, &business);
+            }
+            _ => {
+                env::panic(format!("unknown business {}", business_id).as_bytes());
+            }
+        }
+
+        let account_id = env::signer_account_id();
+        env::log(format!("recording user donation {}", account_id).as_bytes());
+        match self.users.get(&account_id) {
+            Some(mut user) => {
+                env::log(format!("recording user donation {} {}", &account_id, amount).as_bytes());
+                println!("recording user donation {} {}", &account_id, amount);
+                user.donations.push(&amount);
+                self.users.insert(&account_id, &user);
+            }
+            _ => {
+                env::log(
+                    format!("recording new user donation {} {}", &account_id, amount).as_bytes(),
+                );
+                println!("recording new user donation {} {}", &account_id, amount);
+                let mut donations: Vector<Balance> = Vector::new(
+                    format!("user::donations::{}", account_id)
+                        .as_bytes()
+                        .to_vec(),
+                );
+                donations.push(&amount);
+                let user = User { donations };
+                self.users.insert(&account_id, &user);
+            }
+        }
+
+        self.total_donations += amount;
+    }
+    pub fn register_business(&mut self, name: String, image: String, description: String) {
+        assert_eq!(
+            env::current_account_id(),
+            env::signer_account_id(),
+            "owner required"
+        );
+        env::log(format!("registering business {} {} {}", name, image, description).as_bytes());
+
+        let business_id: u64 = (self.businesses.len() as u64) + 1;
+        let donations: Vector<Balance> = Vector::new(
+            format!("business::donations::{}", business_id)
+                .as_bytes()
+                .to_vec(),
+        );
+        let business = Business {
+            name,
+            image,
+            description,
+            donations,
+        };
+        self.businesses.insert(&business_id, &business);
+    }
+    pub fn get_businesses(&self) -> HashMap<u64, BusinessResponse> {
+        env::log(format!("looking up businesses").as_bytes());
+        let mut ret: HashMap<u64, BusinessResponse> = HashMap::new();
+        for (id, b) in self.businesses.iter() {
+            ret.insert(id, b.export());
+        }
+        return ret;
+    }
+    pub fn get_business(&self, business_id: u64) -> BusinessResponse {
+        env::log(format!("looking up business({})", business_id).as_bytes());
+        match self.businesses.get(&business_id) {
+            Some(b) => b.export(),
+            _ => {
+                env::panic(format!("unknown business {}", business_id).as_bytes());
+            }
+        }
+    }
+    pub fn get_owner(&self) -> AccountId {
+        return env::current_account_id().clone();
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use near_sdk::{testing_env, AccountId, MockedBlockchain, VMContext};
+
+    fn contract_owner() -> AccountId {
+        "contract-owner.near".to_string()
+    }
+
+    fn business_owner() -> AccountId {
+        "business-owner.near".to_string()
+    }
+
+    fn donor() -> AccountId {
+        "donator.near".to_string()
+    }
+
+    fn get_context(account_id: AccountId) -> VMContext {
+        VMContext {
+            current_account_id: contract_owner(),
+            signer_account_id: account_id.clone(),
+            predecessor_account_id: account_id.clone(),
+            signer_account_pk: vec![0, 1, 2],
+            input: vec![],
+            block_index: 0,
+            block_timestamp: 0,
+            account_balance: 0,
+            account_locked_balance: 0,
+            storage_usage: 10u64.pow(6),
+            attached_deposit: MIN_DONATION,
+            prepaid_gas: 10u64.pow(18),
+            random_seed: vec![0, 1, 2],
+            is_view: false,
+            output_data_receivers: vec![],
+            epoch_height: 0,
+        }
+    }
+
+    #[test]
+    fn donate() {
+        let context = get_context(contract_owner());
+        testing_env!(context);
+
+        let mut contract = DowntownStimulus::default();
+        contract.register_business(
+            "Peet's Coffee".to_string(),
+            "coffee.png".to_string(),
+            "In need of 10k stimulus in order to keep all our loyal staff through the year."
+                .to_string(),
+        );
+
+        for (id, b) in contract.businesses.iter() {
+            assert_eq!(id, 1);
+            assert_eq!(b.name, "Peet's Coffee");
+            assert_eq!(b.donations.len(), 0);
+        }
+
+        contract.donate(1);
+        println!("businesses {}", contract.businesses.len());
+        for (_id, b) in contract.businesses.iter() {
+            assert_eq!(b.donations.len(), 1);
+            assert_eq!(b.donations.get(0).unwrap(), MIN_DONATION);
+        }
+
+        for (id, u) in contract.users.iter() {
+            assert_eq!(id, contract_owner());
+            assert_eq!(u.donations.len(), 1);
+            assert_eq!(u.donations.get(0).unwrap(), MIN_DONATION);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "owner required")]
+    fn assert_only_owner_can_register_business() {
+        let context = get_context(contract_owner());
+        testing_env!(context);
+
+        let mut contract = DowntownStimulus::default();
+
+        let context = get_context(donor());
+        testing_env!(context);
+
+        contract.register_business(
+            "Peet's Coffee".to_string(),
+            "coffee.png".to_string(),
+            "In need of 10k stimulus in order to keep all our loyal staff through the year."
+                .to_string(),
+        );
+    }
+}
+
+'''
+'''--- contract/tmp/a.json ---
+{
+  "name": "Tastebuds",
+  "image": "https://media-cdn.tripadvisor.com/media/photo-s/07/e3/f6/8d/chocolate-cafe.jpg",
+  "description": "Funding to be used to pay rent..."
+}
+
+'''
+'''--- contract/tmp/b.json ---
+{
+  "name": "The Temple Bar",
+  "image": "https://encrypted-tbn0.gstatic.com/images?q=tbn%3AANd9GcQNU6TVcyVq16CovYsknkWpale5iqumYURRe7F7D5igl6V_9NsN&usqp=CAU",
+  "description": "Funding to be used to pay rent..."
+}
+
+'''
+'''--- contract/tmp/c.json ---
+{
+  "name": "SFO Bakeries",
+  "image": "https://encrypted-tbn0.gstatic.com/images?q=tbn%3AANd9GcRSe-F7SYNAH2Hr2oLEdnygNRPZvQYD2CiQ9AvKNZB6H9AL2th4&usqp=CAU",
+  "description": "Funding to be used to pay rent..."
+}
+
+'''
+'''--- contract/tmp/d.json ---
+{
+  "name": "Best Coffee",
+  "image": "https://img.theculturetrip.com/x/smart/wp-content/uploads/2018/02/coffee-3120750_1280-1.jpg",
+  "description": "Funding to be used to pay rent..."
+}
+
+'''
+'''--- frontend/README.md ---
+
+'''
+'''--- frontend/package.json ---
+{
+  "name": "downtown-stimulus",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": {
+    "@material-ui/core": "^4.9.1",
+    "@material-ui/icons": "^4.9.1",
+    "@testing-library/jest-dom": "^4.2.4",
+    "@testing-library/react": "^9.4.0",
+    "@testing-library/user-event": "^7.2.1",
+    "bluebird": "^3.7.2",
+    "chart.js": "^2.9.3",
+    "history": "^4.10.1",
+    "lodash": "^4.17.15",
+    "moment": "^2.24.0",
+    "near-api-js": "^0.25.1",
+    "nprogress": "^0.2.0",
+    "react": "^16.12.0",
+    "react-dom": "^16.12.0",
+    "react-joyride": "^2.2.1",
+    "react-redux": "^7.1.3",
+    "react-router-dom": "^5.1.2",
+    "react-scripts": "3.3.1",
+    "redux": "^4.0.5",
+    "redux-async-initial-state": "^0.3.0",
+    "redux-thunk": "^2.3.0",
+    "reselect": "^4.0.0",
+    "sweetalert": "^1.1.3",
+    "unfetch": "^4.1.0"
+  },
+  "devDependencies": {
+    "eslint-config-prettier": "^6.9.0",
+    "eslint-plugin-prettier": "^3.1.2",
+    "node-sass": "^4.13.1",
+    "prettier": "^1.19.1",
+    "prettier-eslint": "^10.1.1"
+  },
+  "resolutions": {
+    "react-dev-utils": "10.1.0"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test",
+    "eject": "react-scripts eject"
+  },
+  "eslintConfig": {
+    "extends": "react-app"
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  }
+}
+
+'''
+'''--- frontend/public/index.html ---
+<!DOCTYPE html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="%PUBLIC_URL%/logo.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#000000" />
+    <meta name="description" content="Downtown Stimulus" />
+    <link rel="apple-touch-icon" href="%PUBLIC_URL%/logo.png" />
+    <!--
+      manifest.json provides metadata used when your web app is installed on a
+      user's mobile device or desktop. See https://developers.google.com/web/fundamentals/web-app-manifest/
+    -->
+    <link rel="manifest" href="%PUBLIC_URL%/manifest.json" />
+    <!--
+      Notice the use of %PUBLIC_URL% in the tags above.
+      It will be replaced with the URL of the `public` folder during the build.
+      Only files inside the `public` folder can be referenced from the HTML.
+
+      Unlike "/favicon.ico" or "favicon.ico", "%PUBLIC_URL%/favicon.ico" will
+      work correctly both with client-side routing and a non-root public URL.
+      Learn how to configure a non-root public URL by running `npm run build`.
+    -->
+    <title>Downtown Stimulus</title>
+    <link
+      href="https://fonts.googleapis.com/css?family=Work+Sans&display=swap"
+      rel="stylesheet"
+    />
+    <style media="screen">
+      html,
+      body {
+        height: 100%;
+        width: 100%;
+        margin: 0;
+        padding: 0;
+      }
+
+      body {
+        margin: 0;
+        padding: 0;
+        font-family: 'Work Sans', Arial, sans-serif;
+        color: #404040;
+        background: white;
+      }
+
+      .dark body {
+        background: #212121;
+      }
+
+      .anim-loading,
+      .anim-loading body {
+        height: 100%;
+        width: 100%;
+      }
+
+      .anim-loading body {
+        display: flex;
+        flex-direction: row;
+      }
+
+      #loader-container {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex: 1;
+        height: 100%;
+      }
+
+      #loader {
+        animation: loader 1s infinite ease-in-out;
+        -webkit-animation: loader 1s infinite ease-in-out;
+        animation-delay: -0.16s;
+        -webkit-animation-delay: -0.16s;
+        background: #fc0;
+        color: #fc0;
+        font-size: 6px;
+        height: 20px;
+        position: relative;
+        text-indent: -9999em;
+        transform: translateZ(0);
+        -ms-transform: translateZ(0);
+        -webkit-transform: translateZ(0);
+        width: 1em;
+      }
+
+      #loader:before {
+        animation: loader 1s infinite ease-in-out;
+        -webkit-animation: loader 1s infinite ease-in-out;
+        animation-delay: -0.32s;
+        -webkit-animation-delay: -0.32s;
+        background: #fc0;
+        content: '';
+        height: 20px;
+        left: -1.5em;
+        position: absolute;
+        top: 0;
+        width: 1em;
+      }
+
+      #loader:after {
+        animation: loader 1s infinite ease-in-out;
+        -webkit-animation: loader 1s infinite ease-in-out;
+        animation-delay: 0.08s;
+        -webkit-animation-delay: 0.08s;
+        background: #fc0;
+        content: '';
+        height: 20px;
+        left: 1.5em;
+        position: absolute;
+        top: 0;
+        width: 1em;
+      }
+
+      @keyframes loader {
+        0%,
+        80%,
+        100% {
+          box-shadow: 0 0;
+          height: 20px;
+        }
+        40% {
+          box-shadow: 0 -2em;
+          height: 5em;
+        }
+      }
+
+      @-webkit-keyframes loader {
+        0%,
+        80%,
+        100% {
+          box-shadow: 0 0;
+          height: 20px;
+        }
+        40% {
+          box-shadow: 0 -2em;
+          height: 5em;
+        }
+      }
+    </style>
+    <script>
+      var root = document.documentElement.classList;
+      if (themeIsDark()) {
+        root.remove('light');
+        root.add('dark');
+      } else {
+        root.remove('dark');
+        root.add('light');
+      }
+
+      function themeIsDark() {
+        try {
+          if (!('localStorage' in window && window['localStorage'] !== null)) {
+            return false;
+          }
+          var theme = localStorage.getItem('theme');
+          return !theme || 'dark' === JSON.parse(theme);
+        } catch (e) {
+          return false;
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <noscript> You need to enable JavaScript to run this app. </noscript>
+    <div id="loader-container">
+      <div id="loader"></div>
+    </div>
+    <!--
+      This HTML file is a template.
+      If you open it directly in the browser, you will see an empty page.
+
+      You can add webfonts, meta tags, or analytics to this file.
+      The build step will place the bundled scripts into the <body> tag.
+
+      To begin the development, run `npm start` or `yarn start`.
+      To create a production bundle, use `npm run build` or `yarn build`.
+    -->
+  </body>
+</html>
+
+'''
+'''--- frontend/public/manifest.json ---
+{
+  "name": "Downtown Stimulus",
+  "description": "Downtown Stimulus",
+  "icons": [
+    {
+      "src": "logo.png",
+      "sizes": "300x300",
+      "type": "image/png"
+    }
+  ],
+  "start_url": "./index.html",
+  "display": "standalone"
+}
+
+'''
+'''--- frontend/public/robots.txt ---
+# https://www.robotstxt.org/robotstxt.html
+User-agent: *
+Disallow:
+
+'''
+'''--- frontend/src/actions/app.js ---
+import cache from 'utils/cache';
+import { history } from 'store';
+import { ACTION_TYPE_TOGGLE_THEME } from 'config';
+
+export function toggleTheme() {
+  return async(dispatch, getState) => {
+    dispatch({ type: ACTION_TYPE_TOGGLE_THEME });
+    cache('theme', getState().app.theme);
+  };
+}
+
+export function navigate(payload) {
+  return async(dispatch, getState) => {
+    history.push(payload);
+  };
+}
+
+export function goHome(payload) {
+  return async(dispatch, getState) => {
+    dispatch(navigate('/'));
+  };
+}
+
+'''
+'''--- frontend/src/actions/data.js ---
+// import Promise from 'bluebird';
+import NProgress from 'nprogress';
+import { parseNearAmount } from 'near-api-js/lib/utils/format';
+import { ACTION_TYPE_UPDATE_DATA } from 'config';
+import near from 'utils/wallet';
+import { parseBusiness, parseBusinesses } from 'utils/data';
+import { CONTRACT_NAME } from 'config/wallet';
+
+export function updateData(payload) {
+  return {
+    type: ACTION_TYPE_UPDATE_DATA,
+    payload,
+  };
+}
+
+export function registerBusiness(fields) {
+  return async (dispatch, getState) => {
+    NProgress.start();
+    NProgress.set(0.4);
+    const { contract } = near();
+    try {
+      await contract.register_business(fields);
+      dispatch(
+        updateData({
+          businesses: parseBusinesses(await contract.get_businesses()),
+        })
+      );
+    } finally {
+      NProgress.done();
+    }
+  };
+}
+
+export function donate(businessId, donation) {
+  return async (dispatch, getState) => {
+    NProgress.start();
+    NProgress.set(0.4);
+    const { wallet } = near();
+    try {
+      await wallet.account().functionCall(
+        CONTRACT_NAME,
+        'donate',
+        { business_id: parseInt(businessId) },
+        null, // use default gas
+        parseNearAmount(donation.toString())
+      );
+    } finally {
+      NProgress.done();
+    }
+  };
+}
+
+export function fetchBusiness(businessId) {
+  return async (dispatch, getState) => {
+    NProgress.start();
+    NProgress.set(0.4);
+    try {
+      const { contract } = near();
+      const {
+        data: { businesses },
+      } = getState();
+      const b = await contract.get_business({
+        business_id: businessId,
+      });
+      b.id = businessId;
+      businesses[businessId] = parseBusiness(b);
+      dispatch(
+        updateData({
+          businesses,
+        })
+      );
+    } finally {
+      NProgress.done();
+    }
+  };
+}
+
+'''
+'''--- frontend/src/actions/index.js ---
+export * from './app';
+export * from './wallet';
+export * from './data';
+
+'''
+'''--- frontend/src/actions/wallet.js ---
+// import Promise from 'bluebird';
+import { ACTION_TYPE_UPDATE_WALLET, APP_TITLE } from 'config';
+import near from 'utils/wallet';
+import { sleep } from 'utils';
+
+export function loadWallet() {
+  return async (dispatch, getState) => {
+    try {
+      dispatch(updateWallet({ isLoaded: false }));
+      dispatch(
+        updateWallet({
+          isLoggedIn: near().wallet.isSignedIn(),
+        })
+      );
+    } finally {
+      dispatch(updateWallet({ isLoaded: true }));
+    }
+  };
+}
+
+export function activateWallet() {
+  return async (dispatch, getState) => {
+    const {
+      wallet,
+      nearConfig: { contractName },
+    } = near();
+    wallet.requestSignIn(contractName, APP_TITLE);
+  };
+}
+
+export function deactivateWallet() {
+  return async (dispatch, getState) => {
+    near().wallet.signOut();
+    await sleep(500);
+    // dispatch(loadWallet());
+    window.location.reload();
+  };
+}
+
+export function updateWallet(payload) {
+  return {
+    type: ACTION_TYPE_UPDATE_WALLET,
+    payload,
+  };
+}
+
+export function fetchBalance(businessId) {
+  return async (dispatch, getState) => {
+    const { account } = near();
+    dispatch(
+      updateWallet({
+        balance: (await account.getAccountBalance()).available,
+      })
+    );
+  };
+}
+
+'''
+'''--- frontend/src/components/App.js ---
+import React from 'react';
+import { connect } from 'react-redux';
+import * as mapDispatchToProps from 'actions';
+import { ThemeProvider, makeStyles } from '@material-ui/core/styles';
+import { DANGER_COLOR } from 'config';
+import Header from './Header';
+import Home from './Home';
+import LearnMore from './LearnMore';
+import Donate from './Donate';
+import Loader from './Loader';
+import { Router, Route, Switch } from 'react-router-dom';
+import { history } from 'store';
+import themeSelector, { isDarkSelector } from 'selectors/theme';
+import { CssBaseline } from '@material-ui/core';
+
+const useStyles = makeStyles(theme => ({
+  error: { padding: 50, color: DANGER_COLOR },
+}));
+
+function Component({ error, isLoaded, theme, isDark }) {
+  const classes = useStyles();
+
+  React.useEffect(() => {
+    const root = document.documentElement;
+    if (root.classList.contains(isDark ? 'light' : 'dark')) {
+      root.classList.remove(isDark ? 'light' : 'dark');
+      root.classList.add(isDark ? 'dark' : 'light');
+    }
+  }, [isDark]);
+
+  let pane;
+  if (error) {
+    pane = <div className={classes.error}>{error}</div>;
+  } else if (isLoaded) {
+    pane = (
+      <div className="flex-grow">
+        <Header />
+        <Home />
+        <Switch>
+          <Route exact path={'/learn-more'} component={LearnMore} />
+          <Route exact path={'/donate'} component={Donate} />
+        </Switch>
+      </div>
+    );
+  } else {
+    pane = <Loader fullscreen />;
+  }
+  return (
+    <ThemeProvider theme={theme}>
+      <CssBaseline />
+      <Router {...{ history }}>
+        <div>{pane}</div>
+      </Router>
+    </ThemeProvider>
+  );
+}
+
+export default connect(state => {
+  const { app, user } = state;
+  const { isLoaded, error } = app;
+  let err;
+  if (error) {
+    console.log(error);
+    err = error.message || 'Error Loading Application!';
+  }
+
+  return {
+    isLoaded,
+    user,
+    error: err,
+    theme: themeSelector(state),
+    isDark: isDarkSelector(state),
+  };
+}, mapDispatchToProps)(Component);
+
+'''
+'''--- frontend/src/components/Business.js ---
+import React from 'react';
+import { connect } from 'react-redux';
+import * as mapDispatchToProps from 'actions';
+import { makeStyles } from '@material-ui/core/styles';
+import Card from '@material-ui/core/Card';
+import CardActionArea from '@material-ui/core/CardActionArea';
+import CardActions from '@material-ui/core/CardActions';
+import CardContent from '@material-ui/core/CardContent';
+import CardMedia from '@material-ui/core/CardMedia';
+import Button from '@material-ui/core/Button';
+import Typography from '@material-ui/core/Typography';
+import NEAR from 'components/NEAR';
+import sl from 'utils/sl';
+
+const useStyles = makeStyles({
+  root: {
+    '& .MuiCardContent-root': {
+      padding: '16px 16px 0',
+    },
+  },
+  media: {
+    height: 100,
+  },
+});
+
+function Component({ business, donate, accountId, activateWallet }) {
+  const classes = useStyles();
+
+  const onDonate = async () => {
+    if (!accountId) {
+      return sl(
+        'info',
+        'You will be redirected to connect with your near testnet wallet account...',
+        'Please login',
+        activateWallet
+      );
+    }
+    let donation = prompt('Enter NEAR amount?');
+    if (donation === null) {
+      return;
+    }
+    donation = parseInt(donation);
+    if (!donation) {
+      return await onDonate();
+    }
+    await donate(business.id, donation);
+  };
+
+  return (
+    <Card className={classes.root}>
+      <CardActionArea>
+        <CardMedia
+          className={classes.media}
+          image={business.image}
+          title={business.name}
+        />
+        <CardContent>
+          <Typography gutterBottom variant="h5" component="h2">
+            {business.name}
+          </Typography>
+          {/*
+          <Typography gutterBottom variant="p" component="p">
+            {business.description}
+          </Typography>
+          */}
+          <Typography variant="body2" color="textSecondary" component="p">
+            <NEAR amount={business.totalDonations} /> /{' '}
+            <NEAR amount={business.totalMatchedDonations} /> N
+          </Typography>
+        </CardContent>
+      </CardActionArea>
+      <CardActions>
+        <Button size="small" color="primary" onClick={onDonate}>
+          Donate
+        </Button>
+        {/*
+        <Button size="small" color="primary">
+          Learn More
+        </Button>
+        */}
+      </CardActions>
+    </Card>
+  );
+}
+
+export default connect(({ wallet: { accountId } }) => {
+  return { accountId };
+}, mapDispatchToProps)(Component);
+
+'''
+'''--- frontend/src/components/Donate.js ---
+import React from 'react';
+import { connect } from 'react-redux';
+import * as mapDispatchToProps from 'actions';
+import { makeStyles } from '@material-ui/core/styles';
+import {
+  Button,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
+  TextField,
+} from '@material-ui/core';
+import { getRegistryContract } from 'utils/wallet';
+import Promise from 'bluebird';
+import xhr from 'utils/xhr';
+import sl from 'utils/sl';
+
+const useStyles = makeStyles(theme => ({
+  button: {
+    width: 130,
+    margin: '0 5px;',
+  },
+}));
+
+function Component({
+  navigate,
+  match: {
+    params: { listingHash },
+  },
+}) {
+  const classes = useStyles();
+  const [reason, setReason] = React.useState('');
+  const [amount, setAmount] = React.useState(50);
+
+  const handleClose = () => {
+    navigate('/');
+  };
+
+  const handleSubmit = async() => {
+    
+  };
+
+  return (
+    <Dialog
+      open={true}
+      onClose={handleClose}
+      aria-labelledby="dialog-title"
+      aria-describedby="dialog-description"
+      className={classes.root}
+      fullWidth
+    >
+      <DialogTitle id="dialog-title">
+        Challenge POI (work in progress)
+      </DialogTitle>
+      <DialogContent>
+        <DialogContentText id="dialog-description">
+          Describe the issues with this Point of Interest
+        </DialogContentText>
+        <div className="flex flex--justify-center" style={{ marginBottom: 20 }}>
+          <TextField
+            id="amount"
+            label="FOAM"
+            type="number"
+            InputLabelProps={{
+              shrink: true,
+            }}
+            placeholder={'50 FOAM minimum...'}
+            value={amount}
+            onChange={e => setAmount(e.target.value)}
+            fullWidth
+          />
+        </div>
+        <div className="flex flex--justify-center">
+          <TextField
+            id="reason"
+            label="Reason"
+            type="text"
+            InputLabelProps={{
+              shrink: true,
+            }}
+            placeholder={'Say something here...'}
+            value={reason}
+            onChange={e => setReason(e.target.value)}
+            fullWidth
+            multiline
+            rows="2"
+          />
+        </div>
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={handleClose} color="default">
+          Cancel
+        </Button>
+        <Button onClick={handleSubmit} color="primary">
+          Challenge
+        </Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
+
+export default connect(state => {
+  return {};
+}, mapDispatchToProps)(Component);
+
+'''
+'''--- frontend/src/components/Donations.js ---
+import React from 'react';
+import { connect } from 'react-redux';
+import * as mapDispatchToProps from 'actions';
+import { makeStyles } from '@material-ui/core/styles';
+import { Paper } from '@material-ui/core';
+import Chart from 'chart.js';
+
+const useStyles = makeStyles({
+  root: {
+    padding: '50px 20px',
+  },
+});
+
+function Component({ x, totalDonations, totalMatchedDonations }) {
+  const classes = useStyles();
+  const chartRef = React.useRef();
+
+  React.useEffect(() => {
+    const chart = new Chart(chartRef.current.getContext('2d'), {
+      type: 'bar',
+      data: {
+        labels: 'Business',
+        datasets: [
+          {
+            label: 'Actual',
+            data: totalDonations,
+            backgroundColor: '#fff',
+            borderColor: '#fff',
+            fill: false,
+          },
+          {
+            label: 'Matched',
+            data: totalMatchedDonations,
+            backgroundColor: '#fc0',
+            borderColor: '#fff',
+            fill: false,
+          },
+        ],
+      },
+      options: {
+        maintainAspectRatio: false,
+        legend: {
+          // display: false,
+          labels: {
+            fontColor: '#ddd',
+          },
+          onClick(e) {
+            e.stopPropagation();
+          },
+        },
+        scales: {
+          xAxes: [{ gridLines: {}, ticks: { fontColor: '#fff' } }],
+          yAxes: [{ gridLines: {}, ticks: { fontColor: '#fff' } }],
+        },
+      },
+    });
+    chart.canvas.parentNode.style.height = '450px';
+    // }, [chartRef]); // eslint-disable-line react-hooks/exhaustive-deps
+    //
+    // React.useEffect(() => {
+    chart.data.labels = x;
+    chart.data.datasets[0].data = totalDonations;
+    chart.data.datasets[1].data = totalMatchedDonations;
+    chart.update();
+  }, [totalDonations, totalMatchedDonations]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  return (
+    <Paper className={classes.root}>
+      <canvas ref={chartRef}></canvas>
+    </Paper>
+  );
+}
+
+export default connect((state, { businesses }) => {
+  return {
+    x: businesses.map(b => b.name),
+    totalDonations: businesses.map(b => b.totalDonations / 10 ** 24),
+    totalMatchedDonations: businesses.map(
+      b => b.totalMatchedDonations / 10 ** 24
+    ),
+  };
+}, mapDispatchToProps)(Component);
+
+'''
+'''--- frontend/src/components/Header.js ---
+import React from 'react';
+import { connect } from 'react-redux';
+import * as mapDispatchToProps from 'actions';
+import { makeStyles } from '@material-ui/core/styles';
+import {
+  IconButton,
+  Tooltip,
+  AppBar,
+  Typography,
+  Toolbar,
+  Button,
+} from '@material-ui/core';
+import MenuIcon from '@material-ui/icons/Menu';
+import LightIcon from '@material-ui/icons/Brightness7';
+import DarkIcon from '@material-ui/icons/Brightness4';
+import { isDarkSelector } from 'selectors/theme';
+import { APP_TITLE } from 'config';
+import NEAR from 'components/NEAR';
+
+const useStyles = makeStyles(theme => ({
+  account: {
+    color: 'white',
+    marginRight: 10,
+  },
+  balance: {
+    color: 'white',
+    marginRight: 10,
+  },
+}));
+
+function Component({
+  toggleTheme,
+  isDark,
+  isLoggedIn,
+  activateWallet,
+  deactivateWallet,
+  accountId,
+  balance,
+}) {
+  const classes = useStyles();
+
+  return (
+    <AppBar position="fixed" color="inherit">
+      <Toolbar color="inherit">
+        <IconButton edge="start" color="inherit" aria-label="menu">
+          <MenuIcon />
+        </IconButton>
+        <Typography
+          variant="h6"
+          className={'flex flex--justify-center flex--grow'}
+        >
+          {APP_TITLE}
+        </Typography>
+
+        <Button
+          onClick={isLoggedIn ? deactivateWallet : activateWallet}
+          color="secondary"
+        >
+          {isLoggedIn ? (
+            <>
+              <div className={classes.account}>{accountId}</div>{' '}
+              <div className={classes.balance}>
+                (<NEAR amount={balance} /> N)
+              </div>{' '}
+              <div>Sign Out</div>{' '}
+            </>
+          ) : (
+            <div>Connect Near Account</div>
+          )}
+        </Button>
+
+        <Tooltip title="Toggle light/dark theme">
+          <IconButton
+            onClick={toggleTheme}
+            color="inherit"
+            aria-label="Toggle light/dark theme"
+          >
+            {isDark ? <LightIcon /> : <DarkIcon />}
+          </IconButton>
+        </Tooltip>
+      </Toolbar>
+    </AppBar>
+  );
+}
+
+const mapStateToProps = state => {
+  const {
+    wallet: { isLoggedIn, accountId, balance },
+  } = state;
+  return {
+    isDark: isDarkSelector(state),
+    isLoggedIn,
+    accountId,
+    balance,
+  };
+};
+
+export default connect(mapStateToProps, mapDispatchToProps)(Component);
+
+'''
+'''--- frontend/src/components/Home.js ---
+import React from 'react';
+import { connect } from 'react-redux';
+import {Link} from 'react-router-dom';
+import * as mapDispatchToProps from 'actions';
+import { makeStyles } from '@material-ui/core/styles';
+import clsx from 'clsx';
+import { businessesSelector } from 'selectors/data';
+import Loader from './Loader';
+import Business from './Business';
+import Donations from './Donations';
+
+const useStyles = makeStyles(theme => ({
+  container: {
+    position: 'relative',
+  },
+  paper: { marginTop: 50, padding: 50 },
+  paperInactive: {
+    opacity: 0.5,
+    pointerEvents: 'none',
+  },
+  bodyContainer: {
+    marginTop: 100,
+    width: 960,
+    margin: '0 auto',
+  },
+  sectionsContainer: {
+    '& > div': { width: '50%', padding: 10 },
+  },
+  loader: {
+    position: 'absolute',
+    top: '50%',
+  },
+  businesses: {
+    display: 'grid',
+    gridTemplateColumns: '1fr 1fr',
+    gridRowGap: '5px',
+    gridColumnGap: '5px',
+  },
+}));
+
+function Component({
+  isWorking,
+  wallet,
+  activateWallet,
+  isLoggedIn,
+  businesses,
+}) {
+  const classes = useStyles();
+
+  return (
+    <div className={clsx('flex flex--justify-center', classes.container)}>
+      <div className={clsx('flex', 'flex--column', classes.bodyContainer)}>
+        <h1 className="flex flex--grow flex--justify-center">
+          Round #1 Funding Pledge: $100,000
+        </h1>
+        <br />
+  <p>Help save these small businesses by donating below. We use quadratic funding to match the final allocations so every small contribution goes a long way towards saving these small businesses. {/*Click <Link to='/learn-more' style={{color: '#fc0'}}>here</Link> to learn more about quadratic funding.*/}</p>
+        <br />
+        <div className={clsx('flex', classes.sectionsContainer)}>
+          <div>
+            <div className={clsx(classes.businesses)}>
+              {businesses.map(b => (
+                <Business key={b.id} business={b} />
+              ))}
+            </div>
+          </div>
+          <div>
+            <Donations businesses={businesses} />
+          </div>
+        </div>
+      </div>
+
+      {!isWorking ? null : (
+        <div className={classes.loader}>
+          <Loader />
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default connect(state => {
+  const {
+    wallet: { isLoggedIn },
+  } = state;
+  return {
+    isLoggedIn,
+    businesses: businessesSelector(state),
+  };
+}, mapDispatchToProps)(Component);
+
+'''
+'''--- frontend/src/components/LearnMore.js ---
+import React from 'react';
+import { connect } from 'react-redux';
+import * as mapDispatchToProps from 'actions';
+import { makeStyles } from '@material-ui/core/styles';
+import {
+  Button,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
+  TextField,
+} from '@material-ui/core';
+import { getRegistryContract } from 'utils/wallet';
+import Promise from 'bluebird';
+import sl from 'utils/sl';
+
+const useStyles = makeStyles(theme => ({
+  button: {
+    width: 130,
+    margin: '0 5px;',
+  },
+}));
+
+function Component({
+  navigate,
+  match: {
+    params: { listingHash },
+  },
+}) {
+  const classes = useStyles();
+  const [reason, setReason] = React.useState('');
+  const [amount, setAmount] = React.useState(50);
+
+  const handleClose = () => {
+    navigate('/');
+  };
+
+  const handleSubmit = async() => {
+
+  };
+
+  return (
+    <Dialog
+      open={true}
+      onClose={handleClose}
+      aria-labelledby="dialog-title"
+      aria-describedby="dialog-description"
+      className={classes.root}
+      fullWidth
+    >
+      <DialogTitle id="dialog-title">
+        Challenge POI (work in progress)
+      </DialogTitle>
+      <DialogContent>
+        <DialogContentText id="dialog-description">
+          Describe the issues with this Point of Interest
+        </DialogContentText>
+        <div className="flex flex--justify-center" style={{ marginBottom: 20 }}>
+          <TextField
+            id="amount"
+            label="FOAM"
+            type="number"
+            InputLabelProps={{
+              shrink: true,
+            }}
+            placeholder={'1 minimum...'}
+            value={amount}
+            onChange={e => setAmount(e.target.value)}
+            fullWidth
+          />
+        </div>
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={handleClose} color="default">
+          Cancel
+        </Button>
+        <Button onClick={handleSubmit} color="primary">
+          Challenge
+        </Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
+
+export default connect(state => {
+  return {};
+}, mapDispatchToProps)(Component);
+
+'''
+'''--- frontend/src/components/Loader.js ---
+import React from 'react';
+import CircularProgress from '@material-ui/core/CircularProgress';
+
+export default function({ opacity = 1, fullscreen }) {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        justifyContent: 'center',
+        alignItems: 'center',
+        height: '100%',
+        ...(fullscreen
+          ? {
+              position: 'fixed',
+              left: 0,
+              right: 0,
+              top: 0,
+              bottom: 0,
+            }
+          : {}),
+        zIndex: 1000,
+        opacity,
+      }}
+    >
+      <div style={{ position: 'relative' }}>
+        <CircularProgress
+          style={{ position: 'relative' }}
+          left={0}
+          top={0}
+          status="loading"
+        />
+      </div>
+    </div>
+  );
+}
+
+'''
+'''--- frontend/src/components/NEAR.js ---
+import React from 'react';
+// import { formatNearAmount } from 'near-api-js/lib/utils/format';
+
+export default ({ amount }) => {
+  return <span>{(amount / 10 ** 24).toFixed(2)}</span>;
+  // return <span>{formatNearAmount(amount, 2)}</span>;
+};
+
+'''
+'''--- frontend/src/config/actions.js ---
+export const ACTION_TYPE_TOGGLE_THEME = 'ACTION_TYPE_TOGGLE_THEME';
+export const ACTION_TYPE_UPDATE_WALLET = 'ACTION_TYPE_UPDATE_WALLET';
+export const ACTION_TYPE_UPDATE_DATA = 'ACTION_TYPE_UPDATE_DATA';
+
+'''
+'''--- frontend/src/config/base.js ---
+export const APP_TITLE = 'Downtown Stimulus';
+export const SECONDARY_COLOR = '#fc0';
+export const DANGER_COLOR = SECONDARY_COLOR;
+export const { REACT_APP_IS_DEV: IS_DEV } = process.env;
+
+'''
+'''--- frontend/src/config/index.js ---
+export * from './base';
+export * from './actions';
+export * from './ui';
+
+'''
+'''--- frontend/src/config/ui.js ---
+
+'''
+'''--- frontend/src/config/wallet.js ---
+export const CONTRACT_NAME = 'downtown-stimulus-downtown-stimulus';
+export const VIEW_METHODS = ['get_businesses', 'get_business', 'get_owner'];
+export const CHANGE_METHODS = ['register_business', 'donate'];
+
+export default function(env) {
+  switch (env) {
+    case 'production':
+    case 'mainnet':
+      return {
+        networkId: 'mainnet',
+        nodeUrl: 'https://rpc.mainnet.near.org',
+        contractName: CONTRACT_NAME,
+        walletUrl: 'https://wallet.mainnet.near.org',
+        helperUrl: 'https://helper.mainnet.near.org',
+      };
+    case 'development':
+    case 'testnet':
+      return {
+        networkId: 'default',
+        nodeUrl: 'https://rpc.testnet.near.org',
+        contractName: CONTRACT_NAME,
+        walletUrl: 'https://wallet.testnet.near.org',
+        helperUrl: 'https://helper.testnet.near.org',
+      };
+    case 'devnet':
+      return {
+        networkId: 'devnet',
+        nodeUrl: 'https://rpc.devnet.near.org',
+        contractName: CONTRACT_NAME,
+        walletUrl: 'https://wallet.devnet.near.org',
+        helperUrl: 'https://helper.devnet.near.org',
+      };
+    case 'betanet':
+      return {
+        networkId: 'betanet',
+        nodeUrl: 'https://rpc.betanet.near.org',
+        contractName: CONTRACT_NAME,
+        walletUrl: 'https://wallet.betanet.near.org',
+        helperUrl: 'https://helper.betanet.near.org',
+      };
+    case 'local':
+      return {
+        networkId: 'local',
+        nodeUrl: 'http://localhost:3030',
+        keyPath: `${process.env.HOME}/.near/validator_key.json`,
+        walletUrl: 'http://localhost:4000/wallet',
+        contractName: CONTRACT_NAME,
+      };
+    case 'test':
+    case 'ci':
+      return {
+        networkId: 'shared-test',
+        nodeUrl: 'https://rpc.ci-testnet.near.org',
+        contractName: CONTRACT_NAME,
+        masterAccount: 'test.near',
+      };
+    case 'ci-betanet':
+      return {
+        networkId: 'shared-test-staging',
+        nodeUrl: 'https://rpc.ci-betanet.near.org',
+        contractName: CONTRACT_NAME,
+        masterAccount: 'test.near',
+      };
+    default:
+      throw Error(
+        `Unconfigured environment '${env}'. Can be configured in src/config.js.`
+      );
+  }
+}
+
+'''
+'''--- frontend/src/contracts.js ---
+import { Contract } from 'utils/wallet';
+
+export const COUNTER_CONTRACT = new Contract();
+
+'''
+'''--- frontend/src/index.js ---
+import 'nprogress/nprogress.css';
+import './styles';
+
+import React from 'react';
+import { render } from 'react-dom';
+import { Provider } from 'react-redux';
+import * as serviceWorker from './serviceWorker';
+import store from 'store';
+import App from 'components/App';
+
+(async () => {
+  document.documentElement.classList.remove('anim-loading');
+  document.getElementById('loader-container').remove();
+  const root = document.createElement('div');
+  root.setAttribute('id', 'root');
+  document.body.appendChild(root);
+
+  render(
+    <Provider store={store}>
+      <App />
+    </Provider>,
+    document.getElementById('root')
+  );
+})();
+
+// If you want your app to work offline and load faster, you can change
+// unregister() to register() below. Note this comes with some pitfalls.
+// Learn more about service workers: https://bit.ly/CRA-PWA
+serviceWorker.unregister();
+
+'''
+'''--- frontend/src/reducers/app.js ---
+import cache from 'utils/cache';
+import { ACTION_TYPE_TOGGLE_THEME } from 'config';
+
+const DEFAULT_STATE = {
+  isLoaded: false,
+  error: null,
+  theme: cache('theme') || 'dark',
+};
+
+export default (state = DEFAULT_STATE, action) => {
+  switch (action.type) {
+    case ACTION_TYPE_TOGGLE_THEME: {
+      return Object.assign({}, state, {
+        theme: state.theme === 'dark' ? 'light' : 'dark',
+      });
+    }
+    default:
+      return state;
+  }
+};
+
+'''
+'''--- frontend/src/reducers/data.js ---
+import { ACTION_TYPE_UPDATE_DATA } from 'config';
+
+const DEFAULT_STATE = {
+  businesses: {},
+};
+
+export default (state = DEFAULT_STATE, action) => {
+  switch (action.type) {
+    case ACTION_TYPE_UPDATE_DATA: {
+      return Object.assign({}, state, action.payload);
+    }
+
+    default:
+      return state;
+  }
+};
+
+'''
+'''--- frontend/src/reducers/index.js ---
+import { combineReducers } from 'redux';
+import * as asyncInitialState from 'redux-async-initial-state';
+import app from './app';
+import wallet from './wallet';
+import data from './data';
+
+export default asyncInitialState.outerReducer(
+  combineReducers({
+    app,
+    wallet,
+    data,
+    asyncInitialState: asyncInitialState.innerReducer, // last
+  })
+);
+
+'''
+'''--- frontend/src/reducers/wallet.js ---
+import { ACTION_TYPE_UPDATE_NEAR } from 'config';
+
+const DEFAULT_STATE = {};
+
+export default (state = DEFAULT_STATE, action) => {
+  switch (action.type) {
+    case ACTION_TYPE_UPDATE_NEAR: {
+      return Object.assign({}, state, action.payload);
+    }
+
+    default:
+      return state;
+  }
+};
+
+'''
+'''--- frontend/src/selectors/data.js ---
+import { createSelector } from 'reselect';
+
+export const businessesSelector = createSelector(
+  state => state.data.businesses,
+  businesses => Object.values(businesses)
+);
+
+'''
+'''--- frontend/src/selectors/theme.js ---
+import { createMuiTheme } from '@material-ui/core/styles';
+import { SECONDARY_COLOR } from 'config';
+import { createSelector } from 'reselect';
+
+export const isDarkSelector = createSelector(
+  state => state.app.theme,
+  theme => theme === 'dark'
+);
+
+export default createSelector(isDarkSelector, isDark =>
+  createMuiTheme({
+    typography: {
+      fontFamily: ['Work Sans', 'sans-serif'].join(','),
+    },
+    palette: {
+      type: isDark ? 'dark' : 'light',
+      primary: {
+        main: isDark ? '#ffffff' : '#373836',
+      },
+      secondary: {
+        main: SECONDARY_COLOR,
+      },
+    },
+    overrides: {
+      MuiButton: {
+        root: {
+          borderRadius: 2,
+        },
+      },
+    },
+  })
+);
+
+'''
+'''--- frontend/src/serviceWorker.js ---
+// This optional code is used to register a service worker.
+// register() is not called by default.
+
+// This lets the app load faster on subsequent visits in production, and gives
+// it offline capabilities. However, it also means that developers (and users)
+// will only see deployed updates on subsequent visits to a page, after all the
+// existing tabs open on the page have been closed, since previously cached
+// resources are updated in the background.
+
+// To learn more about the benefits of this model and instructions on how to
+// opt-in, read https://bit.ly/CRA-PWA
+
+const isLocalhost = Boolean(
+  window.location.hostname === 'localhost' ||
+    // [::1] is the IPv6 localhost address.
+    window.location.hostname === '[::1]' ||
+    // 127.0.0.0/8 are considered localhost for IPv4.
+    window.location.hostname.match(
+      /^127(?:\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)){3}$/
+    )
+);
+
+export function register(config) {
+  if (process.env.NODE_ENV === 'production' && 'serviceWorker' in navigator) {
+    // The URL constructor is available in all browsers that support SW.
+    const publicUrl = new URL(process.env.PUBLIC_URL, window.location.href);
+    if (publicUrl.origin !== window.location.origin) {
+      // Our service worker won't work if PUBLIC_URL is on a different origin
+      // from what our page is served on. This might happen if a CDN is used to
+      // serve assets; see https://github.com/facebook/create-react-app/issues/2374
+      return;
+    }
+
+    window.addEventListener('load', () => {
+      const swUrl = `${process.env.PUBLIC_URL}/service-worker.js`;
+
+      if (isLocalhost) {
+        // This is running on localhost. Let's check if a service worker still exists or not.
+        checkValidServiceWorker(swUrl, config);
+
+        // Add some additional logging to localhost, pointing developers to the
+        // service worker/PWA documentation.
+        navigator.serviceWorker.ready.then(() => {
+          console.log(
+            'This web app is being served cache-first by a service ' +
+              'worker. To learn more, visit https://bit.ly/CRA-PWA'
+          );
+        });
+      } else {
+        // Is not localhost. Just register service worker
+        registerValidSW(swUrl, config);
+      }
+    });
+  }
+}
+
+function registerValidSW(swUrl, config) {
+  navigator.serviceWorker
+    .register(swUrl)
+    .then(registration => {
+      registration.onupdatefound = () => {
+        const installingWorker = registration.installing;
+        if (installingWorker == null) {
+          return;
+        }
+        installingWorker.onstatechange = () => {
+          if (installingWorker.state === 'installed') {
+            if (navigator.serviceWorker.controller) {
+              // At this point, the updated precached content has been fetched,
+              // but the previous service worker will still serve the older
+              // content until all client tabs are closed.
+              console.log(
+                'New content is available and will be used when all ' +
+                  'tabs for this page are closed. See https://bit.ly/CRA-PWA.'
+              );
+
+              // Execute callback
+              if (config && config.onUpdate) {
+                config.onUpdate(registration);
+              }
+            } else {
+              // At this point, everything has been precached.
+              // It's the perfect time to display a
+              // "Content is cached for offline use." message.
+              console.log('Content is cached for offline use.');
+
+              // Execute callback
+              if (config && config.onSuccess) {
+                config.onSuccess(registration);
+              }
+            }
+          }
+        };
+      };
+    })
+    .catch(error => {
+      console.error('Error during service worker registration:', error);
+    });
+}
+
+function checkValidServiceWorker(swUrl, config) {
+  // Check if the service worker can be found. If it can't reload the page.
+  fetch(swUrl, {
+    headers: { 'Service-Worker': 'script' },
+  })
+    .then(response => {
+      // Ensure service worker exists, and that we really are getting a JS file.
+      const contentType = response.headers.get('content-type');
+      if (
+        response.status === 404 ||
+        (contentType != null && contentType.indexOf('javascript') === -1)
+      ) {
+        // No service worker found. Probably a different app. Reload the page.
+        navigator.serviceWorker.ready.then(registration => {
+          registration.unregister().then(() => {
+            window.location.reload();
+          });
+        });
+      } else {
+        // Service worker found. Proceed as normal.
+        registerValidSW(swUrl, config);
+      }
+    })
+    .catch(() => {
+      console.log(
+        'No internet connection found. App is running in offline mode.'
+      );
+    });
+}
+
+export function unregister() {
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.ready.then(registration => {
+      registration.unregister();
+    });
+  }
+}
+
+'''
+'''--- frontend/src/store/index.js ---
+import { createStore, applyMiddleware, compose } from 'redux';
+import thunk from 'redux-thunk';
+import reducer from 'reducers';
+import * as asyncInitialState from 'redux-async-initial-state';
+import loadStore from './load';
+import { createBrowserHistory } from 'history';
+
+const storeCreator = asyncInitialState.middleware(getState =>
+  loadStore.load(getState)
+);
+
+export const store = (window.store = createStore(
+  reducer,
+  compose(applyMiddleware(thunk, storeCreator)) /// storeCreator should come last so dispatch works well i.e. returns promises
+));
+
+export const basename = '/';
+
+export const history = createBrowserHistory({ basename });
+
+store.dispatch({ type: 'noop' }); // required for some reason ??
+
+export default store;
+
+'''
+'''--- frontend/src/store/load/data.js ---
+import { sleep } from 'utils';
+import { load } from 'utils/wallet';
+import { parseBusinesses } from 'utils/data';
+
+export default Base =>
+  class extends Base {
+    async loadData() {
+      const {
+        // keyStore,
+        wallet,
+        contract,
+        accountId,
+        account,
+      } = await load();
+      const isLoggedIn = await wallet.isSignedIn();
+      let balance = 0;
+      if (isLoggedIn) {
+        try {
+          balance = (await account.getAccountBalance()).available;
+        } catch (e) {
+          if (~e.message.search('does not exist while viewing')) {
+            // wallet.signOut();
+            // await sleep(500);
+            // keyStore.clear();
+            window.localStorage.clear();
+            await sleep(500);
+            window.location.reload();
+            return;
+          } else {
+            throw e;
+          }
+        }
+      }
+      this.state.wallet = {
+        isLoggedIn,
+        accountId,
+        balance,
+      };
+      this.state.data.businesses = parseBusinesses(
+        await contract.get_businesses()
+      );
+    }
+  };
+
+'''
+'''--- frontend/src/store/load/index.js ---
+import compose from 'utils/compose';
+import LoadData from './data';
+import MatchLocationPath from './match-location-path';
+
+class Init {
+  async load(getState) {
+    this.state = getState();
+
+    try {
+      await this.loadData();
+      // await this.matchLocationPath();
+    } catch (error) {
+      this.state.app.error = error;
+    }
+
+    this.state.app.isLoaded = true;
+
+    return this.state;
+  }
+}
+
+class Store extends compose([Init, LoadData, MatchLocationPath]) {}
+
+export default new Store();
+
+'''
+'''--- frontend/src/store/load/match-location-path.js ---
+// import xhr from 'utils/xhr';
+// import { getMatchedUrl } from 'utils/location';
+
+export default Base =>
+  class extends Base {
+    async matchLocationPath() {
+      // const matchedUrl = getMatchedUrl();
+      switch (true) {
+        default:
+      }
+    }
+  };
+
+'''
+'''--- frontend/src/styles/index.js ---
+import 'nprogress/nprogress.css';
+import './index.scss';
+
+'''
+'''--- frontend/src/utils/cache.js ---
+export default function cache(k, v) {
+  switch (arguments.length) {
+    case 2:
+      if (v === null) return window.localStorage.removeItem(k);
+      return window.localStorage.setItem(k, JSON.stringify(v));
+
+    case 1:
+      try {
+        return JSON.parse(window.localStorage.getItem(k));
+      } catch (e) {
+        return null;
+      }
+
+    default:
+      return;
+  }
+}
+
+'''
+'''--- frontend/src/utils/clone.js ---
+export default obj => JSON.parse(JSON.stringify(obj));
+
+'''
+'''--- frontend/src/utils/compose.js ---
+export default function(fns) {
+  return fns.reduce((a, b) => b(a));
+}
+
+'''
+'''--- frontend/src/utils/data.js ---
+export function clr(contributions) {
+  const sumOfSquareRoots = contributions.reduce(
+    (sum, contribution) => sum + Math.sqrt(contribution),
+    0
+  );
+
+  const totalContributions = contributions.reduce(
+    (sum, contribution) => sum + contribution,
+    0
+  );
+
+  return totalContributions + Math.pow(sumOfSquareRoots, 2);
+}
+
+export function parseBusiness(b) {
+  b.totalDonations = b.donations.reduce((sum, d) => sum + d, 0);
+  b.totalMatchedDonations = clr(b.donations);
+  return b;
+}
+
+export function parseBusinesses(businesses) {
+  const ret = {};
+  Object.entries(businesses).forEach(([id, b]) => {
+    id = parseInt(id);
+    b.id = id;
+    ret[id] = parseBusiness(b);
+  });
+  return ret;
+}
+
+// (function main() {
+//   const clr_prediction_curve = [
+//     6496.77452758055,
+//     6548.9579218522,
+//     6619.66642447794,
+//     6729.55599254295,
+//     6838.96540535043,
+//     6906.91845659433,
+//   ];
+//
+//   console.log(predictCLRMatch(clr_prediction_curve, 50));
+// })();
+//
+// export function predictCLRMatch(clr_prediction_curve, amount) {
+//   if (amount > 10000) {
+//     amount = 10000;
+//   }
+//
+//   let predicted_clr = 0;
+//
+//   const contributions_axis = [0, 1, 10, 100, 1000, 10000];
+//
+//   let index = 0;
+//
+//   if (isNaN(amount)) {
+//     predicted_clr = clr_prediction_curve[index];
+//   } else if (contributions_axis.indexOf(amount) >= 0) {
+//     index = contributions_axis.indexOf(amount);
+//     predicted_clr = clr_prediction_curve[index];
+//   } else {
+//     let x_lower = 0;
+//     let x_upper = 0;
+//     let y_lower = 0;
+//     let y_upper = 0;
+//
+//     if (0 < amount && amount < 1) {
+//       x_lower = 0;
+//       x_upper = 1;
+//       y_lower = clr_prediction_curve[0];
+//       y_upper = clr_prediction_curve[1];
+//     } else if (1 < amount && amount < 10) {
+//       x_lower = 1;
+//       x_upper = 10;
+//       y_lower = clr_prediction_curve[1];
+//       y_upper = clr_prediction_curve[2];
+//     } else if (10 < amount && amount < 100) {
+//       x_lower = 10;
+//       x_upper = 100;
+//       y_lower = clr_prediction_curve[2];
+//       y_upper = clr_prediction_curve[3];
+//     } else if (100 < amount && amount < 1000) {
+//       x_lower = 100;
+//       x_upper = 1000;
+//       y_lower = clr_prediction_curve[3];
+//       y_upper = clr_prediction_curve[4];
+//     } else {
+//       x_lower = 1000;
+//       x_upper = 10000;
+//       y_lower = clr_prediction_curve[4];
+//       y_upper = clr_prediction_curve[5];
+//     }
+//
+//     predicted_clr = lerp(x_lower, x_upper, y_lower, y_upper, amount);
+//   }
+//
+//   return {
+//     clr_match_prediction: predicted_clr.toFixed(2),
+//     clr_increase: (predicted_clr - clr_prediction_curve[0]).toFixed(2),
+//   };
+// }
+//
+// function lerp(x_lower, x_upper, y_lower, y_upper, x) {
+//   return y_lower + ((y_upper - y_lower) * (x - x_lower)) / (x_upper - x_lower);
+// }
+
+'''
+'''--- frontend/src/utils/index.js ---
+import Promise from 'bluebird';
+
+export function listToRedux(list) {
+  const ids = [];
+  const data = {};
+  list.forEach(d => {
+    ids.push(d._id);
+    data[d._id] = d;
+  });
+  return { ids, data };
+}
+
+export const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+export const sortAndCopy = (prop, desc = true) => {
+  const r1 = desc ? -1 : 1;
+  const r2 = desc ? 1 : -1;
+  return data =>
+    data
+      .sort((a, b) => {
+        if (a[prop] < b[prop]) return r1;
+        if (a[prop] > b[prop]) return r2;
+        return 0;
+      })
+      .map(x => x);
+};
+
+export const updateEntry = (data, id, update) => {
+  for (let i = 0; i < data.length; i++) {
+    const entry = data[i];
+    if (entry.id === id) {
+      Object.entries(update).forEach(([k, v]) => {
+        entry[k] = v;
+      });
+      break;
+    }
+  }
+  return data;
+};
+
+'''
+'''--- frontend/src/utils/location.js ---
+export const local = window.location.hostname === 'localhost';
+
+export const getMatchedUrl = () => window.location.pathname.replace('/', '');
+
+'''
+'''--- frontend/src/utils/sl.js ---
+import sl from 'sweetalert/dist/sweetalert-dev.js';
+// import swal from 'sweetalert/dev/sweetalert.es6.js';
+import 'sweetalert/dist/sweetalert.css';
+import Promise from 'bluebird';
+
+const noop = () => {};
+
+const notify = (type, msg, title, done = noop, moreOpts = {}) => {
+  if ('error' === type) msg = msg.responseText || msg.message || msg;
+
+  const opts = {
+    title: title || type.toUpperCase() + '!',
+    text: msg,
+    type,
+  };
+
+  for (const k in moreOpts) {
+    if (moreOpts.hasOwnProperty(k)) opts[k] = moreOpts[k];
+  }
+
+  opts.confirmButtonColor = {
+    success: '#A5DC86',
+    info: '##C9DAE1',
+    warning: '#DD6B55',
+    error: '#DD6B55',
+  }[type];
+
+  sl(opts, done);
+};
+
+export const showInputError = sl.showInputError;
+
+export const slPrompt = async(msg, title, fn) => {
+  await new Promise(resolve =>
+    notify('warning', msg, title, resolve, {
+      showCancelButton: true,
+      closeOnConfirm: false,
+    })
+  );
+
+  try {
+    await fn();
+    sl.close();
+  } catch (err) {
+    notify('error', err);
+  }
+};
+
+export const warn = (title, fn) => {
+  notify('warning', 'This action is irreversible', title, fn, {
+    showCancelButton: true,
+  });
+};
+
+export default notify;
+
+'''
+'''--- frontend/src/utils/wallet.js ---
+import * as nearlib from 'near-api-js';
+import getConfig, { VIEW_METHODS, CHANGE_METHODS } from 'config/wallet';
+
+const cache = {};
+
+export default function() {
+  return cache;
+}
+
+export async function load() {
+  const nearConfig = getConfig(process.env.NEAR_ENV || 'development');
+  // console.log('nearConfig', nearConfig);
+
+  const keyStore = new nearlib.keyStores.BrowserLocalStorageKeyStore();
+
+  // Initializing connection to the NEAR DevNet.
+  const near = await nearlib.connect(
+    Object.assign(
+      {
+        deps: {
+          keyStore,
+        },
+      },
+      nearConfig
+    )
+  );
+
+  // Needed to access wallet login
+  const walletAccount = new nearlib.WalletAccount(near);
+
+  // Getting the Account ID. If unauthorized yet, it's just empty string.
+  const accountId = walletAccount.getAccountId();
+
+  // Initializing our contract APIs by contract name and configuration.
+  const account = await new nearlib.Account(near.connection, accountId);
+  // window.walletAccount = walletAccount;
+  // window.account = account;
+  const contract = await new nearlib.Contract(
+    account,
+    nearConfig.contractName,
+    {
+      // View methods are read only. They don't modify the state, but usually return some value.
+      viewMethods: VIEW_METHODS,
+      // Change methods can modify the state. But you don't receive the returned value when called.
+      changeMethods: CHANGE_METHODS,
+      // Sender is the account ID to initialize transactions.
+      sender: accountId,
+    }
+  );
+
+  // console.log({
+  //   nearConfig,
+  //   near,
+  //   wallet: walletAccount,
+  //   accountId,
+  //   account,
+  //   contract,
+  // });
+
+  Object.entries({
+    nearConfig,
+    near,
+    wallet: walletAccount,
+    accountId,
+    account,
+    contract,
+    keyStore,
+  }).forEach(([k, v]) => {
+    cache[k] = v;
+  });
+
+  return cache;
+}
+
+'''
+'''--- frontend/src/utils/xhr.js ---
+import NProgress from 'nprogress';
+import Promise from 'bluebird';
+import fetch from 'unfetch';
+import { stringify } from 'query-string';
+import cache from './cache';
+
+export function xhr(method, url, payload, headers = {}) {
+  method = method.toUpperCase();
+
+  const opts = {
+    credentials: 'omit',
+    method,
+    mode: 'cors',
+    // referrerPolicy: 'no-referrer-when-downgrade',
+    headers: {
+      accept: 'application/json',
+      'accept-language': 'en-GB,en-US;q=0.9,en;q=0.8',
+      'content-type': 'application/json',
+      // 'sec-fetch-mode': 'cors',
+      // 'sec-fetch-site': 'same-site',
+      ...headers,
+    },
+  };
+
+  if (payload) {
+    if ('GET' === method) {
+      url += `?${stringify(payload, {
+        arrayFormat: 'none',
+      })}`;
+    } else {
+      if (
+        opts.headers['Content-Type'] &&
+        -1 !== opts.headers['Content-Type'].search('www')
+      ) {
+        opts.body = stringify(payload, {
+          arrayFormat: 'none',
+        });
+      } else {
+        opts.body = JSON.stringify(payload);
+        // if (!('Content-Type' in opts.headers)) {
+        //   opts.headers['Content-Type'] = 'application/json';
+        // }
+      }
+    }
+  }
+
+  const token = cache('token');
+  if (token) {
+    opts.headers.Authorization = `Bearer ${token}`;
+  }
+
+  NProgress.start();
+  NProgress.set(0.4);
+
+  return new Promise((resolve, reject) => {
+    fetch(url, opts)
+      .then(res => {
+        NProgress.done();
+        if (200 === res.status) {
+          // return res.json();
+          return res.text().then(data => {
+            try {
+              return JSON.parse(data);
+            } catch (e) {
+              console.error(e);
+              return {};
+            }
+          });
+        } else {
+          const err = new Error(res.statusText);
+          err.response = res;
+          throw err;
+        }
+      })
+      .then(json => {
+        resolve(json);
+      })
+      .catch(err => {
+        if (!err.response) return reject(new Error('unexpected error occured'));
+        err.response.text().then(msg => {
+          reject(new Error(msg));
+        });
+      });
+  });
+}
+
+'''

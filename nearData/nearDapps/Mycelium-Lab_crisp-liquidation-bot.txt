@@ -1,0 +1,345 @@
+*GitHub Repository "Mycelium-Lab/crisp-liquidation-bot"*
+
+'''--- Cargo.toml ---
+[package]
+name = "liquidation-bot"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[workspace.metadata.workspaces]
+version = "0.4.1"
+
+[dependencies]
+env_logger = "0.9.1"
+tokio = { version = "1", features = ["full"] }
+near-jsonrpc-client = "0.4.1"
+log = "0.4.17"
+borsh = "0.9.3"
+serde = "1.0.145"
+reqwest = { version = "0.11.12", features = ["json"], default-features = false }
+thiserror = "1.0.37"
+serde_json = "1.0.85"
+lazy_static = "1.4.0"
+
+near-crypto = "0.15.0"
+near-primitives = "0.15.0"
+near-chain-configs = "0.15.0"
+near-jsonrpc-primitives = "0.15.0"
+
+[dev-dependencies]
+tokio = { version = "1.21.2", features = ["macros", "rt-multi-thread"] }
+
+[features]
+default = ["native-tls"]
+any = []
+sandbox = []
+adversarial = []
+native-tls = ["reqwest/native-tls"]
+rustls-tls = ["reqwest/rustls-tls"]
+
+[package.metadata.docs.rs]
+features = ["any", "sandbox"]
+
+'''
+'''--- README.md ---
+# crisp-liquidation-bot
+Bot which automatically liquidates borrow position on crisp-exchange contract. Notice that you have to own enough tokens on your exchange balance!
+
+## Requirements
+
+- NEAR 3.4.2
+- Rust 1.64.0
+
+## Setup
+
+Install near-cli using instructions found [here](https://docs.near.org/tools/near-cli). 
+
+Install rust using [this](https://www.rust-lang.org/tools/install).
+
+## Usage
+
+Write your account_id and secret_key in main.rs:
+```
+pub const ACCOUNT_ID: &str = "abobac.testnet";
+pub const SECRET_KEY: &str = "ed25519:4SSA3XVDM8Z8YaajAMQ8zFomDJbWNsuZc7gJmgAoKPphJHxbieUJ4Weieu6k8g5wDcybZTuGLwT83gcvoikdgSzo";
+```
+Run bot
+```
+cargo run
+```
+
+'''
+'''--- src/main.rs ---
+use near_crypto::InMemorySigner;
+use near_jsonrpc_client::{methods, JsonRpcClient};
+use near_jsonrpc_primitives::types::query::QueryResponseKind;
+use near_jsonrpc_primitives::types::transactions::TransactionInfo;
+use near_primitives::transaction::{Action, FunctionCallAction, Transaction};
+use near_primitives::types::BlockReference;
+use near_primitives::views::FinalExecutionStatus;
+use serde_json::json;
+use tokio::time;
+
+mod utils;
+
+pub const CONTRACT_ID: &str = "dev-1674131081257-52430382583822";
+pub const ACCOUNT_ID: &str = "abobac.testnet";
+pub const SECRET_KEY: &str = "ed25519:4SSA3XVDM8Z8YaajAMQ8zFomDJbWNsuZc7gJmgAoKPphJHxbieUJ4Weieu6k8g5wDcybZTuGLwT83gcvoikdgSzo";
+pub const VIEW_METHOD_NAME: &str = "get_liquidation_list";
+pub const CALL_METHOD_NAME: &str = "liquidate";
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let client = JsonRpcClient::connect("https://rpc.testnet.near.org");
+    let signer_account_id = ACCOUNT_ID.parse()?;
+    let signer_secret_key = SECRET_KEY.parse()?;
+    let signer = near_crypto::InMemorySigner::from_secret_key(signer_account_id, signer_secret_key);
+    loop {
+        match run(client.clone(), signer.clone()).await {
+            Ok(vec) => {
+                println!("vec of borrow id to liquidate = {:?}", vec);
+                if !vec.is_empty() {
+                    match liquidate(client.clone(), signer.clone(), vec[0]).await {
+                        Ok(_) => println!("Borrow {} has been liquidated", vec[0]),
+                        _ => println!("Failure during liquidating borrow {}", vec[0]),
+                    }
+                }
+            }
+            _ => continue,
+        }
+    }
+}
+
+async fn run(
+    client: JsonRpcClient,
+    signer: InMemorySigner,
+) -> Result<Vec<u128>, Box<dyn std::error::Error>> {
+    let access_key_query_response = client
+        .call(methods::query::RpcQueryRequest {
+            block_reference: BlockReference::latest(),
+            request: near_primitives::views::QueryRequest::ViewAccessKey {
+                account_id: signer.account_id.clone(),
+                public_key: signer.public_key.clone(),
+            },
+        })
+        .await?;
+    let current_nonce = match access_key_query_response.kind {
+        QueryResponseKind::AccessKey(access_key) => access_key.nonce,
+        _ => Err("failed to extract current nonce")?,
+    };
+    let transaction = Transaction {
+        signer_id: signer.account_id.clone(),
+        public_key: signer.public_key.clone(),
+        nonce: current_nonce + 1,
+        receiver_id: CONTRACT_ID.parse()?,
+        block_hash: access_key_query_response.block_hash,
+        actions: vec![Action::FunctionCall(FunctionCallAction {
+            method_name: VIEW_METHOD_NAME.to_string(),
+            args: json!({}).to_string().into_bytes(),
+            gas: 100_000_000_000_000, // 100 TeraGas
+            deposit: 0,
+        })],
+    };
+    let request = methods::broadcast_tx_async::RpcBroadcastTxAsyncRequest {
+        signed_transaction: transaction.sign(&signer),
+    };
+    let sent_at = time::Instant::now();
+    let tx_hash = client.call(request).await?;
+    loop {
+        let response = client
+            .call(methods::tx::RpcTransactionStatusRequest {
+                transaction_info: TransactionInfo::TransactionId {
+                    hash: tx_hash,
+                    account_id: signer.account_id.clone(),
+                },
+            })
+            .await;
+        let received_at = time::Instant::now();
+        let delta = (received_at - sent_at).as_secs();
+        if delta > 60 {
+            Err("time limit exceeded for the transaction to be recognized")?;
+        }
+        match response {
+            Err(err) => match err.handler_error() {
+                Some(methods::tx::RpcTransactionError::UnknownTransaction { .. }) => {
+                    time::sleep(time::Duration::from_secs(2)).await;
+                    continue;
+                }
+                _ => Err(err)?,
+            },
+            Ok(response) => {
+                println!("response gotten after: {}s", delta);
+                // println!("response: {:#?}", response.status);
+                match response.status {
+                    FinalExecutionStatus::SuccessValue(value) => {
+                        let vec: Vec<u128> = serde_json::from_slice(&value).unwrap();
+                        return Ok(vec);
+                    }
+                    _ => Err("bad status")?,
+                }
+            }
+        }
+    }
+}
+
+async fn liquidate(
+    client: JsonRpcClient,
+    signer: InMemorySigner,
+    id: u128,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let access_key_query_response = client
+        .call(methods::query::RpcQueryRequest {
+            block_reference: BlockReference::latest(),
+            request: near_primitives::views::QueryRequest::ViewAccessKey {
+                account_id: signer.account_id.clone(),
+                public_key: signer.public_key.clone(),
+            },
+        })
+        .await?;
+    let current_nonce = match access_key_query_response.kind {
+        QueryResponseKind::AccessKey(access_key) => access_key.nonce,
+        _ => Err("failed to extract current nonce")?,
+    };
+    let transaction = Transaction {
+        signer_id: signer.account_id.clone(),
+        public_key: signer.public_key.clone(),
+        nonce: current_nonce + 1,
+        receiver_id: CONTRACT_ID.parse()?,
+        block_hash: access_key_query_response.block_hash,
+        actions: vec![Action::FunctionCall(FunctionCallAction {
+            method_name: CALL_METHOD_NAME.to_string(),
+            args: json!({ "borrow_id": id }).to_string().into_bytes(),
+            gas: 100_000_000_000_000, // 100 TeraGas
+            deposit: 0,
+        })],
+    };
+    let request = methods::broadcast_tx_async::RpcBroadcastTxAsyncRequest {
+        signed_transaction: transaction.sign(&signer),
+    };
+    let sent_at = time::Instant::now();
+    let tx_hash = client.call(request).await?;
+    loop {
+        let response = client
+            .call(methods::tx::RpcTransactionStatusRequest {
+                transaction_info: TransactionInfo::TransactionId {
+                    hash: tx_hash,
+                    account_id: signer.account_id.clone(),
+                },
+            })
+            .await;
+        let received_at = time::Instant::now();
+        let delta = (received_at - sent_at).as_secs();
+        if delta > 60 {
+            Err("time limit exceeded for the transaction to be recognized")?;
+        }
+        match response {
+            Err(err) => match err.handler_error() {
+                Some(methods::tx::RpcTransactionError::UnknownTransaction { .. }) => {
+                    time::sleep(time::Duration::from_secs(2)).await;
+                    continue;
+                }
+                _ => Err(err)?,
+            },
+            Ok(_) => {
+                println!("liquidate");
+                println!("response gotten after: {}s", delta);
+                // println!("response: {:#?}", response.status);
+            }
+        }
+    }
+}
+
+'''
+'''--- src/utils.rs ---
+#![allow(unused)]
+
+use near_jsonrpc_client::JsonRpcClient;
+use std::io::{self, Write};
+
+pub fn input(query: &str) -> io::Result<String> {
+    print!("{}", query);
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim().to_owned())
+}
+
+pub fn select<S, F>(print_msg: fn(), query: &str, chk: F) -> io::Result<S>
+where
+    F: Fn(&str) -> Option<S>,
+{
+    loop {
+        print_msg();
+        for _ in 1..=5 {
+            let selection = input(query)?;
+            if let Some(selection) = chk(selection.to_lowercase().as_str()) {
+                return Ok(selection);
+            }
+            println!("\x1b[31m(i)\x1b[0m invalid selection, retry..");
+        }
+    }
+}
+
+pub fn select_network() -> io::Result<JsonRpcClient> {
+    println!("========[Network Selection]========");
+    let network = select(
+        || {
+            println!(" [1] mainnet \x1b[38;5;244m(alias: m, main)\x1b[0m");
+            println!(" [2] testnet \x1b[38;5;244m(alias: t, test)\x1b[0m");
+            println!(" [3] custom  \x1b[38;5;244m(alias:       c)\x1b[0m");
+        },
+        "\x1b[33m(enter a selection)\x1b[0m> ",
+        |selection| match (selection, selection.parse()) {
+            ("m" | "main" | "mainnet", _) | (_, Ok(1)) => Some("mainnet"),
+            ("t" | "test" | "testnet", _) | (_, Ok(2)) => Some("testnet"),
+            ("c" | "custom", _) | (_, Ok(3)) => Some("custom"),
+            _ => None,
+        },
+    )?;
+    let network_url = if network != "custom" {
+        let archival = select(
+            || (),
+            "Should we connect to an archival node? [y/N] ",
+            |selection| match selection {
+                "" | "n" | "no" => Some(false),
+                "y" | "yes" => Some(true),
+                _ => None,
+            },
+        )?;
+        println!(
+            "\x1b[32m(i)\x1b[0m Connected to the [{}] network{}",
+            network,
+            if archival {
+                " (via an archival node)"
+            } else {
+                ""
+            }
+        );
+        format!(
+            "https://{archival}rpc.{network}.near.org",
+            archival = if archival { "archival-" } else { "" },
+            network = network
+        )
+    } else {
+        loop {
+            let url = input("Enter the RPC Server Address: ")?;
+            if let Err(err) = url.parse::<reqwest::Url>() {
+                println!("\x1b[31m(i)\x1b[0m invalid url ({}), retry..", err);
+                continue;
+            }
+            break url;
+        }
+    };
+    println!("===================================");
+
+    Ok(JsonRpcClient::connect(network_url))
+}
+
+fn main() {
+    panic!("not a binary")
+}
+
+'''

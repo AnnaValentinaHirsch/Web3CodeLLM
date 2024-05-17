@@ -1,0 +1,438 @@
+*GitHub Repository "kingbsby/firefly"*
+
+'''--- Cargo.toml ---
+[package]
+name = "firefly"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+serde = { version = "*", features = ["derive"] }
+serde_json = "*"
+near-sdk = "4.0.0"
+
+[dev-dependencies]
+anyhow = "1.0"
+tokio = { version = "1", features = ["full"] }
+test-log = { version = "0.2.8", default-features = false, features = ["trace"] }
+tracing-subscriber = { version = "0.3.5", features = ["env-filter"] }
+tracing = "0.1"
+near-sandbox-utils = "0.6.1"
+
+[build-dependencies]
+near-sandbox-utils = "0.6.1"
+'''
+'''--- README.md ---
+# firefly
+
+'''
+'''--- deploy.sh ---
+#!/bin/zsh
+cargo clean
+cargo build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/firefly.wasm res/
+rm -rf neardev
+near dev-deploy res/firefly.wasm
+'''
+'''--- src/account_info.rs ---
+pub use crate::*;
+
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::{UnorderedMap};
+use near_sdk::{env, AccountId};
+use near_sdk::serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct AccountInfo {
+    pub name: String,
+    pub image: String,
+    pub friends: UnorderedMap<AccountId, String>,
+    pub hash: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct AccountInfoJson {
+    pub account_id: AccountId,
+    pub name: String,
+    pub image: String,
+    pub hash: String,
+}
+
+impl AccountInfo{
+    pub fn new(account_id: AccountId, name: String, image: String) -> Self{
+        Self {
+            name,
+            image,
+            friends: UnorderedMap::new(StorageKeys::AccountFriends { account_id: account_id.clone() }),
+            hash: "".to_string(),
+        }
+    }
+
+    pub fn update_hash(&mut self, hash: String) {
+        self.hash = hash;
+    }
+
+    pub fn add_friend(&mut self, friend_account_id: &AccountId, topic:&String) {
+        self.friends.insert(friend_account_id, topic);
+    }
+
+    pub fn remove_friend(&mut self, friend_account_id: &AccountId) {
+        self.friends.remove(friend_account_id);
+    }
+}
+
+#[near_bindgen]
+#[allow(dead_code)]
+impl Contract{
+    pub fn register(&mut self, name: String, image: String) -> bool {
+        let account_id = env::signer_account_id();
+        assert!(!self.accounts().contains_key(&account_id), "Account already exists");
+        let account_info = AccountInfo::new(account_id.clone(), name, image);
+        self.accounts_mut().insert(&account_id, &account_info);
+        true
+    }
+
+    pub fn login(&mut self, hash: String) -> Vec<String> {
+        let account_id = env::signer_account_id();
+        assert!(self.accounts().contains_key(&account_id), "Account {0} not registered", &account_id);
+        let mut account_info = self.accounts.get(&account_id).unwrap();
+        account_info.update_hash(hash);
+        self.accounts_mut().insert(&account_id, &account_info);
+        
+        vec![account_info.name, account_info.image]
+    }
+
+    pub fn account_info(&self, account_id: AccountId) -> (String, String) {
+        assert!(self.accounts().contains_key(&account_id), "Account {0} not registered", &account_id);
+        let account_info = self.accounts.get(&account_id).unwrap();
+        (account_info.name, account_info.image)
+    }
+
+    pub fn get_friend_list(&self, account_id: AccountId) ->  Vec<Friend>{
+        println!("get_friend_list account id {}", account_id);
+        assert!(self.accounts().contains_key(&account_id), "Account {account_id} not registered");
+
+        // get friends and topic of current account 
+        let friend_list: UnorderedMap<AccountId, String> = self.accounts().get(&account_id).expect("can not find the account").friends;
+
+        let mut vec_friend: Vec<Friend> = Vec::new();
+        // get account info for friend_list, generate Friend object
+        for friend_account_id in friend_list.keys() {
+            let friend_info = self.accounts().get(&friend_account_id).expect("can not find the friend account '{friend_account_id}'");
+            vec_friend.push(
+                Friend{
+                    account_id: friend_account_id.clone(),
+                    name: friend_info.name,
+                    image: friend_info.image,
+                    topic: friend_list.get(&friend_account_id).expect("friend list not contained the accountId"),
+                    hash: friend_info.hash,
+                }
+            )
+        };
+
+        vec_friend
+    }
+
+    pub fn add_friend(&mut self, friend_account_id: AccountId) -> AccountInfoJson{
+        let account_id = env::signer_account_id();
+        // Calculate the value of topic (hash of account_id and friend_account_id)
+        let mut concat_str = account_id.to_string();
+        concat_str.push_str(friend_account_id.as_str());
+        let mut hasher = DefaultHasher::new();
+        concat_str.hash(&mut hasher);
+        let hash_str = hasher.finish().to_string();
+
+        self.add_friend_to_account(&account_id, &friend_account_id, &hash_str);
+        self.add_friend_to_account(&friend_account_id, &account_id, &hash_str);
+        
+        let friend_info = self.accounts().get(&friend_account_id).unwrap();
+        AccountInfoJson {
+            account_id: friend_account_id,
+            name: friend_info.name,
+            image: friend_info.image,
+            hash: friend_info.hash,
+        }
+    }
+
+    fn add_friend_to_account(&mut self, account_id: &AccountId, friend_account_id: &AccountId, topic: &String) {
+        println!("account id:{}, friend_account_id:{}", &account_id, &friend_account_id);
+        assert!(self.accounts().contains_key(&account_id), "Account {account_id} not registered");
+        assert!(self.accounts().contains_key(&friend_account_id), "Account {friend_account_id} not registered");
+        // get friends object
+        let mut account_info = self.accounts().get(&account_id).expect("can not find the account");
+        account_info.add_friend(friend_account_id, topic);
+
+        self.accounts_mut().insert(&account_id, &account_info);
+    }
+
+    pub fn remove_friend(&mut self, friend_account_id: AccountId) -> bool{
+        let account_id = env::signer_account_id();
+        self.remove_friend_from_account(&account_id, &friend_account_id);
+        self.remove_friend_from_account(&friend_account_id, &account_id);
+        true
+    }
+
+    fn remove_friend_from_account(&mut self, account_id: &AccountId, friend_account_id: &AccountId){
+        // get friends object
+        let mut account_info = self.accounts().get(&account_id).expect("can not find the account");
+
+        // modify friends to add new friend
+        account_info.remove_friend(&friend_account_id);
+        self.accounts_mut().insert(&account_id, &account_info);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(test)]
+mod tests {
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::testing_env;
+
+    use super::*;
+
+    // Allows for modifying the environment of the mocked blockchain
+    fn get_context(signer_account_id: AccountId) -> VMContextBuilder {
+        let mut builder = VMContextBuilder::new();
+        builder
+            .current_account_id(accounts(0))
+            .signer_account_id(signer_account_id.clone())
+            .predecessor_account_id(signer_account_id);
+        builder
+    }
+
+    #[test]
+    fn register_account() {
+        let context = get_context(AccountId::try_from("wx.testnet".to_string()).unwrap());
+        // Initialize the mocked blockchain
+        testing_env!(context.build());
+
+        let mut contract = Contract::default();
+        let result = contract.register("wangxin".to_string(), "http://aaa.jpg".to_string());
+        assert_eq!(
+            result,
+            true
+        );
+    }
+
+    #[test]
+    fn test_add_friend() {
+        let mut context = get_context(AccountId::try_from("wx.testnet".to_string()).unwrap());
+        // Initialize the mocked blockchain
+        testing_env!(context.build());
+        let mut contract = Contract::default();
+        contract.register("wangxin".to_string(), "http://wx.jpg".to_string());
+
+        context.signer_account_id(AccountId::try_from("suzhe.testnet".to_string()).unwrap());
+        testing_env!(context.build());
+        contract.register("suzhe".to_string(), "http://suzhe.jpg".to_string());
+
+        let result = contract.add_friend(AccountId::try_from("wx.testnet".to_string()).unwrap());
+
+        assert_eq!(result.account_id.to_string(), "wx.testnet".to_string());
+        assert_eq!(result.name, "wangxin".to_string());
+        assert_eq!(result.image, "http://wx.jpg".to_string());
+    }
+
+    #[test]
+    fn test_get_friends() {
+        let mut context = get_context(AccountId::try_from("wx.testnet".to_string()).unwrap());
+        // Initialize the mocked blockchain
+        testing_env!(context.build());
+        let mut contract = Contract::default();
+        contract.register("wangxin".to_string(), "http://wx.jpg".to_string());
+
+        context.signer_account_id(AccountId::try_from("suzhe.testnet".to_string()).unwrap());
+        testing_env!(context.build());
+        contract.register("suzhe".to_string(), "http://suzhe.jpg".to_string());
+
+        contract.add_friend(AccountId::try_from("wx.testnet".to_string()).unwrap());
+
+        let binding = contract.get_friend_list(AccountId::try_from("suzhe.testnet".to_string()).unwrap());
+        let friend_name = binding.get(0).unwrap();
+
+        assert_eq!(
+            "wangxin",
+            friend_name.name
+        );
+    }
+
+}
+'''
+'''--- src/friend.rs ---
+use near_sdk::AccountId;
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::serde::Serialize;
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize)]
+pub struct Friend {
+    pub account_id: AccountId,
+    pub name: String,
+    pub image: String,
+    pub topic: String,
+    pub hash: String,
+}
+
+impl Friend{
+    pub fn new(account_id: AccountId, name: String, image: String, topic: String, hash: String) -> Self{
+        Self {
+            account_id,
+            name,
+            image,
+            topic,
+            hash,
+        }
+    }
+}
+'''
+'''--- src/lib.rs ---
+mod friend;
+mod account_info;
+mod room;
+pub use crate::friend::*;
+pub use crate::account_info::*;
+pub use crate::room::*;
+
+use account_info::room::Room;
+use near_sdk::BorshStorageKey;
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::{LookupMap, UnorderedMap};
+use near_sdk::{near_bindgen, AccountId};
+
+#[derive(BorshStorageKey, BorshSerialize)]
+pub(crate) enum StorageKeys {
+    Accounts,
+    AccountFriends { account_id: AccountId },
+    Rooms,
+}
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Contract {
+    accounts: LookupMap<AccountId, AccountInfo>,
+    rooms: UnorderedMap<u32, Room>,
+    room_num: u32,
+}
+
+impl Default for Contract{
+    fn default() -> Self {
+        Self {
+            accounts: LookupMap::new(StorageKeys::Accounts),
+            rooms: UnorderedMap::new(StorageKeys::Rooms),
+            room_num: 0,
+        }
+    }
+}
+
+impl Contract{
+    fn accounts(&self) -> &LookupMap<AccountId, AccountInfo> {
+        &self.accounts
+    }
+
+    fn accounts_mut(&mut self) -> &mut LookupMap<AccountId, AccountInfo> {
+        &mut self.accounts
+    }
+
+    fn rooms(&self) -> &UnorderedMap<u32, Room> {
+        &self.rooms
+    }
+
+    fn rooms_mut(&mut self) -> &mut UnorderedMap<u32, Room> {
+        &mut self.rooms
+    }
+
+    fn get_next_room_id(&mut self) -> u32 {
+        self.room_num = self.room_num + 1;
+        self.room_num
+    }
+}
+'''
+'''--- src/room.rs ---
+pub use crate::*;
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::serde::Serialize;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use near_sdk::{env, AccountId};
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize)]
+pub struct Room {
+    pub id: u32,
+    pub name: String,
+    pub topic: String,
+    pub nft: Vec<String>,
+    pub owner: AccountId,
+}
+
+impl Room{
+    pub fn new(contract: &mut Contract, name: String, nft: Vec<String>) -> Self{
+        let account_id = env::signer_account_id();
+        let room_id = contract.get_next_room_id();
+        // 生成topic，为“room”+id的hash
+        let mut topic_str: String = "room".to_string();
+        topic_str.push_str(room_id.to_string().as_str());
+        let mut hasher = DefaultHasher::new();
+        topic_str.hash(&mut hasher);
+        let topic = hasher.finish().to_string();
+        Self {
+            id: room_id,
+            name,
+            topic,
+            nft,
+            owner: account_id,
+        }
+    }
+}
+
+#[near_bindgen]
+impl Contract{
+    pub fn create_room(&mut self, name: String, nft: Vec<String>) -> u32{
+        let room = Room::new(self, name, nft);
+        let rooms = self.rooms_mut();
+        UnorderedMap::insert(rooms, &room.id, &room);
+        room.id
+    }
+
+    pub fn get_room_list(&self) -> Vec<(u32, Room)>{
+        self.rooms().to_vec()
+    }
+
+    pub fn destory_room(&mut self, room_id: u32) -> u32{
+        let account_id = env::signer_account_id();
+        let room = self.rooms().get(&room_id).expect("room id does not exist");
+        assert_eq!(account_id, room.owner, "You do not have permission to delete this room");
+        self.rooms_mut().remove(&room_id);
+        room_id
+    }
+}
+'''
+'''--- tests/account.rs ---
+// #![recursion_limit = "256"]
+// use test_log::test;
+
+// #[test(tokio::test)]
+// async fn test_subaccount_creation() -> anyhow::Result<()> {
+//     let worker = firefly::sandbox().await?;
+//     let account = worker.dev_create_account().await?;
+
+//     let sub = account
+//         .create_subaccount("subaccount")
+//         .transact()
+//         .await?
+//         .into_result()?;
+
+//     let expect_id = format!("subaccount.{}", account.id());
+//     let actual_id = sub.id().to_string();
+
+//     assert_eq!(actual_id, expect_id);
+
+//     Ok(())
+// }
+'''

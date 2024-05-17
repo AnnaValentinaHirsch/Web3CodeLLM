@@ -1,0 +1,3055 @@
+*GitHub Repository "alexonab/solana-jupiter-bot"*
+
+'''--- src/bot/cache.js ---
+// global cache
+const cache = {
+	startTime: new Date(),
+	queue: {},
+	queueThrottle: 1,
+	sideBuy: true,
+	iteration: 0,
+	iterationPerMinute: {
+		start: performance.now(),
+		value: 0,
+		counter: 0,
+	},
+	initialBalance: {
+		tokenA: 0,
+		tokenB: 0,
+	},
+
+	currentBalance: {
+		tokenA: 0,
+		tokenB: 0,
+	},
+	currentProfit: {
+		tokenA: 0,
+		tokenB: 0,
+	},
+	lastBalance: {
+		tokenA: 0,
+		tokenB: 0,
+	},
+	profit: {
+		tokenA: 0,
+		tokenB: 0,
+	},
+	maxProfitSpotted: {
+		buy: 0,
+		sell: 0,
+	},
+	tradeCounter: {
+		buy: { success: 0, fail: 0 },
+		sell: { success: 0, fail: 0 },
+	},
+	ui: {
+		defaultColor: process.env.UI_COLOR ?? "cyan",
+		showPerformanceOfRouteCompChart: false,
+		showProfitChart: true,
+		showTradeHistory: true,
+		hideRpc: false,
+		showHelp: true,
+		allowClear: true,
+	},
+	chart: {
+		spottedMax: {
+			buy: new Array(120).fill(0),
+			sell: new Array(120).fill(0),
+		},
+		performanceOfRouteComp: new Array(120).fill(0),
+	},
+	hotkeys: {
+		e: false,
+		r: false,
+	},
+	tradingEnabled:
+		process.env.TRADING_ENABLED === undefined
+			? true
+			: process.env.TRADING_ENABLED === "true",
+	wrapUnwrapSOL:
+		process.env.WRAP_UNWRAP_SOL === undefined
+			? true
+			: process.env.WRAP_UNWRAP_SOL === "true",
+	swappingRightNow: false,
+	fetchingResultsFromSolscan: false,
+	fetchingResultsFromSolscanStart: 0,
+	tradeHistory: [],
+	performanceOfTxStart: 0,
+	availableRoutes: {
+		buy: 0,
+		sell: 0,
+	},
+	isSetupDone: false,
+};
+
+module.exports = cache;
+
+'''
+'''--- src/bot/exit.js ---
+const fs = require("fs");
+const chalk = require("chalk");
+
+const cache = require("./cache");
+
+const logExit = (code = 0, error) => {
+	code === 0 && console.log(chalk.black.bgMagentaBright.bold(error.message));
+
+	if (code === 1) {
+		error?.message &&
+			console.log(
+				chalk.black.bgRedBright.black("ERROR: " + chalk.bold(error.message))
+			);
+		error?.stack && console.log(chalk.redBright(error.stack));
+
+		if (cache.isSetupDone) {
+			console.log(
+				chalk.black.bgYellowBright(
+					"Closing connections... ",
+					chalk.bold("WAIT! ")
+				)
+			);
+			console.log(chalk.yellowBright.bgBlack("Press [Ctrl]+[C] to force exit"));
+		}
+	}
+};
+
+const handleExit = () => {
+	try {
+		console.log(
+			chalk.black.bgMagentaBright(
+				`\n	Exit time:  ${chalk.bold(new Date().toLocaleString())} `
+			)
+		);
+
+		// write cache to file
+		try {
+			fs.writeFileSync("./temp/cache.json", JSON.stringify(cache, null, 2));
+			console.log(
+				chalk.black.bgGreenBright(
+					`		> Cache saved to ${chalk.bold("./temp/cache.json")} `
+				)
+			);
+		} catch (error) {
+			console.log(
+				chalk.black.bgRedBright(
+					`		X Error saving cache to ${chalk.bold("./temp/cache.json")} `
+				)
+			);
+		}
+
+		// write trade history to file
+		try {
+			fs.writeFileSync(
+				"./temp/tradeHistory.json",
+				JSON.stringify(cache.tradeHistory, null, 2)
+			);
+			console.log(
+				chalk.black.bgGreenBright(
+					`		> Trade history saved to ${chalk.bold("./temp/tradeHistory.json")} `
+				)
+			);
+		} catch (error) {
+			console.log(
+				chalk.black.bgRedBright(
+					`		X Error saving trade history to ${chalk.bold(
+						"./temp/tradeHistory.json"
+					)} `
+				)
+			);
+		}
+		console.log(chalk.black.bgMagentaBright.bold("	Exit Done! \n"));
+	} catch (error) {
+		console.log(error);
+	}
+};
+
+module.exports = { logExit, handleExit };
+
+'''
+'''--- src/bot/index.js ---
+console.clear();
+
+require("dotenv").config();
+const { clearInterval } = require("timers");
+const { PublicKey } = require("@solana/web3.js");
+
+const {
+	calculateProfit,
+	toDecimal,
+	toNumber,
+	updateIterationsPerMin,
+	checkRoutesResponse,
+} = require("../utils");
+const { handleExit, logExit } = require("./exit");
+const cache = require("./cache");
+const { setup, getInitialOutAmountWithSlippage } = require("./setup");
+const { printToConsole } = require("./ui/");
+const { swap, failedSwapHandler, successSwapHandler } = require("./swap");
+
+const pingpongStrategy = async (jupiter, tokenA, tokenB) => {
+	cache.iteration++;
+	const date = new Date();
+	const i = cache.iteration;
+	cache.queue[i] = -1;
+
+	try {
+		// calculate & update iterations per minute
+		updateIterationsPerMin(cache);
+
+		// Calculate amount that will be used for trade
+		const amountToTrade =
+			cache.config.tradeSize.strategy === "cumulative"
+				? cache.currentBalance[cache.sideBuy ? "tokenA" : "tokenB"]
+				: cache.initialBalance[cache.sideBuy ? "tokenA" : "tokenB"];
+
+		const baseAmount = cache.lastBalance[cache.sideBuy ? "tokenB" : "tokenA"];
+
+		// default slippage
+		const slippage =
+			typeof cache.config.slippage === "number" ? cache.config.slippage : 1;
+
+		// set input / output token
+		const inputToken = cache.sideBuy ? tokenA : tokenB;
+		const outputToken = cache.sideBuy ? tokenB : tokenA;
+
+		// check current routes
+		const performanceOfRouteCompStart = performance.now();
+		const routes = await jupiter.computeRoutes({
+			inputMint: new PublicKey(inputToken.address),
+			outputMint: new PublicKey(outputToken.address),
+			inputAmount: amountToTrade,
+			slippage,
+			forceFetch: true,
+		});
+
+		checkRoutesResponse(routes);
+
+		// count available routes
+		cache.availableRoutes[cache.sideBuy ? "buy" : "sell"] =
+			routes.routesInfos.length;
+
+		// update status as OK
+		cache.queue[i] = 0;
+
+		const performanceOfRouteComp =
+			performance.now() - performanceOfRouteCompStart;
+
+		// choose first route
+		const route = await routes.routesInfos[0];
+
+		// update slippage with "profit or kill" slippage
+		if (cache.config.slippage === "profitOrKill") {
+			route.outAmountWithSlippage =
+				cache.lastBalance[cache.sideBuy ? "tokenB" : "tokenA"];
+		}
+
+		// calculate profitability
+
+		const simulatedProfit = calculateProfit(baseAmount, await route.outAmount);
+
+		// store max profit spotted
+		if (
+			simulatedProfit > cache.maxProfitSpotted[cache.sideBuy ? "buy" : "sell"]
+		) {
+			cache.maxProfitSpotted[cache.sideBuy ? "buy" : "sell"] = simulatedProfit;
+		}
+
+		printToConsole({
+			date,
+			i,
+			performanceOfRouteComp,
+			inputToken,
+			outputToken,
+			tokenA,
+			tokenB,
+			route,
+			simulatedProfit,
+		});
+
+		// check profitability and execute tx
+		let tx, performanceOfTx;
+		if (
+			!cache.swappingRightNow &&
+			(cache.hotkeys.e ||
+				cache.hotkeys.r ||
+				simulatedProfit >= cache.config.minPercProfit)
+		) {
+			// hotkeys
+			if (cache.hotkeys.e) {
+				console.log("[E] PRESSED - EXECUTION FORCED BY USER!");
+				cache.hotkeys.e = false;
+			}
+			if (cache.hotkeys.r) {
+				console.log("[R] PRESSED - REVERT BACK SWAP!");
+				route.outAmountWithSlippage = 0;
+			}
+
+			if (cache.tradingEnabled || cache.hotkeys.r) {
+				cache.swappingRightNow = true;
+				// store trade to the history
+				let tradeEntry = {
+					date: date.toLocaleString(),
+					buy: cache.sideBuy,
+					inputToken: inputToken.symbol,
+					outputToken: outputToken.symbol,
+					inAmount: toDecimal(route.inAmount, inputToken.decimals),
+					expectedOutAmount: toDecimal(route.outAmount, outputToken.decimals),
+					expectedProfit: simulatedProfit,
+				};
+
+				// start refreshing status
+				const printTxStatus = setInterval(() => {
+					if (cache.swappingRightNow) {
+						printToConsole({
+							date,
+							i,
+							performanceOfRouteComp,
+							inputToken,
+							outputToken,
+							tokenA,
+							tokenB,
+							route,
+							simulatedProfit,
+						});
+					}
+				}, 500);
+
+				[tx, performanceOfTx] = await swap(jupiter, route);
+
+				// stop refreshing status
+				clearInterval(printTxStatus);
+
+				const profit = calculateProfit(
+					cache.currentBalance[cache.sideBuy ? "tokenB" : "tokenA"],
+					tx.outputAmount
+				);
+
+				tradeEntry = {
+					...tradeEntry,
+					outAmount: tx.outputAmount || 0,
+					profit,
+					performanceOfTx,
+					error: tx.error?.message || null,
+				};
+
+				// handle TX results
+				if (tx.error) failedSwapHandler(tradeEntry);
+				else {
+					if (cache.hotkeys.r) {
+						console.log("[R] - REVERT BACK SWAP - SUCCESS!");
+						cache.tradingEnabled = false;
+						console.log("TRADING DISABLED!");
+						cache.hotkeys.r = false;
+					}
+					successSwapHandler(tx, tradeEntry, tokenA, tokenB);
+				}
+			}
+		}
+
+		if (tx) {
+			if (!tx.error) {
+				// change side
+				cache.sideBuy = !cache.sideBuy;
+			}
+			cache.swappingRightNow = false;
+		}
+
+		printToConsole({
+			date,
+			i,
+			performanceOfRouteComp,
+			inputToken,
+			outputToken,
+			tokenA,
+			tokenB,
+			route,
+			simulatedProfit,
+		});
+	} catch (error) {
+		cache.queue[i] = 1;
+		console.log(error);
+	} finally {
+		delete cache.queue[i];
+	}
+};
+
+const arbitrageStrategy = async (jupiter, tokenA) => {
+	cache.iteration++;
+	const date = new Date();
+	const i = cache.iteration;
+	cache.queue[i] = -1;
+	try {
+		// calculate & update iterations per minute
+		updateIterationsPerMin(cache);
+
+		// Calculate amount that will be used for trade
+		const amountToTrade =
+			cache.config.tradeSize.strategy === "cumulative"
+				? cache.currentBalance["tokenA"]
+				: cache.initialBalance["tokenA"];
+		const baseAmount = amountToTrade;
+
+		// default slippage
+		const slippage =
+			typeof cache.config.slippage === "number" ? cache.config.slippage : 1;
+		// set input / output token
+		const inputToken = tokenA;
+		const outputToken = tokenA;
+
+		// check current routes
+		const performanceOfRouteCompStart = performance.now();
+		const routes = await jupiter.computeRoutes({
+			inputMint: new PublicKey(inputToken.address),
+			outputMint: new PublicKey(outputToken.address),
+			inputAmount: amountToTrade,
+			slippage,
+			forceFetch: true,
+		});
+
+		checkRoutesResponse(routes);
+
+		// count available routes
+		cache.availableRoutes[cache.sideBuy ? "buy" : "sell"] =
+			routes.routesInfos.length;
+
+		// update status as OK
+		cache.queue[i] = 0;
+
+		const performanceOfRouteComp =
+			performance.now() - performanceOfRouteCompStart;
+
+		// choose first route
+		const route = await routes.routesInfos[1];
+
+		// update slippage with "profit or kill" slippage
+		if (cache.config.slippage === "profitOrKill") {
+			route.outAmountWithSlippage = amountToTrade;
+		}
+
+		// calculate profitability
+
+		const simulatedProfit = calculateProfit(baseAmount, await route.outAmount);
+
+		// store max profit spotted
+		if (simulatedProfit > cache.maxProfitSpotted["buy"]) {
+			cache.maxProfitSpotted["buy"] = simulatedProfit;
+		}
+
+		printToConsole({
+			date,
+			i,
+			performanceOfRouteComp,
+			inputToken,
+			outputToken,
+			tokenA,
+			tokenB: tokenA,
+			route,
+			simulatedProfit,
+		});
+
+		// check profitability and execute tx
+		let tx, performanceOfTx;
+		if (
+			!cache.swappingRightNow &&
+			(cache.hotkeys.e ||
+				cache.hotkeys.r ||
+				simulatedProfit >= cache.config.minPercProfit)
+		) {
+			// hotkeys
+			if (cache.hotkeys.e) {
+				console.log("[E] PRESSED - EXECUTION FORCED BY USER!");
+				cache.hotkeys.e = false;
+			}
+			if (cache.hotkeys.r) {
+				console.log("[R] PRESSED - REVERT BACK SWAP!");
+				route.outAmountWithSlippage = 0;
+			}
+
+			if (cache.tradingEnabled || cache.hotkeys.r) {
+				cache.swappingRightNow = true;
+				// store trade to the history
+				let tradeEntry = {
+					date: date.toLocaleString(),
+					buy: cache.sideBuy,
+					inputToken: inputToken.symbol,
+					outputToken: outputToken.symbol,
+					inAmount: toDecimal(route.inAmount, inputToken.decimals),
+					expectedOutAmount: toDecimal(route.outAmount, outputToken.decimals),
+					expectedProfit: simulatedProfit,
+				};
+
+				// start refreshing status
+				const printTxStatus = setInterval(() => {
+					if (cache.swappingRightNow) {
+						printToConsole({
+							date,
+							i,
+							performanceOfRouteComp,
+							inputToken,
+							outputToken,
+							tokenA,
+							tokenB: tokenA,
+							route,
+							simulatedProfit,
+						});
+					}
+				}, 500);
+
+				[tx, performanceOfTx] = await swap(jupiter, route);
+
+				// stop refreshing status
+				clearInterval(printTxStatus);
+
+				const profit = calculateProfit(tradeEntry.inAmount, tx.outputAmount);
+
+				tradeEntry = {
+					...tradeEntry,
+					outAmount: tx.outputAmount || 0,
+					profit,
+					performanceOfTx,
+					error: tx.error?.message || null,
+				};
+
+				// handle TX results
+				if (tx.error) failedSwapHandler(tradeEntry);
+				else {
+					if (cache.hotkeys.r) {
+						console.log("[R] - REVERT BACK SWAP - SUCCESS!");
+						cache.tradingEnabled = false;
+						console.log("TRADING DISABLED!");
+						cache.hotkeys.r = false;
+					}
+					successSwapHandler(tx, tradeEntry, tokenA, tokenA);
+				}
+			}
+		}
+
+		if (tx) {
+			cache.swappingRightNow = false;
+		}
+
+		printToConsole({
+			date,
+			i,
+			performanceOfRouteComp,
+			inputToken,
+			outputToken,
+			tokenA,
+			tokenB: tokenA,
+			route,
+			simulatedProfit,
+		});
+	} catch (error) {
+		cache.queue[i] = 1;
+		throw error;
+	} finally {
+		delete cache.queue[i];
+	}
+};
+
+const watcher = async (jupiter, tokenA, tokenB) => {
+	if (
+		!cache.swappingRightNow &&
+		Object.keys(cache.queue).length < cache.queueThrottle
+	) {
+		if (cache.config.tradingStrategy === "pingpong") {
+			await pingpongStrategy(jupiter, tokenA, tokenB);
+		}
+		if (cache.config.tradingStrategy === "arbitrage") {
+			await arbitrageStrategy(jupiter, tokenA);
+		}
+	}
+};
+
+const run = async () => {
+	try {
+		// set everything up
+		const { jupiter, tokenA, tokenB } = await setup();
+
+		if (cache.config.tradingStrategy === "pingpong") {
+			// set initial & current & last balance for tokenA
+			cache.initialBalance.tokenA = toNumber(
+				cache.config.tradeSize.value,
+				tokenA.decimals
+			);
+			cache.currentBalance.tokenA = cache.initialBalance.tokenA;
+			cache.lastBalance.tokenA = cache.initialBalance.tokenA;
+
+			// set initial & last balance for tokenB
+			cache.initialBalance.tokenB = await getInitialOutAmountWithSlippage(
+				jupiter,
+				tokenA,
+				tokenB,
+				cache.initialBalance.tokenA
+			);
+			cache.lastBalance.tokenB = cache.initialBalance.tokenB;
+		} else if (cache.config.tradingStrategy === "arbitrage") {
+			// set initial & current & last balance for tokenA
+			cache.initialBalance.tokenA = toNumber(
+				cache.config.tradeSize.value,
+				tokenA.decimals
+			);
+			cache.currentBalance.tokenA = cache.initialBalance.tokenA;
+			cache.lastBalance.tokenA = cache.initialBalance.tokenA;
+		}
+
+		global.botInterval = setInterval(
+			() => watcher(jupiter, tokenA, tokenB),
+			cache.config.minInterval
+		);
+	} catch (error) {
+		logExit(error);
+		process.exitCode = 1;
+	}
+};
+
+run();
+
+// handle exit
+process.on("exit", handleExit);
+
+'''
+'''--- src/bot/setup.js ---
+const fs = require("fs");
+const chalk = require("chalk");
+const ora = require("ora-classic");
+const bs58 = require("bs58");
+const { Jupiter } = require("@jup-ag/core");
+const { Connection, Keypair, PublicKey } = require("@solana/web3.js");
+
+const { logExit } = require("./exit");
+const { loadConfigFile } = require("../utils");
+const { intro, listenHotkeys } = require("./ui");
+const cache = require("./cache");
+
+const setup = async () => {
+	let spinner, tokens, tokenA, tokenB, wallet;
+	try {
+		// listen for hotkeys
+		listenHotkeys();
+		await intro();
+
+		// load config file and store it in cache
+		cache.config = loadConfigFile({ showSpinner: true });
+
+		spinner = ora({
+			text: "Loading tokens...",
+			discardStdin: false,
+			color: "magenta",
+		}).start();
+
+		// read tokens.json file
+		try {
+			tokens = JSON.parse(fs.readFileSync("./temp/tokens.json"));
+			// find tokens full Object
+			tokenA = tokens.find((t) => t.address === cache.config.tokenA.address);
+
+			if (cache.config.tradingStrategy !== "arbitrage")
+				tokenB = tokens.find((t) => t.address === cache.config.tokenB.address);
+		} catch (error) {
+			spinner.text = chalk.black.bgRedBright(
+				`\n	Loading tokens failed!\n	Please try to run the Wizard first using ${chalk.bold(
+					"`yarn start`"
+				)}\n`
+			);
+			throw error;
+		}
+
+		// check wallet private key
+		try {
+			spinner.text = "Checking wallet...";
+			if (
+				!process.env.SOLANA_WALLET_PRIVATE_KEY ||
+				(process.env.SOLANA_WALLET_PUBLIC_KEY &&
+					process.env.SOLANA_WALLET_PUBLIC_KEY?.length !== 88)
+			) {
+				throw new Error("Wallet check failed!");
+			} else {
+				wallet = Keypair.fromSecretKey(
+					bs58.decode(process.env.SOLANA_WALLET_PRIVATE_KEY)
+				);
+			}
+		} catch (error) {
+			spinner.text = chalk.black.bgRedBright(
+				`\n	Wallet check failed! \n	Please make sure that ${chalk.bold(
+					"SOLANA_WALLET_PRIVATE_KEY "
+				)}\n	inside ${chalk.bold(".env")} file is correct \n`
+			);
+			throw error;
+		}
+
+		spinner.text = "Setting up connection ...";
+		// connect to RPC
+		const connection = new Connection(cache.config.rpc[0]);
+
+		spinner.text = "Loading Jupiter SDK...";
+
+		const jupiter = await Jupiter.load({
+			connection,
+			cluster: cache.config.network,
+			user: wallet,
+			restrictIntermediateTokens: true,
+			wrapUnwrapSOL: cache.wrapUnwrapSOL,
+		});
+
+		cache.isSetupDone = true;
+		spinner.succeed("Setup done!");
+
+		return { jupiter, tokenA, tokenB };
+	} catch (error) {
+		if (spinner)
+			spinner.fail(
+				chalk.bold.redBright(`Setting up failed!\n 	${spinner.text}`)
+			);
+		logExit(1, error);
+		process.exitCode = 1;
+	}
+};
+
+const getInitialOutAmountWithSlippage = async (
+	jupiter,
+	inputToken,
+	outputToken,
+	amountToTrade
+) => {
+	let spinner;
+	try {
+		spinner = ora({
+			text: "Computing routes...",
+			discardStdin: false,
+			color: "magenta",
+		}).start();
+
+		// compute routes for the first time
+		const routes = await jupiter.computeRoutes({
+			inputMint: new PublicKey(inputToken.address),
+			outputMint: new PublicKey(outputToken.address),
+			inputAmount: amountToTrade,
+			slippage: 0,
+			forceFetch: true,
+		});
+
+		if (routes?.routesInfos?.length > 0) spinner.succeed("Routes computed!");
+		else spinner.fail("No routes found. Something is wrong!");
+
+		return routes.routesInfos[0].outAmountWithSlippage;
+	} catch (error) {
+		if (spinner)
+			spinner.fail(chalk.bold.redBright("Computing routes failed!\n"));
+		logExit(1, error);
+		process.exitCode = 1;
+	}
+};
+
+module.exports = {
+	setup,
+	getInitialOutAmountWithSlippage,
+};
+
+'''
+'''--- src/bot/swap.js ---
+const { calculateProfit, toDecimal, storeItInTempAsJSON } = require("../utils");
+const cache = require("./cache");
+const { getSwapResultFromSolscanParser } = require("../services/solscan");
+
+const swap = async (jupiter, route) => {
+	try {
+		const performanceOfTxStart = performance.now();
+		cache.performanceOfTxStart = performanceOfTxStart;
+
+		if (process.env.DEBUG) storeItInTempAsJSON("routeInfoBeforeSwap", route);
+
+		const { execute } = await jupiter.exchange({
+			routeInfo: route,
+		});
+		const result = await execute();
+
+		if (process.env.DEBUG) storeItInTempAsJSON("result", result);
+
+		const performanceOfTx = performance.now() - performanceOfTxStart;
+
+		return [result, performanceOfTx];
+	} catch (error) {
+		return [
+			{ error: { message: error?.message || "TX failed, Unknown error" } },
+			0,
+		];
+	}
+};
+exports.swap = swap;
+
+const failedSwapHandler = (tradeEntry) => {
+	// update counter
+	cache.tradeCounter[cache.sideBuy ? "buy" : "sell"].fail++;
+
+	// update trade history
+	cache.config.storeFailedTxInHistory;
+
+	// update trade history
+	let tempHistory = cache.tradeHistory;
+	tempHistory.push(tradeEntry);
+	cache.tradeHistory = tempHistory;
+};
+exports.failedSwapHandler = failedSwapHandler;
+
+const successSwapHandler = async (tx, tradeEntry, tokenA, tokenB) => {
+	if (process.env.DEBUG) storeItInTempAsJSON(`txResultFromSDK_${tx?.txid}`, tx);
+
+	// update counter
+	cache.tradeCounter[cache.sideBuy ? "buy" : "sell"].success++;
+
+	if (cache.config.tradingStrategy === "pingpong") {
+		// update balance
+		if (cache.sideBuy) {
+			cache.lastBalance.tokenA = cache.currentBalance.tokenA;
+			cache.currentBalance.tokenA = 0;
+			cache.currentBalance.tokenB = tx.outputAmount;
+		} else {
+			cache.lastBalance.tokenB = cache.currentBalance.tokenB;
+			cache.currentBalance.tokenB = 0;
+			cache.currentBalance.tokenA = tx.outputAmount;
+		}
+
+		// update profit
+		if (cache.sideBuy) {
+			cache.currentProfit.tokenA = 0;
+			cache.currentProfit.tokenB = calculateProfit(
+				cache.initialBalance.tokenB,
+				cache.currentBalance.tokenB
+			);
+		} else {
+			cache.currentProfit.tokenB = 0;
+			cache.currentProfit.tokenA = calculateProfit(
+				cache.initialBalance.tokenA,
+				cache.currentBalance.tokenA
+			);
+		}
+
+		// update trade history
+		let tempHistory = cache.tradeHistory;
+
+		tradeEntry.inAmount = toDecimal(
+			tx.inputAmount,
+			cache.sideBuy ? tokenA.decimals : tokenB.decimals
+		);
+		tradeEntry.outAmount = toDecimal(
+			tx.outputAmount,
+			cache.sideBuy ? tokenB.decimals : tokenA.decimals
+		);
+
+		tradeEntry.profit = calculateProfit(
+			cache.lastBalance[cache.sideBuy ? "tokenB" : "tokenA"],
+			tx.outputAmount
+		);
+		tempHistory.push(tradeEntry);
+		cache.tradeHistory = tempHistory;
+	}
+	if (cache.config.tradingStrategy === "arbitrage") {
+		/** check real amounts on solscan because Jupiter SDK returns wrong amounts
+		 *  when we trading TokenA <> TokenA (arbitrage)
+		 */
+		const [inAmountFromSolscanParser, outAmountFromSolscanParser] =
+			await getSwapResultFromSolscanParser(tx?.txid);
+
+		if (inAmountFromSolscanParser === -1)
+			throw new Error(
+				`Solscan inputAmount error\n	https://solscan.io/tx/${tx.txid}`
+			);
+		if (outAmountFromSolscanParser === -1)
+			throw new Error(
+				`Solscan outputAmount error\n	https://solscan.io/tx/${tx.txid}`
+			);
+
+		cache.lastBalance.tokenA = cache.currentBalance.tokenA;
+		cache.currentBalance.tokenA =
+			cache.lastBalance.tokenA +
+			(outAmountFromSolscanParser - inAmountFromSolscanParser);
+
+		// update trade history
+		let tempHistory = cache.tradeHistory;
+
+		tradeEntry.inAmount = toDecimal(inAmountFromSolscanParser, tokenA.decimals);
+		tradeEntry.outAmount = toDecimal(
+			outAmountFromSolscanParser,
+			tokenA.decimals
+		);
+
+		tradeEntry.profit = calculateProfit(
+			tradeEntry.inAmount,
+			tradeEntry.outAmount
+		);
+		tempHistory.push(tradeEntry);
+		cache.tradeHistory = tempHistory;
+
+		const prevProfit = cache.currentProfit.tokenA;
+
+		// total profit
+		cache.currentProfit.tokenA = prevProfit + tradeEntry.profit;
+	}
+};
+exports.successSwapHandler = successSwapHandler;
+
+'''
+'''--- src/bot/ui/index.js ---
+const intro = require("./intro");
+const printToConsole = require("./printToConsole");
+const listenHotkeys = require("./listenHotkeys");
+
+module.exports = { intro, printToConsole, listenHotkeys };
+
+'''
+'''--- src/bot/ui/intro.js ---
+const ui = require("cliui")({ width: 140 });
+const chalk = require("chalk");
+const gradient = require("gradient-string");
+
+const package = require("../../../package.json");
+const { DISCORD_INVITE_URL } = require("../../constants");
+
+const universeSize = 15;
+const color = "white";
+const startWarp = 30;
+let colorsSet = [
+	"#cf4884",
+	"#8832b3",
+	"#b5b4fa",
+	"#cdadff",
+	"#6d29c5",
+	"#4e21d9",
+	"#481ede",
+];
+
+const random = (h = 100, l = 1) => Math.floor(Math.random() * (h - l + 1)) + l;
+
+async function intro() {
+	try {
+		const skipIntro = process.env.SKIP_INTRO === "true" || false;
+
+		if (!skipIntro) {
+			ui.div(" ");
+			for (let i = 0; i < 200; i++) {
+				const speed = i > 50 ? 100 - i : i;
+				const a = colorsSet.shift();
+				colorsSet.push(a);
+				const g = gradient(colorsSet);
+
+				const char =
+					i > startWarp
+						? i > 180
+							? g("/").repeat(random(i / 10, i / 10 - 2))
+							: "-".repeat(random(i / 10, i / 10 - 2))
+						: "•";
+				await new Promise((resolve) => setTimeout(resolve, speed));
+
+				console.clear();
+				ui.resetOutput();
+
+				for (let ii = 0; ii < universeSize; ii++) {
+					ui.div({
+						text: `${chalk[color](char)}`,
+						padding: [0, 0, 0, random()],
+					});
+				}
+
+				ui.div(
+					{
+						text: g(`ARB SOLANA BOT - ${package.version}`),
+						width: 50,
+						align: "center",
+						padding: [1, 0, 1, 0],
+					},
+					{
+						text: `Discord: ${chalk.magenta(DISCORD_INVITE_URL)}\n ${chalk.gray(
+							"- PRESS [D] TO OPEN -"
+						)}`,
+						width: 50,
+						align: "center",
+						padding: [1, 0, 1, 0],
+					}
+				);
+
+				for (let ii = 0; ii < universeSize; ii++) {
+					ui.div({
+						text: `${chalk[color](char)}`,
+						padding: [0, 0, 0, random()],
+					});
+				}
+
+				console.log(ui.toString());
+			}
+			ui.div("");
+			console.clear();
+		}
+	} catch (error) {
+		console.log(error);
+	}
+}
+
+module.exports = intro;
+
+'''
+'''--- src/bot/ui/listenHotkeys.js ---
+const keypress = require("keypress");
+const open = require("open");
+
+const { DISCORD_INVITE_URL } = require("../../constants");
+const { logExit } = require("../exit");
+const cache = require("../cache");
+
+const listenHotkeys = () => {
+	keypress(process.stdin);
+
+	process.stdin.on("keypress", function (ch, key) {
+		if (key && key.ctrl && key.name == "c") {
+			cache.ui.allowClear = false;
+			// eslint-disable-next-line no-undef
+			if (global.botInterval) clearInterval(botInterval);
+			logExit(0, { message: "[CTRL]+[C] exiting by user " });
+			process.exitCode = 0;
+			process.stdin.setRawMode(false);
+			process.exit(0);
+		}
+
+		// [E] - forced execution
+		if (key && key.name === "e") {
+			cache.hotkeys.e = true;
+		}
+
+		// [R] - revert back swap
+		if (key && key.name === "r") {
+			cache.hotkeys.r = true;
+		}
+
+		// [P] - switch profit chart visibility
+		if (key && key.name === "p") {
+			cache.ui.showProfitChart = !cache.ui.showProfitChart;
+		}
+
+		// [L] - switch performance chart visibility
+		if (key && key.name === "l") {
+			cache.ui.showPerformanceOfRouteCompChart =
+				!cache.ui.showPerformanceOfRouteCompChart;
+		}
+
+		// [H] - switch trade history visibility
+		if (key && key.name === "t") {
+			cache.ui.showTradeHistory = !cache.ui.showTradeHistory;
+		}
+
+		// [I] - incognito mode (hide RPC)
+		if (key && key.name === "i") {
+			cache.ui.hideRpc = !cache.ui.hideRpc;
+		}
+
+		// [H] - switch help visibility
+		if (key && key.name === "h") {
+			cache.ui.showHelp = !cache.ui.showHelp;
+		}
+
+		// [S] - simulation mode switch
+		if (key && key.name === "s") {
+			cache.tradingEnabled = !cache.tradingEnabled;
+		}
+
+		// [D] - open discord invite link
+		if (key && key.name === "d") {
+			open(DISCORD_INVITE_URL);
+		}
+	});
+
+	process.stdin.setRawMode(true);
+	process.stdin.resume();
+};
+
+module.exports = listenHotkeys;
+
+'''
+'''--- src/bot/ui/printToConsole.js ---
+const ui = require("cliui")({ width: 140 });
+const chalk = require("chalk");
+const moment = require("moment");
+const chart = require("asciichart");
+
+const { toDecimal } = require("../../utils");
+const cache = require("../cache");
+
+function printToConsole({
+	date,
+	i,
+	performanceOfRouteComp,
+	inputToken,
+	outputToken,
+	tokenA,
+	tokenB,
+	route,
+	simulatedProfit,
+}) {
+	try {
+		if (cache.ui.allowClear) {
+			// update max profitability spotted chart
+			if (cache.ui.showProfitChart) {
+				let spottetMaxTemp =
+					cache.chart.spottedMax[cache.sideBuy ? "buy" : "sell"];
+				spottetMaxTemp.shift();
+				spottetMaxTemp.push(
+					simulatedProfit === Infinity
+						? 0
+						: parseFloat(simulatedProfit.toFixed(2))
+				);
+				cache.chart.spottedMax.buy = spottetMaxTemp;
+			}
+
+			// update performance chart
+			if (cache.ui.showPerformanceOfRouteCompChart) {
+				let performanceTemp = cache.chart.performanceOfRouteComp;
+				performanceTemp.shift();
+				performanceTemp.push(parseInt(performanceOfRouteComp.toFixed()));
+				cache.chart.performanceOfRouteComp = performanceTemp;
+			}
+
+			// check swap / fetch result status
+			let statusMessage = " ";
+			let statusPerformance;
+			if (cache.swappingRightNow) {
+				statusPerformance = performance.now() - cache.performanceOfTxStart;
+				statusMessage = chalk.bold[
+					statusPerformance < 45000
+						? "greenBright"
+						: statusPerformance < 60000
+						? "yellowBright"
+						: "redBright"
+				](`SWAPPING ... ${(statusPerformance / 1000).toFixed(2)} s`);
+			} else if (cache.fetchingResultsFromSolscan) {
+				statusPerformance =
+					performance.now() - cache.fetchingResultsFromSolscanStart;
+				statusMessage = chalk.bold[
+					statusPerformance < 45000
+						? "greenBright"
+						: statusPerformance < 90000
+						? "yellowBright"
+						: "redBright"
+				](`FETCHING RESULT ... ${(statusPerformance / 1000).toFixed(2)} s`);
+			}
+
+			// refresh console before print
+			console.clear();
+			ui.resetOutput();
+
+			// show HOTKEYS HELP
+			if (cache.ui.showHelp) {
+				ui.div(
+					chalk.gray("[H] - show/hide help"),
+					chalk.gray("[CTRL]+[C] - exit"),
+					chalk.gray("[I] - incognito RPC")
+				);
+				ui.div(
+					chalk.gray("[L] - show/hide latency chart"),
+					chalk.gray("[P] - show/hide profit chart"),
+					chalk.gray("[T] - show/hide trade history")
+				);
+				ui.div(
+					chalk.gray("[E] - force execution"),
+					chalk.gray("[R] - revert back swap"),
+					chalk.gray("[S] - simulation mode switch")
+				);
+				ui.div(" ");
+			}
+
+			ui.div(
+				{
+					text: `TIMESTAMP: ${chalk[cache.ui.defaultColor](
+						date.toLocaleString()
+					)}`,
+				},
+				{
+					text: `I: ${
+						i % 2 === 0
+							? chalk[cache.ui.defaultColor].bold(i)
+							: chalk[cache.ui.defaultColor](i)
+					} | ${chalk.bold[cache.ui.defaultColor](
+						cache.iterationPerMinute.value
+					)} i/min`,
+				},
+				{
+					text: `RPC: ${chalk[cache.ui.defaultColor](
+						cache.ui.hideRpc
+							? `${cache.config.rpc[0].slice(
+									0,
+									5
+							  )}...${cache.config.rpc[0].slice(-5)}`
+							: cache.config.rpc[0]
+					)}`,
+				}
+			);
+
+			const performanceOfRouteCompColor =
+				performanceOfRouteComp < 1000 ? cache.ui.defaultColor : "redBright";
+
+			ui.div(
+				{
+					text: `STARTED: ${chalk[cache.ui.defaultColor](
+						moment(cache.startTime).fromNow()
+					)}`,
+				},
+				{
+					text: `LOOKUP (ROUTE): ${chalk.bold[performanceOfRouteCompColor](
+						performanceOfRouteComp.toFixed()
+					)} ms`,
+				},
+				{
+					text: `MIN INTERVAL: ${chalk[cache.ui.defaultColor](
+						cache.config.minInterval
+					)} ms QUEUE: ${chalk[cache.ui.defaultColor](
+						Object.keys(cache.queue).length
+					)}/${chalk[cache.ui.defaultColor](cache.queueThrottle)}`,
+				}
+			);
+
+			ui.div(
+				" ",
+				" ",
+				Object.values(cache.queue)
+					.map(
+						(v) => `${chalk[v === 0 ? "green" : v < 0 ? "yellow" : "red"]("●")}`
+					)
+					.join(" ")
+			);
+
+			if (cache.ui.showPerformanceOfRouteCompChart)
+				ui.div(
+					chart.plot(cache.chart.performanceOfRouteComp, {
+						padding: " ".repeat(10),
+						height: 5,
+					})
+				);
+
+			ui.div("");
+			ui.div(chalk.gray("-".repeat(140)));
+
+			ui.div(
+				`${
+					cache.tradingEnabled
+						? "TRADING"
+						: chalk.bold.magentaBright("SIMULATION")
+				}: ${chalk.bold[cache.ui.defaultColor](inputToken.symbol)} ${
+					cache.config.tradingStrategy === "arbitrage"
+						? ""
+						: `-> ${chalk.bold[cache.ui.defaultColor](outputToken.symbol)}`
+				}`,
+				`ROUTES: ${chalk.bold.yellowBright(
+					cache.availableRoutes[cache.sideBuy ? "buy" : "sell"]
+				)}`,
+				`STRATEGY: ${chalk.bold[cache.ui.defaultColor](
+					cache.config.tradingStrategy
+				)}`,
+				{
+					text: statusMessage,
+				}
+			);
+			ui.div("");
+
+			ui.div("BUY", "SELL", " ", " ");
+
+			ui.div(
+				{
+					text: `SUCCESS : ${chalk.bold.green(cache.tradeCounter.buy.success)}`,
+				},
+				{
+					text: `SUCCESS: ${chalk.bold.green(cache.tradeCounter.sell.success)}`,
+				},
+				{
+					text: " ",
+				},
+				{
+					text: " ",
+				}
+			);
+			ui.div(
+				{
+					text: `FAIL: ${chalk.bold.red(cache.tradeCounter.buy.fail)}`,
+				},
+				{
+					text: `FAIL: ${chalk.bold.red(cache.tradeCounter.sell.fail)}`,
+				},
+				{
+					text: " ",
+				},
+				{
+					text: " ",
+				}
+			);
+			ui.div("");
+
+			ui.div(
+				{
+					text: `IN:  ${chalk.yellowBright(
+						toDecimal(route.inAmount, inputToken.decimals)
+					)} ${chalk[cache.ui.defaultColor](inputToken.symbol)}`,
+				},
+				{
+					text: " ",
+				},
+				{
+					text: `SLIPPAGE: ${chalk.magentaBright(
+						`${
+							cache.config.slippage === "profitOrKill"
+								? "ProfitOrKill"
+								: cache.config.slippage + " %"
+						}`
+					)}`,
+				},
+				{
+					text: " ",
+				},
+				{
+					text: " ",
+				}
+			);
+
+			ui.div(
+				{
+					text: `OUT: ${chalk[simulatedProfit > 0 ? "greenBright" : "red"](
+						toDecimal(route.outAmount, outputToken.decimals)
+					)} ${chalk[cache.ui.defaultColor](outputToken.symbol)}`,
+				},
+				{
+					text: " ",
+				},
+				{
+					text: `MIN. OUT: ${chalk.magentaBright(
+						toDecimal(route.outAmountWithSlippage, outputToken.decimals)
+					)}`,
+				},
+				{
+					text: `W/UNWRAP SOL: ${chalk[cache.ui.defaultColor](
+						cache.wrapUnwrapSOL ? "on" : "off"
+					)}`,
+				},
+				{
+					text: " ",
+				}
+			);
+
+			ui.div(
+				{
+					text: `PROFIT: ${chalk[simulatedProfit > 0 ? "greenBright" : "red"](
+						simulatedProfit.toFixed(2)
+					)} % ${chalk.gray(`(${cache?.config?.minPercProfit})`)}`,
+				},
+				{
+					text: " ",
+				},
+				{
+					text: " ",
+				},
+				{
+					text: " ",
+				},
+				{
+					text: " ",
+				}
+			);
+
+			ui.div(" ");
+
+			ui.div("CURRENT BALANCE", "LAST BALANCE", "INIT BALANCE", "PROFIT", " ");
+
+			ui.div(
+				`${chalk[cache.currentBalance.tokenA > 0 ? "yellowBright" : "gray"](
+					toDecimal(cache.currentBalance.tokenA, tokenA.decimals)
+				)} ${chalk[cache.ui.defaultColor](tokenA.symbol)}`,
+
+				`${chalk[cache.lastBalance.tokenA > 0 ? "yellowBright" : "gray"](
+					toDecimal(cache.lastBalance.tokenA, tokenA.decimals)
+				)} ${chalk[cache.ui.defaultColor](tokenA.symbol)}`,
+
+				`${chalk[cache.initialBalance.tokenA > 0 ? "yellowBright" : "gray"](
+					toDecimal(cache.initialBalance.tokenA, tokenA.decimals)
+				)} ${chalk[cache.ui.defaultColor](tokenA.symbol)}`,
+
+				`${chalk[cache.currentProfit.tokenA > 0 ? "greenBright" : "redBright"](
+					cache.currentProfit.tokenA.toFixed(2)
+				)} %`,
+				" "
+			);
+
+			ui.div(
+				`${chalk[cache.currentBalance.tokenB > 0 ? "yellowBright" : "gray"](
+					toDecimal(cache.currentBalance.tokenB, tokenB.decimals)
+				)} ${chalk[cache.ui.defaultColor](tokenB.symbol)}`,
+
+				`${chalk[cache.lastBalance.tokenB > 0 ? "yellowBright" : "gray"](
+					toDecimal(cache.lastBalance.tokenB, tokenB.decimals)
+				)} ${chalk[cache.ui.defaultColor](tokenB.symbol)}`,
+
+				`${chalk[cache.initialBalance.tokenB > 0 ? "yellowBright" : "gray"](
+					toDecimal(cache.initialBalance.tokenB, tokenB.decimals)
+				)} ${chalk[cache.ui.defaultColor](tokenB.symbol)}`,
+
+				`${chalk[cache.currentProfit.tokenB > 0 ? "greenBright" : "redBright"](
+					cache.currentProfit.tokenB.toFixed(2)
+				)} %`,
+				" "
+			);
+
+			ui.div(chalk.gray("-".repeat(140)));
+			ui.div("");
+
+			if (cache.ui.showProfitChart) {
+				ui.div(
+					chart.plot(cache.chart.spottedMax[cache.sideBuy ? "buy" : "sell"], {
+						padding: " ".repeat(10),
+						height: 4,
+						colors: [simulatedProfit > 0 ? chart.lightgreen : chart.lightred],
+					})
+				);
+
+				ui.div("");
+			}
+
+			ui.div(
+				{
+					text: `MAX (BUY): ${chalk[cache.ui.defaultColor](
+						cache.maxProfitSpotted.buy.toFixed(2)
+					)} %`,
+				},
+				{
+					text: `MAX (SELL): ${chalk[cache.ui.defaultColor](
+						cache.maxProfitSpotted.sell.toFixed(2)
+					)} %`,
+				},
+				{ text: " " }
+			);
+
+			ui.div("");
+			ui.div(chalk.gray("-".repeat(140)));
+			ui.div("");
+
+			if (cache.ui.showTradeHistory) {
+				ui.div(
+					{ text: `TIMESTAMP` },
+					{ text: `SIDE` },
+					{ text: `IN` },
+					{ text: `OUT` },
+					{ text: `PROFIT` },
+					{ text: `EXP. OUT` },
+					{ text: `EXP. PROFIT` },
+					{ text: `ERROR` }
+				);
+
+				ui.div(" ");
+
+				if (cache?.tradeHistory?.length > 0) {
+					const tableData = [...cache.tradeHistory].slice(-5);
+					tableData.map((entry) =>
+						ui.div(
+							{ text: `${entry.date}`, border: true },
+							{ text: `${entry.buy ? "BUY" : "SELL"}`, border: true },
+							{ text: `${entry.inAmount} ${entry.inputToken}`, border: true },
+							{ text: `${entry.outAmount} ${entry.outputToken}`, border: true },
+							{
+								text: `${
+									chalk[
+										entry.profit > 0
+											? "greenBright"
+											: entry.profit < 0
+											? "redBright"
+											: "cyanBright"
+									](isNaN(entry.profit) ? "0" : entry.profit.toFixed(2)) + " %"
+								}`,
+								border: true,
+							},
+							{
+								text: `${entry.expectedOutAmount} ${entry.outputToken}`,
+								border: true,
+							},
+							{
+								text: `${entry.expectedProfit.toFixed(2)} %`,
+								border: true,
+							},
+							{
+								text: `${
+									entry.error ? chalk.bold.redBright(entry.error) : "-"
+								}`,
+								border: true,
+							}
+						)
+					);
+				}
+			}
+			ui.div("");
+
+			// print UI
+			console.log(ui.toString());
+		}
+	} catch (error) {
+		console.log(error);
+	}
+}
+
+module.exports = printToConsole;
+
+'''
+'''--- src/constants/index.js ---
+const CONFIG_INITIAL_STATE = {
+	showHelp: true,
+	nav: {
+		currentStep: 0,
+		steps: [
+			"network",
+			"rpc",
+			"strategy",
+			"tokens",
+			"trading size",
+			"profit",
+			"slippage",
+			"advanced",
+			"confirm",
+		],
+	},
+	config: {
+		network: {
+			value: "",
+			isSet: false,
+		},
+		rpc: {
+			value: [],
+			isSet: false,
+			state: {
+				items: [
+					{
+						label: process.env.DEFAULT_RPC,
+						value: process.env.DEFAULT_RPC,
+						isSelected: true,
+					},
+					...String(process.env.ALT_RPC_LIST)
+						.split(",")
+						.map((item) => ({
+							label: item,
+							value: item,
+							isSelected: false,
+						})),
+				],
+			},
+		},
+		strategy: {
+			value: "",
+			isSet: false,
+		},
+		tokens: {
+			value: {
+				tokenA: { symbol: "", address: "" },
+				tokenB: { symbol: "", address: "" },
+			},
+			isSet: {
+				tokenA: false,
+				tokenB: false,
+			},
+		},
+		"trading size": {
+			value: {
+				strategy: "",
+				value: "",
+			},
+			isSet: false,
+		},
+		profit: {
+			value: 1,
+			isSet: {
+				percent: false,
+				strategy: false,
+			},
+		},
+		slippage: {
+			value: 0,
+			isSet: false,
+		},
+		advanced: {
+			value: {
+				minInterval: 30,
+			},
+			isSet: {
+				minInterval: false,
+			},
+		},
+	},
+};
+
+module.exports = {
+	DISCORD_INVITE_URL: "https://discord.gg/wcxYzfKNaE",
+	CONFIG_INITIAL_STATE,
+};
+
+'''
+'''--- src/index.js ---
+#!/usr/bin/env node
+"use strict";
+const React = require("react");
+const importJsx = require("import-jsx");
+const { render } = require("ink");
+const meow = require("meow");
+
+const wizard = importJsx("./wizard/index");
+
+const cli = meow(`
+	Usage
+	  $ solana-jupiter-bot
+
+	Options
+		--name  Your name
+
+	Examples
+	  $ solana-jupiter-bot --name=Jane
+	  Hello, Jane
+`);
+
+console.clear();
+
+render(React.createElement(wizard, cli.flags)).waitUntilExit();
+
+'''
+'''--- src/services/solscan.js ---
+const { default: axios } = require("axios");
+const promiseRetry = require("promise-retry");
+
+const { logExit, handleExit } = require("../bot/exit");
+const { storeItInTempAsJSON } = require("../utils");
+const cache = require("../bot/cache");
+
+const getSwapResultFromSolscanParser = async (txid) => {
+	try {
+		// disable trading till swap result is ready
+		cache.tradingEnabled = false;
+
+		cache.fetchingResultsFromSolscan = true;
+		cache.fetchingResultsFromSolscanStart = performance.now();
+
+		const fetcher = async (retry) => {
+			const response = await axios.get(`https://api.solscan.io/transaction`, {
+				params: {
+					tx: txid,
+				},
+			});
+
+			if (process.env.DEBUG)
+				storeItInTempAsJSON(`solscan_${txid}`, response.data);
+
+			if (response.status === 200) {
+				if (response?.data?.mainActions) {
+					return response.data;
+				} else {
+					retry(new Error("Transaction was not confirmed"));
+				}
+			}
+		};
+
+		const data = await promiseRetry(fetcher, {
+			retries: 40,
+			minTimeout: 2000,
+			maxTimeout: 5000,
+			randomize: true,
+		});
+
+		const ownerAddress = data?.signer[0];
+
+		if (!ownerAddress) throw new Error("Owner address not found");
+
+		const tokenAddress = cache?.config?.tokenA.address;
+
+		const mainActions = data.mainActions;
+
+		let [inputAmount, outputAmount] = [-1, -1];
+		mainActions.filter((action) => {
+			const events = action?.data?.event;
+			if (events) {
+				const inputEvent = events.find(
+					(event) =>
+						event?.sourceOwner === ownerAddress &&
+						event?.tokenAddress === tokenAddress
+				);
+				const outputEvent = events.find(
+					(event) =>
+						event?.destinationOwner === ownerAddress &&
+						event?.tokenAddress === tokenAddress
+				);
+
+				if (inputEvent) inputAmount = parseInt(inputEvent?.amount);
+
+				if (outputEvent) outputAmount = parseInt(outputEvent?.amount);
+			}
+		});
+
+		return [inputAmount, outputAmount];
+	} catch (error) {
+		logExit(1, error);
+		handleExit();
+	} finally {
+		cache.fetchingResultsFromSolscan = false;
+		cache.tradingEnabled = true;
+	}
+};
+
+module.exports = {
+	getSwapResultFromSolscanParser,
+};
+
+'''
+'''--- src/utils/index.js ---
+const chalk = require("chalk");
+const fs = require("fs");
+const ora = require("ora-classic");
+const { logExit } = require("../bot/exit");
+
+const createTempDir = () => !fs.existsSync("./temp") && fs.mkdirSync("./temp");
+
+const storeItInTempAsJSON = (filename, data) =>
+	fs.writeFileSync(`./temp/${filename}.json`, JSON.stringify(data, null, 2));
+
+const createConfigFile = (config) => {
+	const configSpinner = ora({
+		text: "Creating config...",
+		discardStdin: false,
+	}).start();
+
+	const configValues = {
+		network: config.network.value,
+		rpc: config.rpc.value,
+		tradingStrategy: config.strategy.value,
+		tokenA: config.tokens.value.tokenA,
+		tokenB: config.tokens.value.tokenB,
+		slippage: config.slippage.value,
+		minPercProfit: config.profit.value,
+		minInterval: parseInt(config.advanced.value.minInterval),
+		tradeSize: {
+			value: parseFloat(config["trading size"].value.value),
+			strategy: config["trading size"].value.strategy,
+		},
+		ui: {
+			defaultColor: "cyan",
+		},
+		storeFailedTxInHistory: true,
+	};
+
+	fs.writeFileSync("./config.json", JSON.stringify(configValues, null, 2), {});
+	configSpinner.succeed("Config created!");
+};
+
+const verifyConfig = (config) => {
+	let result = true;
+	const badConfig = [];
+	Object.entries(config).forEach(([key, value]) => {
+		const isSet = value.isSet;
+		const isSectionSet =
+			isSet instanceof Object
+				? Object.values(isSet).every((value) => value === true)
+				: isSet;
+
+		if (!isSectionSet) {
+			result = false;
+			badConfig.push(key);
+		}
+	});
+	return { result, badConfig };
+};
+
+/**
+ * It loads the config file and returns the config object
+ * @returns The config object
+ */
+const loadConfigFile = ({ showSpinner = false }) => {
+	let config = {};
+	let spinner;
+	if (showSpinner) {
+		spinner = ora({
+			text: "Loading config...",
+			discardStdin: false,
+		}).start();
+	}
+
+	if (fs.existsSync("./config.json")) {
+		config = JSON.parse(fs.readFileSync("./config.json"));
+		spinner?.succeed("Config loaded!");
+		return config;
+	}
+
+	spinner?.fail(chalk.redBright("Loading config failed!\n"));
+	throw new Error("\nNo config.json file found!\n");
+};
+
+const calculateProfit = (oldVal, newVal) => ((newVal - oldVal) / oldVal) * 100;
+
+const toDecimal = (number, decimals) =>
+	parseFloat(number / 10 ** decimals).toFixed(decimals);
+
+const toNumber = (number, decimals) => number * 10 ** decimals;
+
+/**
+ * It calculates the number of iterations per minute and updates the cache.
+ */
+const updateIterationsPerMin = (cache) => {
+	const iterationTimer =
+		(performance.now() - cache.iterationPerMinute.start) / 1000;
+
+	if (iterationTimer >= 60) {
+		cache.iterationPerMinute.value = Number(
+			cache.iterationPerMinute.counter.toFixed()
+		);
+		cache.iterationPerMinute.start = performance.now();
+		cache.iterationPerMinute.counter = 0;
+	} else cache.iterationPerMinute.counter++;
+};
+
+const checkRoutesResponse = (routes) => {
+	if (Object.hasOwn(routes, "routesInfos")) {
+		if (routes.routesInfos.length === 0) {
+			logExit(1, {
+				message: "No routes found or something is wrong with RPC / Jupiter! ",
+			});
+			process.exit(1);
+		}
+	} else {
+		logExit(1, {
+			message: "Something is wrong with RPC / Jupiter! ",
+		});
+		process.exit(1);
+	}
+};
+
+const checkForEnvFile = () => {
+	if (!fs.existsSync("./.env")) {
+		logExit(1, {
+			message: "No .env file found! ",
+		});
+		process.exit(1);
+	}
+};
+
+module.exports = {
+	createTempDir,
+	storeItInTempAsJSON,
+	createConfigFile,
+	loadConfigFile,
+	verifyConfig,
+	calculateProfit,
+	toDecimal,
+	toNumber,
+	updateIterationsPerMin,
+	checkRoutesResponse,
+	checkForEnvFile,
+};
+
+'''
+'''--- src/wizard/Components/EscNotification.js ---
+const React = require("react");
+const { Box, Text } = require("ink");
+
+const EscNotification = () => {
+	return (
+		<Box paddingTop={1}>
+			<Text dimColor color="yellow">
+				Use <Text bold>ESC</Text> key if U wanna exit
+			</Text>
+		</Box>
+	);
+};
+
+module.exports = EscNotification;
+
+'''
+'''--- src/wizard/Components/Help.js ---
+const React = require("react");
+const { Box, Text } = require("ink");
+const chalk = require("chalk");
+const Help = () => {
+	return (
+		<Box flexDirection="row" justifyContent="space-between" width={118}>
+			<Box width={20} />
+			<Box width={80} justifyContent="space-around">
+				<Text>{chalk.gray`${chalk.bold.white("[")} previous`}</Text>
+				<Text>{chalk.gray`${chalk.bold.white("]")} next`}</Text>
+				<Text>{chalk.gray`[${chalk.bold.white("H")}]elp`}</Text>
+				<Text>{chalk.gray`[${chalk.bold.hex("#481ede")("ESC")}]`}</Text>
+			</Box>
+		</Box>
+	);
+};
+module.exports = Help;
+
+'''
+'''--- src/wizard/Components/Layout.js ---
+const React = require("react");
+const { Box } = require("ink");
+
+const importJsx = require("import-jsx");
+const { useContext } = require("react");
+const WizardContext = require("../WizardContext");
+const Help = require("import-jsx")("./Help");
+
+const WizardHeader = importJsx("./WizardHeader");
+const Menu = importJsx("./Menu");
+const Main = importJsx("./Main");
+
+const Layout = () => {
+	const { showHelp } = useContext(WizardContext);
+	return (
+		<>
+			{showHelp && <Help />}
+			<Box padding={1} justifyContent="flex-start" flexDirection="row">
+				<Menu />
+				<Box
+					width={80}
+					minHeight={20}
+					borderColor="#481fde"
+					borderStyle="bold"
+					padding={1}
+					flexDirection="column"
+				>
+					<WizardHeader />
+					<Main />
+				</Box>
+			</Box>
+		</>
+	);
+};
+
+module.exports = Layout;
+
+'''
+'''--- src/wizard/Components/Main.js ---
+const React = require("react");
+const { Box } = require("ink");
+const WizardContext = require("../WizardContext");
+const { useContext } = require("react");
+const importJsx = require("import-jsx");
+const Divider = require("ink-divider");
+const Router = importJsx("./Router");
+
+function Main() {
+	const { nav } = useContext(WizardContext);
+	return (
+		<Box flexDirection="column">
+			<Divider title={nav.steps[nav.currentStep]} />
+			<Box marginY={1}>
+				<Router />
+			</Box>
+		</Box>
+	);
+}
+module.exports = Main;
+
+'''
+'''--- src/wizard/Components/Menu.js ---
+const { Box, Text } = require("ink");
+const { useContext } = require("react");
+const React = require("react");
+const WizardContext = require("../WizardContext");
+const Menu = () => {
+	const { nav, config } = useContext(WizardContext);
+	return (
+		<Box
+			width="10%"
+			minWidth={12}
+			flexDirection="column"
+			justifyContent="center"
+			alignItems="flex-end"
+		>
+			{nav.steps.map((step, index) => {
+				const isActive = index === nav.currentStep;
+				const isSet = config[nav.steps[index]]?.isSet;
+				const isSectionSet =
+					isSet instanceof Object
+						? Object.values(isSet).every((value) => value === true)
+						: isSet;
+
+				return (
+					<Text
+						color={isSectionSet ? "green" : ""}
+						dimColor={!isActive}
+						bold={isActive}
+						underline={isActive}
+						backgroundColor={isActive && "#481fde"}
+						key={index}
+					>
+						{step}
+					</Text>
+				);
+			})}
+		</Box>
+	);
+};
+
+module.exports = Menu;
+
+'''
+'''--- src/wizard/Components/Router.js ---
+const React = require("react");
+const importJsx = require("import-jsx");
+
+const WizardContext = require("../WizardContext");
+const { useContext } = require("react");
+
+const Network = importJsx("../Pages/Network");
+const Rpc = importJsx("../Pages/Rpc");
+const Strategy = importJsx("../Pages/Strategy");
+const Tokens = importJsx("../Pages/Tokens");
+const TradingSize = importJsx("../Pages/TradingSize");
+const Profit = importJsx("../Pages/Profit");
+const Slippage = importJsx("../Pages/Slippage");
+const Advanced = importJsx("../Pages/Advanced");
+const Confirm = importJsx("../Pages/Confirm");
+
+const ROUTES = {
+	network: <Network />,
+	rpc: <Rpc />,
+	strategy: <Strategy />,
+	tokens: <Tokens />,
+	"trading size": <TradingSize />,
+	profit: <Profit />,
+	slippage: <Slippage />,
+	advanced: <Advanced />,
+	confirm: <Confirm />,
+};
+
+const Router = () => {
+	const { nav } = useContext(WizardContext);
+
+	return <>{ROUTES[nav.steps[nav.currentStep]]}</>;
+};
+module.exports = Router;
+
+'''
+'''--- src/wizard/Components/TabNotification.js ---
+const React = require("react");
+const { Box, Text } = require("ink");
+
+const EscNotification = ({ skip = false }) => {
+	if (skip)
+		return (
+			<Box paddingTop={1}>
+				<Text color="cyanBright">
+					Press <Text bold>TAB</Text> to use <Text>DEFAULT</Text> from .env
+				</Text>
+			</Box>
+		);
+
+	return (
+		<Box paddingTop={1}>
+			<Text color="greenBright">
+				Press <Text bold>TAB</Text> wen done
+			</Text>
+		</Box>
+	);
+};
+
+module.exports = EscNotification;
+
+'''
+'''--- src/wizard/Components/WizardHeader.js ---
+const React = require("react");
+const BigText = require("ink-big-text");
+const Gradient = require("ink-gradient");
+const { Box } = require("ink");
+const { useState, useEffect } = require("react");
+
+let colorsSetInitialState = [
+	"#cf4884",
+	"#8832b3",
+	"#b5b4fa",
+	"#cdadff",
+	"#6d29c5",
+	"#4e21d9",
+	"#481ede",
+	"#4b9db0",
+	"#8deef5",
+	"#cdd4a2",
+	"#e2a659",
+];
+
+const IntroTitle = () => {
+	const [colorsSet, setColorSet] = useState(colorsSetInitialState);
+	useEffect(() => {
+		const changeColorInterval = setInterval(() => {
+			const temp = [...colorsSet];
+			const a = temp.shift();
+			temp.push(a);
+			setColorSet(temp);
+		}, 200);
+
+		return () => {
+			try {
+				clearInterval(changeColorInterval);
+			} catch (error) {
+				console.log("changeColorInterval error: ", error);
+			}
+		};
+	}, [colorsSet]);
+
+	return (
+		<Box flexDirection="row">
+			<Gradient colors={colorsSet.slice(0, 4)}>
+				<BigText text={"ARB"} font="tiny"></BigText>
+			</Gradient>
+			<Gradient colors={colorsSet.slice(4, 8)}>
+				<BigText text="Jupiter" font="tiny" lineHeight={1}></BigText>
+			</Gradient>
+			<Gradient colors={colorsSet.slice(8)}>
+				<BigText text="Bot" font="tiny"></BigText>
+			</Gradient>
+		</Box>
+	);
+};
+
+module.exports = IntroTitle;
+
+'''
+'''--- src/wizard/Pages/Advanced.js ---
+const React = require("react");
+const { Box, Text } = require("ink");
+const { useContext, useState, useRef, useEffect } = require("react");
+const WizardContext = require("../WizardContext");
+const { default: TextInput } = require("ink-text-input");
+
+function Advanced() {
+	let isMountedRef = useRef(false);
+
+	const {
+		config: {
+			advanced: { value: advancedValue, isSet: advancedIsSet },
+		},
+		configSetValue,
+	} = useContext(WizardContext);
+
+	const [tempAdvancedValue, setTempAdvancedValue] = useState(advancedValue);
+
+	const handleSubmit = (key, value) => {
+		configSetValue("advanced", {
+			value: {
+				...advancedValue,
+				[key]: value,
+			},
+			isSet: {
+				...advancedIsSet,
+				[key]: true,
+			},
+		});
+	};
+
+	const handleMinIntervalChange = (value) => {
+		if (!isMountedRef.current) return;
+
+		setTempAdvancedValue({
+			...tempAdvancedValue,
+			minInterval: value,
+		});
+	};
+
+	useEffect(() => {
+		isMountedRef.current = true;
+		return () => (isMountedRef.current = false);
+	}, []);
+
+	return (
+		<Box flexDirection="column">
+			<Text color="gray">
+				Advanced settings can be crucial for strategy efficiency.
+			</Text>
+			<Text color="gray">
+				Please make sure you know what you are doing before changing these
+				settings.
+			</Text>
+			<Box flexDirection="row" marginTop={1}>
+				<Text>
+					Min Interval:{" "}
+					{!advancedIsSet.minInterval ? (
+						<Text color="yellowBright">
+							<TextInput
+								value={
+									tempAdvancedValue?.minInterval
+										? tempAdvancedValue.minInterval.toString()
+										: ""
+								}
+								onChange={handleMinIntervalChange}
+								onSubmit={(value) => {
+									handleSubmit("minInterval", value);
+								}}
+							/>
+						</Text>
+					) : (
+						<Text color="greenBright">{tempAdvancedValue?.minInterval}</Text>
+					)}
+				</Text>
+			</Box>
+		</Box>
+	);
+}
+module.exports = Advanced;
+
+'''
+'''--- src/wizard/Pages/Confirm.js ---
+const React = require("react");
+const { Box, Text, useApp } = require("ink");
+const WizardContext = require("../WizardContext");
+const { useContext, useEffect, useState } = require("react");
+const { default: TextInput } = require("ink-text-input");
+const chalk = require("chalk");
+const { createConfigFile, verifyConfig } = require("../../utils");
+
+const Confirm = () => {
+	const { exit } = useApp();
+	const {
+		config: {
+			network: { value: network },
+			rpc: { value: rpc },
+			strategy: { value: strategy },
+			tokens: { value: tokens },
+			"trading size": { value: tradingSize },
+			profit: { value: profit },
+			slippage: { value: slippage },
+			advanced: { value: advanced },
+		},
+		config,
+	} = useContext(WizardContext);
+	const [isConfigOk, setIsConfigOk] = useState({
+		result: false,
+		badConfig: [],
+	});
+
+	useEffect(() => {
+		setIsConfigOk(verifyConfig(config));
+	}, []);
+
+	return (
+		<Box flexDirection="column">
+			<Text>Confirm your settings:</Text>
+			<Box margin={1} flexDirection="column">
+				<Text>Network: {chalk.greenBright(network)}</Text>
+				<Text>RPC: {chalk.greenBright(rpc)}</Text>
+				<Text>Strategy: {chalk.bold.greenBright(strategy)}</Text>
+				<Text>
+					Tokens: {chalk.bold.blueBright(tokens.tokenA.symbol)} /{" "}
+					{chalk.bold.blueBright(tokens.tokenB.symbol)}
+				</Text>
+				<Text>
+					Trading size: {chalk.bold.greenBright(tradingSize.value)}{" "}
+					{chalk.gray(tokens.tokenA.symbol)} |{" "}
+					{chalk.greenBright(tradingSize.strategy)}
+				</Text>
+				<Text>Profit: {chalk.bold.greenBright(profit)}</Text>
+				<Text>Slippage: {chalk.bold.greenBright(slippage)}</Text>
+				<Text color="gray"></Text>
+				<Text>
+					Min Interval: {chalk.bold.greenBright(advanced.minInterval)}
+				</Text>
+			</Box>
+			{isConfigOk.result ? (
+				<TextInput
+					value={`${chalk.bold.greenBright("[ CONFIRM ]")}`}
+					showCursor={false}
+					onSubmit={async () => {
+						createConfigFile(config);
+						exit();
+					}}
+				/>
+			) : (
+				<Text>
+					Error on step:{" "}
+					{<Text color="red">{isConfigOk.badConfig.join(", ")}</Text>}
+				</Text>
+			)}
+		</Box>
+	);
+};
+
+module.exports = Confirm;
+
+'''
+'''--- src/wizard/Pages/Network.js ---
+const React = require("react");
+const { Box, Text } = require("ink");
+const WizardContext = require("../WizardContext");
+const { useContext } = require("react");
+const { default: SelectInput } = require("ink-select-input");
+const chalk = require("chalk");
+
+const NETWORKS = [
+	{ label: "mainnet-beta", value: "mainnet-beta" },
+	{ label: "devnet", value: "devnet" },
+];
+
+const Indicator = ({ label, value }) => {
+	const {
+		config: {
+			network: { value: selectedValue },
+		},
+	} = useContext(WizardContext);
+
+	const isSelected = value == selectedValue;
+
+	return <Text>{chalk[isSelected ? "greenBright" : "white"](`${label}`)}</Text>;
+};
+
+function Network() {
+	const { configSetValue } = useContext(WizardContext);
+	return (
+		<Box flexDirection="column">
+			<Text>
+				Select Solana <Text color="magenta">Network</Text>:
+			</Text>
+			<Box margin={1}>
+				<SelectInput
+					items={NETWORKS}
+					onSelect={(item) => configSetValue("network", item.value)}
+					itemComponent={Indicator}
+				/>
+			</Box>
+		</Box>
+	);
+}
+module.exports = Network;
+
+'''
+'''--- src/wizard/Pages/Profit.js ---
+const React = require("react");
+const { Box, Text } = require("ink");
+const { useContext, useState, useRef, useEffect } = require("react");
+const WizardContext = require("../WizardContext");
+
+const { default: TextInput } = require("ink-text-input");
+
+function MinProfit() {
+	let isMountedRef = useRef(false);
+	const {
+		config: {
+			profit: { value: profitValue },
+		},
+		configSetValue,
+	} = useContext(WizardContext);
+
+	const [minProfit, setMinProfit] = useState(profitValue.toString());
+	const [inputBorderColor, setInputBorderColor] = useState("gray");
+
+	const handleMinProfitSubmit = (value) => {
+		configSetValue("profit", value);
+	};
+
+	const handleMinProfitChange = (value) => {
+		if (!isMountedRef.current) return;
+
+		const badChars = /[^0-9.]/g;
+		badChars.test(value)
+			? setInputBorderColor("red")
+			: setInputBorderColor("gray");
+		const sanitizedValue = value.replace(badChars, "");
+		setMinProfit(sanitizedValue);
+		setTimeout(() => isMountedRef.current && setInputBorderColor("gray"), 100);
+	};
+
+	useEffect(() => {
+		isMountedRef.current = true;
+		return () => (isMountedRef.current = false);
+	}, []);
+
+	return (
+		<Box flexDirection="column">
+			<Text>
+				Set <Text color="#cdadff">min. profit</Text> value:
+			</Text>
+
+			<Box flexDirection="row" alignItems="center">
+				<Text>Min. Profit:</Text>
+				<Box borderStyle="round" borderColor={inputBorderColor} marginLeft={1}>
+					<TextInput
+						value={minProfit}
+						onChange={handleMinProfitChange}
+						onSubmit={handleMinProfitSubmit}
+					/>
+				</Box>
+				<Text>%</Text>
+			</Box>
+		</Box>
+	);
+}
+module.exports = MinProfit;
+
+'''
+'''--- src/wizard/Pages/Rpc.js ---
+const React = require("react");
+const { Box, Text, useInput, Newline } = require("ink");
+const WizardContext = require("../WizardContext");
+const { useContext, useState } = require("react");
+const { default: SelectInput } = require("ink-select-input");
+const chalk = require("chalk");
+
+const Indicator = ({ label: selectedLabel, value: selectedValue }) => {
+	const {
+		config: {
+			rpc: {
+				value,
+				state: { items },
+			},
+		},
+	} = useContext(WizardContext);
+
+	const isSelected = items.find(
+		(item) => item.value === selectedValue
+	).isSelected;
+
+	return (
+		<Text>
+			{chalk[
+				value?.includes(selectedValue)
+					? "greenBright"
+					: isSelected
+					? "white"
+					: "gray"
+			](`${isSelected ? "⦿" : "○"} ${selectedLabel}`)}
+		</Text>
+	);
+};
+
+function Rpc() {
+	const {
+		config: {
+			rpc: { state },
+		},
+		configSetValue,
+		configSwitchState,
+	} = useContext(WizardContext);
+
+	const items = state?.items || [];
+
+	const handleSelect = () => {
+		const valueToSet = items
+			.filter((item) => item.isSelected)
+			.map((item) => item.value);
+		configSetValue("rpc", valueToSet);
+	};
+
+	const [highlightedItem, setHighlightedItem] = useState();
+
+	useInput((input) => {
+		if (input === " " && highlightedItem) {
+			configSwitchState("rpc", highlightedItem.value);
+		}
+	});
+
+	const handleHighlight = (item) => setHighlightedItem(item);
+	return (
+		<Box flexDirection="column">
+			<Text>Please select at least one RPC.</Text>
+			<Text>
+				If You choose more, You can switch between them while the bot is
+				running.
+			</Text>
+			<Newline />
+			<SelectInput
+				items={items}
+				onHighlight={handleHighlight}
+				onSelect={handleSelect}
+				itemComponent={Indicator}
+			/>
+		</Box>
+	);
+}
+module.exports = Rpc;
+
+'''
+'''--- src/wizard/Pages/Slippage.js ---
+const React = require("react");
+const { Box, Text } = require("ink");
+const { default: SelectInput } = require("ink-select-input");
+const { useContext, useState, useEffect, useRef } = require("react");
+const WizardContext = require("../WizardContext");
+
+const { default: TextInput } = require("ink-text-input");
+const chalk = require("chalk");
+
+const SLIPPAGE_STRATEGIES = [
+	{ label: "Profit Or Kill 🗡", value: "profitOrKill" },
+	{ label: "0.5%", value: 0.5 },
+	{ label: "1%", value: 1 },
+	{ label: "1.5%", value: 1.5 },
+	{ label: "Custom %", value: "custom" },
+];
+
+const Indicator = ({ label, value }) => {
+	const {
+		config: {
+			slippage: { value: selectedValue },
+		},
+	} = useContext(WizardContext);
+
+	const isSelected = value == selectedValue;
+
+	return <Text>{chalk[isSelected ? "greenBright" : "white"](`${label}`)}</Text>;
+};
+
+function Slippage() {
+	const { configSetValue } = useContext(WizardContext);
+	let isMountedRef = useRef(false);
+
+	const [tempSlippageStrategy, setTempSlippageStrategy] = useState(
+		SLIPPAGE_STRATEGIES[0]
+	);
+	const [customSlippage, setCustomSlippage] = useState("1");
+	const [inputBorderColor, setInputBorderColor] = useState("gray");
+
+	const handleSlippageStrategySelect = (slippage) => {
+		const value = slippage.value;
+		setTempSlippageStrategy(value);
+		if (value !== "custom")
+			configSetValue(
+				"slippage",
+				value === "profitOrKill" ? value : Number(value)
+			);
+	};
+
+	const handleCustomSlippageChange = (value) => {
+		const badChars = /[^0-9.]/g;
+		badChars.test(value)
+			? setInputBorderColor("red")
+			: setInputBorderColor("gray");
+		const sanitizedValue = value.replace(badChars, "");
+		setCustomSlippage(sanitizedValue);
+		setTimeout(() => isMountedRef.current && setInputBorderColor("gray"), 100);
+	};
+
+	const handleCustomSlippageSubmit = () => {
+		configSetValue("slippage", Number(customSlippage));
+	};
+
+	useEffect(() => {
+		isMountedRef.current = true;
+		return () => (isMountedRef.current = false);
+	}, []);
+
+	return (
+		<Box flexDirection="column">
+			<Text>
+				Set <Text color="#cdadff">slippage</Text> strategy
+			</Text>
+			<Box margin={1}>
+				<SelectInput
+					items={SLIPPAGE_STRATEGIES}
+					itemComponent={Indicator}
+					onSelect={handleSlippageStrategySelect}
+				/>
+			</Box>
+			{tempSlippageStrategy === "custom" && (
+				<Box flexDirection="row" alignItems="center">
+					<Text>Custom slippage:</Text>
+					<Box
+						borderStyle="round"
+						borderColor={inputBorderColor}
+						marginLeft={1}
+					>
+						<TextInput
+							value={customSlippage}
+							onChange={handleCustomSlippageChange}
+							onSubmit={handleCustomSlippageSubmit}
+						/>
+					</Box>
+					<Text>%</Text>
+				</Box>
+			)}
+		</Box>
+	);
+}
+module.exports = Slippage;
+
+'''
+'''--- src/wizard/Pages/Strategy.js ---
+const React = require("react");
+const { Box, Text } = require("ink");
+const WizardContext = require("../WizardContext");
+const { useContext } = require("react");
+const { default: SelectInput } = require("ink-select-input");
+const chalk = require("chalk");
+
+const TRADING_STRATEGIES = [
+	{ label: "Ping Pong", value: "pingpong" },
+	{ label: "Arbitrage", value: "arbitrage" },
+	{ label: chalk.gray("coming soon..."), value: "null" },
+];
+
+const Indicator = ({ label, value }) => {
+	const {
+		config: {
+			strategy: { value: selectedValue },
+		},
+	} = useContext(WizardContext);
+
+	const isSelected = value === selectedValue;
+
+	return <Text>{chalk[isSelected ? "greenBright" : "white"](`${label}`)}</Text>;
+};
+
+function Strategy() {
+	const { configSetValue } = useContext(WizardContext);
+
+	const handleTradingStrategySelect = (strategy) => {
+		configSetValue("strategy", strategy.value);
+	};
+
+	return (
+		<Box flexDirection="column">
+			<Text>Select Trading Strategy:</Text>
+			<Box margin={1}>
+				<SelectInput
+					items={TRADING_STRATEGIES}
+					itemComponent={Indicator}
+					onSelect={handleTradingStrategySelect}
+				/>
+			</Box>
+		</Box>
+	);
+}
+module.exports = Strategy;
+
+'''
+'''--- src/wizard/Pages/Tokens.js ---
+"use strict";
+const React = require("react");
+const { Box, Text } = require("ink");
+const WizardContext = require("../WizardContext");
+const { useContext, useState, useEffect, useRef } = require("react");
+const { default: SelectInput } = require("ink-select-input");
+const chalk = require("chalk");
+const { default: axios } = require("axios");
+const { TOKEN_LIST_URL } = require("@jup-ag/core");
+const { default: TextInput } = require("ink-text-input");
+const fs = require("fs");
+
+function Tokens() {
+	let isMountedRef = useRef(false);
+
+	const {
+		config: {
+			strategy: { value: strategy },
+			network: { value: network },
+			tokens: { value: tokensValue, isSet: tokensIsSet },
+		},
+		configSetValue,
+	} = useContext(WizardContext);
+	const [tokens, setTokens] = useState([]);
+	const [autocompleteTokens, setAutocompleteTokens] = useState([]);
+	const [tempTokensValue, setTempTokensValue] = useState(tokensValue);
+
+	const handleSubmit = (tokenId, selectedToken) => {
+		// go to the next step only if all tokens are set
+		let goToNextStep = true;
+
+		tokensIsSet[tokenId] = true;
+		tokensValue[tokenId] = {
+			symbol: selectedToken.label,
+			address: selectedToken.value,
+		};
+
+		if (strategy === "arbitrage") {
+			tokensIsSet.tokenB = true;
+		}
+
+		if (strategy === "pingpong" && tokenId === "tokenA") {
+			goToNextStep = false;
+		}
+
+		configSetValue(
+			"tokens",
+			{
+				value: tokensValue,
+				isSet: tokensIsSet,
+			},
+			goToNextStep
+		);
+	};
+
+	const handleTokenChange = (tokenId, value) => {
+		if (!isMountedRef.current) return;
+		const sanitizedValue = value.replace(/[^a-zA-Z0-9]/g, "");
+		const filteredTokens = tokens
+			.map((t) => ({
+				label: t.symbol,
+				value: t.address,
+			}))
+			.filter((t) =>
+				t.label.toLowerCase().includes(sanitizedValue.toLowerCase())
+			);
+		if (isMountedRef.current) {
+			setAutocompleteTokens(filteredTokens);
+			setTempTokensValue({
+				...tempTokensValue,
+				[tokenId]: {
+					symbol: sanitizedValue,
+				},
+			});
+		}
+	};
+
+	if (network === "") {
+		return (
+			<Box>
+				<Text>
+					Plese select <Text color="magenta">network</Text> first!
+				</Text>
+			</Box>
+		);
+	}
+
+	useEffect(() => {
+		// check if tokens.json exist
+		if (fs.existsSync("./tokens.json")) {
+			const tokensFromFile = JSON.parse(fs.readFileSync("./config.json"));
+			tokens.tokensFromFile?.length > 0 && setTokens(tokensFromFile);
+		} else {
+			axios.get(TOKEN_LIST_URL[network]).then((res) => {
+				isMountedRef.current && setTokens(res.data);
+				// save tokens to tokens.json file
+				fs.writeFileSync(
+					"./temp/tokens.json",
+					JSON.stringify(res.data, null, 2)
+				);
+			});
+		}
+	}, []);
+
+	useEffect(() => {
+		isMountedRef.current = true;
+		return () => (isMountedRef.current = false);
+	}, []);
+
+	return (
+		<Box flexDirection="column">
+			<Text>
+				Set tokens for Your strategy. There is{" "}
+				{tokens
+					? chalk.magenta(tokens.length)
+					: chalk.yellowBright("loading...")}{" "}
+				tokens available.
+			</Text>
+			<Text color="gray">Type token symbol and use arrows to select</Text>
+			<Box margin={1} flexDirection="column">
+				<Text>
+					Token A:{" "}
+					{!tokensIsSet.tokenA ? (
+						<Text color="yellowBright">
+							<TextInput
+								value={tempTokensValue.tokenA.symbol.toString() || ""}
+								onChange={(tokenSymbol) =>
+									handleTokenChange("tokenA", tokenSymbol)
+								}
+								placeholder="USDC"
+							/>
+						</Text>
+					) : (
+						<Text color="greenBright" bold>
+							{tokensValue.tokenA.symbol}
+						</Text>
+					)}
+				</Text>
+
+				<Box>
+					{!tokensIsSet.tokenA &&
+						tempTokensValue?.tokenA?.symbol?.length > 1 && (
+							<SelectInput
+								items={autocompleteTokens}
+								limit={4}
+								onSelect={(tokenSymbol) => handleSubmit("tokenA", tokenSymbol)}
+							/>
+						)}
+				</Box>
+
+				{strategy === "pingpong" && (
+					<>
+						<Text>
+							Token B:{" "}
+							{tokensIsSet.tokenA && !tokensIsSet.tokenB ? (
+								<Text color="yellowBright">
+									<TextInput
+										value={tempTokensValue.tokenB.symbol.toString() || ""}
+										onChange={(tokenSymbol) =>
+											handleTokenChange("tokenB", tokenSymbol)
+										}
+										placeholder="ARB"
+									/>
+								</Text>
+							) : (
+								<Text color="greenBright" bold>
+									{tokensValue.tokenB.symbol}
+								</Text>
+							)}
+						</Text>
+						<Box>
+							{!tokensIsSet.tokenB &&
+								tempTokensValue.tokenB?.symbol?.length > 1 && (
+									<SelectInput
+										items={autocompleteTokens.filter(
+											(t) => t.label !== tokensValue.tokenA.symbol
+										)}
+										limit={4}
+										onSelect={(tokenSymbol) =>
+											handleSubmit("tokenB", tokenSymbol)
+										}
+									/>
+								)}
+						</Box>
+					</>
+				)}
+			</Box>
+		</Box>
+	);
+}
+module.exports = Tokens;
+
+'''
+'''--- src/wizard/Pages/TradingSize.js ---
+const React = require("react");
+const { Box, Text } = require("ink");
+const { useContext, useState, useRef, useEffect } = require("react");
+const WizardContext = require("../WizardContext");
+const { default: TextInput } = require("ink-text-input");
+const chalk = require("chalk");
+const { default: SelectInput } = require("ink-select-input");
+
+const TRADING_SIZE_STRATEGIES = [
+	{ label: "cumulative", value: "cumulative" },
+	{ label: "fixed", value: "fixed" },
+];
+
+const Indicator = ({ label, value }) => {
+	const {
+		config: {
+			"trading size": { value: selectedValue },
+		},
+	} = useContext(WizardContext);
+
+	const isSelected = value === selectedValue.strategy;
+
+	return <Text>{chalk[isSelected ? "greenBright" : "white"](`${label}`)}</Text>;
+};
+
+function TradingSize() {
+	let isMountedRef = useRef(false);
+
+	const {
+		config: {
+			tokens: { value: tokensValue },
+			"trading size": { value: tradingSizeValue },
+		},
+		configSetValue,
+	} = useContext(WizardContext);
+
+	const [tradingSize, setTradingSize] = useState(tradingSizeValue.value);
+	const [inputBorderColor, setInputBorderColor] = useState("gray");
+
+	const handleTradingSizeStrategySelect = (selected) => {
+		configSetValue("trading size", {
+			value: {
+				strategy: selected.value,
+				value: tradingSize,
+			},
+		});
+	};
+
+	const handleTradingSizeChange = (value) => {
+		if (!isMountedRef.current) return;
+
+		const badChars = /[^0-9.]/g;
+		badChars.test(value)
+			? setInputBorderColor("red")
+			: setInputBorderColor("gray");
+		const sanitizedValue = value.replace(badChars, "");
+		setTimeout(() => isMountedRef.current && setInputBorderColor("gray"), 100);
+		setTradingSize(sanitizedValue);
+	};
+
+	useEffect(() => {
+		isMountedRef.current = true;
+		return () => (isMountedRef.current = false);
+	}, []);
+
+	return (
+		<Box flexDirection="column">
+			<Text>
+				Set <Text color="#cdadff">trading size</Text> strategy:
+			</Text>
+			<Box margin={1}>
+				<SelectInput
+					items={TRADING_SIZE_STRATEGIES}
+					onSelect={handleTradingSizeStrategySelect}
+					itemComponent={Indicator}
+				/>
+			</Box>
+			<Box flexDirection="row" alignItems="center">
+				<Text>Trading Size:</Text>
+				<Box borderStyle="round" borderColor={inputBorderColor} marginLeft={1}>
+					<TextInput
+						value={tradingSize || ""}
+						placeholder="0.0"
+						onChange={handleTradingSizeChange}
+						// onSubmit={(value) => handleSubmit("percent", value)}
+					/>
+					<Text color="gray"> {tokensValue.tokenA.symbol}</Text>
+				</Box>
+			</Box>
+		</Box>
+	);
+}
+module.exports = TradingSize;
+
+'''
+'''--- src/wizard/WizardContext.js ---
+const { createContext } = require("react");
+const { initialState } = require("./reducer");
+
+const WizardContext = createContext(initialState);
+
+module.exports = WizardContext;
+
+'''
+'''--- src/wizard/WizardProvider.js ---
+const { useInput } = require("ink");
+const React = require("react");
+const { useReducer } = require("react");
+const reducer = require("./reducer");
+const WizardContext = require("./WizardContext");
+const { CONFIG_INITIAL_STATE } = require("../constants");
+
+const WizardProvider = ({ children }) => {
+	const [state, dispatch] = useReducer(reducer, CONFIG_INITIAL_STATE);
+
+	useInput((input, key) => {
+		if (input === "]") dispatch({ type: "NEXT_STEP" });
+		if (input === "[") dispatch({ type: "PREV_STEP" });
+		if (input === "h") dispatch({ type: "TOGGLE_HELP" });
+		if (key.escape) process.exit();
+	});
+
+	const configSetValue = (key, value, goToNextStep = true) => {
+		dispatch({ type: "CONFIG_SET", key, value });
+		goToNextStep && dispatch({ type: "NEXT_STEP" });
+	};
+
+	const configSwitchState = (key, value) => {
+		dispatch({ type: "CONFIG_SWITCH_STATE", key, value });
+	};
+
+	const providerValue = {
+		...state,
+		configSetValue,
+		configSwitchState,
+	};
+	return (
+		<WizardContext.Provider value={providerValue}>
+			{children}
+		</WizardContext.Provider>
+	);
+};
+
+module.exports = WizardProvider;
+
+'''
+'''--- src/wizard/index.js ---
+"use strict";
+
+// check for .env file
+const { checkForEnvFile } = require("../utils");
+checkForEnvFile();
+
+require("dotenv").config();
+const React = require("react");
+
+// create temp dir
+const { createTempDir } = require("../utils");
+createTempDir();
+
+// import components
+const importJsx = require("import-jsx");
+
+const WizardProvider = importJsx("./WizardProvider");
+
+const Layout = importJsx("./Components/Layout");
+
+const App = () => {
+	return (
+		<WizardProvider>
+			<Layout></Layout>
+		</WizardProvider>
+	);
+};
+
+module.exports = App;
+
+'''
+'''--- src/wizard/reducer.js ---
+const reducer = (prevState, action) => {
+	const nav = prevState.nav;
+	const isSet =
+		action.value?.isSet instanceof Object ? action.value?.isSet : true;
+	const value = action.value?.value || action.value;
+	switch (action.type) {
+		case "NEXT_STEP":
+			return {
+				...prevState,
+				nav: {
+					...prevState.nav,
+					currentStep:
+						nav.currentStep === nav.steps.length - 1 ? 0 : nav.currentStep + 1,
+				},
+			};
+		case "PREV_STEP":
+			return {
+				...prevState,
+				nav: {
+					...prevState.nav,
+					currentStep:
+						nav.currentStep === 0 ? nav.steps.length - 1 : nav.currentStep - 1,
+				},
+			};
+		case "TOGGLE_HELP":
+			return {
+				...prevState,
+				showHelp: !prevState.showHelp,
+			};
+		case "CONFIG_SET":
+			return {
+				...prevState,
+				config: {
+					...prevState.config,
+					[action.key]: {
+						...prevState.config[action.key],
+						value: value,
+						isSet: isSet,
+					},
+				},
+			};
+
+		case "CONFIG_SWITCH_STATE":
+			return {
+				...prevState,
+				config: {
+					...prevState.config,
+					[action.key]: {
+						state: {
+							...prevState.config[action.key].state,
+							items: prevState.config[action.key].state.items.map((item) =>
+								item.value === action.value
+									? {
+											...item,
+											isSelected: !item.isSelected,
+									  }
+									: item
+							),
+						},
+						isSet: isSet,
+					},
+				},
+			};
+
+		default:
+			throw new Error(`Unhandled action type: ${action.type}`);
+	}
+};
+
+module.exports = reducer;
+
+'''

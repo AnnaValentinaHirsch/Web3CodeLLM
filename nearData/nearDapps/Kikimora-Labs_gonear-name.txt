@@ -1,0 +1,3392 @@
+*GitHub Repository "Kikimora-Labs/gonear-name"*
+
+'''--- .github/workflows/main.yml ---
+name: Build and deploy master
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout 🛎️
+        uses: actions/checkout@v2.3.1
+
+      - uses: actions/setup-node@v2
+        with:
+          node-version: '14'
+
+      - name: Install and Build 🔧
+        working-directory: frontend
+        run: |
+          yarn install
+          yarn build
+        env:
+          REACT_APP_ENVIRONMENT: ${{ secrets.REACT_APP_ENVIRONMENT_master }}
+
+      - name: Deploy 🚀
+        uses: JamesIves/github-pages-deploy-action@4.1.5
+        with:
+          branch: master
+          folder: frontend/build
+          repository-name: Kikimora-Labs/gonear-name-public
+          ssh-key: ${{ secrets.SSH_KEY_MASTER }}
+'''
+'''--- README.md ---
+# TBD
+
+'''
+'''--- economics/rewards.py ---
+import sys
+
+bet_mult = 1.2
+claim_mult = 2.0
+initial_price = 0.3
+first_bet = 1.25
+reward_decay = 1.0 / 1.44
+reward_decay_on_sell = 1.0 / 1.2
+commission = 0.05
+sell_reward = 0.25
+
+num_bets = int(sys.argv[1])
+
+price = first_bet
+rewards = [0.0]
+bets = [initial_price]
+total_commission = initial_price
+
+for bet in range(num_bets):
+    paid = price
+    bets += [paid]
+
+    total_commission += paid * commission
+    paid *= 1 - commission
+    for i in reversed(range(len(rewards))):
+        rewards[i] += paid * reward_decay
+        paid *= (1 - reward_decay)
+    rewards[0] += paid
+    rewards += [0.0]
+
+    price *= bet_mult
+
+claim_price = price * claim_mult
+
+print('Bet price:', round(price, 4))
+print('Claim price:', round(claim_price, 4))
+print('Sum of bets + placement:', round(sum(bets), 4))
+total_paid = sum(bets) + claim_price
+print('Total paid:', round(total_paid, 4))
+print('Commission:', round(total_commission, 4))
+print('Rewards before claim:')
+for i in range(len(rewards)):
+    print(' %d bet:  %.4f,  rewards:  %.4f,   ratio:  %.4f' % (i, bets[i], rewards[i], rewards[i] / bets[i]), end='\n')
+
+paid = claim_price
+sum_bets = sum(bets)
+rewards[0] += paid * sell_reward
+paid *= (1 - sell_reward)
+# don't take commission on sale
+for i in reversed(range(len(rewards))):
+    rewards[i] += paid * reward_decay_on_sell
+    paid *= (1 - reward_decay_on_sell)
+rewards[0] += paid
+
+print('Rewards after claim:')
+for i in range(len(rewards)):
+    print(' %d bet:  %.4f,  rewards:  %.4f,   ratio:  %.4f' % (i, bets[i], rewards[i], rewards[i] / bets[i]), end='\n')
+print('Sum of rewards:', round(sum(rewards), 4))
+print('Direct sale reward (the case if only owner bets):', round(sum(rewards) - sum(bets), 4))
+print('Direct sale reward to claim price ratio:', round((sum(rewards) - sum(bets)) / claim_price, 4))
+print('Commission ratio to claim price:', round(total_commission / claim_price, 4))
+
+'''
+'''--- escrow_contract/Cargo.toml ---
+[package]
+name = "escrow-marketplace"
+version = "0.1.0"
+authors = ["Alex Kouprin <kpr@near.org>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "=3.1.0"
+
+[dev-dependencies]
+near-sdk-sim = "=3.1.0"
+
+[features]
+expensive_tests = []
+
+[profile.release]
+codegen-units=1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+
+'''
+'''--- escrow_contract/build.sh ---
+#!/bin/bash
+set -e
+cd "`dirname $0`"
+RUSTFLAGS='-C link-arg=-s' cargo +nightly build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/escrow_marketplace.wasm ./res/
+
+'''
+'''--- escrow_contract/compile_and_test.sh ---
+#!/bin/bash
+set -e
+cd "`dirname $0`"
+RUSTFLAGS='-C link-arg=-s' cargo +nightly build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/escrow_marketplace.wasm ./res/
+RUSTFLAGS='-C link-arg=-s' cargo +nightly test --all -- --nocapture
+
+'''
+'''--- escrow_contract/expensive.sh ---
+#!/bin/bash
+set -e
+cd "`dirname $0`"
+RUSTFLAGS='-C link-arg=-s' cargo +nightly build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/accounts_marketplace.wasm ./res/
+RUSTFLAGS='-C link-arg=-s' cargo +nightly test --all --features=expensive_tests -- --nocapture
+
+'''
+'''--- escrow_contract/src/action.rs ---
+use crate::*;
+
+pub const PLACE_DEPOSIT: Balance = 1_000_000_000_000_000_000_000_000;
+pub const WITHDRAW_DEPOSIT: Balance = ONE_YOCTO;
+
+pub const ON_ACQUIRE_FUNCTION_CALL_GAS: u64 = 100_000_000_000_000;
+/// Indicates there are no deposit for a callback for better readability
+pub const ONE_YOCTO: Balance = 1;
+const NO_DEPOSIT: u128 = 0;
+const MAX_DESCRIPTION_LEN: usize = 256;
+
+pub const ERR_PLACE_DEPOSIT_NOT_ENOUGH: &str = "Attached deposit must be no less than 1 NEAR";
+pub const ERR_WITHDRAW_DEPOSIT_NOT_ENOUGH: &str =
+    "Attached deposit must be no less than 1 yoctoNEAR";
+pub const ERR_ACCEPT_DEPOSIT_NOT_ENOUGH: &str =
+    "Attached deposit must be no less than 101% of price";
+pub const ERR_GAINER_SAME_AS_OFFER: &str = "Offered account cannot take profit";
+pub const ERR_ACCESS_DENIED: &str = "Caller is not allowed to perform the action";
+pub const ERR_DESCRIPTION_TOO_LONG: &str = "Description is too long (256 characters max)";
+
+#[near_bindgen]
+impl Contract {
+    #[payable]
+    pub fn place(
+        &mut self,
+        profile_id: ValidAccountId,
+        price: WrappedBalance,
+        description: Description,
+    ) -> bool {
+        assert!(
+            description.len() <= MAX_DESCRIPTION_LEN,
+            "{}",
+            ERR_DESCRIPTION_TOO_LONG
+        );
+
+        let price: Balance = price.into();
+        assert!(
+            env::attached_deposit() >= PLACE_DEPOSIT,
+            "{}",
+            ERR_PLACE_DEPOSIT_NOT_ENOUGH
+        );
+        assert_ne!(
+            &env::predecessor_account_id(),
+            profile_id.as_ref(),
+            "{}",
+            ERR_GAINER_SAME_AS_OFFER
+        );
+
+        // Create proposal
+        let proposal = Proposal::new(
+            profile_id.into(),
+            env::block_timestamp(),
+            price,
+            description,
+        );
+        self.save_proposal_or_panic(&env::predecessor_account_id(), &proposal);
+        self.send(&self.dao_id, PLACE_DEPOSIT);
+        self.total_commission += PLACE_DEPOSIT;
+        self.num_proposals_total += 1;
+
+        true
+    }
+
+    #[payable]
+    pub fn withdraw(
+        &mut self,
+        proposal_id: ValidAccountId,
+        new_public_key: Base58PublicKey,
+    ) -> Promise {
+        assert_eq!(
+            env::attached_deposit(),
+            ONE_YOCTO,
+            "{}",
+            ERR_WITHDRAW_DEPOSIT_NOT_ENOUGH
+        );
+        let proposal = self.extract_proposal_or_panic(proposal_id.as_ref());
+        assert_eq!(
+            env::predecessor_account_id(),
+            proposal.proposal_owner,
+            "{}",
+            ERR_ACCESS_DENIED
+        );
+
+        let key: String = (&new_public_key).into();
+        self.num_proposals_withdrawn += 1;
+
+        // TODO what if Promise fails?
+        Promise::new(proposal_id.clone().into()).function_call(
+            "unlock".to_string().into_bytes(),
+            json!({
+                "public_key": key,
+            })
+            .to_string()
+            .into_bytes(),
+            NO_DEPOSIT,
+            ON_ACQUIRE_FUNCTION_CALL_GAS,
+        )
+    }
+
+    // TODO check the case if price is high and more than contract account amount
+    // The promises might be needed to be executed in the strict order
+    #[payable]
+    pub fn accept(
+        &mut self,
+        proposal_id: ValidAccountId,
+        new_public_key: Base58PublicKey,
+    ) -> Promise {
+        let proposal = self.extract_proposal_or_panic(proposal_id.as_ref());
+        assert!(
+            env::attached_deposit() >= (proposal.price / 100) * 101,
+            "{}",
+            ERR_ACCEPT_DEPOSIT_NOT_ENOUGH
+        );
+        let key: String = (&new_public_key).into();
+
+        // The order of Promises is chosen in such way, that "unlock" calls the latest
+        // to not allow to unlock the account with no paying for it (by playing gas price).
+        // TODO do it in a batch and revert
+        self.send(&self.dao_id, proposal.price / 100);
+        self.total_commission += proposal.price / 100;
+        self.send(&proposal.proposal_owner, proposal.price);
+        self.num_proposals_accepted += 1;
+
+        // TODO what if Promise fails?
+        Promise::new(proposal_id.clone().into()).function_call(
+            "unlock".to_string().into_bytes(),
+            json!({
+                "public_key": key,
+            })
+            .to_string()
+            .into_bytes(),
+            NO_DEPOSIT,
+            ON_ACQUIRE_FUNCTION_CALL_GAS,
+        )
+    }
+
+    // TODO uncomment for testing
+    /*#[payable]
+    pub fn withdraw_test(&mut self, proposal_id: ValidAccountId, new_public_key: Base58PublicKey) {
+        assert_eq!(
+            env::attached_deposit(),
+            ONE_YOCTO,
+            "{}",
+            ERR_WITHDRAW_DEPOSIT_NOT_ENOUGH
+        );
+        let proposal = self.extract_proposal_or_panic(proposal_id.as_ref());
+        assert_eq!(
+            env::predecessor_account_id(),
+            proposal.proposal_owner,
+            "{}",
+            ERR_ACCESS_DENIED
+        );
+
+        let _: String = (&new_public_key).into();
+        self.num_proposals_withdrawn += 1;
+    }
+
+    #[payable]
+    pub fn accept_test(&mut self, proposal_id: ValidAccountId, new_public_key: Base58PublicKey) {
+        let proposal = self.extract_proposal_or_panic(proposal_id.as_ref());
+        assert!(
+            env::attached_deposit() >= (proposal.price / 100) * 101,
+            "{}",
+            ERR_ACCEPT_DEPOSIT_NOT_ENOUGH
+        );
+        let _: String = (&new_public_key).into();
+
+        self.send(&self.dao_id, proposal.price / 100);
+        self.total_commission += proposal.price / 100;
+        self.send(&proposal.proposal_owner, proposal.price);
+        self.num_proposals_accepted += 1;
+    }*/
+}
+
+impl Contract {
+    fn send(&self, account_id: &AccountId, value: Balance) -> Promise {
+        // TODO what if Promise fails?
+        Promise::new(account_id.into()).transfer(value)
+    }
+}
+
+'''
+'''--- escrow_contract/src/lib.rs ---
+mod action;
+mod proposal;
+
+pub use crate::action::*;
+pub use crate::proposal::*;
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::UnorderedMap;
+use near_sdk::json_types::{Base58PublicKey, ValidAccountId, WrappedBalance, WrappedTimestamp};
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::serde_json::json;
+use near_sdk::{env, near_bindgen, AccountId, Balance, PanicOnDefault, Promise, Timestamp};
+
+pub type ProposalId = AccountId;
+pub type Description = String;
+
+near_sdk::setup_alloc!();
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Contract {
+    pub proposals: UnorderedMap<ProposalId, Proposal>,
+
+    pub num_proposals_total: u64,
+    pub num_proposals_withdrawn: u64,
+    pub num_proposals_accepted: u64,
+
+    pub total_commission: Balance,
+
+    pub owner_id: AccountId,
+    pub dao_id: AccountId,
+}
+
+#[near_bindgen]
+impl Contract {
+    #[init]
+    pub fn new(owner_id: ValidAccountId, dao_id: ValidAccountId) -> Self {
+        assert!(!env::state_exists(), "Already initialized");
+        Self {
+            proposals: UnorderedMap::new(b"a".to_vec()),
+            num_proposals_total: 0,
+            num_proposals_withdrawn: 0,
+            num_proposals_accepted: 0,
+            total_commission: 0,
+            owner_id: owner_id.into(),
+            dao_id: dao_id.into(),
+        }
+    }
+
+    pub fn get_global_stats(&self) -> (u64, u64, u64, u64, Balance) {
+        (
+            self.proposals.len(),
+            self.num_proposals_total,
+            self.num_proposals_withdrawn,
+            self.num_proposals_accepted,
+            self.total_commission,
+        )
+    }
+}
+
+'''
+'''--- escrow_contract/src/proposal.rs ---
+use crate::*;
+use std::collections::HashMap;
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Proposal {
+    pub proposal_owner: AccountId,
+    pub published_time: Timestamp,
+    pub price: Balance,
+    pub description: Description,
+}
+
+impl Proposal {
+    pub(crate) fn new(
+        proposal_owner: AccountId,
+        published_time: Timestamp,
+        price: Balance,
+        description: Description,
+    ) -> Self {
+        Self {
+            proposal_owner,
+            published_time,
+            price,
+            description,
+        }
+    }
+}
+
+// TODO remove Debug?
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct ProposalView {
+    pub proposal_owner: AccountId,
+    pub published_time: WrappedTimestamp,
+    pub price: WrappedBalance,
+    pub description: String,
+}
+
+impl From<&Proposal> for ProposalView {
+    fn from(p: &Proposal) -> Self {
+        Self {
+            proposal_owner: p.proposal_owner.clone(),
+            published_time: p.published_time.into(),
+            price: p.price.into(),
+            description: p.description.clone(),
+        }
+    }
+}
+
+#[near_bindgen]
+impl Contract {
+    pub fn get_proposal(&self, proposal_id: ValidAccountId) -> Option<ProposalView> {
+        self.proposals
+            .get(proposal_id.as_ref())
+            .map(|p| (&p).into())
+    }
+
+    pub fn get_proposals(&self, from_index: u64, limit: u64) -> HashMap<ProposalId, ProposalView> {
+        // O(1)
+        let keys = self.proposals.keys_as_vector();
+        // O(1)
+        let values = self.proposals.values_as_vector();
+        // O(limit)
+        (from_index..std::cmp::min(from_index + limit, keys.len()))
+            .map(|index| {
+                (
+                    keys.get(index).unwrap(),
+                    (&values.get(index).unwrap()).into(),
+                )
+            })
+            .collect()
+    }
+}
+
+impl Contract {
+    pub(crate) fn extract_proposal_or_panic(&mut self, proposal_id: &ProposalId) -> Proposal {
+        self.proposals.remove(&proposal_id).unwrap()
+    }
+
+    pub(crate) fn save_proposal_or_panic(&mut self, proposal_id: &ProposalId, proposal: &Proposal) {
+        assert!(self.proposals.insert(proposal_id, proposal).is_none());
+    }
+}
+
+'''
+'''--- escrow_contract/tests/general.rs ---
+use std::convert::TryInto;
+
+/// Import the generated proxy contract
+use escrow_marketplace::ContractContract as EMContract;
+use escrow_marketplace::{
+    ProposalView, ERR_ACCEPT_DEPOSIT_NOT_ENOUGH, ERR_GAINER_SAME_AS_OFFER,
+    ERR_PLACE_DEPOSIT_NOT_ENOUGH, ONE_YOCTO, PLACE_DEPOSIT,
+};
+
+use near_sdk::json_types::Base58PublicKey;
+use near_sdk::Balance;
+use near_sdk_sim::{call, deploy, init_simulator, to_yocto, view, ContractAccount, UserAccount};
+
+// Load in contract bytes at runtime
+near_sdk_sim::lazy_static_include::lazy_static_include_bytes! {
+  CONTRACT_WASM_BYTES => "res/escrow_marketplace.wasm",
+}
+
+const CONTRACT_ID: &str = "marketplace";
+const ANY_ERR: Option<&str> = Some("");
+const PLACE_DESCRIPTION_DEFAULT: &str = "default description";
+
+fn init() -> (UserAccount, ContractAccount<EMContract>) {
+    let master_account = init_simulator(None);
+    let deployed_contract = deploy!(
+        contract: EMContract,
+        contract_id: CONTRACT_ID,
+        bytes: &CONTRACT_WASM_BYTES,
+        signer_account: master_account,
+        init_method: new(master_account.account_id().try_into().unwrap(), master_account.account_id().try_into().unwrap())
+    );
+    (master_account, deployed_contract)
+}
+
+fn to_base58_pk(user: &UserAccount) -> Base58PublicKey {
+    let key: String = (&user.signer.public_key).into();
+    key.try_into().unwrap()
+}
+
+fn create_carol(master_account: &UserAccount) -> UserAccount {
+    master_account.create_user("carol".into(), to_yocto("1000000000"))
+}
+
+fn create_bob_sells_alice(
+    master_account: &UserAccount,
+    contract: &ContractAccount<EMContract>,
+) -> (UserAccount, UserAccount) {
+    let alice = master_account.create_user("alice".into(), to_yocto("1000000000"));
+    let bob = master_account.create_user("bob".into(), to_yocto("1000000000"));
+
+    let outcome = call!(
+        alice,
+        contract.place(
+            bob.account_id().try_into().unwrap(),
+            to_yocto("100").into(),
+            PLACE_DESCRIPTION_DEFAULT.to_string()
+        ),
+        deposit = PLACE_DEPOSIT
+    );
+    outcome.assert_success();
+    let result: bool = outcome.unwrap_json();
+    assert!(result);
+    (alice, bob)
+}
+
+fn do_place(
+    profile: &UserAccount,
+    proposal: &UserAccount,
+    price: Balance,
+    contract: &ContractAccount<EMContract>,
+    err: Option<&str>,
+) {
+    let outcome = call!(
+        proposal,
+        contract.place(
+            profile.account_id().try_into().unwrap(),
+            price.into(),
+            PLACE_DESCRIPTION_DEFAULT.to_string()
+        ),
+        deposit = PLACE_DEPOSIT
+    );
+    if let Some(msg) = err {
+        assert!(format!("{:?}", outcome.status()).contains(msg));
+        assert!(!outcome.is_ok(), "Should panic");
+    } else {
+        outcome.assert_success();
+    }
+}
+
+fn do_withdraw(
+    profile: &UserAccount,
+    proposal: &UserAccount,
+    contract: &ContractAccount<EMContract>,
+    err: Option<&str>,
+) {
+    let outcome = call!(
+        profile,
+        contract.withdraw_test(
+            proposal.account_id().try_into().unwrap(),
+            to_base58_pk(&profile)
+        ),
+        deposit = ONE_YOCTO
+    );
+    if let Some(msg) = err {
+        assert!(format!("{:?}", outcome.status()).contains(msg));
+        assert!(!outcome.is_ok(), "Should panic");
+    } else {
+        outcome.assert_success();
+    }
+}
+
+fn do_accept(
+    profile: &UserAccount,
+    proposal: &UserAccount,
+    deposit: Balance,
+    contract: &ContractAccount<EMContract>,
+    err: Option<&str>,
+) {
+    let outcome = call!(
+        profile,
+        contract.accept_test(
+            proposal.account_id().try_into().unwrap(),
+            to_base58_pk(&profile)
+        ),
+        deposit = deposit
+    );
+    if let Some(msg) = err {
+        assert!(
+            format!("{:?}", outcome.status()).contains(msg),
+            "received msg: {}",
+            msg
+        );
+        assert!(!outcome.is_ok(), "Should panic");
+    } else {
+        outcome.assert_success();
+    }
+}
+
+fn get_proposal_view(
+    proposal: &UserAccount,
+    contract: &ContractAccount<EMContract>,
+) -> Option<ProposalView> {
+    view!(contract.get_proposal(proposal.account_id().try_into().unwrap())).unwrap_json()
+}
+
+#[test]
+fn simulate_init() {
+    let (_, _) = init();
+}
+
+#[test]
+fn simulate_place() {
+    let (master_account, contract) = init();
+
+    let alice = master_account.create_user("alice".to_string(), to_yocto("100").into());
+
+    do_place(
+        &alice,
+        &alice,
+        to_yocto("101"),
+        &contract,
+        Some(ERR_GAINER_SAME_AS_OFFER),
+    );
+    let bob = master_account.create_user("bob".to_string(), to_yocto("204"));
+
+    let outcome = call!(
+        alice,
+        contract.place(
+            bob.account_id().try_into().unwrap(),
+            to_yocto("100").into(),
+            PLACE_DESCRIPTION_DEFAULT.to_string()
+        ),
+        deposit = to_yocto("0.99")
+    );
+    assert!(format!("{:?}", outcome.status()).contains(ERR_PLACE_DEPOSIT_NOT_ENOUGH));
+    let outcome = call!(
+        alice,
+        contract.place(
+            bob.account_id().try_into().unwrap(),
+            to_yocto("100").into(),
+            PLACE_DESCRIPTION_DEFAULT.to_string()
+        ),
+        deposit = to_yocto("1")
+    );
+    outcome.assert_success();
+
+    do_place(&bob, &alice, to_yocto("101"), &contract, ANY_ERR);
+}
+
+#[test]
+fn double_accept() {
+    let (master_account, contract) = init();
+
+    let (alice, bob) = create_bob_sells_alice(&master_account, &contract);
+
+    do_accept(
+        &bob,
+        &alice,
+        to_yocto("100.9"),
+        &contract,
+        Some(ERR_ACCEPT_DEPOSIT_NOT_ENOUGH),
+    );
+    do_accept(&bob, &alice, to_yocto("101"), &contract, None);
+    do_accept(&bob, &alice, to_yocto("101"), &contract, ANY_ERR);
+
+    let carol = create_carol(&master_account);
+
+    do_accept(&carol, &alice, to_yocto("101"), &contract, ANY_ERR);
+    do_accept(&bob, &alice, to_yocto("101"), &contract, ANY_ERR);
+}
+
+#[test]
+fn withdraw_simple() {
+    let (master_account, contract) = init();
+
+    let (alice, bob) = create_bob_sells_alice(&master_account, &contract);
+
+    do_withdraw(&bob, &alice, &contract, None);
+
+    do_accept(&bob, &alice, to_yocto("101"), &contract, ANY_ERR);
+
+    do_withdraw(&bob, &alice, &contract, ANY_ERR);
+
+    do_accept(&bob, &alice, to_yocto("101"), &contract, ANY_ERR);
+}
+
+#[test]
+fn withdraw_after_accept() {
+    let (master_account, contract) = init();
+
+    let (alice, bob) = create_bob_sells_alice(&master_account, &contract);
+
+    let carol = create_carol(&master_account);
+    do_accept(&carol, &alice, to_yocto("101"), &contract, None);
+
+    do_withdraw(&bob, &alice, &contract, ANY_ERR);
+}
+
+#[test]
+fn place_after_accept() {
+    let (master_account, contract) = init();
+
+    let (alice, bob) = create_bob_sells_alice(&master_account, &contract);
+
+    let carol = create_carol(&master_account);
+    do_accept(&carol, &alice, to_yocto("101"), &contract, None);
+
+    do_place(&carol, &alice, to_yocto("101"), &contract, None);
+
+    do_accept(
+        &bob,
+        &alice,
+        to_yocto("102"),
+        &contract,
+        Some(ERR_ACCEPT_DEPOSIT_NOT_ENOUGH),
+    );
+
+    do_accept(&bob, &alice, to_yocto("102.01"), &contract, None);
+}
+
+'''
+'''--- frontend/README.md ---
+# NEAR Protocol Accounts Marketplace dApp
+
+## Quick start
+
+To run this locally:
+
+1. Config envs: `cp .env.example .env`
+2. Install dependencies via `yarn install`
+3. Start the development server using `yarn start`
+4. Open up http://localhost:8080
+
+## Running tests
+
+There are no any tests :–(.
+
+## Deployment
+
+Project deploys on Github Pages via Github Actions. Look through `.github/workflows` to learn more about our CI/CD.
+
+## Links
+TBD.
+test
+'''
+'''--- frontend/package.json ---
+{
+  "name": "near-bet",
+  "version": "0.1.0",
+  "private": true,
+  "homepage": "https://gonear.name",
+  "dependencies": {
+    "@types/node": "^12.0.0",
+    "@types/react": "^17.0.0",
+    "@types/react-dom": "^17.0.0",
+    "@types/react-router-dom": "^5.3.1",
+    "@types/styled-components": "^5.1.15",
+    "moment": "^2.29.1",
+    "near-api-js": "^0.43.1",
+    "near-seed-phrase": "^0.2.0",
+    "react": "^17.0.2",
+    "react-dom": "^17.0.2",
+    "react-moment": "^1.1.1",
+    "react-router-dom": "^5.3.0",
+    "react-scripts": "4.0.3",
+    "react-spinners": "^0.11.0",
+    "styled-components": "^5.3.1",
+    "styled-normalize": "^8.0.7",
+    "swr": "^1.0.1",
+    "typescript": "^4.1.2"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test",
+    "eject": "react-scripts eject",
+    "deploy": "gh-pages -d build",
+    "predeploy": "react-scripts build"
+  },
+  "eslintConfig": {
+    "extends": [
+      "react-app",
+      "react-app/jest"
+    ]
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  }
+}
+
+'''
+'''--- frontend/public/browserconfig.xml ---
+<?xml version="1.0" encoding="utf-8"?>
+<browserconfig>
+    <msapplication>
+        <tile>
+            <square150x150logo src="/mstile-150x150.png"/>
+            <TileColor>#181b21</TileColor>
+        </tile>
+    </msapplication>
+</browserconfig>
+
+'''
+'''--- frontend/public/index.html ---
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <title>Gonear.name</title>
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+    <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+    <link rel="manifest" href="/site.webmanifest">
+    <link rel="mask-icon" href="/safari-pinned-tab.svg" color="#181b21">
+    <meta name="msapplication-TileColor" content="#181b21">
+    <meta name="theme-color" content="#ffffff">
+  </head>
+  <body>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="root"></div>
+  </body>
+</html>
+
+'''
+'''--- frontend/public/robots.txt ---
+User-agent: *
+Disallow:
+
+Host: https://www.gonear.name
+'''
+'''--- frontend/public/safari-pinned-tab.svg ---
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 20010904//EN"
+ "http://www.w3.org/TR/2001/REC-SVG-20010904/DTD/svg10.dtd">
+<svg version="1.0" xmlns="http://www.w3.org/2000/svg"
+ width="512.000000pt" height="512.000000pt" viewBox="0 0 512.000000 512.000000"
+ preserveAspectRatio="xMidYMid meet">
+<metadata>
+Created by potrace 1.14, written by Peter Selinger 2001-2017
+</metadata>
+<g transform="translate(0.000000,512.000000) scale(0.100000,-0.100000)"
+fill="#000000" stroke="none">
+<path d="M1635 4920 c-93 -39 -181 -75 -195 -82 -14 -6 -29 -12 -35 -14 -36
+-9 -453 -190 -505 -219 -111 -63 -229 -167 -318 -282 -45 -57 -113 -189 -161
+-311 -23 -56 -45 -110 -50 -120 -5 -9 -47 -107 -92 -217 -44 -110 -90 -219
+-100 -242 -11 -23 -19 -48 -19 -55 0 -8 -5 -19 -12 -26 -7 -7 -12 -36 -12 -66
+0 -43 5 -61 28 -91 32 -41 78 -65 128 -65 22 0 123 46 313 141 597 302 640
+327 768 453 128 126 182 208 329 501 36 72 116 228 177 348 122 241 129 267
+89 338 -24 43 -85 79 -134 79 -16 -1 -105 -32 -199 -70z"/>
+<path d="M3245 4976 c-65 -29 -102 -90 -97 -160 2 -28 357 -736 433 -864 74
+-125 215 -271 347 -359 48 -32 211 -121 362 -197 151 -77 330 -168 398 -203
+133 -68 168 -75 229 -46 19 9 46 33 60 55 44 66 38 96 -66 348 -52 124 -104
+251 -117 283 -39 93 -75 179 -95 224 -11 23 -19 46 -19 52 0 17 -98 181 -142
+238 -83 108 -222 221 -346 283 -125 62 -861 360 -888 360 -16 -1 -42 -7 -59
+-14z"/>
+<path d="M236 1964 c-66 -24 -112 -96 -101 -160 4 -30 32 -107 65 -179 5 -11
+25 -58 44 -105 19 -47 57 -140 85 -207 28 -66 51 -124 51 -127 0 -3 11 -29 24
+-58 13 -29 39 -89 57 -133 70 -165 205 -334 350 -437 82 -59 162 -99 379 -188
+96 -40 189 -78 205 -85 119 -53 406 -165 432 -169 40 -5 109 28 136 66 11 14
+22 49 25 76 4 48 -1 61 -203 458 -115 225 -230 443 -258 484 -62 93 -219 250
+-312 311 -110 73 -863 455 -910 463 -16 2 -47 -2 -69 -10z"/>
+<path d="M4819 1969 c-20 -4 -124 -53 -230 -107 -107 -55 -282 -144 -389 -199
+-232 -119 -269 -141 -369 -223 -154 -127 -216 -216 -383 -540 -275 -535 -299
+-586 -300 -627 -1 -96 93 -175 184 -153 30 6 339 130 413 165 17 8 55 24 85
+35 30 12 74 30 98 41 24 11 76 33 116 48 183 73 300 147 411 258 77 77 168
+203 203 283 11 25 32 72 47 105 15 33 28 67 30 75 2 8 63 157 136 330 147 349
+154 378 109 443 -40 58 -96 81 -161 66z"/>
+</g>
+</svg>
+
+'''
+'''--- frontend/src/assets/fonts/Poppins/OFL.txt ---
+Copyright 2020 The Poppins Project Authors (https://github.com/itfoundry/Poppins)
+
+This Font Software is licensed under the SIL Open Font License, Version 1.1.
+This license is copied below, and is also available with a FAQ at:
+http://scripts.sil.org/OFL
+
+-----------------------------------------------------------
+SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007
+-----------------------------------------------------------
+
+PREAMBLE
+The goals of the Open Font License (OFL) are to stimulate worldwide
+development of collaborative font projects, to support the font creation
+efforts of academic and linguistic communities, and to provide a free and
+open framework in which fonts may be shared and improved in partnership
+with others.
+
+The OFL allows the licensed fonts to be used, studied, modified and
+redistributed freely as long as they are not sold by themselves. The
+fonts, including any derivative works, can be bundled, embedded, 
+redistributed and/or sold with any software provided that any reserved
+names are not used by derivative works. The fonts and derivatives,
+however, cannot be released under any other type of license. The
+requirement for fonts to remain under this license does not apply
+to any document created using the fonts or their derivatives.
+
+DEFINITIONS
+"Font Software" refers to the set of files released by the Copyright
+Holder(s) under this license and clearly marked as such. This may
+include source files, build scripts and documentation.
+
+"Reserved Font Name" refers to any names specified as such after the
+copyright statement(s).
+
+"Original Version" refers to the collection of Font Software components as
+distributed by the Copyright Holder(s).
+
+"Modified Version" refers to any derivative made by adding to, deleting,
+or substituting -- in part or in whole -- any of the components of the
+Original Version, by changing formats or by porting the Font Software to a
+new environment.
+
+"Author" refers to any designer, engineer, programmer, technical
+writer or other person who contributed to the Font Software.
+
+PERMISSION & CONDITIONS
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of the Font Software, to use, study, copy, merge, embed, modify,
+redistribute, and sell modified and unmodified copies of the Font
+Software, subject to the following conditions:
+
+1) Neither the Font Software nor any of its individual components,
+in Original or Modified Versions, may be sold by itself.
+
+2) Original or Modified Versions of the Font Software may be bundled,
+redistributed and/or sold with any software, provided that each copy
+contains the above copyright notice and this license. These can be
+included either as stand-alone text files, human-readable headers or
+in the appropriate machine-readable metadata fields within text or
+binary files as long as those fields can be easily viewed by the user.
+
+3) No Modified Version of the Font Software may use the Reserved Font
+Name(s) unless explicit written permission is granted by the corresponding
+Copyright Holder. This restriction only applies to the primary font name as
+presented to the users.
+
+4) The name(s) of the Copyright Holder(s) or the Author(s) of the Font
+Software shall not be used to promote, endorse or advertise any
+Modified Version, except to acknowledge the contribution(s) of the
+Copyright Holder(s) and the Author(s) or with their explicit written
+permission.
+
+5) The Font Software, modified or unmodified, in part or in whole,
+must be distributed entirely under this license, and must not be
+distributed under any other license. The requirement for fonts to
+remain under this license does not apply to any document created
+using the Font Software.
+
+TERMINATION
+This license becomes null and void if any of the above conditions are
+not met.
+
+DISCLAIMER
+THE FONT SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO ANY WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT
+OF COPYRIGHT, PATENT, TRADEMARK, OR OTHER RIGHT. IN NO EVENT SHALL THE
+COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+INCLUDING ANY GENERAL, SPECIAL, INDIRECT, INCIDENTAL, OR CONSEQUENTIAL
+DAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM
+OTHER DEALINGS IN THE FONT SOFTWARE.
+
+'''
+'''--- frontend/src/assets/images/light.svg ---
+<svg width="500" height="500" viewBox="0 0 500 500" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <ellipse cx="250" cy="250" rx="250" ry="250" fill="url(#gradient)" />
+    <defs>
+        <radialGradient id="gradient">
+            <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.06" />
+            <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0" />
+        </radialGradient>
+    </defs>
+</svg>
+
+'''
+'''--- frontend/src/helpers/api.ts ---
+import { Near, Account, Contract, utils } from 'near-api-js'
+import { ExtendWalletConnection } from 'helpers/walletConnection'
+import { mapBidInfo, mapProfile, mapStats, IBid, IProfile, IBidSafety, IStat } from 'helpers/mappers'
+import { config } from './config'
+
+export const fromNear = (amount: string): number => parseFloat(utils.format.formatNearAmount(amount || '0'))
+export const toYoctoNear = (amount: number): string => utils.format.parseNearAmount(String(amount)) || '0'
+
+export interface NearContract extends Contract {
+  bet?(params: { bid_id: string }, gas: string, amount: string): void
+  claim?(params: { bid_id: string }, gas: string, amount: string): void
+  finalize?(params: { bid_id: string }, gas: string, amount: string): void
+  get_bid?(params: { bid_id: string }): any
+  acquire?(params: { bid_id: string, new_public_key: string }, gas: string, amount: string): void
+  get_profile?(params: { profile_id: string }): any
+  get_global_stats?(): any
+  get_top_bets?(params: { from_key: string | null, limit: number }): [string, string][]
+  get_top_claims?(params: { from_key: string | null, limit: number }): [string, string][]
+  offer?(params: { profile_id: string }, gas: string, amount: string): boolean
+  collect_rewards?(params: object, gas: string, amount: string): void
+}
+
+class NearApi {
+  readonly near: Near;
+  readonly contract: NearContract;
+  readonly walletConnection: ExtendWalletConnection;
+
+  constructor(near: Near) {
+    this.near = near;
+    this.walletConnection = new ExtendWalletConnection(near, config.contractName)
+    this.contract = this.getContract(this.walletConnection.account())
+  }
+
+  getContract(account: Account): NearContract {
+    return new Contract(account, config.contractName, {
+      viewMethods: [
+        'get_profile',
+        'get_bid',
+        'get_top_bets',
+        'get_top_claims',
+        'get_global_stats'
+      ],
+      changeMethods: [
+        'offer',
+        'bet',
+        'claim',
+        'finalize',
+        'acquire',
+        'collect_rewards'
+      ]
+    })
+  }
+
+  signIn(): void {
+    let successUrl = window.location.href
+    if (window.location.hash.indexOf('offer-processing') >= 0) {
+      successUrl = window.location.origin
+    }
+    this.walletConnection.requestSignIn(config.contractName, undefined, successUrl)
+  }
+
+  signOut(): void {
+    this.walletConnection.signOut()
+  }
+
+  async get_account_id(): Promise<string> {
+    return await this.walletConnection.getAccountId()
+  }
+
+  async account(bid_id: string): Promise<Account> {
+    return await this.near.account(bid_id)
+  }
+
+  async get_balance(bid_id: string): Promise<number | null> {
+    const account = await this.account(bid_id)
+    let balance = null
+    try {
+      const b = await account.getAccountBalance()
+      balance = fromNear(b.total)
+    } catch (e) {
+      console.error('Account not exist')
+    }
+    return balance
+  }
+
+  async bet(bid_id: string, amount: number): Promise<void> {
+    await this.contract.bet?.({ bid_id }, '200000000000000', toYoctoNear(amount))
+  }
+
+  async claim(bid_id: string, amount: number): Promise<void> {
+    await this.contract.claim?.({ bid_id }, '200000000000000', toYoctoNear(amount))
+  }
+
+  async finalize(bid_id: string): Promise<void> {
+    await this.contract.finalize?.({ bid_id }, '200000000000000', '0')
+  }
+
+  async get_bid(bid_id: string): Promise<IBid> {
+    let bid = await this.contract.get_bid?.({ bid_id })
+    if (bid) bid = mapBidInfo({ id: bid_id, ...bid })
+    return bid
+  }
+
+  async get_bid_safety(bid_id: string): Promise<IBidSafety> {
+    const account = await this.account(bid_id)
+    try {
+      const codeHash = (await account.state()).code_hash
+      const accessKeysLen = (await account.getAccessKeys()).length
+      const lockerContract: any = await new Contract(account, bid_id, {
+        viewMethods: ['get_owner'],
+        changeMethods: []
+      })
+      const lockerOwner = await lockerContract.get_owner({})
+      const balance = (await account.getAccountBalance()).total
+      return { codeHash, accessKeysLen, lockerOwner, balance: fromNear(balance) }
+    } catch (e) {
+      console.log('check safety error', e)
+    }
+    return { codeHash: '(unknown)', accessKeysLen: '(unknown)', lockerOwner: '(not found)', balance: 0 }
+  }
+
+  async acquire(bid_id: string, new_public_key: string ): Promise<void> {
+    await this.contract.acquire?.({ bid_id, new_public_key }, '200000000000000', '0')
+  }
+
+  async collect_rewards(): Promise<void> {
+    await this.contract.collect_rewards?.({}, '200000000000000', '0')
+  }
+
+  async get_profile(profile_id: string | null): Promise<IProfile> {
+    const profile = profile_id ? await this.contract.get_profile?.({ profile_id }) : null
+    return mapProfile(profile)
+  }
+
+  async get_global_stats(): Promise<IStat> {
+    return mapStats(await this.contract.get_global_stats?.())
+  }
+
+  async get_top_bets(from_key: string | null, limit: number): Promise<[string, string][]> {
+    if (!this.contract.get_top_bets) return []
+    return await this.contract.get_top_bets?.({ from_key, limit })
+  }
+
+  async get_top_claims(from_key: string | null, limit: number): Promise<[string, string][]> {
+    if (!this.contract.get_top_claims) return []
+    return await this.contract.get_top_claims?.({ from_key, limit })
+  }
+
+  async addFullAccessKey({ account_id, successUrl, failureUrl }: { account_id: string, successUrl?: string, failureUrl?: string }): Promise<void> {
+    const walletConnection = new ExtendWalletConnection(this.near, config.contractName)
+    await walletConnection.addFullAccessKey(account_id, successUrl, failureUrl)
+  }
+
+  async deleteAllKeys(offer: string, deleteLastKey?: boolean): Promise<void> {
+    const account = await this.near.account(offer)
+    const accessKeys = await account.getAccessKeys()
+    const currentKey = (await account.connection.signer.getPublicKey(offer, config.networkId)).toString()
+    for (let index = 0; index < accessKeys.length; index++) {
+      const { public_key } = accessKeys[index]
+      if (currentKey === public_key) continue
+      await account.deleteKey(public_key)
+    }
+    if (deleteLastKey) await account.deleteKey(currentKey)
+  }
+
+  async offer(offer: string, beneficiar: string): Promise<void> {
+    const account = await this.near.account(offer)
+    const contract = this.getContract(account)
+    try {
+      await contract.offer?.({ profile_id: beneficiar }, '200000000000000', toYoctoNear(0.3))
+    } catch (e) {
+      console.error(e)
+    }
+  }
+
+  async createContract(accountId: string): Promise<void> {
+    const account = await this.near.account(accountId);
+    const data = await fetch(config.wasmCode)
+    const buf = await data.arrayBuffer()
+    await account.deployContract(new Uint8Array(buf))
+
+  }
+
+  async lockContract(accountId: string): Promise<void> {
+    const account = await this.near.account(accountId);
+    const contract: any = await new Contract(account, accountId, {
+      viewMethods: [],
+      changeMethods: ['lock']
+    })
+    await contract.lock(Buffer.from('{"owner_id":"' + config.contractName + '"}'))
+
+  }
+
+  async addMarketKeyToAccount(accountId: string): Promise<void> {
+    const account = await this.near.account(accountId);
+    try {
+      await account.addKey(config.marketPublicKey, accountId);
+    } catch(e) {
+      console.error(e);
+    }
+  }
+
+  deleteKeyFromLocalStorage(accountId: string): void {
+    this.walletConnection._keyStore.removeKey(config.networkId, accountId)
+  }
+}
+
+export default NearApi
+'''
+'''--- frontend/src/helpers/config.ts ---
+export interface INearConfig {
+  accountSuffix: string,
+  networkId: string,
+  nodeUrl: string,
+  contractName: string,
+  walletUrl: string,
+  marketPublicKey: string,
+  wasmCode: string,
+  claimPeriod: number
+}
+
+export const config = getConfig()
+
+// TODO: move these data to envs
+function getConfig(): INearConfig {
+  const env = process.env.REACT_APP_ENVIRONMENT || 'development';
+  switch (env) {
+    case 'production':
+    case 'mainnet':
+      return {
+        accountSuffix: 'near',
+        networkId: 'mainnet',
+        nodeUrl: 'https://rpc.mainnet.near.org',
+        contractName: 'c.nearbet.near',
+        walletUrl: 'https://wallet.near.org',
+        marketPublicKey: 'ed25519:5mgNVstFy67S469tG2j8MjRchPuKqJFYsydghKRteR42',
+        wasmCode: 'https://gonear.name/bin',
+        claimPeriod: 72 * 60 * 60
+      }
+    case 'development':
+    case 'testnet':
+    default:
+      return {
+        accountSuffix: 'testnet',
+        networkId: 'testnet',
+        nodeUrl: 'https://rpc.testnet.near.org',
+        contractName: 'dev-1616355537428-9726228',
+        walletUrl: 'https://wallet.testnet.near.org',
+        marketPublicKey: 'ed25519:EgmA4v9E2SjFVu31bmJKJtNW6cjkx2cbM3HyXprsYvrA',
+        wasmCode: 'https://near.bet/bin',
+        claimPeriod: 15 * 60
+      }
+  }
+}
+
+'''
+'''--- frontend/src/helpers/hooks.ts ---
+import {useEffect} from 'react'
+
+export const useTopScroll = () => {
+  useEffect(() => {
+    window.scrollTo(0, 0)
+  }, [])
+}
+
+'''
+'''--- frontend/src/helpers/mappers.ts ---
+import { fromNear } from 'helpers/api'
+
+export interface IStat {
+  numProfiles: number;
+  numBids: number;
+  numBidsOnClaim: number;
+  totalCommission: number;
+  numOffers: number;
+  numBets: number;
+  numClaims: number;
+  numAcquisitions: number;
+}
+
+export const mapStats = (s: any[]): IStat => {
+  return {
+    numProfiles: s[0],
+    numBids: s[1],
+    numBidsOnClaim: s[2],
+    totalCommission: fromNear(s[3]),
+    numOffers: s[4],
+    numBets: s[5],
+    numClaims: s[6],
+    numAcquisitions: s[7]
+  }
+}
+
+export interface IBid {
+  id: string;
+  isAtMarket: boolean;
+  numClaims: number;
+  claimedBy: string | null;
+  claimedTime: number;
+  bets: string[] | null;
+  betPrice: number;
+  claimPrice: number;
+  forfeit: number;
+  isOnAcquisition: boolean;
+}
+
+export const mapBidInfo = (b: any): IBid => {
+  return b && b.bet_price ? {
+    id: b.id,
+    isAtMarket: true,
+    numClaims: b.num_claims,
+    claimedBy: b.claim_status ? b.claim_status[0] : null,
+    claimedTime: b.claim_status ? parseInt(b.claim_status[1]) / 1000000 : 0,
+    bets: b.bets,
+    betPrice: fromNear(b.bet_price),
+    claimPrice: fromNear(b.claim_price),
+    forfeit: fromNear(b.forfeit),
+    isOnAcquisition: b.on_acquisition
+  } : {
+    id: b.id || '',
+    isAtMarket: false,
+    numClaims: 0,
+    claimedBy: null,
+    claimedTime: 0,
+    bets: null,
+    betPrice: 0,
+    claimPrice: 0,
+    forfeit: 0,
+    isOnAcquisition: false
+  }
+}
+
+export interface IProfile {
+  participation: string[];
+  acquisitions: string[];
+  betsVolume: number;
+  availableRewards: number;
+  profitTaken: number;
+  numOffers: number;
+  numBets: number;
+  numClaims: number;
+  numAcquisitions: number;
+}
+
+export const mapProfile = (p: any): IProfile => {
+  return p ? ({
+    participation: p.participation,
+    acquisitions: p.acquisitions,
+    betsVolume: fromNear(p.bets_volume),
+    availableRewards: fromNear(p.available_rewards),
+    profitTaken: fromNear(p.profit_taken),
+    numOffers: p.num_offers,
+    numBets: p.num_bets,
+    numClaims: p.num_claims,
+    numAcquisitions: p.num_acquisitions
+  }) : ({
+    participation: [],
+    acquisitions: [],
+    betsVolume: fromNear('0'),
+    availableRewards: fromNear('0'),
+    profitTaken: fromNear('0'),
+    numOffers: 0,
+    numBets: 0,
+    numClaims: 0,
+    numAcquisitions: 0
+  })
+}
+
+export interface IBidSafety {
+  codeHash: string;
+  accessKeysLen: any;
+  lockerOwner: any;
+  balance: number;
+}
+'''
+'''--- frontend/src/helpers/media.ts ---
+export const
+  break_up = '1000px',
+  break_down = '999px'
+
+'''
+'''--- frontend/src/helpers/near.ts ---
+
+import * as nearAPI from 'near-api-js'
+import { createContext } from 'react';
+import { config, INearConfig } from './config'
+import NearApi from './api'
+const nearSeedPhrase = require('near-seed-phrase')
+
+export const { generateSeedPhrase, parseSeedPhrase } = nearSeedPhrase
+
+export interface INearProps {
+  connected: boolean;
+  api: NearApi;
+  config: INearConfig;
+  signedIn: boolean;
+  signedAccountId: string | null;
+}
+
+export const NearContext = createContext<any>(null);
+
+export const connectNear = async (): Promise<INearProps> => {
+  const keyStore = new nearAPI.keyStores.BrowserLocalStorageKeyStore()
+  const near = await nearAPI.connect(Object.assign({ deps: { keyStore } }, config))
+  const api = new NearApi(near)
+
+  return {
+    connected: true,
+    config: config,
+    api: api,
+    signedIn: false,
+    signedAccountId: null
+  }
+}
+
+'''
+'''--- frontend/src/helpers/routes.ts ---
+import {useState, useEffect} from 'react'
+import {useLocation, useHistory} from 'react-router-dom'
+
+export interface CheckState {
+  isMarket: boolean;
+  isOffer: boolean;
+  isRules: boolean;
+  isProfile: boolean;
+}
+
+const checkState: CheckState = {
+  isMarket: false,
+  isOffer: false,
+  isRules: false,
+  isProfile: false
+}
+
+const market = ['/', '/market']
+
+export const useRouteCheck = (): CheckState => {
+  const [check, setCheck] = useState<CheckState>(checkState)
+  const location = useLocation()
+  
+  useEffect(() => {
+    const {pathname} = location
+    const state: CheckState = {
+      isMarket: market.includes(pathname) || pathname.indexOf('/bid') >= 0,
+      isOffer: pathname.indexOf('/offer') >= 0,
+      isRules: pathname === '/rules',
+      isProfile: pathname === '/profile'
+    }
+    setCheck(state)
+  }, [location])
+  return check
+}
+
+const hideScroll = (open: boolean) =>
+  document.body.style.overflowY = open ? 'hidden' : 'auto'
+
+export const useOpen = (): [boolean, (_: boolean) => void] => {
+  const [open, setOpen] = useState<boolean>(false)
+
+  useEffect(() => {
+    hideScroll(open)
+  }, [open])
+  return [open, setOpen]
+}
+
+export const useToBid = (bidId: string) => {
+  const history = useHistory()
+  
+  return () => {
+    history.push(`/bid/${bidId}`)
+  }
+}
+
+export const useToProfile = (accountId?: string) => {
+  const history = useHistory()
+  
+  return () => {
+    if (accountId) {
+      history.push(`/profile/${accountId}`)
+    } else {
+      history.push(`/profile`)
+    }
+    
+  }
+}
+
+export const useToAcquire = (bidId: string) => {
+  const history = useHistory()
+
+  return () => {
+    history.push(`/acquire/${bidId}`)
+  }
+}
+
+export const useToMarket = () => {
+  const history = useHistory()
+  
+  return () => {
+    history.push(`/`)
+  }
+}
+
+'''
+'''--- frontend/src/helpers/walletConnection.ts ---
+import { WalletConnection, utils } from 'near-api-js'
+const LOGIN_WALLET_URL_SUFFIX = '/login/'
+
+export class ExtendWalletConnection extends WalletConnection {
+  async addFullAccessKey(accountId: string, successUrl?: string, failureUrl?: string): Promise<void> {
+    const currentUrl = new URL(window.location.href);
+    const newUrl = new URL(this._walletBaseUrl + LOGIN_WALLET_URL_SUFFIX);
+    newUrl.searchParams.set('success_url', successUrl || currentUrl.href);
+    newUrl.searchParams.set('failure_url', failureUrl || currentUrl.href);
+    newUrl.searchParams.set('contract_id', '');
+    const accessKey = utils.KeyPair.fromRandom('ed25519');
+    const publicKey = accessKey.getPublicKey().toString();
+    newUrl.searchParams.set('public_key', publicKey);
+    await this._keyStore.setKey(this._networkId, accountId, accessKey);
+    window.location.assign(newUrl.toString());
+  }
+}
+
+'''
+'''--- frontend/src/react-app-env.d.ts ---
+/// <reference types="react-scripts" />
+
+'''
+'''--- frontend/tsconfig.json ---
+{
+  "compilerOptions": {
+    "target": "es5",
+    "baseUrl": "src",
+    "lib": [
+      "dom",
+      "dom.iterable",
+      "esnext"
+    ],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "strict": true,
+    "forceConsistentCasingInFileNames": true,
+    "noFallthroughCasesInSwitch": true,
+    "module": "esnext",
+    "moduleResolution": "node",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx"
+  },
+  "include": [
+    "src"
+  ]
+}
+
+'''
+'''--- lock_unlock_account_contract/Cargo.toml ---
+[package]
+name = "lock-unlock-account"
+version = "0.1.0"
+authors = ["Alex Kouprin <kpr@near.org>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "=3.0.0-pre.2"
+
+[profile.release]
+codegen-units=1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+
+'''
+'''--- lock_unlock_account_contract/LIST_OF_HASHES.md ---
+0.1.0 => 'DKUq738xnns9pKjpv9GifM68UoFSmfnBYNp3hsfkkUFa'
+
+'''
+'''--- lock_unlock_account_contract/build.sh ---
+#!/bin/bash
+set -e
+cd "`dirname $0`"
+RUSTFLAGS='-C link-arg=-s' cargo +nightly build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/lock_unlock_account.wasm ./res/
+
+'''
+'''--- lock_unlock_account_contract/src/lib.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::json_types::{Base58PublicKey, ValidAccountId};
+use near_sdk::{
+    env, ext_contract, near_bindgen, AccountId, PanicOnDefault, Promise, PromiseResult,
+};
+
+const ON_ACCESS_KEY_ADDED_CALLBACK_GAS: u64 = 20_000_000_000_000;
+/// Indicates there are no deposit for a callback for better readability
+const NO_DEPOSIT: u128 = 0;
+
+near_sdk::setup_alloc!();
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Contract {
+    pub owner_id: AccountId,
+}
+
+#[ext_contract(ext_self)]
+pub trait ExtContract {
+    fn on_access_key_added(&mut self, owner_id: AccountId) -> bool;
+}
+
+fn is_promise_success() -> bool {
+    assert_eq!(
+        env::promise_results_count(),
+        1,
+        "Contract expected a result on the callback"
+    );
+    match env::promise_result(0) {
+        PromiseResult::Successful(_) => true,
+        _ => false,
+    }
+}
+
+#[near_bindgen]
+impl Contract {
+    #[init(ignore_state)]
+    pub fn lock(owner_id: ValidAccountId) -> Self {
+        assert_eq!(
+            env::predecessor_account_id(),
+            env::current_account_id(),
+            "Actor is not allowed to init the contract"
+        );
+        Self {
+            owner_id: owner_id.into(),
+        }
+    }
+
+    pub fn unlock(&mut self, public_key: Base58PublicKey) {
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.owner_id,
+            "Actor is not allowed to add a key"
+        );
+        self.owner_id = AccountId::default();
+        Promise::new(env::current_account_id())
+            .add_full_access_key(public_key.into())
+            .then(ext_self::on_access_key_added(
+                env::predecessor_account_id(),
+                &env::current_account_id(),
+                NO_DEPOSIT,
+                ON_ACCESS_KEY_ADDED_CALLBACK_GAS,
+            ));
+    }
+
+    pub fn get_owner(&self) -> AccountId {
+        self.owner_id.clone()
+    }
+
+    // Callback
+    pub fn on_access_key_added(&mut self, owner_id: AccountId) -> bool {
+        assert_eq!(
+            env::predecessor_account_id(),
+            env::current_account_id(),
+            "Callback can only be called from the contract"
+        );
+        let access_key_created = is_promise_success();
+        if !access_key_created {
+            // In case of failure, put owner_id back
+            self.owner_id = owner_id;
+        }
+        access_key_created
+    }
+}
+
+'''
+'''--- marketplace_contract/Cargo.toml ---
+[package]
+name = "accounts-marketplace"
+version = "0.1.0"
+authors = ["Alex Kouprin <kpr@near.org>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# TODO use released sdk
+near-sdk = { path = "../../near-sdk-rs/near-sdk", version = "=3.0.0-pre.3" }
+#near-sdk = "=3.0.0-pre.2"
+
+[dev-dependencies]
+# TODO use released sdk-sim when available
+near-sdk-sim = { path = "../../near-sdk-rs/near-sdk-sim", version = "=3.0.0-pre.3" }
+#near-sdk-sim = { git = "https://github.com/near/near-sdk-rs.git", tag="3.0.0" }
+
+[features]
+expensive_tests = []
+
+[profile.release]
+codegen-units=1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+
+'''
+'''--- marketplace_contract/build.sh ---
+#!/bin/bash
+set -e
+cd "`dirname $0`"
+RUSTFLAGS='-C link-arg=-s' cargo +nightly build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/accounts_marketplace.wasm ./res/
+
+'''
+'''--- marketplace_contract/compile_and_test.sh ---
+#!/bin/bash
+set -e
+cd "`dirname $0`"
+RUSTFLAGS='-C link-arg=-s' cargo +nightly build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/accounts_marketplace.wasm ./res/
+RUSTFLAGS='-C link-arg=-s' cargo +nightly test --all -- --nocapture
+
+'''
+'''--- marketplace_contract/expensive.sh ---
+#!/bin/bash
+set -e
+cd "`dirname $0`"
+RUSTFLAGS='-C link-arg=-s' cargo +nightly build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/accounts_marketplace.wasm ./res/
+RUSTFLAGS='-C link-arg=-s' cargo +nightly test --all --features=expensive_tests -- --nocapture
+
+'''
+'''--- marketplace_contract/src/action.rs ---
+use crate::*;
+
+pub const OFFER_DEPOSIT: Balance = 300_000_000_000_000_000_000_000;
+pub const INIT_BET_PRICE: Balance = 1_250_000_000_000_000_000_000_000;
+
+pub const ON_ACQUIRE_FUNCTION_CALL_GAS: u64 = 100_000_000_000_000;
+/// Indicates there are no deposit for a callback for better readability
+const NO_DEPOSIT: u128 = 0;
+
+pub const INV_COMMISSION: u128 = 20;
+pub const INV_FOUNDER_COMMISSION_ON_SALE: u128 = 4;
+pub const INV_REWARD_DECAY_MULT_100: u128 = 144;
+pub const INV_REWARD_DECAY_ON_SALE_MULT_100: u128 = 120;
+
+pub const ERR_OFFER_DEPOSIT_NOT_ENOUGH: &str =
+    "Attached deposit must be no less than OFFER_DEPOSIT";
+pub const ERR_GAINER_SAME_AS_OFFER: &str = "Offered account cannot take profit";
+pub const ERR_ALREADY_OFFERED: &str = "Bid is already offered";
+pub const ERR_BET_FORFEIT_NOT_ENOUGH: &str =
+    "Attached deposit must be no less than bet price plus forfeit";
+pub const ERR_CLAIM_NOT_ENOUGH: &str = "Attached deposit must be no less than claim price";
+pub const ERR_ALREADY_CLAIMED: &str = "Bid is already claimed";
+pub const ERR_BID_NOT_FOUND: &str = "Bid is not found";
+pub const ERR_BID_CLAIM_NOT_FOUND: &str = "Bid claim is not found";
+pub const ERR_BET_ON_ACQUISITION: &str = "Bid is on acquisition";
+pub const ERR_NOT_ON_ACQUISITION: &str = "Bid is not on acquisition";
+pub const ERR_ACQUIRE_REJECTED: &str = "Do not have permission to acquire";
+
+#[near_bindgen]
+impl Contract {
+    #[payable]
+    pub fn offer(&mut self, profile_id: ValidAccountId) -> bool {
+        assert!(
+            env::attached_deposit() >= OFFER_DEPOSIT,
+            "{}",
+            ERR_OFFER_DEPOSIT_NOT_ENOUGH
+        );
+        assert_ne!(
+            &env::predecessor_account_id(),
+            profile_id.as_ref(),
+            "{}",
+            ERR_GAINER_SAME_AS_OFFER
+        );
+
+        // Create bid
+        let mut bid = self.extract_bid_or_create(&env::predecessor_account_id());
+        assert_eq!(bid.bets.len(), 0, "{}", ERR_ALREADY_OFFERED);
+        bid.participants.insert(profile_id.as_ref());
+
+        // Update profile
+        let mut profile = self.extract_profile_or_create(profile_id.as_ref());
+        profile.num_offers += 1;
+        profile.participation.insert(&env::predecessor_account_id());
+        self.save_profile_or_panic(profile_id.as_ref(), &profile);
+
+        // Update top
+        self.bet_and_update_leaders(
+            profile_id.as_ref(),
+            &env::predecessor_account_id(),
+            &mut bid,
+        );
+
+        self.num_offers += 1;
+        true
+    }
+
+    #[payable]
+    pub fn bet(&mut self, bid_id: ValidAccountId) -> bool {
+        let mut bid = self.extract_bid_or_panic(bid_id.as_ref());
+        assert!(
+            !bid.on_acquisition(&self.acquisition_time),
+            "{}",
+            ERR_BET_ON_ACQUISITION
+        );
+        let bet_price = bid.calculate_bet_price();
+
+        let (forfeit, commission) = if let Some((ref claimer_profile_id, _)) = bid.claim_status {
+            let (forfeit, commission) = bid.calculate_forfeit(&self.acquisition_time).unwrap();
+            let mut claimer_profile = self.extract_profile_or_create(&claimer_profile_id);
+            claimer_profile.available_rewards += bid.force_calculate_claim_price() + forfeit;
+            self.save_profile_or_panic(&claimer_profile_id, &claimer_profile);
+            (forfeit, commission)
+        } else {
+            (0, 0)
+        };
+
+        assert!(
+            env::attached_deposit() >= bet_price + forfeit + commission,
+            "{}",
+            ERR_BET_FORFEIT_NOT_ENOUGH
+        );
+
+        // Update bid
+        bid.claim_status = None;
+        bid.participants.insert(&env::predecessor_account_id());
+
+        // Update profile
+        let mut profile = self.extract_profile_or_create(&env::predecessor_account_id());
+        profile.num_bets += 1;
+        profile.bets_volume += bet_price;
+        profile.participation.insert(bid_id.as_ref());
+        self.save_profile_or_panic(&env::predecessor_account_id(), &profile);
+
+        // Update top and rewards
+        self.bet_and_update_leaders(&env::predecessor_account_id(), bid_id.as_ref(), &mut bid);
+
+        self.num_bets += 1;
+        true
+    }
+
+    #[payable]
+    pub fn claim(&mut self, bid_id: ValidAccountId) -> bool {
+        let mut bid = self.extract_bid_or_panic(bid_id.as_ref());
+        assert!(bid.claim_status.is_none(), "{}", ERR_ALREADY_CLAIMED);
+        let claim_price = bid.force_calculate_claim_price();
+        assert!(
+            env::attached_deposit() >= claim_price,
+            "{}",
+            ERR_CLAIM_NOT_ENOUGH
+        );
+
+        // Update bid
+        bid.claim_status = Some((env::predecessor_account_id(), env::block_timestamp()));
+        bid.participants.insert(&env::predecessor_account_id());
+        self.save_bid_or_panic(bid_id.as_ref(), &bid);
+
+        // Update profile
+        let mut profile = self.extract_profile_or_create(&env::predecessor_account_id());
+        profile.num_claims += 1;
+        profile.participation.insert(bid_id.as_ref());
+        self.save_profile_or_panic(&env::predecessor_account_id(), &profile);
+
+        // Update top
+        self.top_claims.insert(&(claim_price, bid_id.into()), &());
+
+        self.num_claims += 1;
+        true
+    }
+
+    pub fn finalize(&mut self, bid_id: ValidAccountId) -> bool {
+        let mut bid = self.extract_bid_or_panic(bid_id.as_ref());
+        assert!(
+            bid.on_acquisition(&self.acquisition_time),
+            "{}",
+            ERR_NOT_ON_ACQUISITION
+        );
+        let profile_id = if let Some((profile_id, _)) = &bid.claim_status {
+            profile_id
+        } else {
+            unreachable!()
+        };
+
+        // Update profile
+        let mut profile = self.extract_profile_or_create(&profile_id);
+        profile.acquisitions.insert(bid_id.as_ref());
+        self.save_profile_or_panic(&profile_id, &profile);
+
+        // Update rewards
+        self.update_final_rewards(bid_id.as_ref(), &bid);
+
+        // Update top
+        self.top_bets
+            .remove(&(bid.calculate_bet_price(), bid_id.clone().into()));
+        self.top_claims
+            .remove(&(bid.force_calculate_claim_price(), bid_id.into()));
+
+        // Clear Bid completely from storage
+        self.clear_bid(&mut bid);
+
+        true
+    }
+
+    pub fn acquire(&mut self, bid_id: ValidAccountId, new_public_key: Base58PublicKey) -> bool {
+        // Update profile
+        let mut profile = self.extract_profile_or_create(&env::predecessor_account_id());
+        assert!(
+            profile.acquisitions.remove(bid_id.as_ref()),
+            "{}",
+            ERR_ACQUIRE_REJECTED
+        );
+        profile.num_acquisitions += 1;
+        self.save_profile_or_panic(&env::predecessor_account_id(), &profile);
+
+        let key: String = (&new_public_key).into();
+
+        // TODO what if Promise fails?
+        Promise::new(bid_id.clone().into()).function_call(
+            "unlock".to_string().into_bytes(),
+            json!({
+                "public_key": key,
+            })
+            .to_string()
+            .into_bytes(),
+            NO_DEPOSIT,
+            ON_ACQUIRE_FUNCTION_CALL_GAS,
+        );
+
+        self.num_acquisitions += 1;
+        true
+    }
+}
+
+impl Contract {
+    fn bet_and_update_leaders(&mut self, profile_id: &ProfileId, bid_id: &BidId, bid: &mut Bid) {
+        let mut bet_price = bid.calculate_bet_price();
+        if bid.bets.len() == 0 {
+            // Offer
+            self.update_commission(OFFER_DEPOSIT);
+        } else {
+            // Bet
+            self.top_bets
+                .remove(&(bet_price, bid_id.clone()))
+                .expect(ERR_BID_NOT_FOUND);
+            self.top_claims.remove(&(bet_price * 2, bid_id.clone()));
+            self.update_commission(bet_price / INV_COMMISSION);
+            let mut paid = bet_price - bet_price / INV_COMMISSION;
+            for i in (0..bid.bets.len()).rev() {
+                self.update_reward(
+                    &bid.bets.get(i).unwrap(),
+                    &(paid / INV_REWARD_DECAY_MULT_100 * 100),
+                );
+                paid -= paid / INV_REWARD_DECAY_MULT_100 * 100;
+            }
+            self.update_reward(&bid.bets.get(0).unwrap(), &paid);
+            bet_price = bet_price * 6 / 5;
+        }
+
+        bid.bets.push(&profile_id);
+        self.top_bets.insert(&(bet_price, bid_id.clone()), &());
+        self.save_bid_or_panic(bid_id, bid);
+    }
+
+    fn update_final_rewards(&mut self, bid_id: &BidId, bid: &Bid) {
+        // Update participants list
+        for profile_id in bid.participants.iter() {
+            let mut profile = self.extract_profile_or_create(&profile_id);
+            profile.participation.remove(bid_id);
+            self.save_profile_or_panic(&profile_id, &profile);
+        }
+
+        // Update rewards
+        let mut paid = bid.force_calculate_claim_price();
+        self.update_reward(
+            &bid.bets.get(0).unwrap(),
+            &(paid / INV_FOUNDER_COMMISSION_ON_SALE),
+        );
+        paid = paid - paid / INV_FOUNDER_COMMISSION_ON_SALE;
+        for i in (0..bid.bets.len()).rev() {
+            self.update_reward(
+                &bid.bets.get(i).unwrap(),
+                &(paid / INV_REWARD_DECAY_ON_SALE_MULT_100 * 100),
+            );
+            paid -= paid / INV_REWARD_DECAY_ON_SALE_MULT_100 * 100;
+        }
+        self.update_reward(&bid.bets.get(0).unwrap(), &paid);
+    }
+
+    fn update_commission(&mut self, value: Balance) {
+        self.total_commission += value;
+        // All commission goes to DAO
+        Promise::new(self.dao_id.clone()).transfer(value);
+        // TODO keep necessary amount for storage automatically
+    }
+}
+
+'''
+'''--- marketplace_contract/src/bid.rs ---
+use crate::*;
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Bid {
+    pub bets: Vector<ProfileId>,
+    pub participants: UnorderedSet<ProfileId>,
+
+    pub claim_status: Option<(ProfileId, Timestamp)>,
+
+    pub num_claims: u64,
+}
+
+impl Bid {
+    pub(crate) fn calculate_bet_price(&self) -> Balance {
+        let mut bet_price = INIT_BET_PRICE;
+        for _ in 1..self.bets.len() {
+            bet_price = bet_price * 6 / 5;
+        }
+        bet_price
+    }
+
+    pub(crate) fn force_calculate_claim_price(&self) -> Balance {
+        self.calculate_bet_price() * 2
+    }
+
+    pub(crate) fn calculate_claim_price(&self) -> Option<Balance> {
+        if self.claim_status.is_none() {
+            Some(self.force_calculate_claim_price())
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn calculate_forfeit(&self, acquisition_time: &u64) -> Option<(Balance, Balance)> {
+        if let Some((_profile_id, timestamp)) = &self.claim_status {
+            let bet_price = self.calculate_bet_price();
+            Some((
+                std::cmp::min(
+                    ((env::block_timestamp() - timestamp) / acquisition_time).into(),
+                    1_000_000_000,
+                ) // [0..1] ratio multiplied by 1e9
+                * (bet_price / 40_000_000_000), // this will be 2.5% for Claimer
+                bet_price / 40, // this is 2.5% commission of Marketplace
+            ))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn on_acquisition(&self, acquisition_time: &u64) -> bool {
+        if let Some((_profile_id, timestamp)) = &self.claim_status {
+            env::block_timestamp() - timestamp >= acquisition_time * 1_000_000_000
+        } else {
+            false
+        }
+    }
+}
+
+// TODO remove Debug?
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct BidView {
+    pub bets: Vec<ProfileId>,
+
+    pub claim_status: Option<(ProfileId, WrappedTimestamp)>,
+
+    pub bet_price: WrappedBalance,
+    pub claim_price: Option<WrappedBalance>,
+    pub forfeit: Option<WrappedBalance>,
+    pub on_acquisition: bool,
+
+    pub num_claims: u64,
+}
+
+impl From<(&Bid, &u64)> for BidView {
+    fn from(a: (&Bid, &u64)) -> Self {
+        Self {
+            bets: a.0.bets.iter().map(|x| x.into()).collect(),
+            claim_status: a
+                .0
+                .claim_status
+                .as_ref()
+                .map(|(p, t)| (p.into(), (t.clone().into()))),
+            bet_price: a.0.calculate_bet_price().into(),
+            claim_price: (a.0.calculate_claim_price()).map(|c| (c).into()),
+            forfeit: a.0.calculate_forfeit(a.1).map(|(x, y)| (x + y).into()),
+            on_acquisition: a.0.on_acquisition(a.1),
+            num_claims: a.0.num_claims,
+        }
+    }
+}
+
+#[near_bindgen]
+impl Contract {
+    pub fn get_bid(&self, bid_id: ValidAccountId) -> Option<BidView> {
+        self.bids
+            .get(bid_id.as_ref())
+            .map(|a| (&a, &self.acquisition_time).into())
+    }
+
+    pub fn get_top_bets(
+        &self,
+        from_key: Option<(WrappedBalance, BidId)>,
+        limit: u64,
+    ) -> Vec<(WrappedBalance, BidId)> {
+        if let Some((balance, bid_id)) = from_key {
+            self.top_bets
+                .iter_rev_from((balance.into(), bid_id))
+                .take(limit as usize)
+                .map(|((balance, bid_id), _)| (balance.into(), bid_id))
+                .collect()
+        } else {
+            self.top_bets
+                .iter_rev()
+                .take(limit as usize)
+                .map(|((balance, bid_id), _)| (balance.into(), bid_id))
+                .collect()
+        }
+    }
+
+    pub fn get_top_claims(
+        &self,
+        from_key: Option<(WrappedBalance, BidId)>,
+        limit: u64,
+    ) -> Vec<(WrappedBalance, BidId)> {
+        if let Some((balance, bid_id)) = from_key {
+            self.top_claims
+                .iter_rev_from((balance.into(), bid_id))
+                .take(limit as usize)
+                .map(|((balance, bid_id), _)| (balance.into(), bid_id))
+                .collect()
+        } else {
+            self.top_claims
+                .iter_rev()
+                .take(limit as usize)
+                .map(|((balance, bid_id), _)| (balance.into(), bid_id))
+                .collect()
+        }
+    }
+}
+
+impl Contract {
+    pub(crate) fn extract_bid_or_create(&mut self, bid_id: &BidId) -> Bid {
+        self.bids.remove(&bid_id).unwrap_or_else(|| {
+            let mut prefix = Vec::with_capacity(33);
+            prefix.push(b'y');
+            prefix.extend(env::sha256(bid_id.as_bytes()));
+            let mut prefix2 = Vec::with_capacity(33);
+            prefix2.push(b'z');
+            prefix2.extend(env::sha256(bid_id.as_bytes()));
+            Bid {
+                bets: Vector::new(prefix),
+                participants: UnorderedSet::new(prefix2),
+                claim_status: None,
+                num_claims: 0,
+            }
+        })
+    }
+
+    pub(crate) fn extract_bid_or_panic(&mut self, bid_id: &BidId) -> Bid {
+        self.bids.remove(&bid_id).unwrap()
+    }
+
+    pub(crate) fn save_bid_or_panic(&mut self, bid_id: &BidId, bid: &Bid) {
+        assert!(self.bids.insert(bid_id, bid).is_none());
+    }
+
+    pub(crate) fn clear_bid(&self, bid: &mut Bid) {
+        // This method helps to clear Bid data from storage completely after finalizing
+        bid.bets.clear();
+        bid.participants.clear();
+        bid.claim_status = None;
+        bid.num_claims = 0;
+    }
+}
+
+'''
+'''--- marketplace_contract/src/lib.rs ---
+mod action;
+mod bid;
+mod profile;
+
+pub use crate::action::*;
+pub use crate::bid::*;
+pub use crate::profile::*;
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::{TreeMap, UnorderedMap, UnorderedSet, Vector};
+use near_sdk::json_types::{Base58PublicKey, ValidAccountId, WrappedBalance, WrappedTimestamp};
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::serde_json::json;
+use near_sdk::{
+    env, ext_contract, log, near_bindgen, AccountId, Balance, PanicOnDefault, Promise,
+    PromiseResult, Timestamp,
+};
+
+pub type BidId = AccountId;
+pub type ProfileId = AccountId;
+
+pub const ACQUISITION_TIME: u64 = 72 * 60 * 60; // 72 hours
+
+near_sdk::setup_alloc!();
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Contract {
+    pub profiles: UnorderedMap<ProfileId, Profile>,
+
+    pub bids: UnorderedMap<BidId, Bid>,
+
+    pub top_bets: TreeMap<(Balance, BidId), ()>,
+    pub top_claims: TreeMap<(Balance, BidId), ()>,
+
+    pub num_offers: u64,
+    pub num_bets: u64,
+    pub num_claims: u64,
+    pub num_acquisitions: u64,
+
+    pub total_commission: Balance,
+
+    pub acquisition_time: u64, // in seconds
+
+    pub owner_id: AccountId,
+    pub dao_id: AccountId,
+
+    pub contract_ext: Option<()>,
+}
+
+#[near_bindgen]
+impl Contract {
+    #[init]
+    pub fn test_new(acquisition_time: u64, dao_id: ValidAccountId) -> Self {
+        assert!(!env::state_exists(), "Already initialized");
+        log!(
+            "Test init with owner_id = {:?}, dao_id = {:?}, acquisition_time = {:?}",
+            env::signer_account_id(),
+            dao_id,
+            acquisition_time
+        );
+        Self {
+            profiles: UnorderedMap::new(b"u".to_vec()),
+            bids: UnorderedMap::new(b"a".to_vec()),
+            top_bets: TreeMap::new(b"b".to_vec()),
+            top_claims: TreeMap::new(b"c".to_vec()),
+            num_offers: 0,
+            num_bets: 0,
+            num_claims: 0,
+            num_acquisitions: 0,
+            total_commission: 0,
+            acquisition_time,
+            owner_id: env::signer_account_id(),
+            dao_id: dao_id.into(),
+            contract_ext: None,
+        }
+    }
+
+    #[init]
+    pub fn new(owner_id: ValidAccountId, dao_id: ValidAccountId) -> Self {
+        assert!(!env::state_exists(), "Already initialized");
+        Self {
+            profiles: UnorderedMap::new(b"u".to_vec()),
+            bids: UnorderedMap::new(b"a".to_vec()),
+            top_bets: TreeMap::new(b"b".to_vec()),
+            top_claims: TreeMap::new(b"c".to_vec()),
+            num_offers: 0,
+            num_bets: 0,
+            num_claims: 0,
+            num_acquisitions: 0,
+            total_commission: 0,
+            acquisition_time: ACQUISITION_TIME,
+            owner_id: owner_id.into(),
+            dao_id: dao_id.into(),
+            contract_ext: None,
+        }
+    }
+
+    pub fn get_global_stats(&self) -> (u64, u64, u64, WrappedBalance, u64, u64, u64, u64) {
+        (
+            self.profiles.len(),
+            self.bids.len(),
+            self.top_claims.len(),
+            self.total_commission.into(),
+            self.num_offers,
+            self.num_bets,
+            self.num_claims,
+            self.num_acquisitions,
+        )
+    }
+}
+
+'''
+'''--- marketplace_contract/src/profile.rs ---
+use crate::*;
+
+pub const MIN_REWARDS: Balance = 100_000_000_000_000_000_000_000;
+pub const ON_REWARDS_COLLECTED_CALLBACK_GAS: u64 = 30_000_000_000_000;
+/// Indicates there are no deposit for a callback for better readability
+const NO_DEPOSIT: u128 = 0;
+
+pub const ERR_REWARD_BALANCE_INSUFFICIENT: &str =
+    "Available rewards amount is less than MIN_REWARDS boundary";
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Profile {
+    pub participation: UnorderedSet<BidId>,
+    pub acquisitions: UnorderedSet<BidId>,
+
+    pub bets_volume: Balance,
+    pub available_rewards: Balance,
+    pub profit_taken: Balance,
+
+    pub num_offers: u64,
+    pub num_bets: u64,
+    pub num_claims: u64,
+    pub num_acquisitions: u64,
+}
+
+// TODO remove Debug?
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct ProfileView {
+    pub participation: Vec<BidId>,
+    pub acquisitions: Vec<BidId>,
+
+    pub bets_volume: WrappedBalance,
+    pub available_rewards: WrappedBalance,
+    pub profit_taken: WrappedBalance,
+
+    pub num_offers: u64,
+    pub num_bets: u64,
+    pub num_claims: u64,
+    pub num_acquisitions: u64,
+}
+
+impl From<&Profile> for ProfileView {
+    fn from(p: &Profile) -> Self {
+        Self {
+            participation: p.participation.iter().map(|x| x.into()).collect(),
+            acquisitions: p.acquisitions.iter().map(|x| x.into()).collect(),
+            bets_volume: p.bets_volume.into(),
+            available_rewards: p.available_rewards.into(),
+            profit_taken: p.profit_taken.into(),
+            num_offers: p.num_offers,
+            num_bets: p.num_bets,
+            num_claims: p.num_claims,
+            num_acquisitions: p.num_acquisitions,
+        }
+    }
+}
+
+#[ext_contract(ext_self)]
+pub trait ExtContract {
+    /// Callback after rewards collecting
+    fn on_rewards_collected(&mut self, predecessor_account_id: AccountId, rewards: Balance)
+        -> bool;
+}
+
+fn is_promise_success() -> bool {
+    assert_eq!(
+        env::promise_results_count(),
+        1,
+        "Contract expected a result on the callback"
+    );
+    match env::promise_result(0) {
+        PromiseResult::Successful(_) => true,
+        _ => false,
+    }
+}
+
+#[near_bindgen]
+impl Contract {
+    pub fn get_profile(&self, profile_id: ValidAccountId) -> Option<ProfileView> {
+        self.profiles.get(profile_id.as_ref()).map(|p| (&p).into())
+    }
+
+    pub fn collect_rewards(&mut self) -> Promise {
+        let mut profile = self.extract_profile_or_create(&env::predecessor_account_id());
+        let rewards = profile.available_rewards;
+        assert!(
+            rewards >= MIN_REWARDS,
+            "{}",
+            ERR_REWARD_BALANCE_INSUFFICIENT
+        );
+        profile.available_rewards = 0;
+        profile.profit_taken += rewards;
+        self.save_profile_or_panic(&env::predecessor_account_id(), &profile);
+
+        Promise::new(env::predecessor_account_id())
+            .transfer(rewards)
+            .then(ext_self::on_rewards_collected(
+                env::predecessor_account_id(),
+                rewards,
+                &env::current_account_id(),
+                NO_DEPOSIT,
+                ON_REWARDS_COLLECTED_CALLBACK_GAS,
+            ))
+    }
+
+    pub fn on_rewards_collected(
+        &mut self,
+        predecessor_account_id: AccountId,
+        rewards: Balance,
+    ) -> bool {
+        assert_eq!(
+            env::predecessor_account_id(),
+            env::current_account_id(),
+            "Callback can only be called from the contract"
+        );
+        let rewards_transferred = is_promise_success();
+        if !rewards_transferred {
+            // In case of failure, put the amount back
+            let mut profile = self.extract_profile_or_create(&predecessor_account_id);
+            profile.available_rewards = rewards;
+            profile.profit_taken -= rewards;
+            self.save_profile_or_panic(&env::predecessor_account_id(), &profile);
+        }
+        rewards_transferred
+    }
+}
+
+impl Contract {
+    pub(crate) fn extract_profile_or_create(&mut self, profile_id: &ProfileId) -> Profile {
+        self.profiles.remove(&profile_id).unwrap_or_else(|| {
+            let mut prefix = Vec::with_capacity(33);
+            prefix.push(b'p');
+            prefix.extend(env::sha256(profile_id.as_bytes()));
+            let mut prefix2 = Vec::with_capacity(33);
+            prefix2.push(b'q');
+            prefix2.extend(env::sha256(profile_id.as_bytes()));
+            Profile {
+                participation: UnorderedSet::new(prefix),
+                acquisitions: UnorderedSet::new(prefix2),
+                bets_volume: 0,
+                available_rewards: 0,
+                profit_taken: 0,
+                num_offers: 0,
+                num_bets: 0,
+                num_claims: 0,
+                num_acquisitions: 0,
+            }
+        })
+    }
+
+    pub(crate) fn save_profile_or_panic(&mut self, profile_id: &ProfileId, profile: &Profile) {
+        assert!(self.profiles.insert(profile_id, profile).is_none());
+    }
+
+    pub(crate) fn update_reward(&mut self, profile_id: &ProfileId, value: &Balance) {
+        let mut profile = self.extract_profile_or_create(profile_id);
+        profile.available_rewards += value;
+        self.save_profile_or_panic(profile_id, &profile);
+    }
+}
+
+'''
+'''--- marketplace_contract/tests/general.rs ---
+use std::convert::TryInto;
+
+/// Import the generated proxy contract
+use accounts_marketplace::ContractContract as AMContract;
+use accounts_marketplace::{
+    BidId, BidView, ProfileView, ERR_ACQUIRE_REJECTED, ERR_ALREADY_CLAIMED, ERR_ALREADY_OFFERED,
+    ERR_BET_FORFEIT_NOT_ENOUGH, ERR_BET_ON_ACQUISITION, ERR_CLAIM_NOT_ENOUGH,
+    ERR_GAINER_SAME_AS_OFFER, ERR_OFFER_DEPOSIT_NOT_ENOUGH, ERR_REWARD_BALANCE_INSUFFICIENT,
+    INIT_BET_PRICE, OFFER_DEPOSIT,
+};
+
+use near_sdk::json_types::{Base58PublicKey, WrappedBalance};
+use near_sdk::{AccountId, Balance};
+use near_sdk_sim::{call, deploy, init_simulator, to_yocto, view, ContractAccount, UserAccount};
+
+// Load in contract bytes at runtime
+near_sdk_sim::lazy_static_include::lazy_static_include_bytes! {
+  CONTRACT_WASM_BYTES => "res/accounts_marketplace.wasm",
+}
+
+const CONTRACT_ID: &str = "marketplace";
+const ANY_ERR: Option<&str> = Some("");
+const MIN_STORAGE_FOR_ACCOUNT: Balance = 16543800000000000000000;
+
+fn test_init() -> (UserAccount, ContractAccount<AMContract>) {
+    let master_account = init_simulator(None);
+
+    let deployed_contract = deploy!(
+        contract: AMContract,
+        contract_id: CONTRACT_ID,
+        bytes: &CONTRACT_WASM_BYTES,
+        signer_account: master_account,
+        init_method: test_new(10, master_account.account_id().try_into().unwrap()) // 10 seconds
+    );
+    (master_account, deployed_contract)
+}
+
+fn init() -> (UserAccount, ContractAccount<AMContract>) {
+    let master_account = init_simulator(None);
+    let deployed_contract = deploy!(
+        contract: AMContract,
+        contract_id: CONTRACT_ID,
+        bytes: &CONTRACT_WASM_BYTES,
+        signer_account: master_account,
+        init_method: new(master_account.account_id().try_into().unwrap(), master_account.account_id().try_into().unwrap())
+    );
+    (master_account, deployed_contract)
+}
+
+fn to_base58_pk(user: &UserAccount) -> Base58PublicKey {
+    let key: String = (&user.signer.public_key).into();
+    key.try_into().unwrap()
+}
+
+fn create_carol(master_account: &UserAccount) -> UserAccount {
+    master_account.create_user("carol".into(), to_yocto("1000000000"))
+}
+
+fn create_bob_sells_alice(
+    master_account: &UserAccount,
+    contract: &ContractAccount<AMContract>,
+) -> (UserAccount, UserAccount) {
+    let alice = master_account.create_user("alice".into(), to_yocto("1000000000"));
+    let bob = master_account.create_user("bob".into(), to_yocto("1000000000"));
+
+    let outcome = call!(
+        alice,
+        contract.offer(bob.account_id().try_into().unwrap()),
+        deposit = OFFER_DEPOSIT
+    );
+    outcome.assert_success();
+    let result: bool = outcome.unwrap_json();
+    assert!(result);
+    (alice, bob)
+}
+
+fn do_offer(
+    profile: &UserAccount,
+    bid: &UserAccount,
+    contract: &ContractAccount<AMContract>,
+    err: Option<&str>,
+) {
+    let outcome = call!(
+        bid,
+        contract.offer(profile.account_id().try_into().unwrap()),
+        deposit = OFFER_DEPOSIT
+    );
+    if let Some(msg) = err {
+        assert!(format!("{:?}", outcome.status()).contains(msg));
+        assert!(!outcome.is_ok(), "Should panic");
+    } else {
+        outcome.assert_success();
+    }
+}
+
+fn do_bet(
+    profile: &UserAccount,
+    bid: &UserAccount,
+    contract: &ContractAccount<AMContract>,
+    err: Option<&str>,
+) {
+    let bet_price: Balance = get_bet_price(bid, contract);
+    let outcome = call!(
+        profile,
+        contract.bet(bid.account_id().try_into().unwrap()),
+        deposit = bet_price * 3
+    );
+    if let Some(msg) = err {
+        assert!(format!("{:?}", outcome.status()).contains(msg));
+        assert!(!outcome.is_ok(), "Should panic");
+    } else {
+        outcome.assert_success();
+    }
+}
+
+fn do_claim(
+    profile: &UserAccount,
+    bid: &UserAccount,
+    contract: &ContractAccount<AMContract>,
+    err: Option<&str>,
+) {
+    let claim_price: Balance = get_claim_price(bid, contract);
+    let outcome = call!(
+        profile,
+        contract.claim(bid.account_id().try_into().unwrap()),
+        deposit = claim_price * 3
+    );
+    if let Some(msg) = err {
+        assert!(format!("{:?}", outcome.status()).contains(msg));
+        assert!(!outcome.is_ok(), "Should panic");
+    } else {
+        outcome.assert_success();
+    }
+}
+
+fn do_finalize(
+    profile: &UserAccount,
+    bid: &UserAccount,
+    contract: &ContractAccount<AMContract>,
+    err: Option<&str>,
+) {
+    let outcome = call!(
+        profile,
+        contract.finalize(bid.account_id().try_into().unwrap()),
+        deposit = 0
+    );
+    if let Some(msg) = err {
+        assert!(format!("{:?}", outcome.status()).contains(msg));
+        assert!(!outcome.is_ok(), "Should panic");
+    } else {
+        outcome.assert_success();
+    }
+}
+
+fn do_acquire(
+    profile: &UserAccount,
+    bid: &UserAccount,
+    contract: &ContractAccount<AMContract>,
+    err: Option<&str>,
+) {
+    let outcome = call!(
+        profile,
+        contract.acquire(bid.account_id().try_into().unwrap(), to_base58_pk(&profile)),
+        deposit = 0
+    );
+    if let Some(msg) = err {
+        assert!(format!("{:?}", outcome.status()).contains(msg));
+        assert!(!outcome.is_ok(), "Should panic");
+    } else {
+        outcome.assert_success();
+    }
+}
+
+fn do_collect_rewards(
+    profile: &UserAccount,
+    contract: &ContractAccount<AMContract>,
+    err: Option<&str>,
+) {
+    let outcome = call!(profile, contract.collect_rewards());
+    if let Some(msg) = err {
+        assert!(format!("{:?}", outcome.status()).contains(msg));
+        assert!(!outcome.is_ok(), "Should panic");
+    } else {
+        outcome.assert_success();
+    }
+}
+
+fn get_forfeit(bid: &UserAccount, contract: &ContractAccount<AMContract>) -> Balance {
+    let bw: Option<BidView> =
+        view!(contract.get_bid(bid.account_id().try_into().unwrap())).unwrap_json();
+    bw.unwrap().forfeit.unwrap().into()
+}
+
+fn get_bet_price(bid: &UserAccount, contract: &ContractAccount<AMContract>) -> Balance {
+    let bw: Option<BidView> =
+        view!(contract.get_bid(bid.account_id().try_into().unwrap())).unwrap_json();
+    bw.unwrap().bet_price.into()
+}
+
+fn get_claim_price(bid: &UserAccount, contract: &ContractAccount<AMContract>) -> Balance {
+    let bw: Option<BidView> =
+        view!(contract.get_bid(bid.account_id().try_into().unwrap())).unwrap_json();
+    bw.unwrap().claim_price.unwrap().into()
+}
+
+fn get_bid_view(bid: &UserAccount, contract: &ContractAccount<AMContract>) -> Option<BidView> {
+    view!(contract.get_bid(bid.account_id().try_into().unwrap())).unwrap_json()
+}
+
+fn get_profile(profile: &UserAccount, contract: &ContractAccount<AMContract>) -> ProfileView {
+    let profile_view: Option<ProfileView> =
+        view!(contract.get_profile(profile.account_id().try_into().unwrap())).unwrap_json();
+    profile_view.unwrap()
+}
+
+fn sdk_sim_tick_tock(profile: &UserAccount, contract: &ContractAccount<AMContract>) {
+    let _outcome = call!(
+        profile,
+        contract.bet("123".try_into().unwrap()),
+        deposit = 456
+    );
+}
+
+#[test]
+fn simulate_test_init() {
+    let (_, _) = test_init();
+}
+
+#[test]
+fn simulate_init() {
+    let (_, _) = init();
+}
+
+#[test]
+fn min_storage() {
+    let master_account = init_simulator(None);
+    master_account.create_user("dao".into(), MIN_STORAGE_FOR_ACCOUNT);
+}
+
+#[test]
+#[should_panic]
+fn min_storage_minus_1() {
+    let master_account = init_simulator(None);
+    master_account.create_user("dao".into(), MIN_STORAGE_FOR_ACCOUNT - 1);
+}
+
+#[test]
+fn simulate_offer() {
+    let (master_account, contract) = init();
+
+    let alice = master_account.create_user("alice".to_string(), to_yocto("100"));
+
+    let outcome = call!(
+        alice,
+        contract.offer(alice.account_id().try_into().unwrap()),
+        deposit = 10
+    );
+    assert!(format!("{:?}", outcome.status()).contains(ERR_OFFER_DEPOSIT_NOT_ENOUGH));
+
+    let outcome = call!(
+        alice,
+        contract.offer(alice.account_id().try_into().unwrap()),
+        deposit = OFFER_DEPOSIT
+    );
+    assert!(format!("{:?}", outcome.status()).contains(ERR_GAINER_SAME_AS_OFFER));
+
+    let bob = master_account.create_user("bob".to_string(), to_yocto("100"));
+
+    let outcome = call!(
+        alice,
+        contract.offer(bob.account_id().try_into().unwrap()),
+        deposit = OFFER_DEPOSIT
+    );
+    outcome.assert_success();
+    let result: bool = outcome.unwrap_json();
+    assert!(result);
+
+    let outcome = call!(
+        alice,
+        contract.offer(bob.account_id().try_into().unwrap()),
+        deposit = OFFER_DEPOSIT
+    );
+    assert!(format!("{:?}", outcome.status()).contains(ERR_ALREADY_OFFERED));
+}
+
+#[test]
+fn view_first_offer() {
+    let (master_account, contract) = init();
+
+    let (alice, bob) = create_bob_sells_alice(&master_account, &contract);
+
+    let (
+        num_profiles,
+        _num_bids,
+        _num_bids_on_claim,
+        _total_commission,
+        _num_offers,
+        _num_bets,
+        _num_claims,
+        _num_acquisitions,
+    ): (u64, u64, u64, WrappedBalance, u64, u64, u64, u64) =
+        view!(contract.get_global_stats()).unwrap_json();
+    assert_eq!(num_profiles, 1);
+
+    let profile_view: Option<ProfileView> =
+        view!(contract.get_profile(alice.account_id().try_into().unwrap())).unwrap_json();
+    assert!(profile_view.is_none());
+    let profile_view: Option<ProfileView> =
+        view!(contract.get_profile(bob.account_id().try_into().unwrap())).unwrap_json();
+    let profile_view = profile_view.unwrap();
+    assert_eq!(profile_view.participation, vec!["alice"]);
+    assert_eq!(profile_view.acquisitions, Vec::<AccountId>::default());
+    assert_eq!(profile_view.num_offers, 1);
+}
+
+#[test]
+fn view_first_bet() {
+    let (master_account, contract) = init();
+
+    let (alice, bob) = create_bob_sells_alice(&master_account, &contract);
+
+    let bet_price = get_bet_price(&alice, &contract);
+    assert_eq!(bet_price, INIT_BET_PRICE);
+    assert!(get_bid_view(&bob, &contract).is_none());
+
+    let outcome = call!(
+        bob,
+        contract.bet(alice.account_id().try_into().unwrap()),
+        deposit = 10
+    );
+    assert!(format!("{:?}", outcome.status()).contains(ERR_BET_FORFEIT_NOT_ENOUGH));
+
+    let outcome = call!(
+        bob,
+        contract.bet(alice.account_id().try_into().unwrap()),
+        deposit = OFFER_DEPOSIT * 100
+    );
+    outcome.assert_success();
+
+    let profile_view: Option<ProfileView> =
+        view!(contract.get_profile(bob.account_id().try_into().unwrap())).unwrap_json();
+    let profile_view = profile_view.unwrap();
+    assert_eq!(profile_view.participation, vec!["alice"]);
+    assert_eq!(profile_view.acquisitions, Vec::<AccountId>::default());
+    assert_eq!(profile_view.num_offers, 1);
+    assert_eq!(profile_view.num_bets, 1);
+    assert_eq!(profile_view.bets_volume, INIT_BET_PRICE.into());
+
+    let bet_price = get_bet_price(&alice, &contract);
+    assert_eq!(bet_price, INIT_BET_PRICE * 6 / 5);
+}
+
+#[cfg(feature = "expensive_tests")]
+#[test]
+fn view_100_bets() {
+    let (master_account, contract) = init();
+
+    let (alice, bob) = create_bob_sells_alice(&master_account, &contract);
+
+    let mut proven_price = INIT_BET_PRICE;
+    let mut bets_volume = 0;
+
+    for _ in 0..100 {
+        let bet_price = get_bet_price(&alice, &contract);
+        assert_eq!(bet_price, proven_price);
+
+        let outcome = call!(
+            bob,
+            contract.bet(alice.account_id().try_into().unwrap()),
+            deposit = proven_price
+        );
+        outcome.assert_success();
+
+        bets_volume += proven_price;
+
+        proven_price = proven_price * 6 / 5;
+    }
+
+    let profile_view: Option<ProfileView> =
+        view!(contract.get_profile(bob.account_id().try_into().unwrap())).unwrap_json();
+    let profile_view = profile_view.unwrap();
+    assert_eq!(profile_view.participation, vec!["alice"]);
+    assert_eq!(profile_view.acquisitions, Vec::<AccountId>::default());
+    assert_eq!(profile_view.num_offers, 1);
+    assert_eq!(profile_view.num_bets, 100);
+    assert_eq!(profile_view.bets_volume, bets_volume.into());
+}
+
+#[test]
+fn view_first_claim() {
+    let (master_account, contract) = init();
+
+    let (alice, bob) = create_bob_sells_alice(&master_account, &contract);
+
+    let claim_price = get_claim_price(&alice, &contract);
+    assert_eq!(claim_price, INIT_BET_PRICE * 2);
+    assert!(get_bid_view(&bob, &contract).is_none());
+
+    let outcome = call!(
+        bob,
+        contract.claim(alice.account_id().try_into().unwrap()),
+        deposit = 10
+    );
+    assert!(format!("{:?}", outcome.status()).contains(ERR_CLAIM_NOT_ENOUGH));
+
+    let outcome = call!(
+        bob,
+        contract.claim(alice.account_id().try_into().unwrap()),
+        deposit = OFFER_DEPOSIT * 100
+    );
+    outcome.assert_success();
+
+    let profile_view: Option<ProfileView> =
+        view!(contract.get_profile(bob.account_id().try_into().unwrap())).unwrap_json();
+    let profile_view = profile_view.unwrap();
+    assert_eq!(profile_view.participation, vec!["alice"]);
+    assert_eq!(profile_view.acquisitions, Vec::<AccountId>::default());
+    assert_eq!(profile_view.num_offers, 1);
+    assert_eq!(profile_view.num_claims, 1);
+
+    let bet_price = get_bet_price(&alice, &contract);
+    assert_eq!(bet_price, INIT_BET_PRICE);
+    assert!(get_bid_view(&alice, &contract)
+        .unwrap()
+        .claim_price
+        .is_none());
+}
+
+#[test]
+fn double_claim() {
+    let (master_account, contract) = init();
+
+    let (alice, bob) = create_bob_sells_alice(&master_account, &contract);
+
+    let outcome = call!(
+        bob,
+        contract.claim(alice.account_id().try_into().unwrap()),
+        deposit = OFFER_DEPOSIT * 100
+    );
+    outcome.assert_success();
+
+    let carol = master_account.create_user("carol".into(), to_yocto("1000000000"));
+
+    let outcome = call!(
+        carol,
+        contract.claim(alice.account_id().try_into().unwrap()),
+        deposit = OFFER_DEPOSIT * 300
+    );
+    assert!(format!("{:?}", outcome.status()).contains(ERR_ALREADY_CLAIMED));
+}
+
+#[test]
+fn bet_claim_simple() {
+    let (master_account, contract) = init();
+
+    let (alice, bob) = create_bob_sells_alice(&master_account, &contract);
+
+    for _ in 0..10 {
+        let outcome = call!(
+            bob,
+            contract.claim(alice.account_id().try_into().unwrap()),
+            deposit = OFFER_DEPOSIT * 100
+        );
+        outcome.assert_success();
+
+        let outcome = call!(
+            bob,
+            contract.bet(alice.account_id().try_into().unwrap()),
+            deposit = OFFER_DEPOSIT * 100
+        );
+        outcome.assert_success();
+    }
+}
+
+#[test]
+fn bet_claim_forfeit() {
+    let (master_account, contract) = init();
+
+    let (alice, bob) = create_bob_sells_alice(&master_account, &contract);
+
+    for _ in 0..10 {
+        do_claim(&bob, &alice, &contract, None);
+        let mut deposit = get_bet_price(&alice, &contract);
+        let outcome = call!(
+            bob,
+            contract.bet(alice.account_id().try_into().unwrap()),
+            deposit = deposit
+        );
+        assert!(format!("{:?}", outcome.status()).contains(ERR_BET_FORFEIT_NOT_ENOUGH));
+
+        let forfeit = get_forfeit(&alice, &contract);
+        assert!(forfeit * 39 < deposit);
+        assert!(forfeit * 40 > deposit);
+        deposit += forfeit;
+        let outcome = call!(
+            bob,
+            contract.bet(alice.account_id().try_into().unwrap()),
+            deposit = deposit - 1
+        );
+        assert!(format!("{:?}", outcome.status()).contains(ERR_BET_FORFEIT_NOT_ENOUGH));
+
+        deposit = deposit * 1001 / 1000;
+        let outcome = call!(
+            bob,
+            contract.bet(alice.account_id().try_into().unwrap()),
+            deposit = deposit
+        );
+        outcome.assert_success();
+    }
+}
+
+#[test]
+fn view_carol_bet_and_claim() {
+    let (master_account, contract) = init();
+
+    let (alice, bob) = create_bob_sells_alice(&master_account, &contract);
+    let carol = create_carol(&master_account);
+
+    let bet_price = get_bet_price(&alice, &contract);
+
+    let outcome = call!(
+        carol,
+        contract.bet(alice.account_id().try_into().unwrap()),
+        deposit = bet_price
+    );
+    outcome.assert_success();
+
+    let profile_view: Option<ProfileView> =
+        view!(contract.get_profile(bob.account_id().try_into().unwrap())).unwrap_json();
+    let profile_view = profile_view.unwrap();
+    assert_eq!(profile_view.participation, vec!["alice"]);
+    assert_eq!(profile_view.acquisitions, Vec::<AccountId>::default());
+    assert_eq!(profile_view.num_offers, 1);
+    assert_eq!(profile_view.num_bets, 0);
+    assert_eq!(profile_view.num_claims, 0);
+    assert_eq!(profile_view.bets_volume, 0.into());
+
+    let profile_view: Option<ProfileView> =
+        view!(contract.get_profile(carol.account_id().try_into().unwrap())).unwrap_json();
+    let profile_view = profile_view.unwrap();
+    assert_eq!(profile_view.participation, vec!["alice"]);
+    assert_eq!(profile_view.acquisitions, Vec::<AccountId>::default());
+    assert_eq!(profile_view.num_offers, 0);
+    assert_eq!(profile_view.num_bets, 1);
+    assert_eq!(profile_view.num_claims, 0);
+    assert_eq!(profile_view.bets_volume, INIT_BET_PRICE.into());
+
+    let claim_price = get_claim_price(&alice, &contract);
+    let outcome = call!(
+        carol,
+        contract.claim(alice.account_id().try_into().unwrap()),
+        deposit = claim_price
+    );
+    outcome.assert_success();
+
+    let profile_view: Option<ProfileView> =
+        view!(contract.get_profile(carol.account_id().try_into().unwrap())).unwrap_json();
+    let profile_view = profile_view.unwrap();
+    assert_eq!(profile_view.participation, vec!["alice"]);
+    assert_eq!(profile_view.acquisitions, Vec::<AccountId>::default());
+    assert_eq!(profile_view.num_offers, 0);
+    assert_eq!(profile_view.num_bets, 1);
+    assert_eq!(profile_view.num_claims, 1);
+    assert_eq!(profile_view.bets_volume, INIT_BET_PRICE.into());
+}
+
+#[cfg(feature = "expensive_tests")]
+#[test]
+fn rewards_converge() {
+    let (master_account, contract) = init();
+
+    let (alice, bob) = create_bob_sells_alice(&master_account, &contract);
+
+    let mut accounts = vec![];
+    let mut prices = Vec::<Balance>::new();
+
+    for i in 0..20 {
+        let cur_account = master_account.create_user(
+            ("test".to_string() + &i.to_string()).into(),
+            to_yocto("1000000000"),
+        );
+
+        let bet_price = get_bet_price(&alice, &contract);
+        let outcome = call!(
+            cur_account,
+            contract.bet(alice.account_id().try_into().unwrap()),
+            deposit = bet_price
+        );
+        outcome.assert_success();
+
+        accounts.push(cur_account);
+        prices.push(bet_price);
+    }
+
+    for i in 0..15 {
+        let cur_account = &accounts[i];
+        let bet_price = prices[i] as f64;
+        let profile_view: Option<ProfileView> =
+            view!(contract.get_profile(cur_account.account_id().try_into().unwrap())).unwrap_json();
+        let reward: Balance = profile_view.unwrap().available_rewards.into();
+        let ratio = reward as f64 / bet_price;
+        assert!(ratio < 1.25);
+        assert!(ratio > 1.24);
+    }
+    let profile_view: Option<ProfileView> =
+        view!(contract.get_profile(bob.account_id().try_into().unwrap())).unwrap_json();
+    let reward: Balance = profile_view.unwrap().available_rewards.into();
+    assert!(reward < to_yocto("1.8751"));
+    assert!(reward > to_yocto("1.8749"));
+}
+
+#[test]
+fn simple_acquisition() {
+    let (master_account, contract) = test_init();
+
+    let (alice, bob) = create_bob_sells_alice(&master_account, &contract);
+    do_claim(&bob, &alice, &contract, None);
+
+    let mut last_forfeit = 0;
+
+    for _ in 0..10 {
+        let forfeit = get_forfeit(&alice, &contract);
+        assert!(forfeit >= last_forfeit);
+        last_forfeit = forfeit;
+
+        sdk_sim_tick_tock(&alice, &contract);
+    }
+
+    let bet_price = get_bet_price(&alice, &contract);
+    assert_eq!(bet_price, last_forfeit * 20);
+
+    do_bet(&bob, &alice, &contract, Some(ERR_BET_ON_ACQUISITION));
+
+    do_finalize(&bob, &alice, &contract, None);
+
+    let carol = create_carol(&master_account);
+    let outcome = call!(
+        carol,
+        contract.acquire(alice.account_id().try_into().unwrap(), to_base58_pk(&carol))
+    );
+    assert!(format!("{:?}", outcome.status()).contains(ERR_ACQUIRE_REJECTED));
+
+    let outcome = call!(
+        bob,
+        contract.acquire(alice.account_id().try_into().unwrap(), to_base58_pk(&carol)),
+        deposit = 0
+    );
+    outcome.assert_success();
+
+    let outcome = call!(
+        bob,
+        contract.acquire(alice.account_id().try_into().unwrap(), to_base58_pk(&carol)),
+        deposit = OFFER_DEPOSIT * 100
+    );
+    assert!(!outcome.is_ok(), "Should panic");
+}
+
+#[test]
+fn top_bets_claims() {
+    let (master_account, contract) = test_init();
+
+    let bets: Vec<(WrappedBalance, BidId)> = view!(contract.get_top_bets(None, 100)).unwrap_json();
+    assert_eq!(bets.len(), 0);
+    let claims: Vec<(WrappedBalance, BidId)> =
+        view!(contract.get_top_claims(None, 100)).unwrap_json();
+    assert_eq!(claims.len(), 0);
+
+    let (alice, bob) = create_bob_sells_alice(&master_account, &contract);
+    let mut bet_price = INIT_BET_PRICE;
+
+    // bet = 0.5, claim = 1.0
+
+    let bets: Vec<(WrappedBalance, BidId)> = view!(contract.get_top_bets(None, 100)).unwrap_json();
+    assert_eq!(bets, vec![(bet_price.into(), "alice".to_string())]);
+    let claims: Vec<(WrappedBalance, BidId)> =
+        view!(contract.get_top_claims(None, 100)).unwrap_json();
+    assert_eq!(claims.len(), 0);
+
+    do_claim(&bob, &alice, &contract, None);
+    let mut claim_price = INIT_BET_PRICE * 2;
+
+    // bet = 0.5, claim = impossible
+
+    let bets: Vec<(WrappedBalance, BidId)> = view!(contract.get_top_bets(None, 100)).unwrap_json();
+    assert_eq!(bets, vec![(bet_price.into(), "alice".to_string())]);
+    let claims: Vec<(WrappedBalance, BidId)> =
+        view!(contract.get_top_claims(None, 100)).unwrap_json();
+    assert_eq!(claims, vec![(claim_price.into(), "alice".to_string())]);
+
+    do_bet(&bob, &alice, &contract, None);
+    bet_price = bet_price * 6 / 5;
+
+    // bet = 0.6, claim = 1.2
+
+    let bets: Vec<(WrappedBalance, BidId)> = view!(contract.get_top_bets(None, 100)).unwrap_json();
+    assert_eq!(bets, vec![(bet_price.into(), "alice".to_string())]);
+    let claims: Vec<(WrappedBalance, BidId)> =
+        view!(contract.get_top_claims(None, 100)).unwrap_json();
+    assert_eq!(claims.len(), 0);
+
+    do_claim(&bob, &alice, &contract, None);
+    claim_price = claim_price * 6 / 5;
+
+    // bet = 0.6, claim = impossible
+
+    let bets: Vec<(WrappedBalance, BidId)> = view!(contract.get_top_bets(None, 100)).unwrap_json();
+    assert_eq!(bets, vec![(bet_price.into(), "alice".to_string())]);
+    let claims: Vec<(WrappedBalance, BidId)> =
+        view!(contract.get_top_claims(None, 100)).unwrap_json();
+    assert_eq!(claims, vec![(claim_price.into(), "alice".to_string())]);
+
+    for _ in 0..10 {
+        sdk_sim_tick_tock(&alice, &contract);
+    }
+
+    let bets: Vec<(WrappedBalance, BidId)> = view!(contract.get_top_bets(None, 100)).unwrap_json();
+    assert_eq!(bets, vec![(bet_price.into(), "alice".to_string())]);
+    let claims: Vec<(WrappedBalance, BidId)> =
+        view!(contract.get_top_claims(None, 100)).unwrap_json();
+    assert_eq!(claims, vec![(claim_price.into(), "alice".to_string())]);
+
+    do_finalize(&bob, &alice, &contract, None);
+
+    let bets: Vec<(WrappedBalance, BidId)> = view!(contract.get_top_bets(None, 100)).unwrap_json();
+    assert_eq!(bets.len(), 0);
+    let claims: Vec<(WrappedBalance, BidId)> =
+        view!(contract.get_top_claims(None, 100)).unwrap_json();
+    assert_eq!(claims.len(), 0);
+
+    do_acquire(&bob, &alice, &contract, None);
+
+    let bets: Vec<(WrappedBalance, BidId)> = view!(contract.get_top_bets(None, 100)).unwrap_json();
+    assert_eq!(bets.len(), 0);
+    let claims: Vec<(WrappedBalance, BidId)> =
+        view!(contract.get_top_claims(None, 100)).unwrap_json();
+    assert_eq!(claims.len(), 0);
+}
+
+#[test]
+fn offer_same_after_acquisition() {
+    let (master_account, contract) = test_init();
+
+    let (alice, bob) = create_bob_sells_alice(&master_account, &contract);
+    do_claim(&bob, &alice, &contract, None);
+
+    for _ in 0..10 {
+        sdk_sim_tick_tock(&alice, &contract);
+    }
+
+    let bw: Option<BidView> =
+        view!(contract.get_bid(alice.account_id().try_into().unwrap())).unwrap_json();
+    assert!(bw.is_some());
+
+    do_finalize(&bob, &alice, &contract, None);
+    do_acquire(&bob, &alice, &contract, None);
+
+    let bw: Option<BidView> =
+        view!(contract.get_bid(alice.account_id().try_into().unwrap())).unwrap_json();
+    assert!(bw.is_none());
+
+    do_offer(&bob, &alice, &contract, None);
+
+    let bets: Vec<(WrappedBalance, BidId)> = view!(contract.get_top_bets(None, 100)).unwrap_json();
+    assert_eq!(bets, vec![(INIT_BET_PRICE.into(), "alice".to_string())]);
+    let claims: Vec<(WrappedBalance, BidId)> =
+        view!(contract.get_top_claims(None, 100)).unwrap_json();
+    assert_eq!(claims.len(), 0);
+    let bw: Option<BidView> =
+        view!(contract.get_bid(alice.account_id().try_into().unwrap())).unwrap_json();
+    assert!(bw.is_some());
+
+    do_claim(&bob, &alice, &contract, None);
+
+    for _ in 0..10 {
+        sdk_sim_tick_tock(&alice, &contract);
+    }
+
+    do_finalize(&bob, &alice, &contract, None);
+    do_acquire(&bob, &alice, &contract, None);
+    do_offer(&bob, &alice, &contract, None);
+}
+
+#[test]
+fn bob_carol_finalize_acquire() {
+    let (master_account, contract) = test_init();
+
+    let (alice, bob) = create_bob_sells_alice(&master_account, &contract);
+    let carol = create_carol(&master_account);
+
+    do_claim(&carol, &alice, &contract, None);
+    do_finalize(&alice, &alice, &contract, ANY_ERR);
+    do_finalize(&bob, &alice, &contract, ANY_ERR);
+    do_finalize(&carol, &alice, &contract, ANY_ERR);
+    for _ in 0..10 {
+        sdk_sim_tick_tock(&alice, &contract);
+    }
+
+    do_acquire(&bob, &alice, &contract, ANY_ERR);
+    do_acquire(&carol, &alice, &contract, ANY_ERR);
+    do_finalize(&alice, &alice, &contract, None);
+    do_finalize(&alice, &alice, &contract, ANY_ERR);
+    do_finalize(&carol, &alice, &contract, ANY_ERR);
+    do_acquire(&bob, &alice, &contract, ANY_ERR);
+    do_acquire(&carol, &alice, &contract, None);
+    do_acquire(&carol, &alice, &contract, ANY_ERR);
+
+    // We cannot prove keys at this point - any first offer should work
+    do_offer(&carol, &alice, &contract, None);
+    do_offer(&bob, &alice, &contract, ANY_ERR);
+
+    do_claim(&bob, &alice, &contract, None);
+    do_finalize(&bob, &alice, &contract, ANY_ERR);
+    do_finalize(&carol, &alice, &contract, ANY_ERR);
+    do_finalize(&alice, &alice, &contract, ANY_ERR);
+    for _ in 0..10 {
+        sdk_sim_tick_tock(&alice, &contract);
+    }
+
+    do_acquire(&bob, &alice, &contract, ANY_ERR);
+    do_acquire(&carol, &alice, &contract, ANY_ERR);
+    do_finalize(&carol, &alice, &contract, None);
+    do_finalize(&carol, &alice, &contract, ANY_ERR);
+    do_finalize(&alice, &alice, &contract, ANY_ERR);
+    do_acquire(&carol, &alice, &contract, ANY_ERR);
+    do_acquire(&bob, &alice, &contract, None);
+    do_acquire(&bob, &alice, &contract, ANY_ERR);
+
+    // Same as above
+    do_offer(&bob, &alice, &contract, None);
+    do_offer(&bob, &alice, &contract, ANY_ERR);
+}
+
+#[test]
+fn claim_update_rewards() {
+    let (master_account, contract) = init();
+
+    let (alice, bob) = create_bob_sells_alice(&master_account, &contract);
+    let carol = create_carol(&master_account);
+
+    for _ in 0..10 {
+        let claim_price = get_claim_price(&alice, &contract);
+        do_claim(&carol, &alice, &contract, None);
+
+        let cur_rewards: Balance = get_profile(&carol, &contract).available_rewards.into();
+
+        do_bet(&bob, &alice, &contract, None);
+
+        let final_rewards: Balance = get_profile(&carol, &contract).available_rewards.into();
+
+        // claim_price + little forfeit
+        assert!(final_rewards - cur_rewards > claim_price);
+        assert!(final_rewards - cur_rewards < claim_price * 1001 / 1000);
+    }
+}
+
+#[test]
+fn collect_rewards_simple() {
+    let (master_account, contract) = test_init();
+
+    let alice = master_account.create_user("alice".into(), to_yocto("1000000000"));
+    let bob = master_account.create_user("bob".into(), MIN_STORAGE_FOR_ACCOUNT);
+    let carol = create_carol(&master_account);
+
+    let outcome = call!(
+        alice,
+        contract.offer(bob.account_id().try_into().unwrap()),
+        deposit = OFFER_DEPOSIT
+    );
+    outcome.assert_success();
+
+    do_claim(&carol, &alice, &contract, None);
+    for _ in 0..10 {
+        sdk_sim_tick_tock(&alice, &contract);
+    }
+    do_collect_rewards(&bob, &contract, Some(ERR_REWARD_BALANCE_INSUFFICIENT));
+
+    do_finalize(&carol, &alice, &contract, None);
+
+    do_collect_rewards(&bob, &contract, None);
+    do_collect_rewards(&bob, &contract, Some(ERR_REWARD_BALANCE_INSUFFICIENT));
+
+    bob.transfer("alice".to_string(), to_yocto("1.00"));
+}
+
+#[test]
+fn dao_rewards_simple() {
+    let master_account = init_simulator(None);
+    let dao = master_account.create_user("dao".into(), MIN_STORAGE_FOR_ACCOUNT);
+
+    let contract = deploy!(
+        contract: AMContract,
+        contract_id: CONTRACT_ID,
+        bytes: &CONTRACT_WASM_BYTES,
+        signer_account: master_account,
+        init_method: new(master_account.account_id().try_into().unwrap(), dao.account_id().try_into().unwrap())
+    );
+
+    let (alice, bob) = create_bob_sells_alice(&master_account, &contract);
+
+    dao.transfer("alice".to_string(), OFFER_DEPOSIT);
+
+    do_bet(&bob, &alice, &contract, None);
+
+    dao.transfer("alice".to_string(), INIT_BET_PRICE / 20);
+
+    do_bet(&bob, &alice, &contract, None);
+
+    dao.transfer("alice".to_string(), INIT_BET_PRICE * 6 / 5 / 20);
+}
+
+'''

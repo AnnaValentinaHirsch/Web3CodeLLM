@@ -1,0 +1,1957 @@
+*GitHub Repository "near/near-analytics"*
+
+'''--- .github/workflows/lint.yml ---
+name: Lint
+
+on: [push, pull_request]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: psf/black@stable
+
+'''
+'''--- CONTRIBUTING.md ---
+# Contributing guide
+
+Thank you for your readiness to contribute to NEAR Analytics!  
+Please read this file before the start, it will simplify your life and make the review process faster.
+
+## Overall idea
+
+We have [NEAR Indexer for Explorer](https://github.com/near/near-indexer-for-explorer) which collects the data streamed from NEAR blockchain.
+The resulting Indexer DB could be the best place for any sort of analytics, if only it were smaller.
+`receipts` table has 125M or records today (2021-12-03), just `count(*)` takes 5 minutes.
+
+We have to live with it, that's why we've introduced NEAR Analytics.
+Every day we collect some useful values and store them in Analytics DB.
+We had a small talk about the overall architecture, you can find it out [here](https://drive.google.com/file/d/17ONZ1Gg4HloADDoMm4cJDpvDlx1XLGio/view).
+
+## Can I add my own statistics?
+
+Sure, and we are ready to collect the data daily.
+But, you need to design it properly.
+We split the advice into the categories below.
+
+### General
+
+- The statistics should be general enough; it should be possible to reuse the collected data for other needs;
+- Use intuitive naming; naming should suit well with the one we use at other NEAR projects;
+- Write the documentation if it helps to understand the code; especially, write the documentation if you propose new entities.
+
+### SQL
+
+- The performance is super important. Please check the query plans, think how to improve any communication with Indexer DB;
+- While creating a new table, use `NOT NULL` for all the columns you've added. If the column should be nullable, think twice, maybe the solution could be improved somehow;
+- While creating a new table, think about data types and explain your choice in the comments. You could take inspiration from any of the existing tables;
+- Do not compose SQL statements from the pieces. Even if you don't take the parameters from the user, it anyway leads us to the chance of SQL injection;
+- Please format your SQL statements to simplify the reading. Be careful, IDEs will not do that since we store SQLs in strings. I usually write SQLs in a separate editor, format them, and only then copy-paste them into the project.
+
+### Python code
+
+- We use `black` to unify the formatting in the project. Run `black .` before any commit;
+- Think twice before you add any new library; if it's required, don't forget to add it to `requirements.txt`;
+- Try to follow Python common best practices.
+
+## Final checklist before you open the PR
+
+- [ ] The PR includes exhaustive explanation, what is being added, why, how do you plan to use this data;
+- [ ] The PR includes performance measurements for the queries to the Indexer DB;
+- [ ] The code is tested properly. Please set up your own environment and make end-to-end testing by computing the data for 4-5 days. I kindly suggest using testnet for testing purposes, the average load there is lower;
+- [ ] Review the code yourself before assigning the reviewer.
+
+'''
+'''--- README.md ---
+# near-analytics
+
+Analytics Tool for NEAR Blockchain.  
+[NEAR Explorer](https://explorer.near.org/) uses it for [mainnet](https://explorer.near.org/stats) and [testnet](https://explorer.testnet.near.org/stats).
+
+Keep in mind that the data (both format and the contents) could be changed at any time, the tool is under development.
+
+<img width="918" alt="Example of data" src="https://user-images.githubusercontent.com/11246099/135101272-61fe872f-2129-455d-aee1-00d0f4570900.png">
+
+### Install
+
+```bash
+sudo apt install python3.9-distutils libpq-dev python3.9-dev postgresql-server-dev-all
+
+python3.9 -m pip install --upgrade pip
+python3.9 -m pip install -r requirements.txt
+```
+
+### Run
+
+```bash
+python3.9 main.py -h
+```
+
+### Contribute
+
+See [Contributing Guide](CONTRIBUTING.md) for details
+
+### Usage examples
+
+Apart from [NEAR Explorer](https://explorer.near.org/stats), see [nice blogpost](https://analyticali.substack.com/p/near-analytics-cheatsheet) with the tutorial and beautiful pictures based on NEAR Analytics data.
+
+'''
+'''--- aggregations/__init__.py ---
+from .db_tables.daily_accounts_added_per_ecosystem_entity import (
+    DailyAccountsAddedPerEcosystemEntity,
+)
+from .db_tables.daily_active_accounts_count import DailyActiveAccountsCount
+from .db_tables.daily_active_contracts_count import DailyActiveContractsCount
+from .db_tables.daily_deleted_accounts_count import DailyDeletedAccountsCount
+from .db_tables.daily_deposit_amount import DailyDepositAmount
+from .db_tables.daily_gas_used import DailyGasUsed
+from .db_tables.daily_ingoing_transactions_per_account_count import (
+    DailyIngoingTransactionsPerAccountCount,
+)
+from .db_tables.daily_new_accounts_count import DailyNewAccountsCount
+from .db_tables.daily_new_accounts_per_ecosystem_entity_count import (
+    DailyNewAccountsPerEcosystemEntityCount,
+)
+from .db_tables.daily_new_contracts_count import DailyNewContractsCount
+from .db_tables.daily_new_unique_contracts_count import DailyNewUniqueContractsCount
+from .db_tables.daily_outgoing_transactions_per_account_count import (
+    DailyOutgoingTransactionsPerAccountCount,
+)
+from .db_tables.daily_receipts_per_contract_count import DailyReceiptsPerContractCount
+from .db_tables.daily_tokens_spent_on_fees import DailyTokensSpentOnFees
+from .db_tables.daily_transaction_count_by_gas_burnt_ranges import (
+    DailyTransactionCountByGasBurntRanges,
+)
+from .db_tables.daily_transactions_count import DailyTransactionsCount
+from .db_tables.deployed_contracts import DeployedContracts
+from .db_tables.unique_contracts import UniqueContracts
+from .db_tables.weekly_active_accounts_count import WeeklyActiveAccountsCount
+from .db_tables.near_ecosystem_entities import NearEcosystemEntities
+
+'''
+'''--- aggregations/base_aggregations.py ---
+import abc
+import dataclasses
+import psycopg2
+
+# Base class with all public methods needed to interact with each aggregation
+@dataclasses.dataclass
+class BaseAggregations(abc.ABC):
+    analytics_connection: psycopg2.extensions.connection
+    indexer_connection: psycopg2.extensions.connection
+
+    # Collects the aggregations for the requested_timestamp.
+    # If it's not possible to compute aggregations for given requested_timestamp,
+    # (for example, we ask about daily stats for today: the day is not ended),
+    # empty list will be returned.
+    # The method should return the list of values,
+    # each of the values should be possible to add to the table (from `create_table` method) without any changes
+    @abc.abstractmethod
+    def collect(self, requested_timestamp: int) -> list:
+        pass
+
+    @abc.abstractmethod
+    def store(self, parameters: list):
+        pass
+
+    @abc.abstractmethod
+    def create_table(self):
+        pass
+
+    @abc.abstractmethod
+    def drop_table(self):
+        pass
+
+# Be careful, don't create circular dependencies
+BaseAggregations.DEPENDENCIES = []
+
+'''
+'''--- aggregations/db_tables/__init__.py ---
+from datetime import date, datetime, timedelta
+
+DAY_LEN_SECONDS = 86400
+WEEK_LEN_SECONDS = DAY_LEN_SECONDS * 7
+
+def query_genesis_timestamp(indexer_connection) -> int:
+    select_genesis_timestamp = """
+                SELECT DIV(block_timestamp, 1000 * 1000 * 1000)
+                FROM blocks
+                ORDER BY block_timestamp
+                LIMIT 1
+            """
+    with indexer_connection.cursor() as indexer_cursor:
+        indexer_cursor.execute(select_genesis_timestamp)
+        return int(indexer_cursor.fetchone()[0])
+
+def daily_start_of_range(timestamp: int) -> int:
+    return timestamp - timestamp % DAY_LEN_SECONDS
+
+def weekly_start_of_range(timestamp: int) -> int:
+    day: date = datetime.utcfromtimestamp(timestamp).date()
+    monday: date = day - timedelta(days=day.weekday())
+    seconds_since_epoch = (monday - datetime(1970, 1, 1).date()).total_seconds()
+    return round(seconds_since_epoch)
+
+def to_nanos(timestamp_seconds):
+    return timestamp_seconds * 1000 * 1000 * 1000
+
+def time_range_json(from_timestamp, duration):
+    return {
+        "from_timestamp": to_nanos(from_timestamp),
+        "to_timestamp": to_nanos(from_timestamp + duration),
+    }
+
+def time_json(timestamp):
+    return {"timestamp": to_nanos(timestamp)}
+
+'''
+'''--- aggregations/db_tables/daily_accounts_added_per_ecosystem_entity.py ---
+from . import DAY_LEN_SECONDS, daily_start_of_range
+from ..periodic_aggregations import PeriodicAggregations
+
+"""
+This code builds a table intended to assist with calculating statistics
+relating accounts ("added_accounts") to ecosystem entities ("entities")
+and is originally intended to be used for tracking new accounts added to each entity.
+"""
+
+class DailyAccountsAddedPerEcosystemEntity(PeriodicAggregations):
+    DEPENDENCIES = ["near_ecosystem_entities"]
+
+    @property
+    def sql_create_table(self):
+        return """
+            CREATE TABLE IF NOT EXISTS daily_accounts_added_per_ecosystem_entity
+            (
+                entity_id                           TEXT NOT NULL,
+                account_id                          TEXT NOT NULL,
+                added_at_block_timestamp            numeric(20, 0) NOT NULL,
+                CONSTRAINT daily_accounts_added_per_ecosystem_entity_pk PRIMARY KEY (entity_id, account_id)
+            );
+        """
+
+    @property
+    def sql_drop_table(self):
+        return """
+            DROP TABLE IF EXISTS daily_accounts_added_per_ecosystem_entity
+            """
+
+    @property
+    def sql_select(self):
+        # grab map of entity slug/contract-id pairs from near analytics db
+        # and apply that mapping to receiver entity ID's from near explore indexer db
+        # because each entity may be associated with more than one contract
+        entity_contracts_sql = """
+            SELECT
+                REPLACE(TRIM(slug),$$'$$,'')          AS entity 
+                , REPLACE(TRIM(contract_id),$$'$$,'') AS contract_id
+            FROM public.near_ecosystem_entities e, unnest(string_to_array(e.contract, ', ')) s(contract_id)
+            WHERE length(contract) > 0
+            """
+
+        with self.analytics_connection.cursor() as analytics_cursor:
+            analytics_cursor.execute(entity_contracts_sql)
+            entity_contracts = analytics_cursor.fetchall()
+
+        indented_newline = "                    \n"
+        cases_sql = indented_newline.join(
+            [f"WHEN '{c}' THEN '{e}'" for e, c in entity_contracts]
+        )
+
+        return """
+            WITH
+            added_to_entity_events AS
+            (
+                SELECT
+                    CASE (args -> 'access_key' -> 'permission' -> 'permission_details' ->> 'receiver_id')
+                        {cases_sql}
+                        END                         AS entity_id
+                    , receipt_receiver_account_id AS account_id
+                    , receipt_included_in_block_timestamp as added_at_timestamp
+                FROM public.action_receipt_actions
+                WHERE action_kind IN ('ADD_KEY')
+                    AND args ->'access_key' -> 'permission' ->> 'permission_kind' = 'FUNCTION_CALL'
+                    AND receipt_included_in_block_timestamp  >= %(from_timestamp)s
+                    AND receipt_included_in_block_timestamp  < %(to_timestamp)s
+                GROUP BY 1, 2, 3
+            )
+            SELECT entity_id,
+            account_id,
+            MIN(added_at_timestamp) as added_at_timestamp
+            FROM added_to_entity_events
+            WHERE entity_id NOT IN (account_id, 'near')
+            GROUP BY 1, 2
+            """.format(
+            cases_sql=cases_sql
+        )
+
+    @property
+    def sql_insert(self):
+        return """
+            INSERT INTO daily_accounts_added_per_ecosystem_entity VALUES %s 
+            ON CONFLICT DO NOTHING
+        """
+
+    @property
+    def duration_seconds(self):
+        return DAY_LEN_SECONDS
+
+    def start_of_range(self, timestamp: int) -> int:
+        return daily_start_of_range(timestamp)
+
+    @staticmethod
+    def prepare_data(parameters: list, **kwargs) -> list:
+        return parameters
+
+'''
+'''--- aggregations/db_tables/daily_active_accounts_count.py ---
+from . import DAY_LEN_SECONDS, daily_start_of_range
+from ..periodic_aggregations import PeriodicAggregations
+
+class DailyActiveAccountsCount(PeriodicAggregations):
+    @property
+    def sql_create_table(self):
+        # For September 2021, we have 10^6 accounts on the Mainnet.
+        # It means we fit into integer (10^9)
+        return """
+            CREATE TABLE IF NOT EXISTS daily_active_accounts_count
+            (
+                collected_for_day     DATE PRIMARY KEY,
+                active_accounts_count INTEGER NOT NULL
+            )
+        """
+
+    @property
+    def sql_drop_table(self):
+        return """
+            DROP TABLE IF EXISTS daily_active_accounts_count
+        """
+
+    @property
+    def sql_select(self):
+        return """
+            SELECT COUNT(DISTINCT transactions.signer_account_id)
+            FROM transactions
+            WHERE transactions.block_timestamp >= %(from_timestamp)s
+                AND transactions.block_timestamp < %(to_timestamp)s
+        """
+
+    @property
+    def sql_insert(self):
+        return """
+            INSERT INTO daily_active_accounts_count VALUES %s
+            ON CONFLICT DO NOTHING
+        """
+
+    @property
+    def duration_seconds(self):
+        return DAY_LEN_SECONDS
+
+    def start_of_range(self, timestamp: int) -> int:
+        return daily_start_of_range(timestamp)
+
+'''
+'''--- aggregations/db_tables/daily_active_contracts_count.py ---
+from . import DAY_LEN_SECONDS, daily_start_of_range
+from ..periodic_aggregations import PeriodicAggregations
+
+class DailyActiveContractsCount(PeriodicAggregations):
+    @property
+    def sql_create_table(self):
+        # For September 2021, we have 10^6 accounts on the Mainnet.
+        # It means we fit into integer (10^9)
+        return """
+            CREATE TABLE IF NOT EXISTS daily_active_contracts_count
+            (
+                collected_for_day      DATE PRIMARY KEY,
+                active_contracts_count INTEGER NOT NULL
+            )
+        """
+
+    @property
+    def sql_drop_table(self):
+        return """
+            DROP TABLE IF EXISTS daily_active_contracts_count
+        """
+
+    @property
+    def sql_select(self):
+        return """
+            SELECT COUNT(DISTINCT action_receipt_actions.receipt_receiver_account_id)
+            FROM action_receipt_actions
+            WHERE action_receipt_actions.receipt_included_in_block_timestamp >= %(from_timestamp)s
+                AND action_receipt_actions.receipt_included_in_block_timestamp < %(to_timestamp)s
+                AND action_receipt_actions.action_kind = 'FUNCTION_CALL'
+        """
+
+    @property
+    def sql_insert(self):
+        return """
+            INSERT INTO daily_active_contracts_count VALUES %s
+            ON CONFLICT DO NOTHING
+        """
+
+    @property
+    def duration_seconds(self):
+        return DAY_LEN_SECONDS
+
+    def start_of_range(self, timestamp: int) -> int:
+        return daily_start_of_range(timestamp)
+
+'''
+'''--- aggregations/db_tables/daily_deleted_accounts_count.py ---
+from . import DAY_LEN_SECONDS, daily_start_of_range
+from ..periodic_aggregations import PeriodicAggregations
+
+class DailyDeletedAccountsCount(PeriodicAggregations):
+    @property
+    def sql_create_table(self):
+        # For September 2021, we have 10^6 accounts on the Mainnet.
+        # It means we fit into integer (10^9)
+        return """
+            CREATE TABLE IF NOT EXISTS daily_deleted_accounts_count
+            (
+                collected_for_day      DATE PRIMARY KEY,
+                deleted_accounts_count INTEGER NOT NULL
+            )
+        """
+
+    @property
+    def sql_drop_table(self):
+        return """
+            DROP TABLE IF EXISTS daily_deleted_accounts_count
+        """
+
+    @property
+    def sql_select(self):
+        return """
+            SELECT COUNT(accounts.deleted_by_receipt_id)
+            FROM accounts
+            JOIN receipts ON receipts.receipt_id = accounts.deleted_by_receipt_id
+            WHERE receipts.included_in_block_timestamp >= %(from_timestamp)s
+                AND receipts.included_in_block_timestamp < %(to_timestamp)s
+        """
+
+    @property
+    def sql_insert(self):
+        return """
+            INSERT INTO daily_deleted_accounts_count VALUES %s
+            ON CONFLICT DO NOTHING
+        """
+
+    @property
+    def duration_seconds(self):
+        return DAY_LEN_SECONDS
+
+    def start_of_range(self, timestamp: int) -> int:
+        return daily_start_of_range(timestamp)
+
+'''
+'''--- aggregations/db_tables/daily_deposit_amount.py ---
+from . import DAY_LEN_SECONDS, daily_start_of_range
+from ..periodic_aggregations import PeriodicAggregations
+
+class DailyDepositAmount(PeriodicAggregations):
+    @property
+    def sql_create_table(self):
+        # For September 2021, the biggest value here is 10^34.
+        # In Indexer, we store all the balances in numeric(45,0), including total_supply.
+        # Assuming the users move not more than total_supply inside each second,
+        # I suggest to use numeric(50, 0)
+        return """
+            CREATE TABLE IF NOT EXISTS daily_deposit_amount
+            (
+                collected_for_day DATE PRIMARY KEY,
+                deposit_amount    numeric(50, 0) NOT NULL
+            )
+        """
+
+    @property
+    def sql_drop_table(self):
+        return """
+            DROP TABLE IF EXISTS daily_deposit_amount
+        """
+
+    @property
+    def sql_select(self):
+        return """
+            SELECT SUM((action_receipt_actions.args->>'deposit')::numeric)
+            FROM action_receipt_actions
+            JOIN execution_outcomes ON execution_outcomes.receipt_id = action_receipt_actions.receipt_id
+            WHERE execution_outcomes.executed_in_block_timestamp >= %(from_timestamp)s
+                AND execution_outcomes.executed_in_block_timestamp < %(to_timestamp)s
+                AND action_receipt_actions.receipt_predecessor_account_id != 'system'
+                AND action_receipt_actions.action_kind IN ('FUNCTION_CALL', 'TRANSFER')
+                AND (action_receipt_actions.args->>'deposit')::numeric > 0
+                AND execution_outcomes.status IN ('SUCCESS_VALUE', 'SUCCESS_RECEIPT_ID')
+        """
+
+    @property
+    def sql_insert(self):
+        return """
+            INSERT INTO daily_deposit_amount VALUES %s
+            ON CONFLICT DO NOTHING
+        """
+
+    @property
+    def duration_seconds(self):
+        return DAY_LEN_SECONDS
+
+    def start_of_range(self, timestamp: int) -> int:
+        return daily_start_of_range(timestamp)
+
+'''
+'''--- aggregations/db_tables/daily_gas_used.py ---
+from . import DAY_LEN_SECONDS, daily_start_of_range
+from ..periodic_aggregations import PeriodicAggregations
+
+class DailyGasUsed(PeriodicAggregations):
+    @property
+    def sql_create_table(self):
+        # In Indexer, we store `chunks.gas_used` in numeric(20,0).
+        # We produce the block each second (10^5).
+        # We plan to use several chunks, let's say max chunks count is 10^3
+        # 28 sounds weird, so I suggest numeric(30, 0)
+        return """
+            CREATE TABLE IF NOT EXISTS daily_gas_used
+            (
+                collected_for_day DATE PRIMARY KEY,
+                gas_used          numeric(30, 0) NOT NULL
+            )
+        """
+
+    @property
+    def sql_drop_table(self):
+        return """
+            DROP TABLE IF EXISTS daily_gas_used
+        """
+
+    @property
+    def sql_select(self):
+        return """
+            SELECT SUM(chunks.gas_used)
+            FROM blocks
+            JOIN chunks ON chunks.included_in_block_hash = blocks.block_hash
+            WHERE blocks.block_timestamp >= %(from_timestamp)s
+                AND blocks.block_timestamp < %(to_timestamp)s
+        """
+
+    @property
+    def sql_insert(self):
+        return """
+            INSERT INTO daily_gas_used VALUES %s
+            ON CONFLICT DO NOTHING
+        """
+
+    @property
+    def duration_seconds(self):
+        return DAY_LEN_SECONDS
+
+    def start_of_range(self, timestamp: int) -> int:
+        return daily_start_of_range(timestamp)
+
+'''
+'''--- aggregations/db_tables/daily_ingoing_transactions_per_account_count.py ---
+import datetime
+
+from . import DAY_LEN_SECONDS, daily_start_of_range
+from ..periodic_aggregations import PeriodicAggregations
+
+class DailyIngoingTransactionsPerAccountCount(PeriodicAggregations):
+    @property
+    def sql_create_table(self):
+        # Suppose we have at most 10^5 (100K) transactions per second.
+        # In the worst case, they are all from one account.
+        # It gives ~10^10 transactions per day.
+        # It means we fit into BIGINT (10^18)
+        return """
+            CREATE TABLE IF NOT EXISTS daily_ingoing_transactions_per_account_count
+            (
+                collected_for_day          DATE   NOT NULL,
+                account_id                 TEXT   NOT NULL,
+                ingoing_transactions_count BIGINT NOT NULL,
+                CONSTRAINT daily_ingoing_transactions_per_account_count_pk PRIMARY KEY (collected_for_day, account_id)
+            );
+            CREATE INDEX IF NOT EXISTS daily_ingoing_transactions_per_account_count_idx
+                ON daily_ingoing_transactions_per_account_count (account_id, ingoing_transactions_count);
+            CREATE INDEX IF NOT EXISTS daily_ingoing_transactions_chart_idx
+                ON daily_ingoing_transactions_per_account_count (collected_for_day, ingoing_transactions_count)
+        """
+
+    @property
+    def sql_drop_table(self):
+        return """
+            DROP TABLE IF EXISTS daily_ingoing_transactions_per_account_count
+        """
+
+    @property
+    def sql_select(self):
+        # Ingoing transactions for user X aren't only transactions where receiver_account_id == X.
+        # We need to find all chains with receipts where X was the receiver.
+        # It's important to add 10 minutes to receipt border, we should pack the transaction
+        # with all their receipts together, or the numbers will not be accurate.
+        # Other receipts from the next day will be naturally ignored.
+        # Transactions border remains the same, taking only transactions for the specified day.
+        # If you want to change 10 minutes constant, fix it also in PeriodicAggregations.is_indexer_ready
+
+        # Conditions on receipts timestamps are added because of performance issues:
+        # Joining 2 relatively small tables work much faster (4-6s VS 70-150s)
+        # Conditions on transactions timestamps are required by design.
+        # Though, they were placed into JOIN section also because of performance issues. Not sure why,
+        # but it changes the query plan to a better one and gives much better performance
+        return """
+            SELECT
+                receipts.receiver_account_id,
+                COUNT(DISTINCT transactions.transaction_hash) AS ingoing_transactions_count
+            FROM transactions
+            LEFT JOIN receipts ON receipts.originated_from_transaction_hash = transactions.transaction_hash
+                AND transactions.block_timestamp >= %(from_timestamp)s
+                AND transactions.block_timestamp < %(to_timestamp)s
+            WHERE receipts.included_in_block_timestamp >= %(from_timestamp)s
+                AND receipts.included_in_block_timestamp < (%(to_timestamp)s + 600000000000)
+                AND transactions.signer_account_id != receipts.receiver_account_id 
+            GROUP BY receipts.receiver_account_id
+        """
+
+    @property
+    def sql_insert(self):
+        return """
+            INSERT INTO daily_ingoing_transactions_per_account_count VALUES %s
+            ON CONFLICT DO NOTHING
+        """
+
+    @property
+    def duration_seconds(self):
+        return DAY_LEN_SECONDS
+
+    def start_of_range(self, timestamp: int) -> int:
+        return daily_start_of_range(timestamp)
+
+    @staticmethod
+    def prepare_data(parameters: list, *, start_of_range=None, **kwargs) -> list:
+        computed_for = datetime.datetime.utcfromtimestamp(start_of_range).strftime(
+            "%Y-%m-%d"
+        )
+        return [(computed_for, account_id, count) for (account_id, count) in parameters]
+
+'''
+'''--- aggregations/db_tables/daily_new_accounts_count.py ---
+from . import DAY_LEN_SECONDS, daily_start_of_range
+from ..periodic_aggregations import PeriodicAggregations
+
+class DailyNewAccountsCount(PeriodicAggregations):
+    @property
+    def sql_create_table(self):
+        # Suppose we have at most 10^4 (10K) new accounts per second.
+        # It gives ~10^9 new accounts per day.
+        # It means we fit into integer (10^9)
+        return """
+            CREATE TABLE IF NOT EXISTS daily_new_accounts_count
+            (
+                collected_for_day DATE PRIMARY KEY,
+                new_accounts_count INTEGER NOT NULL
+            )
+        """
+
+    @property
+    def sql_drop_table(self):
+        return """
+            DROP TABLE IF EXISTS daily_new_accounts_count
+        """
+
+    @property
+    def sql_select(self):
+        return """
+            SELECT COUNT(created_by_receipt_id)
+            FROM accounts
+            JOIN receipts ON receipts.receipt_id = accounts.created_by_receipt_id
+            WHERE receipts.included_in_block_timestamp >= %(from_timestamp)s
+                AND receipts.included_in_block_timestamp < %(to_timestamp)s
+        """
+
+    @property
+    def sql_insert(self):
+        return """
+            INSERT INTO daily_new_accounts_count VALUES %s
+            ON CONFLICT DO NOTHING
+        """
+
+    @property
+    def duration_seconds(self):
+        return DAY_LEN_SECONDS
+
+    def start_of_range(self, timestamp: int) -> int:
+        return daily_start_of_range(timestamp)
+
+'''
+'''--- aggregations/db_tables/daily_new_accounts_per_ecosystem_entity_count.py ---
+import datetime
+
+from . import DAY_LEN_SECONDS, daily_start_of_range, time_range_json
+from ..periodic_aggregations import PeriodicAggregations
+
+# This metric is computed based on `daily_accounts_added_per_ecosystem_entity` table in Analytics DB
+class DailyNewAccountsPerEcosystemEntityCount(PeriodicAggregations):
+    DEPENDENCIES = ["daily_accounts_added_per_ecosystem_entity"]
+
+    @property
+    def sql_create_table(self):
+        return """
+            CREATE TABLE IF NOT EXISTS daily_new_accounts_per_ecosystem_entity_count
+            (
+                collected_for_day          DATE NOT NULL,
+                entity_id                  TEXT NOT NULL,
+                new_accounts_count         BIGINT  NOT NULL,
+                CONSTRAINT daily_new_accounts_per_ecosystem_entity_count_pk PRIMARY KEY (collected_for_day, entity_id)
+            )
+        """
+
+    @property
+    def sql_drop_table(self):
+        return """
+            DROP TABLE IF EXISTS daily_new_accounts_per_ecosystem_entity_count
+        """
+
+    @property
+    def sql_select(self):
+        raise NotImplementedError(
+            "no reason to request from Indexer DB for daily_new_accounts_per_ecosystem_entity_count"
+        )
+
+    @property
+    def sql_insert(self):
+        return """
+            INSERT INTO daily_new_accounts_per_ecosystem_entity_count VALUES %s
+            ON CONFLICT DO NOTHING
+        """
+
+    def collect(self, requested_timestamp: int) -> list:
+        new_entity_users_select = """
+            SELECT
+              entity_id,
+              COUNT(*) as new_accounts_count
+            FROM daily_accounts_added_per_ecosystem_entity
+            WHERE
+              added_at_block_timestamp >= %(from_timestamp)s
+              AND added_at_block_timestamp < %(to_timestamp)s
+            GROUP BY entity_id
+        """
+
+        from_timestamp = self.start_of_range(requested_timestamp)
+        with self.analytics_connection.cursor() as analytics_cursor:
+            analytics_cursor.execute(
+                new_entity_users_select,
+                time_range_json(from_timestamp, self.duration_seconds),
+            )
+            result = analytics_cursor.fetchall()
+            return self.prepare_data(result, start_of_range=from_timestamp)
+
+    @property
+    def duration_seconds(self):
+        return DAY_LEN_SECONDS
+
+    def start_of_range(self, timestamp: int) -> int:
+        return daily_start_of_range(timestamp)
+
+    @staticmethod
+    def prepare_data(parameters: list, **kwargs) -> list:
+        computed_for = datetime.datetime.utcfromtimestamp(
+            kwargs["start_of_range"]
+        ).strftime("%Y-%m-%d")
+        return [(computed_for, entity_id, count) for (entity_id, count) in parameters]
+
+'''
+'''--- aggregations/db_tables/daily_new_contracts_count.py ---
+from . import DAY_LEN_SECONDS, daily_start_of_range
+from ..periodic_aggregations import PeriodicAggregations
+
+class DailyNewContractsCount(PeriodicAggregations):
+    @property
+    def sql_create_table(self):
+        # For September 2021, we have 10^6 accounts on the Mainnet.
+        # It means we fit into integer (10^9)
+        return """
+            CREATE TABLE IF NOT EXISTS daily_new_contracts_count
+            (
+                collected_for_day   DATE PRIMARY KEY,
+                new_contracts_count INTEGER NOT NULL
+            )
+        """
+
+    @property
+    def sql_drop_table(self):
+        return """
+            DROP TABLE IF EXISTS daily_new_contracts_count
+        """
+
+    @property
+    def sql_select(self):
+        return """
+            SELECT COUNT(DISTINCT receipts.receiver_account_id)
+            FROM action_receipt_actions
+            JOIN receipts ON receipts.receipt_id = action_receipt_actions.receipt_id
+            WHERE receipts.included_in_block_timestamp >= %(from_timestamp)s
+                AND receipts.included_in_block_timestamp < %(to_timestamp)s
+                AND action_receipt_actions.action_kind = 'DEPLOY_CONTRACT'
+        """
+
+    @property
+    def sql_insert(self):
+        return """
+            INSERT INTO daily_new_contracts_count VALUES %s
+            ON CONFLICT DO NOTHING
+        """
+
+    @property
+    def duration_seconds(self):
+        return DAY_LEN_SECONDS
+
+    def start_of_range(self, timestamp: int) -> int:
+        return daily_start_of_range(timestamp)
+
+'''
+'''--- aggregations/db_tables/daily_new_unique_contracts_count.py ---
+import datetime
+
+from . import DAY_LEN_SECONDS, daily_start_of_range, time_range_json
+from ..periodic_aggregations import PeriodicAggregations
+
+# This metric is computed based on `deployed_contracts` table in Analytics DB
+class DailyNewUniqueContractsCount(PeriodicAggregations):
+    DEPENDENCIES = ["deployed_contracts"]
+
+    @property
+    def sql_create_table(self):
+        # For September 2021, we have 10^6 accounts on the Mainnet.
+        # It means we fit into integer (10^9)
+        return """
+            CREATE TABLE IF NOT EXISTS daily_new_unique_contracts_count
+            (
+                collected_for_day          DATE PRIMARY KEY,
+                new_unique_contracts_count INTEGER NOT NULL
+            )
+        """
+
+    @property
+    def sql_drop_table(self):
+        return """
+            DROP TABLE IF EXISTS daily_new_unique_contracts_count
+        """
+
+    @property
+    def sql_select(self):
+        raise NotImplementedError(
+            "No requests to Indexer DB needed for daily_new_unique_contracts_count"
+        )
+
+    @property
+    def sql_insert(self):
+        return """
+            INSERT INTO daily_new_unique_contracts_count VALUES %s
+            ON CONFLICT DO NOTHING
+        """
+
+    def collect(self, requested_timestamp: int) -> list:
+        new_unique_hashes_select = """
+            SELECT COUNT(*) FROM (
+            SELECT DISTINCT contract_code_sha256
+            FROM deployed_contracts
+            WHERE deployed_at_block_timestamp >= %(from_timestamp)s
+                AND deployed_at_block_timestamp < %(to_timestamp)s
+            EXCEPT
+            SELECT contract_code_sha256
+            FROM deployed_contracts
+            WHERE deployed_at_block_timestamp < %(from_timestamp)s
+            ) deployed_contract_hashes
+        """
+
+        from_timestamp = self.start_of_range(requested_timestamp)
+        with self.analytics_connection.cursor() as analytics_cursor:
+            analytics_cursor.execute(
+                new_unique_hashes_select,
+                time_range_json(from_timestamp, self.duration_seconds),
+            )
+            result = analytics_cursor.fetchall()
+            return self.prepare_data(result, start_of_range=from_timestamp)
+
+    @property
+    def duration_seconds(self):
+        return DAY_LEN_SECONDS
+
+    def start_of_range(self, timestamp: int) -> int:
+        return daily_start_of_range(timestamp)
+
+'''
+'''--- aggregations/db_tables/daily_outgoing_transactions_per_account_count.py ---
+import datetime
+
+from . import DAY_LEN_SECONDS, daily_start_of_range
+from ..periodic_aggregations import PeriodicAggregations
+
+class DailyOutgoingTransactionsPerAccountCount(PeriodicAggregations):
+    @property
+    def sql_create_table(self):
+        # Suppose we have at most 10^5 (100K) transactions per second.
+        # In the worst case, they are all from one account.
+        # It gives ~10^10 transactions per day.
+        # It means we fit into BIGINT (10^18)
+        return """
+            CREATE TABLE IF NOT EXISTS daily_outgoing_transactions_per_account_count
+            (
+                collected_for_day           DATE   NOT NULL,
+                account_id                  TEXT   NOT NULL,
+                outgoing_transactions_count BIGINT NOT NULL,
+                CONSTRAINT daily_outgoing_transactions_per_account_count_pk PRIMARY KEY (collected_for_day, account_id)
+            );
+            CREATE INDEX IF NOT EXISTS daily_outgoing_transactions_per_account_count_idx
+                ON daily_outgoing_transactions_per_account_count (account_id, outgoing_transactions_count);
+            CREATE INDEX IF NOT EXISTS daily_outgoing_transactions_chart_idx
+                ON daily_outgoing_transactions_per_account_count (collected_for_day, outgoing_transactions_count)
+        """
+
+    @property
+    def sql_drop_table(self):
+        return """
+            DROP TABLE IF EXISTS daily_outgoing_transactions_per_account_count
+        """
+
+    @property
+    def sql_select(self):
+        return """
+            SELECT
+                signer_account_id,
+                COUNT(*) AS outgoing_transactions_count
+            FROM transactions
+            WHERE transactions.block_timestamp >= %(from_timestamp)s
+                AND transactions.block_timestamp < %(to_timestamp)s
+            GROUP BY signer_account_id
+        """
+
+    @property
+    def sql_insert(self):
+        return """
+            INSERT INTO daily_outgoing_transactions_per_account_count VALUES %s
+            ON CONFLICT DO NOTHING
+        """
+
+    @property
+    def duration_seconds(self):
+        return DAY_LEN_SECONDS
+
+    def start_of_range(self, timestamp: int) -> int:
+        return daily_start_of_range(timestamp)
+
+    @staticmethod
+    def prepare_data(parameters: list, *, start_of_range=None, **kwargs) -> list:
+        computed_for = datetime.datetime.utcfromtimestamp(start_of_range).strftime(
+            "%Y-%m-%d"
+        )
+        return [(computed_for, account_id, count) for (account_id, count) in parameters]
+
+'''
+'''--- aggregations/db_tables/daily_receipts_per_contract_count.py ---
+import datetime
+
+from . import DAY_LEN_SECONDS, daily_start_of_range
+from ..periodic_aggregations import PeriodicAggregations
+
+class DailyReceiptsPerContractCount(PeriodicAggregations):
+    @property
+    def sql_create_table(self):
+        # Suppose we have at most 10^5 (100K) transactions per second.
+        # In the worst case, they are all from one account.
+        # It gives ~10^10 transactions per day.
+        # It means we fit into BIGINT (10^18)
+        return """
+            CREATE TABLE IF NOT EXISTS daily_receipts_per_contract_count
+            (
+                collected_for_day DATE NOT NULL,
+                contract_id       TEXT NOT NULL,
+                receipts_count    BIGINT NOT NULL,
+                CONSTRAINT daily_receipts_per_contract_count_pk PRIMARY KEY (collected_for_day, contract_id)
+            );
+            CREATE INDEX IF NOT EXISTS daily_receipts_per_contract_count_idx
+                ON daily_receipts_per_contract_count (collected_for_day, receipts_count DESC)
+        """
+
+    @property
+    def sql_drop_table(self):
+        return """
+            DROP TABLE IF EXISTS daily_receipts_per_contract_count
+        """
+
+    @property
+    def sql_select(self):
+        return """
+            SELECT
+                action_receipt_actions.receipt_receiver_account_id,
+                COUNT(action_receipt_actions.receipt_id) AS receipts_count
+            FROM action_receipt_actions
+            WHERE action_receipt_actions.action_kind = 'FUNCTION_CALL'
+                AND action_receipt_actions.receipt_included_in_block_timestamp >= %(from_timestamp)s
+                AND action_receipt_actions.receipt_included_in_block_timestamp < %(to_timestamp)s
+            GROUP BY action_receipt_actions.receipt_receiver_account_id
+        """
+
+    @property
+    def sql_insert(self):
+        return """
+            INSERT INTO daily_receipts_per_contract_count VALUES %s
+            ON CONFLICT DO NOTHING
+        """
+
+    @property
+    def duration_seconds(self):
+        return DAY_LEN_SECONDS
+
+    def start_of_range(self, timestamp: int) -> int:
+        return daily_start_of_range(timestamp)
+
+    @staticmethod
+    def prepare_data(parameters: list, *, start_of_range=None, **kwargs) -> list:
+        computed_for = datetime.datetime.utcfromtimestamp(start_of_range).strftime(
+            "%Y-%m-%d"
+        )
+        return [
+            (computed_for, contract_id, count) for (contract_id, count) in parameters
+        ]
+
+'''
+'''--- aggregations/db_tables/daily_tokens_spent_on_fees.py ---
+from . import DAY_LEN_SECONDS, daily_start_of_range
+from ..periodic_aggregations import PeriodicAggregations
+
+# The fee is usually burnt in Near architecture.
+# However, `daily_tokens_spent_on_fees` are not equal to daily tokens burnt by fees.
+# Part of this sum goes to royalty for contract creators. See the example of computation here:
+# https://github.com/telezhnaya/docs/blob/master/docs/tokens/balances.md#calling-a-function
+class DailyTokensSpentOnFees(PeriodicAggregations):
+    @property
+    def sql_create_table(self):
+        # In Indexer, we store all the balances in numeric(45,0), including total_supply.
+        # Assuming the users spend on fees not more than total_supply inside each second,
+        # I suggest to use numeric(50, 0)
+        return """
+            CREATE TABLE IF NOT EXISTS daily_tokens_spent_on_fees
+            (
+                collected_for_day    DATE PRIMARY KEY,
+                tokens_spent_on_fees numeric(50, 0) NOT NULL
+            )
+        """
+
+    @property
+    def sql_drop_table(self):
+        return """
+            DROP TABLE IF EXISTS daily_tokens_spent_on_fees
+        """
+
+    @property
+    def sql_select(self):
+        return """
+            SELECT SUM(chunks.gas_used * blocks.gas_price)
+            FROM blocks
+            JOIN chunks ON chunks.included_in_block_hash = blocks.block_hash
+            WHERE blocks.block_timestamp >= %(from_timestamp)s
+                AND blocks.block_timestamp < %(to_timestamp)s
+        """
+
+    @property
+    def sql_insert(self):
+        return """
+            INSERT INTO daily_tokens_spent_on_fees VALUES %s
+            ON CONFLICT DO NOTHING
+        """
+
+    @property
+    def duration_seconds(self):
+        return DAY_LEN_SECONDS
+
+    def start_of_range(self, timestamp: int) -> int:
+        return daily_start_of_range(timestamp)
+
+'''
+'''--- aggregations/db_tables/daily_transaction_count_by_gas_burnt_ranges.py ---
+import datetime
+
+from . import DAY_LEN_SECONDS, daily_start_of_range
+from ..periodic_aggregations import PeriodicAggregations
+
+# It's not cumulative. top_of_range_in_teragas == 200 means the range 150-200
+class DailyTransactionCountByGasBurntRanges(PeriodicAggregations):
+    @property
+    def sql_create_table(self):
+        # Suppose we have at most 10^5 (100K) transactions per second.
+        # In the worst case, they are all in the one range
+        # It gives ~10^10 transactions per day.
+        # It means we fit into BIGINT (10^18)
+        return """
+            CREATE TABLE IF NOT EXISTS daily_transaction_count_by_gas_burnt_ranges
+            (
+                collected_for_day       DATE    NOT NULL,
+                top_of_range_in_teragas INTEGER NOT NULL,
+                transactions_count      BIGINT  NOT NULL,
+                CONSTRAINT daily_transaction_count_by_gas_burnt_ranges_pk PRIMARY KEY (collected_for_day, top_of_range_in_teragas)
+            )
+        """
+
+    @property
+    def sql_drop_table(self):
+        return """
+            DROP TABLE IF EXISTS daily_transaction_count_by_gas_burnt_ranges
+        """
+
+    @property
+    def sql_select(self):
+        return """
+            SELECT (range_in_teragas + 1) * 50, count(transaction_hash)
+            FROM (
+                SELECT receipts.originated_from_transaction_hash AS transaction_hash,
+                    round(div(sum(execution_outcomes.gas_burnt), CAST(power(10, 12) * 50 AS BIGINT))) as range_in_teragas
+                FROM execution_outcomes JOIN receipts ON receipts.receipt_id = execution_outcomes.receipt_id
+                WHERE receipts.included_in_block_timestamp >= %(from_timestamp)s
+                    AND receipts.included_in_block_timestamp < %(to_timestamp)s
+                GROUP BY receipts.originated_from_transaction_hash
+            ) a
+            GROUP BY range_in_teragas
+        """
+
+    @property
+    def sql_insert(self):
+        return """
+            INSERT INTO daily_transaction_count_by_gas_burnt_ranges VALUES %s
+            ON CONFLICT DO NOTHING
+        """
+
+    @property
+    def duration_seconds(self):
+        return DAY_LEN_SECONDS
+
+    def start_of_range(self, timestamp: int) -> int:
+        return daily_start_of_range(timestamp)
+
+    @staticmethod
+    def prepare_data(parameters: list, *, start_of_range=None, **kwargs) -> list:
+        computed_for = datetime.datetime.utcfromtimestamp(start_of_range).strftime(
+            "%Y-%m-%d"
+        )
+        return [
+            (computed_for, top_of_range, count) for (top_of_range, count) in parameters
+        ]
+
+'''
+'''--- aggregations/db_tables/daily_transactions_count.py ---
+from . import DAY_LEN_SECONDS, daily_start_of_range
+from ..periodic_aggregations import PeriodicAggregations
+
+class DailyTransactionsCount(PeriodicAggregations):
+    @property
+    def sql_create_table(self):
+        # Suppose we have at most 10^5 (100K) transactions per second.
+        # It gives ~10^10 transactions per day.
+        # It means we fit into BIGINT (10^18)
+        return """
+            CREATE TABLE IF NOT EXISTS daily_transactions_count
+            (
+                collected_for_day  DATE PRIMARY KEY,
+                transactions_count BIGINT NOT NULL
+            )
+        """
+
+    @property
+    def sql_drop_table(self):
+        return """
+            DROP TABLE IF EXISTS daily_transactions_count
+        """
+
+    @property
+    def sql_select(self):
+        return """
+            SELECT COUNT(*) FROM transactions
+            WHERE block_timestamp >= %(from_timestamp)s
+                AND block_timestamp < %(to_timestamp)s
+        """
+
+    @property
+    def sql_insert(self):
+        return """
+            INSERT INTO daily_transactions_count VALUES %s
+            ON CONFLICT DO NOTHING
+        """
+
+    @property
+    def duration_seconds(self):
+        return DAY_LEN_SECONDS
+
+    def start_of_range(self, timestamp: int) -> int:
+        return daily_start_of_range(timestamp)
+
+'''
+'''--- aggregations/db_tables/deployed_contracts.py ---
+from . import DAY_LEN_SECONDS, daily_start_of_range
+from ..periodic_aggregations import PeriodicAggregations
+
+class DeployedContracts(PeriodicAggregations):
+    @property
+    def sql_create_table(self):
+        return """
+            CREATE TABLE IF NOT EXISTS deployed_contracts
+            (
+                contract_code_sha256        text           NOT NULL,
+                deployed_to_account_id      text           NOT NULL,
+                deployed_by_receipt_id      text           PRIMARY KEY,
+                -- It is important to store here not only day, but the exact timestamp
+                -- Because there could be several deployments at the same day
+                deployed_at_block_timestamp numeric(20, 0) NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS deployed_contracts_timestamp_idx
+                ON deployed_contracts (deployed_at_block_timestamp);
+            CREATE INDEX IF NOT EXISTS deployed_contracts_sha256_idx
+                ON deployed_contracts (contract_code_sha256);
+            CREATE INDEX IF NOT EXISTS deployed_contracts_deployed_to_account_id_idx
+                ON deployed_contracts (deployed_to_account_id);
+            ALTER TABLE deployed_contracts
+                ADD COLUMN IF NOT EXISTS deployed_at_block_hash text NOT NULL DEFAULT '';
+        """
+
+    @property
+    def sql_drop_table(self):
+        return """
+            DROP TABLE IF EXISTS deployed_contracts
+        """
+
+    @property
+    def sql_select(self):
+        return """
+            SELECT
+                action_receipt_actions.args->>'code_sha256' as contract_code_sha256,
+                action_receipt_actions.receipt_receiver_account_id as deployed_to_account_id,
+                action_receipt_actions.receipt_id as deployed_by_receipt_id,
+                execution_outcomes.executed_in_block_timestamp as deployed_at_block_timestamp,
+                execution_outcomes.executed_in_block_hash as deployed_at_block_hash
+            FROM action_receipt_actions
+            JOIN execution_outcomes ON execution_outcomes.receipt_id = action_receipt_actions.receipt_id
+            WHERE action_receipt_actions.action_kind = 'DEPLOY_CONTRACT'
+                AND execution_outcomes.status = 'SUCCESS_VALUE'
+                AND execution_outcomes.executed_in_block_timestamp >= %(from_timestamp)s
+                AND execution_outcomes.executed_in_block_timestamp < %(to_timestamp)s
+            ORDER BY execution_outcomes.executed_in_block_timestamp
+        """
+
+    @property
+    def sql_insert(self):
+        return """
+            INSERT INTO deployed_contracts (
+                contract_code_sha256,
+                deployed_to_account_id,
+                deployed_by_receipt_id,
+                deployed_at_block_timestamp,
+                deployed_at_block_hash
+            ) VALUES %s
+            ON CONFLICT DO NOTHING
+        """
+
+    @property
+    def duration_seconds(self):
+        return DAY_LEN_SECONDS
+
+    def start_of_range(self, timestamp: int) -> int:
+        return daily_start_of_range(timestamp)
+
+    @staticmethod
+    def prepare_data(parameters: list, *, start_of_range=None, **kwargs) -> list:
+        return parameters
+
+'''
+'''--- aggregations/db_tables/near_ecosystem_entities.py ---
+import json
+import requests
+
+from ..sql_aggregations import SqlAggregations
+
+class NearEcosystemEntities(SqlAggregations):
+    @property
+    def sql_create_table(self):
+        return """
+            CREATE TABLE IF NOT EXISTS near_ecosystem_entities
+            (
+                slug     TEXT PRIMARY KEY,
+                title    TEXT,
+                oneliner TEXT,
+                website  TEXT,
+                category TEXT,
+                status   TEXT,
+                contract TEXT,
+                logo     TEXT,
+                is_app   BOOLEAN,
+                is_nft   BOOLEAN,
+                is_guild BOOLEAN,
+                is_defi  BOOLEAN,
+                is_dao   BOOLEAN
+            )
+        """
+
+    @property
+    def sql_drop_table(self):
+        return """
+            DROP TABLE IF EXISTS near_ecosystem_entities
+        """
+
+    @property
+    def sql_select(self):
+        raise NotImplementedError(
+            "No requests to Indexer DB needed for near_ecosystem_entities"
+        )
+
+    @property
+    def sql_insert(self):
+        return """
+            INSERT INTO near_ecosystem_entities VALUES %s
+            ON CONFLICT DO NOTHING
+        """
+
+    def collect(self, requested_timestamp: int) -> list:
+        # Dirty hack to enforce the DB rewrite all the data each time
+        self.drop_table()
+        self.create_table()
+
+        url = "https://raw.githubusercontent.com/near/ecosystem/main/entities.json"
+        data = json.loads(requests.get(url).text)
+
+        return [
+            [
+                record.get("slug"),
+                record.get("title"),
+                record.get("oneliner"),
+                record.get("website"),
+                record.get("category"),
+                record.get("status"),
+                record.get("contract"),
+                record.get("logo"),
+                "app" in record["category"],
+                "nft" in record["category"],
+                "guild" in record["category"],
+                "defi" in record["category"],
+                "dao" in record["category"],
+            ]
+            for record in data
+        ]
+
+'''
+'''--- aggregations/db_tables/unique_contracts.py ---
+import base64
+import near_api
+import os
+import traceback
+
+from . import DAY_LEN_SECONDS, daily_start_of_range, time_range_json
+from ..periodic_aggregations import PeriodicAggregations
+
+class UniqueContracts(PeriodicAggregations):
+    DEPENDENCIES = ["deployed_contracts"]
+
+    @property
+    def sql_create_table(self):
+        return """
+            CREATE TABLE IF NOT EXISTS unique_contracts
+            (
+                contract_code_sha256              text           PRIMARY KEY,
+                contract_sdk_type                 text           NOT NULL DEFAULT '',
+                first_deployed_to_account_id      text           NOT NULL,
+                first_deployed_by_receipt_id      text           NOT NULL,
+                -- It is important to store here not only day, but the exact timestamp
+                -- Because there could be several deployments at the same day
+                first_deployed_at_block_timestamp numeric(20, 0) NOT NULL,
+                first_deployed_at_block_hash      text           NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS unique_contracts_contract_sdk_type_idx
+                ON unique_contracts (contract_sdk_type);
+            CREATE INDEX IF NOT EXISTS unique_contracts_timestamp_idx
+                ON unique_contracts (first_deployed_at_block_timestamp);
+            CREATE INDEX IF NOT EXISTS unique_contracts_first_deployed_to_account_id_idx
+                ON unique_contracts (first_deployed_to_account_id);
+        """
+
+    @property
+    def sql_drop_table(self):
+        return """
+            DROP TABLE IF EXISTS unique_contracts
+        """
+
+    @property
+    def sql_select(self):
+        raise NotImplementedError(
+            "No requests to Indexer DB needed for unique_contracts"
+        )
+
+    @property
+    def sql_insert(self):
+        return """
+            INSERT INTO unique_contracts (
+                contract_code_sha256,
+                first_deployed_to_account_id,
+                first_deployed_by_receipt_id,
+                first_deployed_at_block_timestamp,
+                first_deployed_at_block_hash
+            ) VALUES %s
+            ON CONFLICT DO NOTHING
+        """
+
+    @property
+    def duration_seconds(self):
+        return DAY_LEN_SECONDS
+
+    def start_of_range(self, timestamp: int) -> int:
+        return daily_start_of_range(timestamp)
+
+    def collect(self, requested_timestamp: int) -> list:
+        new_unique_contracts_select = """
+            SELECT
+                DISTINCT contract_code_sha256,
+                deployed_to_account_id,
+                deployed_by_receipt_id,
+                deployed_at_block_timestamp,
+                deployed_at_block_hash
+            FROM deployed_contracts
+            WHERE deployed_at_block_timestamp >= %(from_timestamp)s
+                AND deployed_at_block_timestamp < %(to_timestamp)s
+            ORDER BY contract_code_sha256, deployed_at_block_timestamp
+        """
+
+        from_timestamp = self.start_of_range(requested_timestamp)
+        with self.analytics_connection.cursor() as analytics_cursor:
+            analytics_cursor.execute(
+                new_unique_contracts_select,
+                time_range_json(from_timestamp, self.duration_seconds),
+            )
+            result = analytics_cursor.fetchall()
+            return self.prepare_data(result, start_of_range=from_timestamp)
+
+    @staticmethod
+    def prepare_data(parameters: list, *, start_of_range=None, **kwargs) -> list:
+        print("INFO: Preparing unique_contracts...")
+        return parameters
+
+    def store(self, parameters: list) -> list:
+        print("INFO: Storing unique_contracts...")
+        super().store(parameters)
+
+        print("INFO: Updating SDK types in unique_contracts...")
+
+        near_rpc_url = os.getenv("NEAR_RPC_URL")
+        if not near_rpc_url:
+            print("WARN: NEAR_RPC_URL is not set, so contract SDK types won't be set")
+            return
+        near_rpc = near_api.providers.JsonProvider(near_rpc_url)
+
+        sql_missing_sdk_type = """
+            SELECT contract_code_sha256, first_deployed_to_account_id, first_deployed_at_block_hash
+            FROM unique_contracts
+            WHERE contract_sdk_type = ''
+            LIMIT 100
+        """
+
+        with self.analytics_connection.cursor() as analytics_cursor:
+            while True:
+                analytics_cursor.execute(sql_missing_sdk_type)
+                unknown_contracts = analytics_cursor.fetchall()
+                print(
+                    f"INFO: There are {len(unknown_contracts)} unique contracts pending for SDK type identification..."
+                )
+                if not unknown_contracts:
+                    break
+
+                contract_sdk_types = []
+                for (
+                    contract_code_sha256,
+                    contract_account_id,
+                    deployed_at_block_hash,
+                ) in unknown_contracts:
+                    print(
+                        f"INFO: Fetching contract code for {contract_account_id} at block {deployed_at_block_hash}..."
+                    )
+                    contract_code = download_contract_code(
+                        near_rpc, contract_account_id, deployed_at_block_hash
+                    )
+
+                    contract_sdk_type = get_contract_sdk_type(
+                        contract_code, contract_code_sha256
+                    )
+
+                    contract_sdk_types.append((contract_code_sha256, contract_sdk_type))
+
+                sql_update_contract_sdk_types = ";".join(
+                    f"""UPDATE unique_contracts SET contract_sdk_type = '{contract_sdk_type}' WHERE contract_code_sha256 = '{contract_code_sha256}'"""
+                    for (contract_code_sha256, contract_sdk_type) in contract_sdk_types
+                )
+                analytics_cursor.execute(sql_update_contract_sdk_types)
+                self.analytics_connection.commit()
+
+        print("INFO: Finished updating unique_contracts")
+
+def download_contract_code(
+    near_rpc: near_api.providers.JsonProvider, account_id: str, block_id: str
+) -> bytes:
+    for _ in range(1000):
+        try:
+            response = near_rpc.json_rpc(
+                "query",
+                {
+                    "request_type": "view_code",
+                    "account_id": account_id,
+                    "block_id": block_id,
+                },
+            )
+        except near_api.providers.JsonProviderError as e:
+            if e.args[0].get("cause", {}).get("name") == "UNKNOWN_ACCOUNT":
+                return b""
+            print("WARN: Retrying fetching contract code...")
+            traceback.print_exc()
+        except Exception:
+            print("WARN: Retrying fetching contract code...")
+            traceback.print_exc()
+        else:
+            return base64.b64decode(response["code_base64"])
+
+    raise Exception("Could not download contract code even after 1000 retries")
+
+def get_contract_sdk_type(contract_code: bytes, contract_code_sha256: str) -> str:
+    # Since there is no way to remove a contract once deployed, users can only deploy an empty file to reduce the storage usage.
+    if contract_code == b"":
+        return "EMPTY"
+
+    # Sometimes people deploy some garbage (images, text files, etc).
+    if not contract_code.startswith(b"\0asm"):
+        return "NOT_WASM"
+
+    likely_sdk_types = set()
+
+    if b"__data_end" in contract_code and b"__heap_base" in contract_code:
+        likely_sdk_types.add("RS")
+
+    if b"JS_TAG_MODULE" in contract_code and b"quickjs-libc-min." in contract_code:
+        likely_sdk_types.add("JS")
+
+    if (
+        b"l\x00i\x00b\x00/\x00a\x00s\x00s\x00e\x00m\x00b\x00l\x00y\x00s\x00c\x00r\x00i\x00p\x00t"
+        in contract_code
+        or b"~lib/near-sdk-core/collections/persistentMap/PersistentMap"
+        in contract_code
+    ):
+        likely_sdk_types.add("AS")
+
+    # Only set the sdk type if exactly one match is received since if we matched multiple, it is impossible to make a call.
+    if len(likely_sdk_types) == 1:
+        return likely_sdk_types.pop()
+
+    if len(likely_sdk_types) > 1:
+        print(
+            f"WARN: We detected markers of several programming languages ({likely_sdk_types}) at once for contract with hash {contract_code_sha256}, falling back to UNKNOWN type..."
+        )
+    return "UNKNOWN"
+
+'''
+'''--- aggregations/db_tables/weekly_active_accounts_count.py ---
+from . import WEEK_LEN_SECONDS, weekly_start_of_range
+from ..periodic_aggregations import PeriodicAggregations
+
+class WeeklyActiveAccountsCount(PeriodicAggregations):
+    @property
+    def sql_create_table(self):
+        # For September 2021, we have 10^6 accounts on the Mainnet.
+        # It means we fit into integer (10^9)
+        return """
+            CREATE TABLE IF NOT EXISTS weekly_active_accounts_count
+            (
+                collected_for_week    DATE PRIMARY KEY, -- start of the week (Monday)
+                active_accounts_count INTEGER NOT NULL
+            )
+        """
+
+    @property
+    def sql_drop_table(self):
+        return """
+            DROP TABLE IF EXISTS weekly_active_accounts_count
+        """
+
+    @property
+    def sql_select(self):
+        return """
+            SELECT COUNT(DISTINCT transactions.signer_account_id)
+            FROM transactions
+            WHERE transactions.block_timestamp >= %(from_timestamp)s
+                AND transactions.block_timestamp < %(to_timestamp)s
+        """
+
+    @property
+    def sql_insert(self):
+        return """
+            INSERT INTO weekly_active_accounts_count VALUES %s
+            ON CONFLICT DO NOTHING
+        """
+
+    @property
+    def duration_seconds(self):
+        return WEEK_LEN_SECONDS
+
+    def start_of_range(self, timestamp: int) -> int:
+        return weekly_start_of_range(timestamp)
+
+'''
+'''--- aggregations/periodic_aggregations.py ---
+import abc
+import datetime
+
+from .sql_aggregations import SqlAggregations
+from .db_tables import time_range_json
+
+class PeriodicAggregations(SqlAggregations):
+    @abc.abstractmethod
+    def start_of_range(self, timestamp: int) -> int:
+        pass
+
+    @property
+    @abc.abstractmethod
+    def duration_seconds(self) -> int:
+        pass
+
+    # requested_timestamp will be rounded to the start of the day, week (Monday), month, etc.
+    def collect(self, requested_timestamp: int) -> list:
+        from_timestamp = self.start_of_range(requested_timestamp)
+        if not self.is_indexer_ready(from_timestamp + self.duration_seconds):
+            return []
+        with self.indexer_connection.cursor() as indexer_cursor:
+            indexer_cursor.execute(
+                self.sql_select, time_range_json(from_timestamp, self.duration_seconds)
+            )
+            result = indexer_cursor.fetchall()
+            return self.prepare_data(result, start_of_range=from_timestamp)
+
+    @staticmethod
+    def prepare_data(parameters: list, *, start_of_range=None, **kwargs) -> list:
+        # We usually have one-value returns, we need to merge it with corresponding date
+        if len(parameters[0]) == 1:
+            assert (
+                len(parameters) == 1
+            ), "Only one value expected. Can't be sure that we need to add timestamp"
+            computed_for = datetime.datetime.utcfromtimestamp(start_of_range)
+            parameters = [(computed_for, parameters[0][0] or 0)]
+        return [
+            (computed_for.strftime("%Y-%m-%d"), data)
+            for (computed_for, data) in parameters
+        ]
+
+    def is_indexer_ready(self, needed_timestamp):
+        select_latest_timestamp = """
+            SELECT DIV(block_timestamp, 1000 * 1000 * 1000)
+            FROM blocks
+            ORDER BY block_timestamp DESC
+            LIMIT 1
+        """
+        with self.indexer_connection.cursor() as indexer_cursor:
+            indexer_cursor.execute(select_latest_timestamp)
+            latest_timestamp = indexer_cursor.fetchone()[0]
+            # Adding 10 minutes to be sure that all the data is collected
+            # Important for DailyIngoingTransactionsPerAccountCount
+            return latest_timestamp >= needed_timestamp + 10 * 60
+
+'''
+'''--- aggregations/sql_aggregations.py ---
+import abc
+import psycopg2
+import psycopg2.extras
+
+from .base_aggregations import BaseAggregations
+from .db_tables import time_json, daily_start_of_range
+
+class SqlAggregations(BaseAggregations):
+    @property
+    @abc.abstractmethod
+    def sql_create_table(self):
+        pass
+
+    @property
+    @abc.abstractmethod
+    def sql_drop_table(self):
+        pass
+
+    @property
+    @abc.abstractmethod
+    def sql_select(self):
+        pass
+
+    @property
+    @abc.abstractmethod
+    def sql_insert(self):
+        pass
+
+    def create_table(self):
+        with self.analytics_connection.cursor() as analytics_cursor:
+            try:
+                analytics_cursor.execute(self.sql_create_table)
+                self.analytics_connection.commit()
+            except psycopg2.errors.DuplicateTable:
+                self.analytics_connection.rollback()
+
+    def drop_table(self):
+        with self.analytics_connection.cursor() as analytics_cursor:
+            try:
+                analytics_cursor.execute(self.sql_drop_table)
+                self.analytics_connection.commit()
+            except psycopg2.errors.UndefinedTable:
+                self.analytics_connection.rollback()
+
+    def collect(self, requested_timestamp: int) -> list:
+        with self.indexer_connection.cursor() as indexer_cursor:
+            indexer_cursor.execute(
+                self.sql_select, time_json(daily_start_of_range(requested_timestamp))
+            )
+            result = indexer_cursor.fetchall()
+            return self.prepare_data(result)
+
+    def store(self, parameters: list):
+        chunk_size = 100
+        with self.analytics_connection.cursor() as analytics_cursor:
+            for i in range(0, len(parameters), chunk_size):
+                try:
+                    psycopg2.extras.execute_values(
+                        analytics_cursor,
+                        self.sql_insert,
+                        parameters[i : i + chunk_size],
+                    )
+                    self.analytics_connection.commit()
+                except psycopg2.errors.UniqueViolation:
+                    self.analytics_connection.rollback()
+
+    # Overload this method if you need to prepare data before insert
+    @staticmethod
+    def prepare_data(parameters, **kwargs) -> list:
+        return parameters
+
+'''
+'''--- main.py ---
+import argparse
+import dotenv
+import os
+import psycopg2
+import time
+import traceback
+import typing
+
+from aggregations import (
+    DailyAccountsAddedPerEcosystemEntity,
+    DailyActiveAccountsCount,
+    DailyActiveContractsCount,
+    DailyDeletedAccountsCount,
+    DailyDepositAmount,
+    DailyGasUsed,
+    DailyIngoingTransactionsPerAccountCount,
+    DailyNewAccountsCount,
+    DailyNewAccountsPerEcosystemEntityCount,
+    DailyNewContractsCount,
+    DailyNewUniqueContractsCount,
+    DailyOutgoingTransactionsPerAccountCount,
+    DailyReceiptsPerContractCount,
+    DailyTokensSpentOnFees,
+    DailyTransactionCountByGasBurntRanges,
+    DailyTransactionsCount,
+    DeployedContracts,
+    UniqueContracts,
+    WeeklyActiveAccountsCount,
+    NearEcosystemEntities,
+)
+from aggregations.db_tables import DAY_LEN_SECONDS, query_genesis_timestamp
+
+from datetime import datetime
+
+# TODO maybe we want to get rid of this list somehow
+STATS = {
+    "daily_accounts_added_per_ecosystem_entity": DailyAccountsAddedPerEcosystemEntity,
+    "daily_active_accounts_count": DailyActiveAccountsCount,
+    "daily_active_contracts_count": DailyActiveContractsCount,
+    "daily_deleted_accounts_count": DailyDeletedAccountsCount,
+    "daily_deposit_amount": DailyDepositAmount,
+    "daily_gas_used": DailyGasUsed,
+    "daily_ingoing_transactions_per_account_count": DailyIngoingTransactionsPerAccountCount,
+    "daily_new_accounts_count": DailyNewAccountsCount,
+    "daily_new_accounts_per_ecosystem_entity_count": DailyNewAccountsPerEcosystemEntityCount,
+    "daily_new_contracts_count": DailyNewContractsCount,
+    "daily_new_unique_contracts_count": DailyNewUniqueContractsCount,
+    "daily_outgoing_transactions_per_account_count": DailyOutgoingTransactionsPerAccountCount,
+    "daily_receipts_per_contract_count": DailyReceiptsPerContractCount,
+    "daily_tokens_spent_on_fees": DailyTokensSpentOnFees,
+    "daily_transaction_count_by_gas_burnt_ranges": DailyTransactionCountByGasBurntRanges,
+    "daily_transactions_count": DailyTransactionsCount,
+    "deployed_contracts": DeployedContracts,
+    "unique_contracts": UniqueContracts,
+    "weekly_active_accounts_count": WeeklyActiveAccountsCount,
+    "near_ecosystem_entities": NearEcosystemEntities,
+}
+
+def compute(
+    analytics_connection,
+    indexer_connection,
+    statistics_type: str,
+    statistics,
+    timestamp: int,
+):
+    start_time = time.time()
+    try:
+        print(
+            f"Started computing {statistics_type} for {datetime.utcfromtimestamp(timestamp).date()}"
+        )
+
+        statistics.create_table()
+        result = statistics.collect(timestamp)
+        statistics.store(result)
+
+        print(
+            f"Finished computing {statistics_type} in {round(time.time() - start_time, 1)} seconds"
+        )
+    except Exception as e:
+        print(
+            f"Failed to compute {statistics_type} (spent {round(time.time() - start_time, 1)} seconds)"
+        )
+        # psycopg2 does not provide proper exception if the connection is closed.
+        # The given exception is too broad, and sometimes psycopg2 gives different error types on a same reason.
+        # As a result, we can fail here if we try to rollback the transaction on the closed connection.
+        # We anyway handle the exception further, so I decided to ignore this issue here
+        analytics_connection.rollback()
+        indexer_connection.rollback()
+        raise e
+
+def compute_statistics(
+    analytics_database_url,
+    indexer_database_url,
+    statistics_type: str,
+    timestamp: typing.Optional[int],
+    collect_all,
+):
+    statistics_cls = STATS[statistics_type]
+
+    for cls in statistics_cls.DEPENDENCIES:
+        compute_statistics(
+            analytics_database_url, indexer_database_url, cls, timestamp, collect_all
+        )
+
+    analytics_connection = psycopg2.connect(analytics_database_url)
+    indexer_connection = psycopg2.connect(indexer_database_url)
+    if collect_all:
+        statistics = statistics_cls(analytics_connection, indexer_connection)
+        statistics.drop_table()
+        current_day = query_genesis_timestamp(indexer_connection)
+        while current_day < int(time.time()):
+            for attempt in range(10, 0, -1):
+                try:
+                    compute(
+                        analytics_connection,
+                        indexer_connection,
+                        statistics_type,
+                        statistics_cls(analytics_connection, indexer_connection),
+                        current_day,
+                    )
+                except Exception:
+                    print(f"Compute for {current_day} failed. See details below.")
+                    traceback.print_exc()
+                    if attempt == 0:
+                        raise
+                    print(f"Retrying...")
+                    analytics_connection = psycopg2.connect(analytics_database_url)
+                    indexer_connection = psycopg2.connect(indexer_database_url)
+                else:
+                    break
+            current_day += DAY_LEN_SECONDS
+    else:
+        # Computing for yesterday by default
+        timestamp = timestamp or int(time.time() - DAY_LEN_SECONDS)
+        compute(
+            analytics_connection,
+            indexer_connection,
+            statistics_type,
+            statistics_cls(analytics_connection, indexer_connection),
+            timestamp,
+        )
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Compute aggregations for given Indexer DB"
+    )
+    parser.add_argument(
+        "-t",
+        "--timestamp",
+        type=int,
+        help="The timestamp in seconds precision, indicates the period for computing the aggregations. "
+        "The rounding will be performed. By default, takes yesterday. "
+        "If it's not possible to compute the aggregations for given period, "
+        "nothing will be added to the DB.",
+    )
+    parser.add_argument(
+        "-s",
+        "--stats-types",
+        nargs="+",
+        choices=STATS,
+        default=[],
+        help="The type of aggregations to compute. By default, everything will be computed.",
+    )
+    parser.add_argument(
+        "-a",
+        "--all",
+        action="store_true",
+        help="Drop all previous data for given `stats-types` and fulfill the DB "
+        "with all values till now. Can't be used with `--timestamp`",
+    )
+    args = parser.parse_args()
+    if args.all and args.timestamp:
+        raise ValueError("`timestamp` parameter can't be combined with `all` option")
+
+    dotenv.load_dotenv()
+    ANALYTICS_DATABASE_URL = os.getenv("ANALYTICS_DATABASE_URL")
+    INDEXER_DATABASE_URL = os.getenv("INDEXER_DATABASE_URL")
+
+    stats_need_to_compute = set(args.stats_types or STATS.keys())
+    for i in range(1, 6):
+        print(f"Attempt {i}...")
+        stats_computed = set()
+        try:
+            for stats_type in stats_need_to_compute:
+                try:
+                    compute_statistics(
+                        ANALYTICS_DATABASE_URL,
+                        INDEXER_DATABASE_URL,
+                        stats_type,
+                        args.timestamp,
+                        args.all,
+                    )
+                    stats_computed.add(stats_type)
+                except Exception:
+                    print(f"Failed to compute the value for {stats_type}")
+                    traceback.print_exc()
+
+        except Exception as e:
+            # If we lost connection and try to catch related DB exception here,
+            # it raises a new one in a process of handling the initial one,
+            # so we have to catch the general Exception here
+            print("The connection is probably lost")
+            print(e)
+            time.sleep(10)
+
+        stats_need_to_compute -= stats_computed
+        if not stats_need_to_compute:
+            break
+
+    # It's important to have non-zero exit code in case of any errors,
+    # It helps AWX to identify and report the problem
+    if stats_need_to_compute:
+        raise TimeoutError(
+            f"Some aggregations could not be calculated: [{' '.join(stats_need_to_compute)}]"
+        )
+
+'''
+'''--- requirements.txt ---
+black==21.11b1
+psycopg2==2.9.1
+python-dotenv
+requests==2.26.0
+near-api-py
+
+'''

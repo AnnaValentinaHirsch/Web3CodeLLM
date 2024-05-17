@@ -1,0 +1,1527 @@
+*GitHub Repository "evgenykuzyakov/berryfarm"*
+
+'''--- README.md ---
+# Berry Farm
+
+Sell your berry for profits
+
+'''
+'''--- contract-rs/berry-farm/Cargo.toml ---
+[package]
+name = "berry-farm"
+version = "0.1.0"
+authors = ["Near Inc <hello@nearprotocol.com>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "3.1.0"
+near-contract-standards = "3.2.0"
+uint = { version = "0.8.3", default-features = false }
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "s"
+lto = true
+debug = false
+panic = "abort"
+# Opt into extra safety checks on arithmetic operations https://stackoverflow.com/a/64136471/249801
+overflow-checks = true
+
+[workspace]
+members = []
+
+'''
+'''--- contract-rs/berry-farm/README.md ---
+# NEAR Place
+
+Smart contract to keep track of the board.
+
+## Building
+
+```bash
+./build.sh
+```
+
+## Testing
+
+To test run:
+
+```bash
+cargo test --package near-place -- --nocapture
+```
+
+'''
+'''--- contract-rs/berry-farm/build.sh ---
+#!/bin/bash
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/berry_farm.wasm ./res/
+
+'''
+'''--- contract-rs/berry-farm/src/ft_core.rs ---
+use crate::*;
+use near_contract_standards::fungible_token::core::FungibleTokenCore;
+use near_contract_standards::fungible_token::core_impl::ext_fungible_token_receiver;
+use near_sdk::{assert_one_yocto, log, Gas, PromiseOrValue, PromiseResult};
+
+const GAS_FOR_RESOLVE_TRANSFER: Gas = 5_000_000_000_000;
+const GAS_FOR_FT_TRANSFER_CALL: Gas = 25_000_000_000_000 + GAS_FOR_RESOLVE_TRANSFER;
+
+const NO_DEPOSIT: Balance = 0;
+
+#[near_bindgen]
+impl FungibleTokenCore for Farm {
+    #[payable]
+    fn ft_transfer(&mut self, receiver_id: ValidAccountId, amount: U128, memo: Option<String>) {
+        assert_one_yocto();
+        let amount = amount.into();
+        let sender_id = self.withdraw_from_sender(receiver_id.as_ref(), amount);
+        self.deposit_to_account(receiver_id.as_ref(), amount);
+        log!(
+            "Transfer 🥒{} from {} to {}",
+            amount,
+            sender_id,
+            receiver_id
+        );
+        if let Some(memo) = memo {
+            log!("Memo: {}", memo);
+        }
+    }
+
+    #[payable]
+    fn ft_transfer_call(
+        &mut self,
+        receiver_id: ValidAccountId,
+        amount: U128,
+        memo: Option<String>,
+        msg: String,
+    ) -> PromiseOrValue<U128> {
+        assert_one_yocto();
+        let amount = amount.into();
+        let sender_id = self.withdraw_from_sender(receiver_id.as_ref(), amount);
+        self.deposit_to_account(receiver_id.as_ref(), amount);
+        log!(
+            "Transfer 🥒{} from {} to {}",
+            amount,
+            sender_id,
+            receiver_id
+        );
+        if let Some(memo) = memo {
+            log!("Memo: {}", memo);
+        }
+        // Initiating receiver's call and the callback
+        ext_fungible_token_receiver::ft_on_transfer(
+            sender_id.clone(),
+            amount.into(),
+            msg,
+            receiver_id.as_ref(),
+            NO_DEPOSIT,
+            env::prepaid_gas() - GAS_FOR_FT_TRANSFER_CALL,
+        )
+        .then(ext_ft_self::ft_resolve_transfer(
+            sender_id,
+            receiver_id.into(),
+            amount.into(),
+            &env::current_account_id(),
+            NO_DEPOSIT,
+            GAS_FOR_RESOLVE_TRANSFER,
+        ))
+        .into()
+    }
+
+    fn ft_total_supply(&self) -> U128 {
+        self.total_cucumber_balance.into()
+    }
+
+    fn ft_balance_of(&self, account_id: ValidAccountId) -> U128 {
+        self.get_internal_account(account_id.as_ref())
+            .1
+            .map(|account| account.cucumber_balance)
+            .unwrap_or(0)
+            .into()
+    }
+}
+
+#[ext_contract(ext_ft_self)]
+trait FungibleTokenResolver {
+    fn ft_resolve_transfer(
+        &mut self,
+        sender_id: AccountId,
+        receiver_id: AccountId,
+        amount: U128,
+    ) -> U128;
+}
+
+trait FungibleTokenResolver {
+    fn ft_resolve_transfer(
+        &mut self,
+        sender_id: AccountId,
+        receiver_id: AccountId,
+        amount: U128,
+    ) -> U128;
+}
+
+#[near_bindgen]
+impl FungibleTokenResolver for Farm {
+    #[private]
+    fn ft_resolve_transfer(
+        &mut self,
+        sender_id: AccountId,
+        receiver_id: AccountId,
+        amount: U128,
+    ) -> U128 {
+        let amount: Balance = amount.into();
+
+        // Get the unused amount from the `ft_on_transfer` call result.
+        let unused_amount = match env::promise_result(0) {
+            PromiseResult::NotReady => unreachable!(),
+            PromiseResult::Successful(value) => {
+                if let Ok(unused_amount) = near_sdk::serde_json::from_slice::<U128>(&value) {
+                    std::cmp::min(amount, unused_amount.0)
+                } else {
+                    amount
+                }
+            }
+            PromiseResult::Failed => amount,
+        };
+
+        if unused_amount > 0 {
+            let (receiver_account_id_hash, mut receiver_account) =
+                self.get_mut_account(&receiver_id);
+
+            let receiver_balance = receiver_account.cucumber_balance;
+            if receiver_balance > 0 {
+                let refund_amount = std::cmp::min(receiver_balance, unused_amount);
+                receiver_account.cucumber_balance -= refund_amount;
+                self.save_account(&receiver_account_id_hash, &receiver_account);
+
+                let (sender_account_id_hash, mut sender_account) = self.get_mut_account(&sender_id);
+                sender_account.cucumber_balance += refund_amount;
+                self.save_account(&sender_account_id_hash, &sender_account);
+                log!(
+                    "Refund 🥒{} from {} to {}",
+                    refund_amount,
+                    receiver_id,
+                    sender_id
+                );
+                return (amount - refund_amount).into();
+            }
+        }
+        amount.into()
+    }
+}
+
+'''
+'''--- contract-rs/berry-farm/src/ft_meta.rs ---
+use crate::*;
+use near_contract_standards::fungible_token::metadata::{
+    FungibleTokenMetadata, FungibleTokenMetadataProvider, FT_METADATA_SPEC,
+};
+
+const CUCUMBER_SVG: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' xmlns:xlink='http://www.w3.org/1999/xlink' width='256' height='256'%3E%3Cdefs%3E%3Ctext id='A' x='50' y='180' font-size='180'%3E🥒%3C/text%3E%3C/defs%3E%3Cuse xlink:href='%23A'/%3E%3C/svg%3E%0A";
+
+#[near_bindgen]
+impl FungibleTokenMetadataProvider for Farm {
+    fn ft_metadata(&self) -> FungibleTokenMetadata {
+        FungibleTokenMetadata {
+            spec: FT_METADATA_SPEC.to_string(),
+            name: String::from("Cucumber"),
+            symbol: String::from("CUCUMBER"),
+            icon: Some(String::from(CUCUMBER_SVG)),
+            reference: None,
+            reference_hash: None,
+            decimals: 18,
+        }
+    }
+}
+
+'''
+'''--- contract-rs/berry-farm/src/ft_storage.rs ---
+use crate::*;
+use near_contract_standards::storage_management::{
+    StorageBalance, StorageBalanceBounds, StorageManagement,
+};
+use std::convert::TryInto;
+use std::mem::size_of;
+
+const STORAGE_AMOUNT_BYTES: usize = size_of::<Account>() + 21 + 40;
+
+#[allow(unused_variables)]
+#[near_bindgen]
+impl StorageManagement for Farm {
+    #[payable]
+    fn storage_deposit(
+        &mut self,
+        account_id: Option<ValidAccountId>,
+        registration_only: Option<bool>,
+    ) -> StorageBalance {
+        let account_id = account_id
+            .map(|a| a.into())
+            .unwrap_or_else(env::predecessor_account_id);
+        let attached_deposit = env::attached_deposit();
+        let (account_id_hash, account) = self.get_mut_account(&account_id);
+        let refund_amount = if self.accounts.contains_key(&account_id_hash) {
+            attached_deposit
+        } else {
+            self.save_account(&account_id_hash, &account);
+            let amount = self.storage_balance_bounds().min.0;
+            assert!(attached_deposit >= amount);
+            attached_deposit - amount
+        };
+        if refund_amount > 0 {
+            Promise::new(env::predecessor_account_id()).transfer(refund_amount);
+        }
+        self.storage_balance_of(account_id.try_into().unwrap())
+            .unwrap()
+    }
+
+    fn storage_withdraw(&mut self, amount: Option<U128>) -> StorageBalance {
+        env::panic(b"Unimplemented");
+    }
+
+    fn storage_unregister(&mut self, force: Option<bool>) -> bool {
+        env::panic(b"Unimplemented");
+    }
+
+    fn storage_balance_bounds(&self) -> StorageBalanceBounds {
+        let v = STORAGE_AMOUNT_BYTES as Balance * env::storage_byte_cost();
+        StorageBalanceBounds {
+            min: v.into(),
+            max: Some(v.into()),
+        }
+    }
+
+    fn storage_balance_of(&self, account_id: ValidAccountId) -> Option<StorageBalance> {
+        if self.accounts.contains_key(&account_id.as_ref().into()) {
+            Some(StorageBalance {
+                total: self.storage_balance_bounds().min,
+                available: 0.into(),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+'''
+'''--- contract-rs/berry-farm/src/fungible_token_receiver.rs ---
+use crate::*;
+use near_contract_standards::fungible_token::receiver::FungibleTokenReceiver;
+use near_sdk::json_types::{ValidAccountId, U128};
+use near_sdk::PromiseOrValue;
+
+#[near_bindgen]
+impl FungibleTokenReceiver for Farm {
+    fn ft_on_transfer(
+        &mut self,
+        sender_id: ValidAccountId,
+        amount: U128,
+        msg: String,
+    ) -> PromiseOrValue<U128> {
+        if &env::predecessor_account_id() != &self.banana_token_account_id {
+            env::panic(b"This farm can only receive bananas through a contract API");
+        }
+        let payload: OnReceiverPayload =
+            serde_json::from_str(&msg).expect("Failed to parse the payload");
+
+        let amount: Balance = amount.into();
+
+        match payload {
+            OnReceiverPayload::DepositAndStake => {
+                let (account_id_hash, mut account) = self.get_mut_account(sender_id.as_ref());
+                account.cucumber_balance += amount;
+                self.save_account(&account_id_hash, &account);
+
+                self.total_cucumber_balance += amount;
+                PromiseOrValue::Value(0.into())
+            }
+        }
+    }
+}
+
+'''
+'''--- contract-rs/berry-farm/src/legacy_token.rs ---
+use crate::*;
+
+use near_sdk::json_types::ValidAccountId;
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{ext_contract, Balance, Gas, Promise};
+
+/// Don't need deposits for function calls.
+pub const NO_DEPOSIT: Balance = 0;
+
+/// NOTE: These fees are going to change with the update.
+/// Basic compute.
+const GAS_BASE_COMPUTE: Gas = 5_000_000_000_000;
+/// Fee for function call promise.
+const GAS_FOR_PROMISE: Gas = 5_000_000_000_000;
+/// Fee for the `.then` call.
+const GAS_FOR_DATA_DEPENDENCY: Gas = 10_000_000_000_000;
+
+/// Gas attached to the receiver for `on_receive_with_safe` call.
+/// NOTE: The minimum logic is to do some very basic compute and schedule a withdrawal from safe
+/// that it returns from the promise.
+const MIN_GAS_FOR_RECEIVER: Gas = GAS_FOR_PROMISE + GAS_BASE_COMPUTE;
+/// Gas attached to the callback to resolve safe. It only needs to do basic compute.
+/// NOTE: It doesn't account for storage refunds.
+const GAS_FOR_CALLBACK: Gas = GAS_BASE_COMPUTE;
+/// The amount of gas required to complete the execution of `transfer_with_safe`.
+/// We need to create 2 promises with a dependencies and with some basic compute to write to the
+/// state.
+/// NOTE: It doesn't account for storage refunds.
+const GAS_FOR_REMAINING_COMPUTE: Gas =
+    2 * GAS_FOR_PROMISE + GAS_FOR_DATA_DEPENDENCY + GAS_BASE_COMPUTE;
+
+pub const GAS_FOR_ACCOUNT_REGISTRATION: Gas = GAS_BASE_COMPUTE;
+
+pub const GAS_FOR_WITHDRAW_FROM_VAULT: Gas = GAS_BASE_COMPUTE;
+
+/// Safe identifier.
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Copy)]
+#[serde(crate = "near_sdk::serde")]
+pub struct VaultId(pub u64);
+
+impl VaultId {
+    pub fn next(&self) -> Self {
+        Self(self.0 + 1)
+    }
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Vault {
+    /// The `ShortAccountHash` of the receiver ID.
+    /// This information is only needed to validate safe ownership during withdrawal.
+    pub receiver_id_hash: ShortAccountHash,
+    /// The remaining amount of tokens in the safe.
+    pub balance: Balance,
+}
+
+#[ext_contract(ext_token_receiver)]
+trait ExtTokenReceiver {
+    fn on_receive_with_vault(
+        &mut self,
+        sender_id: AccountId,
+        amount: U128,
+        vault_id: VaultId,
+        payload: String,
+    );
+}
+
+#[ext_contract(ext_self)]
+trait ExtSelf {
+    fn resolve_vault(&mut self, vault_id: VaultId, sender_id: AccountId);
+}
+
+/// NEP 122
+trait VaultFungibleToken {
+    /// Simple transfers
+    /// Gas requirement: 5 TGas or 5000000000000 Gas
+    /// Should be called by the balance owner.
+    /// Requires that the sender and the receiver accounts be registered.
+    ///
+    /// Actions:
+    /// - Transfers `amount` of tokens from `predecessor_id` to `receiver_id`.
+    fn transfer_raw(&mut self, receiver_id: ValidAccountId, amount: U128);
+
+    /// Transfer to a contract with payload
+    /// Gas requirement: 40+ TGas or 40000000000000 Gas.
+    /// Consumes: 30 TGas and the remaining gas is passed to the `receiver_id` (at least 10 TGas)
+    /// Should be called by the balance owner.
+    /// Returns a promise, that will result in the unspent balance from the transfer `amount`.
+    ///
+    /// Actions:
+    /// - Withdraws `amount` from the `predecessor_id` account.
+    /// - Creates a new local safe with a new unique `safe_id` with the following content:
+    ///     `{sender_id: predecessor_id, amount: amount, receiver_id: receiver_id}`
+    /// - Saves this safe to the storage.
+    /// - Calls on `receiver_id` method `on_token_receive(sender_id: predecessor_id, amount, safe_id, payload)`/
+    /// - Attaches a self callback to this promise `resolve_safe(safe_id, sender_id)`
+    fn transfer_with_vault(
+        &mut self,
+        receiver_id: ValidAccountId,
+        amount: U128,
+        payload: String,
+    ) -> Promise;
+    fn withdraw_from_vault(&mut self, vault_id: VaultId, receiver_id: ValidAccountId, amount: U128);
+    fn resolve_vault(&mut self, vault_id: VaultId, sender_id: AccountId) -> U128;
+
+    fn get_total_supply(&self) -> U128;
+    fn get_balance(&self, account_id: ValidAccountId) -> U128;
+}
+
+#[near_bindgen]
+impl VaultFungibleToken for Farm {
+    #[payable]
+    fn transfer_raw(&mut self, receiver_id: ValidAccountId, amount: U128) {
+        assert_paid();
+        let amount = amount.into();
+        self.withdraw_from_sender(receiver_id.as_ref(), amount);
+        self.deposit_to_account(receiver_id.as_ref(), amount);
+    }
+
+    #[payable]
+    fn transfer_with_vault(
+        &mut self,
+        receiver_id: ValidAccountId,
+        amount: U128,
+        payload: String,
+    ) -> Promise {
+        assert_paid();
+        let gas_to_receiver =
+            env::prepaid_gas().saturating_sub(GAS_FOR_REMAINING_COMPUTE + GAS_FOR_CALLBACK);
+
+        if gas_to_receiver < MIN_GAS_FOR_RECEIVER {
+            env::panic(b"Not enough gas attached. Attach at least 40 TGas");
+        }
+
+        let amount = amount.into();
+        let sender_id = self.withdraw_from_sender(receiver_id.as_ref(), amount);
+
+        // Creating a new vault
+        let vault_id = self.next_vault_id;
+        self.next_vault_id = vault_id.next();
+        let vault = Vault {
+            receiver_id_hash: receiver_id.as_ref().into(),
+            balance: amount,
+        };
+        self.vaults.insert(&vault_id, &vault);
+
+        // Calling the receiver
+        ext_token_receiver::on_receive_with_vault(
+            sender_id.clone(),
+            amount.into(),
+            vault_id,
+            payload,
+            receiver_id.as_ref(),
+            NO_DEPOSIT,
+            gas_to_receiver,
+        )
+        .then(ext_self::resolve_vault(
+            vault_id,
+            sender_id,
+            &env::current_account_id(),
+            NO_DEPOSIT,
+            GAS_FOR_CALLBACK,
+        ))
+    }
+
+    fn withdraw_from_vault(
+        &mut self,
+        vault_id: VaultId,
+        receiver_id: ValidAccountId,
+        amount: U128,
+    ) {
+        let mut vault = self.vaults.get(&vault_id).expect("Vault doesn't exist");
+        let vault_receiver_id = env::predecessor_account_id();
+        if &ShortAccountHash::from(&vault_receiver_id) != &vault.receiver_id_hash {
+            env::panic(b"The vault is not owned by the predecessor");
+        }
+        let amount = amount.into();
+        if vault.balance < amount {
+            env::panic(b"Not enough balance in the vault");
+        }
+        vault.balance -= amount;
+        self.vaults.insert(&vault_id, &vault);
+
+        self.deposit_to_account(receiver_id.as_ref(), amount);
+    }
+
+    fn resolve_vault(&mut self, vault_id: VaultId, sender_id: AccountId) -> U128 {
+        if env::current_account_id() != env::predecessor_account_id() {
+            env::panic(b"This method is private");
+        }
+
+        let vault = self.vaults.remove(&vault_id).expect("Vault doesn't exist");
+
+        if vault.balance > 0 {
+            self.deposit_to_account(&sender_id, vault.balance);
+        }
+
+        vault.balance.into()
+    }
+
+    fn get_total_supply(&self) -> U128 {
+        self.total_cucumber_balance.into()
+    }
+
+    fn get_balance(&self, account_id: ValidAccountId) -> U128 {
+        self.get_internal_account(account_id.as_ref())
+            .1
+            .map(|account| account.cucumber_balance)
+            .unwrap_or(0)
+            .into()
+    }
+}
+
+impl Farm {
+    /// Withdraws `amount` from the `predecessor_id` while comparing it to the `receiver_id`.
+    /// Return `predecessor_id` and hash of the predecessor
+    pub(crate) fn withdraw_from_sender(
+        &mut self,
+        receiver_id: &AccountId,
+        amount: Balance,
+    ) -> AccountId {
+        if amount == 0 {
+            env::panic(b"Transfer amount should be positive");
+        }
+        let sender_id = env::predecessor_account_id();
+        if &sender_id == receiver_id {
+            env::panic(b"The receiver should be different from the sender");
+        }
+
+        // Retrieving the account from the state.
+        let (account_id_hash, mut account) = self.get_mut_account(&sender_id.clone());
+
+        // Checking and updating the balance
+        if account.cucumber_balance < amount {
+            env::panic(b"Not enough cucumber balance");
+        }
+        account.cucumber_balance -= amount;
+
+        // Saving the account back to the state.
+        self.save_account(&account_id_hash, &account);
+
+        sender_id
+    }
+
+    /// Deposits `amount` to the `account_id`
+    pub(crate) fn deposit_to_account(&mut self, account_id: &AccountId, amount: Balance) {
+        if amount == 0 {
+            return;
+        }
+        // Retrieving the account from the state.
+        let (account_id_hash, account) = self.get_internal_account(&account_id);
+        let mut account = account.expect("Receiver account doesn't exist");
+        self.touch(&mut account);
+
+        account.cucumber_balance += amount;
+        // Saving the account back to the state.
+        self.save_account(&account_id_hash, &account);
+    }
+}
+
+fn assert_paid() {
+    assert!(
+        env::attached_deposit() > 0,
+        "Requires a deposit of at least 1 yoctoNEAR to prevent function access key calls"
+    );
+}
+
+'''
+'''--- contract-rs/berry-farm/src/lib.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::LookupMap;
+use near_sdk::json_types::{ValidAccountId, U128};
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::serde_json;
+use near_sdk::{env, ext_contract, near_bindgen, AccountId, Balance, PanicOnDefault, Promise};
+
+mod ft_core;
+mod ft_meta;
+mod ft_storage;
+mod fungible_token_receiver;
+mod legacy_token;
+
+pub use crate::fungible_token_receiver::*;
+
+pub use crate::legacy_token::*;
+
+#[global_allocator]
+static ALLOC: near_sdk::wee_alloc::WeeAlloc<'_> = near_sdk::wee_alloc::WeeAlloc::INIT;
+
+uint::construct_uint! {
+    /// 256-bit unsigned integer.
+    pub struct U256(4);
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Account {
+    pub last_near_per_cucumber_numer: Balance,
+    pub near_balance: Balance,
+    pub cucumber_balance: Balance,
+    pub near_claimed: Balance,
+}
+
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct HumanAccount {
+    pub near_balance: U128,
+    pub cucumber_balance: U128,
+    pub near_claimed: U128,
+}
+
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct HumanStats {
+    pub total_cucumber_balance: U128,
+    pub total_near_claimed: U128,
+    pub total_near_received: U128,
+}
+
+pub const NEAR_PER_CUCUMBER_DENOM: Balance = 1_000_000_000_000_000_000;
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Farm {
+    pub accounts: LookupMap<ShortAccountHash, Account>,
+
+    pub banana_token_account_id: AccountId,
+
+    pub near_per_cucumber_numer: Balance,
+
+    pub total_cucumber_balance: Balance,
+
+    pub total_near_received: Balance,
+
+    pub total_near_claimed: Balance,
+
+    pub vaults: LookupMap<VaultId, Vault>,
+
+    pub next_vault_id: VaultId,
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Clone, PartialEq)]
+pub struct ShortAccountHash(pub [u8; 20]);
+
+impl From<&AccountId> for ShortAccountHash {
+    fn from(account_id: &AccountId) -> Self {
+        let mut buf = [0u8; 20];
+        buf.copy_from_slice(&env::sha256(account_id.as_bytes())[..20]);
+        Self(buf)
+    }
+}
+
+#[ext_contract(ext_token)]
+pub trait ExtVaultFungibleToken {
+    fn withdraw_from_vault(&mut self, vault_id: VaultId, receiver_id: AccountId, amount: U128);
+    fn register_account(&mut self, account_id: AccountId);
+    fn transfer_unsafe(&mut self, receiver_id: AccountId, amount: U128);
+}
+
+#[derive(Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub enum OnReceiverPayload {
+    DepositAndStake,
+}
+
+/// Implements a trait to receiver_id
+pub trait VaultFungibleTokenReceiver {
+    fn on_receive_with_vault(
+        &mut self,
+        sender_id: ValidAccountId,
+        amount: U128,
+        vault_id: VaultId,
+        payload: String,
+    ) -> Promise;
+}
+
+#[near_bindgen]
+impl Farm {
+    #[init]
+    pub fn new(banana_token_account_id: ValidAccountId) -> Self {
+        // Registering the account for banana token to be able to withdraw.
+        ext_token::register_account(
+            env::current_account_id(),
+            banana_token_account_id.as_ref(),
+            NO_DEPOSIT,
+            GAS_FOR_ACCOUNT_REGISTRATION,
+        );
+        Self {
+            accounts: LookupMap::new(b"a".to_vec()),
+            banana_token_account_id: banana_token_account_id.into(),
+            near_per_cucumber_numer: 0,
+            total_cucumber_balance: 0,
+            total_near_received: 0,
+            total_near_claimed: 0,
+            vaults: LookupMap::new(b"v".to_vec()),
+            next_vault_id: VaultId(0),
+        }
+    }
+
+    #[payable]
+    pub fn take_my_near(&mut self) {
+        assert!(
+            self.total_cucumber_balance >= NEAR_PER_CUCUMBER_DENOM,
+            "Not enough cucumbers"
+        );
+        let attached_deposit = env::attached_deposit();
+        let near_per_cucumber = (U256::from(attached_deposit)
+            * U256::from(NEAR_PER_CUCUMBER_DENOM)
+            / U256::from(self.total_cucumber_balance))
+        .as_u128();
+        self.near_per_cucumber_numer += near_per_cucumber;
+        self.total_near_received += attached_deposit;
+    }
+
+    pub fn register_account(&mut self) {
+        let (account_id_hash, account) = self.get_mut_account(&env::predecessor_account_id());
+        self.save_account(&account_id_hash, &account);
+    }
+
+    pub fn account_exists(&self, account_id: ValidAccountId) -> bool {
+        self.get_internal_account(account_id.as_ref()).1.is_some()
+    }
+
+    pub fn claim_near(&mut self) -> U128 {
+        let account_id = env::predecessor_account_id();
+        let (account_id_hash, mut account) = self.get_mut_account(&account_id);
+        let amount = account.near_balance;
+        account.near_balance = 0;
+        account.near_claimed += amount;
+        self.save_account(&account_id_hash, &account);
+        if amount > 0 {
+            Promise::new(account_id).transfer(amount);
+            self.total_near_claimed += amount;
+        }
+        amount.into()
+    }
+
+    pub fn get_near_balance(&self, account_id: ValidAccountId) -> U128 {
+        self.get_internal_account(account_id.as_ref())
+            .1
+            .map(|mut account| {
+                self.touch(&mut account);
+                account.near_balance
+            })
+            .unwrap_or(0)
+            .into()
+    }
+
+    pub fn get_account(&self, account_id: ValidAccountId) -> Option<HumanAccount> {
+        self.get_internal_account(account_id.as_ref())
+            .1
+            .map(|mut account| {
+                self.touch(&mut account);
+                HumanAccount {
+                    near_balance: account.near_balance.into(),
+                    cucumber_balance: account.cucumber_balance.into(),
+                    near_claimed: account.near_claimed.into(),
+                }
+            })
+    }
+
+    pub fn get_stats(&self) -> HumanStats {
+        HumanStats {
+            total_cucumber_balance: self.total_cucumber_balance.into(),
+            total_near_claimed: self.total_near_claimed.into(),
+            total_near_received: self.total_near_received.into(),
+        }
+    }
+
+    pub fn get_total_near_claimed(&self) -> U128 {
+        self.total_near_claimed.into()
+    }
+
+    pub fn get_total_near_received(&self) -> U128 {
+        self.total_near_received.into()
+    }
+}
+
+#[near_bindgen]
+impl VaultFungibleTokenReceiver for Farm {
+    fn on_receive_with_vault(
+        &mut self,
+        sender_id: ValidAccountId,
+        amount: U128,
+        vault_id: VaultId,
+        payload: String,
+    ) -> Promise {
+        if &env::predecessor_account_id() != &self.banana_token_account_id {
+            env::panic(b"This farm can only receive bananas through a contract API");
+        }
+        let payload: OnReceiverPayload =
+            serde_json::from_str(&payload).expect("Failed to parse the payload");
+
+        let amount: Balance = amount.into();
+
+        match payload {
+            OnReceiverPayload::DepositAndStake => {
+                let (account_id_hash, mut account) = self.get_mut_account(sender_id.as_ref());
+                account.cucumber_balance += amount;
+                self.save_account(&account_id_hash, &account);
+
+                self.total_cucumber_balance += amount;
+
+                ext_token::withdraw_from_vault(
+                    vault_id,
+                    env::current_account_id(),
+                    amount.into(),
+                    &self.banana_token_account_id,
+                    NO_DEPOSIT,
+                    GAS_FOR_WITHDRAW_FROM_VAULT,
+                )
+            }
+        }
+    }
+}
+
+impl Farm {
+    fn get_internal_account(&self, account_id: &AccountId) -> (ShortAccountHash, Option<Account>) {
+        let account_id_hash: ShortAccountHash = account_id.into();
+        let account = self.accounts.get(&account_id_hash);
+        (account_id_hash, account)
+    }
+
+    /// Redeeming rewards and updating inner pool balances.
+    fn touch(&self, account: &mut Account) {
+        let near_per_cucumber_diff =
+            self.near_per_cucumber_numer - account.last_near_per_cucumber_numer;
+        let earned_balance = (U256::from(near_per_cucumber_diff)
+            * U256::from(account.cucumber_balance)
+            / U256::from(NEAR_PER_CUCUMBER_DENOM))
+        .as_u128();
+        account.near_balance += earned_balance;
+        account.last_near_per_cucumber_numer = self.near_per_cucumber_numer;
+    }
+
+    fn get_mut_account(&mut self, account_id: &AccountId) -> (ShortAccountHash, Account) {
+        let (account_id_hash, account) = self.get_internal_account(&account_id);
+        let mut account = account.unwrap_or_else(|| Account {
+            last_near_per_cucumber_numer: self.near_per_cucumber_numer,
+            near_balance: 0,
+            cucumber_balance: 0,
+            near_claimed: 0,
+        });
+        self.touch(&mut account);
+        (account_id_hash, account)
+    }
+
+    fn save_account(&mut self, account_id_hash: &ShortAccountHash, account: &Account) {
+        self.accounts.insert(account_id_hash, account);
+    }
+}
+
+'''
+'''--- frontend/package.json ---
+{
+  "name": "frontend",
+  "version": "0.2.0",
+  "homepage": "https://farm.berryclub.io",
+  "private": true,
+  "dependencies": {
+    "@testing-library/jest-dom": "^4.2.4",
+    "@testing-library/react": "^9.3.2",
+    "@testing-library/user-event": "^7.1.2",
+    "bn.js": "^5.1.1",
+    "near-api-js": "^0.32.0",
+    "node-sass": "^4.0.0",
+    "react": "^16.13.1",
+    "react-compound-timer": "^1.2.0",
+    "react-dom": "^16.13.1",
+    "react-input-number": "^5.0.19",
+    "react-scripts": "3.4.0"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test",
+    "eject": "react-scripts eject",
+    "deploy": "yarn build && gh-pages -d build"
+  },
+  "eslintConfig": {
+    "extends": "react-app"
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  },
+  "devDependencies": {
+    "gh-pages": "^2.2.0"
+  }
+}
+
+'''
+'''--- frontend/public/index.html ---
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="%PUBLIC_URL%/favicon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#000000" />
+    <meta
+      name="description"
+      content="Berry Farm - stake 🍌 - get 🥒 - farm Ⓝ"
+    />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta property="og:image" content="https://farm.berryclub.io/berry_cycle.jpg"/>
+    <meta property="og:url" content="https://farm.berryclub.io/" />
+    <meta property="og:title" content="Berry Farm" />
+    <meta property="og:description" content="Berry Farm - stake 🍌 - get 🥒 - farm Ⓝ" />
+    <link rel="apple-touch-icon" href="%PUBLIC_URL%/favicon.png" />
+    <!--
+      manifest.json provides metadata used when your web app is installed on a
+      user's mobile device or desktop. See https://developers.google.com/web/fundamentals/web-app-manifest/
+    -->
+    <link rel="manifest" href="%PUBLIC_URL%/manifest.json" />
+    <!--
+      Notice the use of %PUBLIC_URL% in the tags above.
+      It will be replaced with the URL of the `public` folder during the build.
+      Only files inside the `public` folder can be referenced from the HTML.
+
+      Unlike "/favicon.ico" or "favicon.ico", "%PUBLIC_URL%/favicon.ico" will
+      work correctly both with client-side routing and a non-root public URL.
+      Learn how to configure a non-root public URL by running `npm run build`.
+    -->
+    <title>Berry Farm</title>
+  </head>
+  <body>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="root"></div>
+    <!--
+      This HTML file is a template.
+      If you open it directly in the browser, you will see an empty page.
+
+      You can add webfonts, meta tags, or analytics to this file.
+      The build step will place the bundled scripts into the <body> tag.
+
+      To begin the development, run `npm start` or `yarn start`.
+      To create a production bundle, use `npm run build` or `yarn build`.
+    -->
+  </body>
+</html>
+
+'''
+'''--- frontend/public/manifest.json ---
+{
+  "short_name": "Berry Farm",
+  "name": "Berry Farm - stake \uD83C\uDF4C - get \uD83E\uDD52 - farm Ⓝ",
+  "icons": [
+    {
+      "src": "favicon.png",
+      "sizes": "256x256",
+      "type": "image/png"
+    }
+  ],
+  "start_url": ".",
+  "display": "standalone",
+  "theme_color": "#000000",
+  "background_color": "#ffffff"
+}
+
+'''
+'''--- frontend/public/robots.txt ---
+# https://www.robotstxt.org/robotstxt.html
+User-agent: *
+Disallow:
+
+'''
+'''--- frontend/src/App.js ---
+import "./App.scss";
+import React from 'react';
+import BN from 'bn.js';
+import * as nearAPI from 'near-api-js'
+import InputNumber from 'react-input-number';
+import Timer from 'react-compound-timer';
+
+const IsMainnet = true;
+const TestNearConfig = {
+  networkId: 'testnet',
+  nodeUrl: 'https://rpc.testnet.near.org',
+  bananaContractName: 'berryclub.testnet',
+  contractName: 'farm.berryclub.testnet',
+  walletUrl: 'https://wallet.testnet.near.org',
+};
+const MainNearConfig = {
+  networkId: 'mainnet',
+  nodeUrl: 'https://rpc.mainnet.near.org',
+  bananaContractName: 'berryclub.ek.near',
+  contractName: 'farm.berryclub.ek.near',
+  walletUrl: 'https://wallet.near.org',
+};
+const NearConfig = IsMainnet ? MainNearConfig : TestNearConfig;
+
+const Avocado = <span role="img" aria-label="avocado" className="berry">🥑</span>;
+const Banana = <span role="img" aria-label="banana" className="berry">🍌</span>;
+const Cucumber = <span role="img" aria-label="cucumber" className="berry">🥒</span>;
+const Near = <span role="img" aria-label="near" className="berry">Ⓝ</span>;
+
+const Berry = {
+  Avocado: 'Avocado',
+  Banana: 'Banana',
+};
+
+class App extends React.Component {
+  constructor(props) {
+    super(props);
+
+    this.state = {
+      connected: false,
+      signedIn: false,
+      accountId: null,
+      account: null,
+      claiming: false,
+      bananaNum: 1,
+    };
+    this._balanceRefreshTimer = null;
+
+    this._initNear().then(() => {
+      this.setState({
+        connected: true,
+        signedIn: !!this._accountId,
+        accountId: this._accountId,
+      });
+    });
+  }
+
+  componentDidMount() {
+
+  }
+
+  parseBananaAccount(account, accountId) {
+    if (!account) {
+      account = {
+        accountId,
+        accountIndex: -1,
+        avocadoBalance: 25.0,
+        bananaBalance: 0.0,
+        bananaBalanceBN: new BN(0),
+        numPixels: 0,
+        farmingPreference: Berry.Avocado,
+      }
+    } else {
+      account = {
+        accountId: account.account_id,
+        accountIndex: account.account_index,
+        avocadoBalance: parseFloat(account.avocado_balance) / this._pixelCost,
+        bananaBalance: parseFloat(account.banana_balance) / this._pixelCost,
+        bananaBalanceBN: new BN(account.banana_balance),
+        numPixels: account.num_pixels,
+        farmingPreference: account.farming_preference,
+      }
+    }
+    account.startTime = new Date().getTime();
+    account.avocadoPixels = (account.farmingPreference === Berry.Avocado) ? (account.numPixels + 1) : 0;
+    account.bananaPixels = (account.farmingPreference === Berry.Banana) ? (account.numPixels) : 0;
+    account.avocadoRewardPerMs = account.avocadoPixels / (24 * 60 * 60 * 1000);
+    account.bananaRewardPerMs = account.bananaPixels / (24 * 60 * 60 * 1000);
+    account.bananaRewardPerMsBN = account.bananaBalanceBN.div(new BN(24 * 60 * 60 * 1000));
+    return account;
+  }
+
+  async getAccount(accountId, stats) {
+    const account = this.parseBananaAccount(
+      await this._bananaContract.get_account({account_id: accountId}),
+      accountId
+    );
+    let cucumberAccount = await this._contract.get_account({account_id: accountId});
+    if (!cucumberAccount) {
+      Object.assign(account, {
+        nearBalanceBn: new BN(0),
+        cucumberBalanceBn: new BN(0),
+        nearClaimed: 0,
+      });
+    } else {
+      Object.assign(account, {
+        nearBalanceBn: new BN(cucumberAccount.near_balance),
+        cucumberBalanceBn: new BN(cucumberAccount.cucumber_balance),
+        nearClaimed: parseFloat(cucumberAccount.near_claimed) / Math.pow(10, 24),
+      });
+    }
+    await this._account.fetchState();
+    account.accountNearBalance = parseFloat(this._account._state.amount) / 1e24;
+    account.nearBalance = parseFloat(account.nearBalanceBn.toString()) / Math.pow(10, 24);
+    account.cucumberBalance = parseFloat(account.cucumberBalanceBn.toString()) / this._pixelCost;
+    account.percent = account.cucumberBalance * 100 / stats.totalSupply;
+    return account;
+  }
+
+  async refreshStats(forced) {
+    if (!forced && document.hidden) {
+      return;
+    }
+
+    let currentTime = new Date().getTime();
+    const nextReward = parseFloat(await this._bananaContract.get_next_reward_timestamp()) / 1e6;
+    const lastReward = parseFloat(await this._bananaContract.get_last_reward_timestamp()) / 1e6;
+    const expectedReward = parseFloat(await this._bananaContract.get_expected_reward()) / 1e24;
+    const rawStats = await this._contract.get_stats();
+    const stats = {
+      totalSupplyBn: new BN(rawStats.total_cucumber_balance),
+      totalSupply: parseFloat(rawStats.total_cucumber_balance) / this._pixelCost,
+      totalNearClaimed: parseFloat(rawStats.total_near_claimed) / Math.pow(10, 24),
+      totalNearRewarded: parseFloat(rawStats.total_near_received) / Math.pow(10, 24),
+      timeToNextRewards: nextReward - currentTime,
+      timeFromLastRewards: currentTime - lastReward,
+      expectedReward,
+    };
+    this.setState({
+      stats,
+    })
+  }
+
+  async refreshAccountStats() {
+    await this.refreshStats(true);
+    let account = await this.getAccount(this._accountId, this.state.stats);
+
+    if (this._balanceRefreshTimer) {
+      clearInterval(this._balanceRefreshTimer);
+      this._balanceRefreshTimer = null;
+    }
+
+    this.setState({
+      account,
+    });
+
+    this._balanceRefreshTimer = setInterval(() => {
+      const t = new Date().getTime() - account.startTime;
+      this.setState({
+        account: Object.assign({}, account, {
+          avocadoBalance: account.avocadoBalance + t * account.avocadoRewardPerMs,
+          bananaBalance: account.bananaBalance + t * account.bananaRewardPerMs,
+        }),
+      });
+    }, 100);
+  }
+
+  async _initNear() {
+    const keyStore = new nearAPI.keyStores.BrowserLocalStorageKeyStore();
+    const near = await nearAPI.connect(Object.assign({ deps: { keyStore } }, NearConfig));
+    this._keyStore = keyStore;
+    this._near = near;
+
+    this._walletConnection = new nearAPI.WalletConnection(near, NearConfig.contractName);
+    this._accountId = this._walletConnection.getAccountId();
+
+    this._account = this._walletConnection.account();
+    this._bananaContract = new nearAPI.Contract(this._account, NearConfig.bananaContractName, {
+      viewMethods: ['get_account', 'get_expected_reward', 'get_next_reward_timestamp', 'get_last_reward_timestamp', 'get_account_by_index', 'get_lines', 'get_line_versions', 'get_pixel_cost', 'get_account_balance', 'get_account_num_pixels', 'get_account_id_by_index'],
+      changeMethods: ['transfer_with_vault', 'ft_transfer_call'],
+    });
+    this._contract = new nearAPI.Contract(this._account, NearConfig.contractName, {
+      viewMethods: ['account_exists', 'get_account', 'get_stats', 'get_near_balance', 'get_total_near_claimed', 'get_total_near_received', 'get_balance', 'get_total_supply'],
+      changeMethods: ['claim_near', 'transfer_raw'],
+    });
+    this._pixelCostBN = new BN(await this._bananaContract.get_pixel_cost());
+    this._pixelCost = parseFloat(this._pixelCostBN.toString());
+    await this.refresh();
+  }
+
+  async requestSignIn() {
+    const appTitle = 'Berry Farm';
+    await this._walletConnection.requestSignIn(
+        NearConfig.contractName,
+        appTitle
+    )
+  }
+
+  async logOut() {
+    this._walletConnection.signOut();
+    this._accountId = null;
+    this.setState({
+      signedIn: !!this._accountId,
+      accountId: this._accountId,
+    })
+  }
+
+  async stakeBananas(bananas) {
+    await this.refreshAccountStats();
+    if (bananas) {
+      bananas = new BN(Math.trunc(bananas * 100000)).mul(this._pixelCostBN).div(new BN(100000));
+    } else {
+      bananas = this.state.account.bananaBalanceBN;
+    }
+    await this._bananaContract.ft_transfer_call({
+      receiver_id: NearConfig.contractName,
+      amount: bananas.toString(),
+      memo: `Swapping ${bananas.toString()} 🍌 to get ${bananas.toString()} 🥒`,
+      msg: '"DepositAndStake"',
+    }, new BN("50000000000000"), new BN("1"))
+  }
+
+  async claimNear() {
+    this.setState({
+      claiming: true
+    });
+    await this._contract.claim_near();
+    await this.refreshAccountStats();
+    this.setState({
+      claiming: false
+    });
+  }
+
+  async refresh() {
+    if (this._accountId) {
+      await this.refreshAccountStats();
+    } else {
+      await this.refreshStats(true);
+    }
+  }
+
+  render() {
+    const account = this.state.account;
+    const fraction = 3;
+    const content = !this.state.connected ? (
+        <div>Connecting... <span className="spinner-grow spinner-grow-sm" role="status" aria-hidden="true"></span></div>
+    ) : (this.state.signedIn ? (
+        <div>
+          <div className="float-right">
+            <button
+              className="btn btn-outline-secondary"
+              onClick={() => this.logOut()}>Log out ({this.state.accountId})</button>
+          </div>
+          <div>
+            { account ? (
+              <div className="lines">
+                <div>
+                  <h3>Your Balances</h3>
+                  <button
+                    className="btn"
+                    onClick={() => this.refreshAccountStats()}
+                  >
+                    Refresh
+                  </button>
+                </div>
+                <div className="balances">
+                  {Avocado}{' '}{account.avocadoBalance.toFixed(fraction)}
+                  {(account.avocadoPixels > 0) ? (
+                    <span>
+                      {' (+'}{account.avocadoPixels}{Avocado}{'/day)'}
+                    </span>
+                  ) : ""}
+                </div>
+                <div className="balances">
+                  {Banana}{' '}{account.bananaBalance.toFixed(fraction)}
+                  {(account.bananaPixels > 0) ? (
+                    <span>
+                      {' (+'}{account.bananaPixels}{Banana}{'/day)'}
+                    </span>
+                  ) : ""}
+                </div>
+                <div>
+                  <div>
+                    <span className="balances label-for-swap">{Banana}</span>
+                    <InputNumber
+                      className="balances swap-input"
+                      min={0.001}
+                      max={this.state.account.bananaBalance}
+                      value={this.state.bananaNum}
+                      onChange={(bananaNum) => this.setState({bananaNum})}
+                      enableMobileNumericKeyboard
+                    />
+                    <button
+                      className={"btn-max balances"}
+                      disabled={account.bananaBalance === 0}
+                      onClick={() => this.setState({bananaNum: ''})}
+                    >
+                      MAX
+                    </button>
+
+                  <Swap
+                    account={this.state.account}
+                    stakeBananas={(b) => this.stakeBananas(b)}
+                    amount={this.state.bananaNum}
+                  />
+                  </div>
+                </div>
+                <div className="balances">
+                  {Cucumber}{' '}{account.cucumberBalance.toFixed(fraction)}{' ('}{account.percent.toFixed(fraction)}{'% share)'}
+                </div>
+                <div className="balances">
+                  {Near}{' '}{account.accountNearBalance.toFixed(fraction)}
+                </div>
+                <div>
+                  <button
+                    className={"btn btn-success" + ((account.nearBalance > 0) ? " btn-large" : " hidden")}
+                    disabled={this.state.claiming}
+                    onClick={() => this.claimNear()}
+                  >
+                    Claim {account.nearBalance.toFixed(fraction)} {Near}
+                  </button>
+                </div>
+              </div>
+            ) : ""}
+            </div>
+        </div>
+    ) : (
+        <div style={{marginBottom: "10px"}}>
+          <button
+              className="btn btn-primary"
+              onClick={() => this.requestSignIn()}>Log in with NEAR Wallet</button>
+        </div>
+    ));
+    const stats = this.state.stats;
+    const statsContent = stats ? (
+        <div>
+          <div>
+            <h3>Rewards</h3>
+            <button
+              className="btn"
+              onClick={() => this.refresh()}
+            >
+              Refresh
+            </button>
+          </div>
+          <div className="lines">
+            <div>
+              Berry Club distributes rewards at most once per minute
+            </div>
+            {account ? (
+              <div>
+                <div>
+                  <span className="label">Your next reward {Near}</span>
+                  <span className="balances">{(stats.expectedReward * account.percent / 100).toFixed(6)}</span>
+                </div>
+                <div>
+                  <span className="label">Total earned {Near}</span>
+                  <span className="balances">
+                    {(account.nearClaimed + account.nearBalance).toFixed(6)}
+                  </span>
+                </div>
+              </div>
+              ): ""}
+            <div>
+              <span className="label">{(stats.timeToNextRewards > 0) ? "Time until next reward" : "Time from last reward"}</span>
+              <span className={"balances" + ((stats.timeToNextRewards < 0) ? " red" : "")}>
+                <Timer
+                  key={stats.timeToNextRewards}
+                  initialTime={(stats.timeToNextRewards > 0) ? stats.timeToNextRewards : stats.timeFromLastRewards}
+                  direction={(stats.timeToNextRewards > 0) ? "backward" : "forward"}
+                  timeToUpdate={100}
+                  lastUnit="h"
+                  checkpoints={[
+                    {
+                      time: 0,
+                      callback: () => this.refreshStats(),
+                    },
+                  ]}
+                >
+                  {() => (
+                    <React.Fragment>
+                      <Timer.Hours />:
+                      <Timer.Minutes formatValue={v => `${v}`.padStart(2, '0')}/>:
+                      <Timer.Seconds formatValue={v => `${v}`.padStart(2, '0')} />.
+                      <Timer.Milliseconds formatValue={v => `${v}`.padStart(3, '0')} />
+                    </React.Fragment>
+                  )}
+                </Timer>
+              </span>
+            </div>
+            {(stats.timeToNextRewards < 0) ? (
+              <div className="larger font-weight-bold">
+                Use {Avocado} to draw a pixel on berry club to distribute {Near} rewards.
+              </div>
+            ) : ""}
+          </div>
+          <div>
+            <h3>Global stats</h3>
+            <button
+              className="btn"
+              onClick={() => this.refresh()}
+            >
+              Refresh
+            </button>
+          </div>
+          <div className="lines">
+            <div>
+              <span className="label">Next reward {Near}</span>
+              <span className="balances">{stats.expectedReward.toFixed(6)}</span>
+            </div>
+            <div>
+              <span className="label">Total {Cucumber} Supplied</span>
+              <span className="balances">{stats.totalSupply.toFixed(3)}</span>
+            </div>
+            <div>
+              <span className="label">Total {Near} Rewarded</span>
+              <span className="balances">{stats.totalNearRewarded.toFixed(6)}</span>
+            </div>
+            <div>
+              <span className="label">Total {Near} Claimed</span>
+              <span className="balances">{stats.totalNearClaimed.toFixed(6)}</span>
+            </div>
+
+          </div>
+        </div>
+      ) : "";
+    return (
+        <div className="container">
+          <div className="row">
+            <div>
+              <div>
+              <h2>Berry Farm {Cucumber}</h2>
+              <a
+                className="btn btn-outline-none"
+                href="https://berryclub.io">{Avocado} Berry Club {Banana}
+              </a>
+              <a
+                className="btn btn-outline-none"
+                href="https://app.ref.finance/#wrap.near|farm.berryclub.ek.near">REF Finance {Cucumber}
+              </a>
+              </div>
+              <div className="call-to-action">
+                Swap {Banana} to stake {Cucumber} to farm {Near}
+              </div>
+              {content}
+              {statsContent}
+              <div>
+              </div>
+            </div>
+          </div>
+        </div>
+    );
+  }
+}
+
+const Swap = (props) => {
+  return (
+    <button
+      className={"btn btn-large" + (props.amount === 0 ? " btn-success" : "")}
+      disabled={props.account.bananaBalance < props.amount}
+      onClick={() => props.stakeBananas(props.amount)}
+    >
+      Swap <span className="font-weight-bold">{props.amount || "ALL"}{Banana}</span> to <span className="font-weight-bold">{Cucumber}</span>
+    </button>
+  );
+}
+
+/*
+const Account = (props) => {
+  const accountId = props.accountId;
+  const shortAccountId = (accountId.length > 6 + 6 + 3) ?
+    (accountId.slice(0, 6) + '...' + accountId.slice(-6)) :
+    accountId;
+  return <a className="account"
+            href={`https://wayback.berryclub.io/${accountId}`}>{shortAccountId}</a>
+}
+*/
+export default App;
+
+'''
+'''--- frontend/src/index.css ---
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+code {
+  font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
+    monospace;
+}
+
+'''
+'''--- frontend/src/index.js ---
+import React from 'react';
+import ReactDOM from 'react-dom';
+import './index.css';
+import App from './App';
+
+ReactDOM.render(<App />, document.getElementById('root'));
+
+'''

@@ -1,0 +1,2094 @@
+*GitHub Repository "NearPass/near-nft-js-example"*
+
+'''--- .github/workflows/tests.yml ---
+name: Tests
+on: push
+jobs:
+  workflows:
+    strategy:
+      matrix:
+        platform: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-node@v2
+        with:
+          node-version: "16"
+      - name: Install modules
+        run: yarn
+      - name: Build contract
+        run: yarn build
+      - name: Run tests
+        run: yarn test
+
+'''
+'''--- README.md ---
+This was practice!
+
+'''
+'''--- __tests__/test-template.ava.js ---
+import { Worker } from 'near-workspaces';
+import test from 'ava';
+
+test.beforeEach(async t => {
+    // Init the worker and start a Sandbox server
+    const worker = await Worker.init();
+
+    // Prepare sandbox for tests, create accounts, deploy contracts, etc.
+    const root = worker.rootAccount;
+
+    // Deploy the counter contract.
+    const counter = await root.createAndDeploy(
+        root.getSubAccount('counter').accountId,
+        './build/contract.wasm'
+    );
+
+    // Init the contract
+    await counter.call(counter, 'init', {});
+
+    // Test users
+    const ali = await root.createSubAccount('ali');
+    const bob = await root.createSubAccount('bob');
+
+    // Save state for test runs
+    t.context.worker = worker;
+    t.context.accounts = { root, counter, ali, bob };
+});
+
+// If the environment is reused, use test.after to replace test.afterEach
+test.afterEach(async t => {
+    await t.context.worker.tearDown().catch(error => {
+        console.log('Failed to tear down the worker:', error);
+    });
+});
+
+test('Initial count is 0', async t => {
+    const { counter } = t.context.accounts;
+    const result = await counter.view('getCount', {});
+    t.is(result, 0);
+});
+
+test('Increase works', async t => {
+    const { counter, ali, bob } = t.context.accounts;
+    await ali.call(counter, 'increase', {});
+
+    let result = await counter.view('getCount', {});
+    t.is(result, 1);
+
+    await bob.call(counter, 'increase', { n: 4 });
+    result = await counter.view('getCount', {});
+    t.is(result, 5);
+});
+
+test('Decrease works', async t => {
+    const { counter, ali, bob } = t.context.accounts;
+    await ali.call(counter, 'decrease', {});
+
+    let result = await counter.view('getCount', {});
+    t.is(result, -1);
+
+    await bob.call(counter, 'decrease', { n: 4 });
+    result = await counter.view('getCount', {});
+    t.is(result, -5);
+});
+'''
+'''--- babel.config.json ---
+{
+  "plugins": [
+    "near-sdk-js/lib/build-tools/near-bindgen-exporter",
+    ["@babel/plugin-proposal-decorators", {"version": "legacy"}]
+  ],
+  "presets": ["@babel/preset-typescript"]
+}
+'''
+'''--- commands.txt ---
+near dev-deploy build/contract.wasm -f && source ./neardev/dev-account.env && near call $CONTRACT_NAME init '{"owner_id": "'$CONTRACT_NAME'"}' --accountId $CONTRACT_NAME && near call $CONTRACT_NAME nft_mint '{"token_id": "token-1", "metadata": {"title": "My Non Fungible Team Token", "description": "The Team Most Certainly Goes :)", "media": "https://bafybeiftczwrtyr3k7a2k4vutd3amkwsmaqyhrdzlhvpt33dyjivufqusq.ipfs.dweb.link/goteam-gif.gif"}, "receiver_id": "'$CONTRACT_NAME'"}' --accountId $CONTRACT_NAME --amount 0.1 
+
+near call $CONTRACT_NAME nft_transfer '{"receiver_id": "benji.fayyr.testnet", "token_id": "token-1"}' --accountId $CONTRACT_NAME --depositYocto 1
+'''
+'''--- jsconfig.json ---
+{
+    "compilerOptions": {
+        "experimentalDecorators": true,
+    },
+    "exclude": [
+        "node_modules"
+    ],
+}
+'''
+'''--- neardev/dev-account.env ---
+CONTRACT_NAME=dev-1659724732366-66506674516641
+'''
+'''--- package.json ---
+{
+  "name": "template",
+  "version": "1.0.0",
+  "description": "Contract template with near-sdk-js",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "build": "yarn build:nft && yarn build:market",
+    "build:nft": "near-sdk-js build src/nft-contract/index.ts build/nft.wasm",
+    "build:market": "near-sdk-js build src/market-contract/index.ts build/market.wasm",
+    "test": "ava"
+  },
+  "author": "Near Inc <hello@nearprotocol.com>",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "near-sdk-js": "0.4.0-5",
+    "lodash-es": "^4.17.21"
+  },
+  "devDependencies": {
+    "typescript": "^4.7.4"
+  }
+}
+
+'''
+'''--- src/market-contract/index.ts ---
+import { NearContract, NearBindgen, near, call, view, LookupMap, UnorderedMap, Vector, UnorderedSet, assert } from 'near-sdk-js'
+import { assertOneYocto, restoreOwners } from './internal';
+import { internalNftOnApprove } from './nft_callbacks';
+import { internalOffer, internalRemoveSale, internalResolvePurchase, internalUpdatePrice, Sale } from './sale';
+import { internalGetSale, internalSalesByNftContractId, internalSalesByOwnerId, internalSupplyByNftContractId, internalSupplyByOwnerId, internalSupplySales } from './sale_views';
+
+/// This spec can be treated like a version of the standard.
+export const NFT_METADATA_SPEC = "nft-1.0.0";
+
+/// This is the name of the NFT standard we're using
+export const NFT_STANDARD_NAME = "nep171";
+
+//the minimum storage to have a sale on the contract.
+export const STORAGE_PER_SALE: bigint = BigInt(1000) * near.storageByteCost().valueOf();
+
+//every sale will have a unique ID which is `CONTRACT + DELIMITER + TOKEN_ID`
+export const DELIMETER = ".";
+
+@NearBindgen
+export class Contract extends NearContract {
+    //keep track of the owner of the contract
+    ownerId: string;
+    
+    /*
+        to keep track of the sales, we map the ContractAndTokenId to a Sale. 
+        the ContractAndTokenId is the unique identifier for every sale. It is made
+        up of the `contract ID + DELIMITER + token ID`
+    */
+    sales: UnorderedMap;
+    
+    //keep track of all the Sale IDs for every account ID
+    byOwnerId: LookupMap;
+
+    //keep track of all the token IDs for sale for a given contract
+    byNftContractId: LookupMap;
+
+    //keep track of the storage that accounts have payed
+    storageDeposits: LookupMap;
+
+    /*
+        initialization function (can only be called once).
+        this initializes the contract with metadata that was passed in and
+        the owner_id. 
+    */
+    constructor({ owner_id }: { owner_id: string }) {
+        super()
+        this.ownerId = owner_id;
+        this.sales = new UnorderedMap("sales");
+        this.byOwnerId = new LookupMap("byOwnerId");
+        this.byNftContractId = new LookupMap("byNftContractId");
+        this.storageDeposits = new LookupMap("storageDeposits");
+    }
+
+    default() {
+        return new Contract({owner_id: ''})
+    }
+
+    /*
+        STORAGE
+    */
+    @call
+    //Allows users to deposit storage. This is to cover the cost of storing sale objects on the contract
+    //Optional account ID is to users can pay for storage for other people.
+    storage_deposit({ account_id }: { account_id?: string }) {
+        //get the account ID to pay for storage for
+        let storageAccountId = account_id || near.predecessorAccountId();
+
+        //get the deposit value which is how much the user wants to add to their storage
+        let deposit = near.attachedDeposit().valueOf();
+
+        //make sure the deposit is greater than or equal to the minimum storage for a sale
+        assert(deposit >= STORAGE_PER_SALE, `Requires minimum deposit of ${STORAGE_PER_SALE}`);
+
+        //get the balance of the account (if the account isn't in the map we default to a balance of 0)
+        let balance: string = this.storageDeposits.get(storageAccountId) as string || "0";
+        //add the deposit to their balance
+        let newBalance = BigInt(balance) + deposit;
+        //insert the balance back into the map for that account ID
+        this.storageDeposits.set(storageAccountId, newBalance.toString());
+    }
+
+    @call
+    //Allows users to withdraw any excess storage that they're not using. Say Bob pays 0.01N for 1 sale
+    //Alice then buys Bob's token. This means bob has paid 0.01N for a sale that's no longer on the marketplace
+    //Bob could then withdraw this 0.01N back into his account. 
+    storage_withdraw() {
+        //make sure the user attaches exactly 1 yoctoNEAR for security purposes.
+        //this will redirect them to the NEAR wallet (or requires a full access key). 
+        assertOneYocto();
+
+        //the account to withdraw storage to is always the function caller
+        let ownerId = near.predecessorAccountId();
+        //get the amount that the user has by removing them from the map. If they're not in the map, default to 0
+        let amount: string = this.storageDeposits.remove(ownerId) as string || "0";
+        
+        //how many sales is that user taking up currently. This returns a set
+        let sales = restoreOwners(this.byOwnerId.get(ownerId));
+        //get the length of that set. 
+        let len = 0;
+        if (sales != null) {
+            len = sales.len();
+        }   
+        
+        //how much NEAR is being used up for all the current sales on the account 
+        let diff = BigInt(len) * STORAGE_PER_SALE;
+        //the excess to withdraw is the total storage paid - storage being used up.
+        let amountLeft = BigInt(amount) - diff;
+
+        //if that excess to withdraw is > 0, we transfer the amount to the user.
+        if (amountLeft > 0) {
+            const promise = near.promiseBatchCreate(ownerId);
+            near.promiseBatchActionTransfer(promise, amountLeft)
+        }
+
+        //we need to add back the storage being used up into the map if it's greater than 0.
+        //this is so that if the user had 500 sales on the market, we insert that value here so
+        //if those sales get taken down, the user can then go and withdraw 500 sales worth of storage.
+        if (diff > 0) {
+            this.storageDeposits.set(ownerId, diff.toString());
+        }
+    }
+
+    @view
+    //return the minimum storage for 1 sale
+    storage_minimum_balance(): string {
+        return STORAGE_PER_SALE.toString()
+    }
+
+    @view
+    //return how much storage an account has paid for
+    storage_balance_of({ account_id }: { account_id: string}): string {
+        return this.storageDeposits.get(account_id) as string || "0";
+    }
+
+    /*
+        SALES
+    */
+    @call
+    //removes a sale from the market. 
+    remove_sale({nft_contract_id, token_id}:{nft_contract_id: string, token_id: string}) {
+        return internalRemoveSale({contract: this, nftContractId: nft_contract_id, tokenId: token_id});
+    }
+
+    @call
+    //updates the price for a sale on the market
+    update_price({nft_contract_id, token_id, price}:{nft_contract_id: string, token_id: string, price: string}) {
+        return internalUpdatePrice({contract: this, nftContractId: nft_contract_id, tokenId: token_id, price: price});
+    }
+
+    @call
+    //place an offer on a specific sale. The sale will go through as long as your deposit is greater than or equal to the list price
+    offer({nft_contract_id, token_id}:{nft_contract_id: string, token_id: string}) {
+        return internalOffer({contract: this, nftContractId: nft_contract_id, tokenId: token_id});
+    }
+
+    @call
+    //place an offer on a specific sale. The sale will go through as long as your deposit is greater than or equal to the list price
+    resolve_purchase({buyer_id, price}:{buyer_id: string, price: string}) {
+        return internalResolvePurchase({buyerId: buyer_id, price: price});
+    }
+
+    /*
+        SALE VIEWS
+    */
+    @view
+    //returns the number of sales the marketplace has up (as a string)
+    get_supply_sales(): string {
+        return internalSupplySales({contract: this});
+    }
+
+    @view
+    //returns the number of sales for a given account (result is a string)
+    get_supply_by_owner_id({account_id}:{account_id: string}): string {
+        return internalSupplyByOwnerId({contract: this, accountId: account_id});
+    }
+
+    @view
+    //returns paginated sale objects for a given account. (result is a vector of sales)
+    get_sales_by_owner_id({account_id, from_index, limit}:{account_id: string, from_index?: string, limit?: number}): Sale[] {
+        return internalSalesByOwnerId({contract: this, accountId: account_id, fromIndex: from_index, limit: limit});
+    }
+
+    @view
+    //returns paginated sale objects for a given account. (result is a vector of sales)
+    get_supply_by_nft_contract_id({nft_contract_id}:{nft_contract_id: string}): string {
+        return internalSupplyByNftContractId({contract: this, nftContractId: nft_contract_id});        
+    }
+
+    @view
+    //returns paginated sale objects associated with a given nft contract. (result is a vector of sales)
+    get_sales_by_nft_contract_id({nft_contract_id, from_index, limit}:{nft_contract_id: string, from_index?: string, limit?: number}): Sale[] {
+        return internalSalesByNftContractId({contract: this, accountId: nft_contract_id, fromIndex: from_index, limit: limit});
+    }
+
+    @view
+    //get a sale information for a given unique sale ID (contract + DELIMITER + token ID)
+    get_sale({nft_contract_token}:{nft_contract_token: string}): Sale {
+        return internalGetSale({contract: this, nftContractToken: nft_contract_token});
+    }
+
+    /*
+        APPROVALS
+    */
+    @call
+        /// where we add the sale because we know nft owner can only call nft_approve
+        nft_on_approve({token_id, owner_id, approval_id, msg}:{token_id: string, owner_id: string, approval_id: number, msg: string}) {
+        return internalNftOnApprove({contract: this, tokenId: token_id, ownerId: owner_id, approvalId: approval_id, msg: msg});
+    }  
+
+}
+'''
+'''--- src/market-contract/internal.ts ---
+import { assert, near, UnorderedSet } from "near-sdk-js";
+import { Contract, DELIMETER } from ".";
+import { Sale } from "./sale";
+
+export function restoreOwners(collection) {
+    if (collection == null) {
+        return null;
+    }
+    return UnorderedSet.deserialize(collection as UnorderedSet);
+}
+
+//used to make sure the user attached exactly 1 yoctoNEAR
+export function assertOneYocto() {
+    assert(near.attachedDeposit().toString() === "1", "Requires attached deposit of exactly 1 yoctoNEAR");
+}
+
+//internal method for removing a sale from the market. This returns the previously removed sale object
+export function internallyRemoveSale(contract: Contract, nftContractId: string, tokenId: string): Sale {
+    //get the unique sale ID (contract + DELIMITER + token ID)
+    let contractAndTokenId = `${nftContractId}${DELIMETER}${tokenId}`;
+    //get the sale object by removing the unique sale ID. If there was no sale, panic
+    let sale = contract.sales.remove(contractAndTokenId) as Sale;
+    if (sale == null) {
+        near.panic("no sale");
+    }
+    
+    //get the set of sales for the sale's owner. If there's no sale, panic. 
+    let byOwnerId = restoreOwners(contract.byOwnerId.get(sale.owner_id));
+    if (byOwnerId == null) {
+        near.panic("no sales by owner");
+    }
+    //remove the unique sale ID from the set of sales
+    byOwnerId.remove(contractAndTokenId);
+
+    //if the set of sales is now empty after removing the unique sale ID, we simply remove that owner from the map
+    if (byOwnerId.isEmpty()) {
+        contract.byOwnerId.remove(sale.owner_id);
+    //if the set of sales is not empty after removing, we insert the set back into the map for the owner
+    } else {
+        contract.byOwnerId.set(sale.owner_id, byOwnerId);
+    }
+
+    //get the set of token IDs for sale for the nft contract ID. If there's no sale, panic. 
+    let byNftContractId = restoreOwners(contract.byNftContractId.get(nftContractId));
+    if (byNftContractId == null) {
+        near.panic("no sales by nft contract");
+    }
+    
+    //remove the token ID from the set 
+    byNftContractId.remove(tokenId);
+    //if the set is now empty after removing the token ID, we remove that nft contract ID from the map
+    if (byNftContractId.isEmpty()) {
+        contract.byNftContractId.remove(nftContractId);
+    //if the set is not empty after removing, we insert the set back into the map for the nft contract ID
+    } else {
+        contract.byNftContractId.set(nftContractId, byNftContractId);
+    }
+
+    //return the sale object
+    return sale;
+}
+
+'''
+'''--- src/market-contract/nft_callbacks.ts ---
+import { assert, near, UnorderedSet } from "near-sdk-js";
+import { Contract, DELIMETER } from ".";
+import { Sale } from "./sale";
+import { internalSupplyByOwnerId } from "./sale_views";
+
+/// where we add the sale because we know nft owner can only call nft_approve
+export function internalNftOnApprove({
+    contract,
+    tokenId,
+    ownerId,
+    approvalId,
+    msg
+}:{ 
+    contract: Contract, 
+    tokenId: string, 
+    ownerId: string, 
+    approvalId: number, 
+    msg: string 
+}) {
+    // get the contract ID which is the predecessor
+    let contractId = near.predecessorAccountId();
+    //get the signer which is the person who initiated the transaction
+    let signerId = near.signerAccountId();
+    
+    //make sure that the signer isn't the predecessor. This is so that we're sure
+    //this was called via a cross-contract call
+    assert(signerId != contractId, "this function can only be called via a cross-contract call");
+    //make sure the owner ID is the signer. 
+    assert(ownerId == signerId, "only the owner of the token can approve it");
+    
+    //we need to enforce that the user has enough storage for 1 EXTRA sale.  
+    let storageAmount = contract.storage_minimum_balance();
+    //get the total storage paid by the owner
+    let ownerPaidStorage = contract.storageDeposits.get(signerId) || BigInt(0);
+    //get the storage required which is simply the storage for the number of sales they have + 1 
+    let signerStorageRequired = (BigInt(internalSupplyByOwnerId({contract, accountId: signerId})) + BigInt(1)) * BigInt(storageAmount); 
+    
+    //make sure that the total paid is >= the required storage
+    assert(ownerPaidStorage >= signerStorageRequired, "the owner does not have enough storage to approve this token");
+    
+    //if all these checks pass we can create the sale conditions object.
+    let saleConditions = JSON.parse(msg);
+    if (!saleConditions.hasOwnProperty('sale_conditions') || Object.keys(saleConditions).length != 1) {
+        near.panic("invalid sale conditions");
+    }
+    //create the unique sale ID which is the contract + DELIMITER + token ID
+    let contractAndTokenId = `${contractId}${DELIMETER}${tokenId}`;
+    
+    //insert the key value pair into the sales map. Key is the unique ID. value is the sale object
+    contract.sales.set(contractAndTokenId, new Sale({
+        ownerId: ownerId, //owner of the sale / token
+        approvalId: approvalId, //approval ID for that token that was given to the market
+        nftContractId: contractId, //NFT contract the token was minted on
+        tokenId: tokenId, //the actual token ID
+        saleConditions: saleConditions.sale_conditions //the sale conditions 
+    }));
+
+    //Extra functionality that populates collections necessary for the view calls 
+    //get the sales by owner ID for the given owner. If there are none, we create a new empty set
+    let byOwnerId = contract.byOwnerId.get(ownerId) as UnorderedSet || new UnorderedSet(ownerId);
+    //insert the unique sale ID into the set
+    byOwnerId.set(contractAndTokenId);
+    //insert that set back into the collection for the owner
+    contract.byOwnerId.set(ownerId, byOwnerId);
+    
+    //get the token IDs for the given nft contract ID. If there are none, we create a new empty set
+    let byNftContractId = contract.byNftContractId.get(contractId) as UnorderedSet || new UnorderedSet(contractId);
+    //insert the token ID into the set
+    byNftContractId.set(tokenId);
+    //insert the set back into the collection for the given nft contract ID
+    contract.byNftContractId.set(contractId, byNftContractId);
+
+}
+'''
+'''--- src/market-contract/sale.ts ---
+import { assert, bytes, near } from "near-sdk-js";
+import { Contract, DELIMETER } from ".";
+import { assertOneYocto, internallyRemoveSale } from "./internal";
+
+//GAS constants to attach to calls
+const GAS_FOR_ROYALTIES = 115_000_000_000_000;
+const GAS_FOR_NFT_TRANSFER = 15_000_000_000_000;
+
+//struct that holds important information about each sale on the market
+export class Sale {
+    //owner of the sale
+    owner_id: string;
+    //market contract's approval ID to transfer the token on behalf of the owner
+    approval_id: number;
+    //nft contract where the token was minted
+    nft_contract_id: string;
+    //actual token ID for sale
+    token_id: String;
+    //sale price in yoctoNEAR that the token is listed for
+    sale_conditions: string;
+    
+    constructor(
+        {
+            ownerId,
+            approvalId,
+            nftContractId,
+            tokenId,
+            saleConditions,
+        }:{ 
+            ownerId: string,
+            approvalId: number,
+            nftContractId: string,
+            tokenId: String,
+            saleConditions: string,
+        }) {
+        this.owner_id = ownerId;
+        this.approval_id = approvalId;
+        this.nft_contract_id = nftContractId;
+        this.token_id = tokenId;
+        this.sale_conditions = saleConditions;
+    }
+}
+
+//removes a sale from the market. 
+export function internalRemoveSale({
+    contract,
+    nftContractId,
+    tokenId
+}:{ 
+    contract: Contract, 
+    nftContractId: string, 
+    tokenId: string 
+}) {
+    //assert that the user has attached exactly 1 yoctoNEAR (for security reasons)
+    assertOneYocto();
+    
+    //get the sale object as the return value from removing the sale internally
+    let sale = internallyRemoveSale(contract, nftContractId, tokenId);
+
+    //get the predecessor of the call and make sure they're the owner of the sale
+    let ownerId = near.predecessorAccountId();
+
+    //assert that the owner of the sale is the same as the caller of the function
+    assert(ownerId == sale.owner_id, "only the owner of the sale can remove it");
+}
+
+//updates the price for a sale on the market
+export function internalUpdatePrice({
+    contract,
+    nftContractId,
+    tokenId,
+    price
+}:{ 
+    contract: Contract, 
+    nftContractId: string, 
+    tokenId: string, 
+    price: string 
+}) {
+    //assert that the user has attached exactly 1 yoctoNEAR (for security reasons)
+    assertOneYocto();
+
+    //create the unique sale ID from the nft contract and token
+    let contractAndTokenId = `${nftContractId}${DELIMETER}${tokenId}`;
+
+    //get the sale object from the unique sale ID. If there is no token, panic. 
+    let sale = contract.sales.get(contractAndTokenId) as Sale;
+    if (sale == null) {
+        near.panic("no sale");
+    }
+
+    assert(near.predecessorAccountId() == sale.owner_id, "only the owner of the sale can update it");
+    //set the sale conditions equal to the passed in price
+    sale.sale_conditions = price; 
+    //insert the sale back into the map for the unique sale ID
+    contract.sales.set(contractAndTokenId, sale);
+}
+
+//place an offer on a specific sale. The sale will go through as long as your deposit is greater than or equal to the list price
+export function internalOffer({
+    contract,
+    nftContractId,
+    tokenId
+}:{
+    contract: Contract, 
+    nftContractId: string, 
+    tokenId: string
+}) {
+    //get the attached deposit and make sure it's greater than 0
+    let deposit = near.attachedDeposit().valueOf();
+    assert(deposit > 0, "deposit must be greater than 0");
+ 
+    //get the unique sale ID (contract + DELIMITER + token ID)
+    let contractAndTokenId = `${nftContractId}${DELIMETER}${tokenId}`;
+    //get the sale object from the unique sale ID. If the sale doesn't exist, panic.
+    let sale = contract.sales.get(contractAndTokenId) as Sale;
+    if (sale == null) {
+        near.panic("no sale");
+    }
+
+    //get the buyer ID which is the person who called the function and make sure they're not the owner of the sale
+    let buyerId = near.predecessorAccountId();
+    assert(buyerId != sale.owner_id, "you can't offer on your own sale");
+
+    //get the u128 price of the token (dot 0 converts from U128 to u128)
+    let price = BigInt(sale.sale_conditions);
+    //make sure the deposit is greater than the price
+    assert(deposit >= price, "deposit must be greater than or equal to price");
+    
+    //process the purchase (which will remove the sale, transfer and get the payout from the nft contract, and then distribute royalties) 
+    processPurchase({contract, nftContractId, tokenId, price: deposit.toString(), buyerId});
+}
+
+//private function used when a sale is purchased. 
+//this will remove the sale, transfer and get the payout from the nft contract, and then distribute royalties
+export function processPurchase({
+    contract,
+    nftContractId,
+    tokenId,
+    price,
+    buyerId
+}:{
+    contract: Contract, 
+    nftContractId: string, 
+    tokenId: string, 
+    price: string, 
+    buyerId: string
+}) {
+    //get the sale object by removing the sale
+    let sale = internallyRemoveSale(contract, nftContractId, tokenId);
+
+    //initiate a cross contract call to the nft contract. This will transfer the token to the buyer and return
+    //a payout object used for the market to distribute funds to the appropriate accounts.
+    const promise = near.promiseBatchCreate(nftContractId);
+    near.promiseBatchActionFunctionCall(
+        promise, 
+        "nft_transfer_payout", 
+        bytes(JSON.stringify({ 
+                receiver_id: buyerId, //purchaser (person to transfer the NFT to)
+                token_id: tokenId, //token ID to transfer
+                approval_id: sale.approval_id, //market contract's approval ID in order to transfer the token on behalf of the owner
+                memo: "payout from market", //memo (to include some context)
+                /*
+                    the price that the token was purchased for. This will be used in conjunction with the royalty percentages
+                    for the token in order to determine how much money should go to which account. 
+                */
+                balance: price, 
+                max_len_payout : 10 //the maximum amount of accounts the market can payout at once (this is limited by GAS)
+        })), 
+        1, // 1 yoctoNEAR
+        GAS_FOR_NFT_TRANSFER
+    );
+
+    //after the transfer payout has been initiated, we resolve the promise by calling our own resolve_purchase function. 
+    //resolve purchase will take the payout object returned from the nft_transfer_payout and actually pay the accounts
+    near.promiseThen(
+        promise, 
+        near.currentAccountId(), 
+        "resolve_purchase", 
+        bytes(JSON.stringify({
+            buyer_id: buyerId, //the buyer and price are passed in incase something goes wrong and we need to refund the buyer
+            price: price
+        })), 
+        0, // no deposit 
+        GAS_FOR_ROYALTIES
+    );
+    return near.promiseReturn(promise);
+}
+
+/*
+    private method used to resolve the promise when calling nft_transfer_payout. This will take the payout object and 
+    check to see if it's authentic and there's no problems. If everything is fine, it will pay the accounts. If there's a problem,
+    it will refund the buyer for the price. 
+*/
+export function internalResolvePurchase({
+    buyerId,
+    price
+}:{
+    buyerId: string, 
+    price: string
+}) {
+    assert(near.currentAccountId() === near.predecessorAccountId(), "Only the contract itself can call this method");
+
+    // checking for payout information returned from the nft_transfer_payout method
+    let result = near.promiseResult(0);
+    let payout = null;
+    if (typeof result === 'string') {
+        //if we set the payout_option to None, that means something went wrong and we should refund the buyer
+        
+        try {
+            let payoutOption = JSON.parse(result);
+            if (Object.keys(payoutOption.payout).length > 10 || Object.keys(payoutOption.payout).length < 1) {
+                //we'll check if length of the payout object is > 10 or it's empty. In either case, we return None
+                throw "Cannot have more than 10 royalties";
+            //if the payout object is the correct length, we move forward
+            } else {
+                //we'll keep track of how much the nft contract wants us to payout. Starting at the full price payed by the buyer
+                let remainder = BigInt(price);
+                //loop through the payout and subtract the values from the remainder. 
+                Object.entries(payoutOption.payout).forEach(([key, value], index) => {
+                    remainder = remainder - BigInt(value as string);
+                });
+
+                //Check to see if the NFT contract sent back a faulty payout that requires us to pay more or too little. 
+                //The remainder will be 0 if the payout summed to the total price. The remainder will be 1 if the royalties
+                //we something like 3333 + 3333 + 3333.
+                if (remainder == BigInt(0) || remainder == BigInt(1)) {
+                    //set the payout because nothing went wrong
+                    payout = payoutOption.payout;
+                } else {
+                    //if the remainder was anything but 1 or 0, we return None
+                    throw "Payout is not correct";
+                }
+            }
+        } catch (e) {
+            near.log(`error parsing payout object ${result}`);
+            payout = null;
+        }
+    }
+    
+    //if the payout was null, we refund the buyer for the price they payed and return
+    if (payout == null) {
+        const promise = near.promiseBatchCreate(buyerId);
+        near.promiseBatchActionTransfer(promise, BigInt(price))
+        return price;
+    } 
+    // NEAR payouts
+    for (let [key, value] of Object.entries(payout)) {
+        const promise = near.promiseBatchCreate(key);
+        near.promiseBatchActionTransfer(promise, BigInt(value as string))
+    }
+
+    //return the price payout out
+    return price;
+}
+'''
+'''--- src/market-contract/sale_views.ts ---
+import { Contract } from ".";
+import { restoreOwners } from "./internal";
+import { Sale } from "./sale";
+    
+//returns the number of sales the marketplace has up (as a string)
+export function internalSupplySales({
+    contract
+}:{
+    contract: Contract
+}): string {
+    //returns the sales object length wrapped as a string
+    return contract.sales.len().toString();
+}
+
+//returns the number of sales for a given account (result is a string)
+export function internalSupplyByOwnerId({
+    contract,
+    accountId
+}:{ 
+    contract: Contract, 
+    accountId: string
+}): string {
+    //get the set of sales for the given owner Id
+    let byOwnerId = restoreOwners(contract.byOwnerId.get(accountId));
+    //if there as some set, we return the length but if there wasn't a set, we return 0
+    if (byOwnerId == null) {
+        return "0"
+    }
+
+    return byOwnerId.len().toString();
+}
+
+//returns paginated sale objects for a given account. (result is a vector of sales)
+export function internalSalesByOwnerId({
+    contract,
+    accountId,
+    fromIndex,
+    limit
+}:{ 
+    contract: Contract, 
+    accountId: string, 
+    fromIndex?: string, 
+    limit?: number
+}): Sale[] {
+    //get the set of token IDs for sale for the given account ID
+    let tokenSet = restoreOwners(contract.byOwnerId.get(accountId));
+
+    //if there was no set, we return an empty array
+    if (tokenSet == null) {
+        return [];
+    }
+    
+    //where to start pagination - if we have a fromIndex, we'll use that - otherwise start from 0 index
+    let start = fromIndex ? parseInt(fromIndex) : 0;
+    //take the first "limit" elements in the array. If we didn't specify a limit, use 50
+    let max = limit ? limit : 50;
+
+    let keys = tokenSet.toArray();
+    let sales: Sale[] = []
+    for(let i = start; i < max; i++) {
+        if(i >= keys.length) {
+            break;
+        }
+        let sale = contract.sales.get(keys[i]) as Sale; 
+        if (sale != null) {
+            sales.push(sale);
+        }
+    }
+    return sales;
+}
+
+//get the number of sales for an nft contract. (returns a string)
+export function internalSupplyByNftContractId({
+    contract,
+    nftContractId
+}:{ 
+    contract: Contract, 
+    nftContractId: string
+}): string {
+    //get the set of tokens for associated with the given nft contract
+    let byNftContractId = restoreOwners(contract.byNftContractId.get(nftContractId));
+    //if there as some set, we return the length but if there wasn't a set, we return 0
+    if (byNftContractId == null) {
+        return "0"
+    }
+
+    return byNftContractId.len().toString();
+}
+
+//returns paginated sale objects associated with a given nft contract. (result is a vector of sales)
+export function internalSalesByNftContractId({
+    contract,
+    accountId,
+    fromIndex,
+    limit
+}:{    
+    contract: Contract, 
+    accountId: string, 
+    fromIndex?: string, 
+    limit?: number
+}): Sale[] {
+    //get the set of token IDs for sale for the given contract ID
+    let tokenSet = restoreOwners(contract.byNftContractId.get(accountId));
+
+    //if there was no set, we return an empty array
+    if (tokenSet == null) {
+        return [];
+    }
+    
+    //where to start pagination - if we have a fromIndex, we'll use that - otherwise start from 0 index
+    let start = fromIndex ? parseInt(fromIndex) : 0;
+    //take the first "limit" elements in the array. If we didn't specify a limit, use 50
+    let max = limit ? limit : 50;
+
+    let keys = tokenSet.toArray();
+    let sales: Sale[] = []
+    for(let i = start; i < max; i++) {
+        if(i >= keys.length) {
+            break;
+        }
+        let sale = contract.sales.get(keys[i]) as Sale; 
+        if (sale != null) {
+            sales.push(sale);
+        }
+    }
+    return sales;
+}
+
+//get a sale information for a given unique sale ID (contract + DELIMITER + token ID)
+export function internalGetSale({
+    contract,
+    nftContractToken,
+}:{
+    contract: Contract, 
+    nftContractToken: string
+}): Sale {
+    //try and get the sale object for the given unique sale ID. Will return an option since
+    //we're not guaranteed that the unique sale ID passed in will be valid.n);
+    return contract.sales.get(nftContractToken) as Sale;
+}
+
+'''
+'''--- src/nft-contract/approval.ts ---
+// @ts-nocheck
+import { assert, bytes, near } from "near-sdk-js";
+import { Contract, NFT_METADATA_SPEC, NFT_STANDARD_NAME } from ".";
+import {
+    assertAtLeastOneYocto,
+    assertOneYocto,
+    bytesForApprovedAccountId,
+    internalAddTokenToOwner,
+    refundDeposit,
+    refundApprovedAccountIds,
+    refundApprovedAccountIdsIter,
+} from "./internal";
+import { Token } from "./metadata";
+
+const GAS_FOR_NFT_ON_APPROVE = 35_000_000_000_000;
+
+//approve an account ID to transfer a token on your behalf
+export function internalNftApprove({
+    contract,
+    tokenId,
+    accountId,
+    msg,
+}: {
+    contract: Contract;
+    tokenId: string;
+    accountId: string;
+    msg: string;
+}) {
+    /*
+        FILL THIS IN
+    */
+    assertAtLeastOneYocto();
+
+    let token = contract.tokensById.get(tokenId) as Token;
+    if (token == null) {
+        near.panic("no token");
+    }
+    assert(
+        near.predecessorAccountId() === token.owner_id,
+        "Predecessor must be the token owner"
+    );
+
+    let approvalId = token.next_approval_id;
+    let isNewApproval = token.approved_account_ids.hasOwnProperty(accountId);
+    token.approved_account_ids[accountId] = approvalId;
+    let storageUsed = isNewApproval ? bytesForApprovedAccountId(accountId) : 0;
+
+    token.next_approval_id += 1;
+    //insert the token back into the tokens_by_id collection
+    contract.tokensById.set(tokenId, token);
+    refundDeposit(BigInt(storageUsed));
+
+    if (msg != null) {
+        // Initiating receiver's call and the callback
+        const promise = near.promiseBatchCreate(accountId);
+        near.promiseBatchActionFunctionCall(
+            promise,
+            "nft_on_approve",
+            bytes(
+                JSON.stringify({
+                    token_id: tokenId,
+                    owner_id: token.owner_id,
+                    approval_id: approvalId,
+                    msg,
+                })
+            ),
+            0, // no deposit
+            GAS_FOR_NFT_ON_APPROVE
+        );
+
+        near.promiseReturn(promise);
+    }
+}
+
+//check if the passed in account has access to approve the token ID
+export function internalNftIsApproved({
+    contract,
+    tokenId,
+    approvedAccountId,
+    approvalId,
+}: {
+    contract: Contract;
+    tokenId: string;
+    approvedAccountId: string;
+    approvalId: number;
+}) {
+    /*
+        FILL THIS IN
+    */
+    //get the token object from the token_id
+    let token = contract.tokensById.get(tokenId) as Token;
+    if (token == null) {
+        near.panic("no token");
+    }
+
+    //get the approval number for the passed in account ID
+    let approval = token.approved_account_ids[approvedAccountId];
+
+    //if there was no approval ID found for the account ID, we simply return false
+    if (approval == null) {
+        return false;
+    }
+
+    //if there was some approval ID found for the account ID
+    //if there was no approval_id passed into the function, we simply return true
+    if (approvalId == null) {
+        return true;
+    }
+
+    //if a specific approval_id was passed into the function
+    //return if the approval ID passed in matches the actual approval ID for the account
+    return approvalId == approval;
+}
+
+//revoke a specific account from transferring the token on your behalf
+export function internalNftRevoke({
+    contract,
+    tokenId,
+    accountId,
+}: {
+    contract: Contract;
+    tokenId: string;
+    accountId: string;
+}) {
+    /*
+        FILL THIS IN
+    */
+    assertOneYocto();
+
+    //get the token object using the passed in token_id
+    let token = contract.tokensById.get(tokenId) as Token;
+    if (token == null) {
+        near.panic("no token");
+    }
+
+    //get the caller of the function and assert that they are the owner of the token
+    let predecessorAccountId = near.predecessorAccountId();
+    assert(
+        predecessorAccountId == token.owner_id,
+        "only token owner can revoke"
+    );
+
+    //if the account ID was in the token's approval, we remove it
+    if (token.approved_account_ids.hasOwnProperty(accountId)) {
+        delete token.approved_account_ids[accountId];
+
+        //refund the funds released by removing the approved_account_id to the caller of the function
+        refundApprovedAccountIdsIter(predecessorAccountId, [accountId]);
+
+        //insert the token back into the tokens_by_id collection with the account_id removed from the approval list
+        contract.tokensById.set(tokenId, token);
+    }
+}
+
+//revoke all accounts from transferring the token on your behalf
+export function internalNftRevokeAll({
+    contract,
+    tokenId,
+}: {
+    contract: Contract;
+    tokenId: string;
+}) {
+    /*
+        FILL THIS IN
+    */
+}
+
+'''
+'''--- src/nft-contract/enumeration.ts ---
+// @ts-nocheck
+import { near, UnorderedSet } from "near-sdk-js";
+import { Contract, NFT_METADATA_SPEC, NFT_STANDARD_NAME } from ".";
+import { restoreOwners } from "./internal";
+import { JsonToken, Token } from "./metadata";
+import { internalNftToken } from "./nft_core";
+
+//Query for the total supply of NFTs on the contract
+export function internalTotalSupply({
+    contract,
+}: {
+    contract: Contract;
+}): number {
+    /*
+        FILL THIS IN
+    */
+    return contract.tokenMetadataById.len();
+}
+
+//Query for nft tokens on the contract regardless of the owner using pagination
+export function internalNftTokens({
+    contract,
+    fromIndex,
+    limit,
+}: {
+    contract: Contract;
+    fromIndex?: string;
+    limit?: number;
+}): JsonToken[] {
+    /*
+        FILL THIS IN
+    */
+    let tokens: JsonToken[] = [];
+    let start = fromIndex ? parseInt(fromIndex) : 0;
+    let max = limit ? parseInt(limit) : 50;
+
+    let keys = contract.tokenMetadataById.toArray();
+    for (let i = start; i < keys.length && i < max; i++) {
+        let jsonToken = internalNftToken({ contract, tokenId: keys[i][0] });
+        tokens.push(jsonToken);
+    }
+    return tokens;
+}
+
+//get the total supply of NFTs for a given owner
+export function internalSupplyForOwner({
+    contract,
+    accountId,
+}: {
+    contract: Contract;
+    accountId: string;
+}): number {
+    /*
+        FILL THIS IN
+    */
+    let tokens = restoreOwners(contract.tokensPerOwner.get(accountId));
+    if (tokens == null) {
+        return 0;
+    }
+
+    return tokens.len();
+}
+
+//Query for all the tokens for an owner
+export function internalTokensForOwner({
+    contract,
+    accountId,
+    fromIndex,
+    limit,
+}: {
+    contract: Contract;
+    accountId: string;
+    fromIndex?: string;
+    limit?: number;
+}): JsonToken[] {
+    /*
+        FILL THIS IN
+    */
+    let tokenSet = restoreOwners(contract.tokensPerOwner.get(accountId));
+
+    if (tokenSet == null) {
+        return [];
+    }
+
+    let start = fromIndex ? parseInt(fromIndex) : 0;
+    let max = limit ? parseInt(limit) : 50;
+
+    let keys = tokenSet.toArray();
+    let tokens: JsonToken[] = [];
+    for (let i = start; i < max; i++) {
+        if (i >= keys.length) {
+            break;
+        }
+        let token = internalNftToken({ contract, tokenId: keys[i] });
+        tokens.push(token);
+    }
+
+    return tokens;
+}
+
+'''
+'''--- src/nft-contract/index.ts ---
+// @ts-nocheck
+import {
+    NearContract,
+    NearBindgen,
+    near,
+    call,
+    view,
+    LookupMap,
+    UnorderedMap,
+    Vector,
+    UnorderedSet,
+} from "near-sdk-js";
+import {
+    NFTContractMetadata,
+    Token,
+    TokenMetadata,
+    internalNftMetadata,
+} from "./metadata";
+import { internalMint } from "./mint";
+import {
+    internalNftTokens,
+    internalSupplyForOwner,
+    internalTokensForOwner,
+    internalTotalSupply,
+} from "./enumeration";
+import {
+    internalNftToken,
+    internalNftTransfer,
+    internalNftTransferCall,
+    internalResolveTransfer,
+} from "./nft_core";
+import {
+    internalNftApprove,
+    internalNftIsApproved,
+    internalNftRevoke,
+    internalNftRevokeAll,
+} from "./approval";
+import { internalNftPayout, internalNftTransferPayout } from "./royalty";
+
+/// This spec can be treated like a version of the standard.
+export const NFT_METADATA_SPEC = "nft-1.0.0";
+
+/// This is the name of the NFT standard we're using
+export const NFT_STANDARD_NAME = "nep171";
+
+@NearBindgen
+export class Contract extends NearContract {
+    /*
+        FILL THIS IN
+    */
+    owner_id: string;
+    tokensPerOwner: LookupMap<AccountId, UnorderedSet<TokenId>>;
+    tokensById: LookupMap<TokenId, Token>;
+    tokenMetadataById: UnorderedMap<TokenId, TokenMetadata>;
+    metadata: NFTContractMetadata;
+
+    /*
+        initialization function (can only be called once).
+        this initializes the contract with metadata that was passed in and
+        the owner_id. 
+    */
+    constructor({
+        owner_id,
+        metadata = {
+            spec: "nft-1.0.0",
+            name: "NFT Tutorial Contract",
+            symbol: "GOTEAM",
+        },
+    }) {
+        /*
+        FILL THIS IN
+    */
+        super();
+        this.owner_id = owner_id;
+        this.tokensPerOwner = new LookupMap("tokensPerOwner");
+        this.tokensById = new LookupMap("tokensById");
+        this.tokenMetadataById = new UnorderedMap("tokenMetadataById");
+        this.metadata = metadata;
+    }
+
+    default() {
+        return new Contract({ owner_id: "" });
+    }
+
+    /*
+        MINT
+    */
+    @call
+    nft_mint({ token_id, metadata, receiver_id, perpetual_royalties }) {
+        return internalMint({
+            contract: this,
+            tokenId: token_id,
+            metadata: metadata,
+            receiverId: receiver_id,
+            perpetualRoyalties: perpetual_royalties,
+        });
+    }
+
+    /*
+        CORE
+    */
+    @view
+    //get the information for a specific token ID
+    nft_token({ token_id }) {
+        return internalNftToken({ contract: this, tokenId: token_id });
+    }
+
+    @call
+    //implementation of the nft_transfer method. This transfers the NFT from the current owner to the receiver.
+    nft_transfer({ receiver_id, token_id, approval_id, memo }) {
+        return internalNftTransfer({
+            contract: this,
+            receiverId: receiver_id,
+            tokenId: token_id,
+            approvalId: approval_id,
+            memo: memo,
+        });
+    }
+
+    @call
+    //implementation of the transfer call method. This will transfer the NFT and call a method on the receiver_id contract
+    nft_transfer_call({ receiver_id, token_id, approval_id, memo, msg }) {
+        return internalNftTransferCall({
+            contract: this,
+            receiverId: receiver_id,
+            tokenId: token_id,
+            approvalId: approval_id,
+            memo: memo,
+            msg: msg,
+        });
+    }
+
+    @call
+    //resolves the cross contract call when calling nft_on_transfer in the nft_transfer_call method
+    //returns true if the token was successfully transferred to the receiver_id
+    nft_resolve_transfer({
+        authorized_id,
+        owner_id,
+        receiver_id,
+        token_id,
+        approved_account_ids,
+        memo,
+    }) {
+        return internalResolveTransfer({
+            contract: this,
+            authorizedId: authorized_id,
+            ownerId: owner_id,
+            receiverId: receiver_id,
+            tokenId: token_id,
+            approvedAccountIds: approved_account_ids,
+            memo: memo,
+        });
+    }
+
+    /*
+        APPROVALS
+    */
+    @view
+    //check if the passed in account has access to approve the token ID
+    nft_is_approved({ token_id, approved_account_id, approval_id }) {
+        return internalNftIsApproved({
+            contract: this,
+            tokenId: token_id,
+            approvedAccountId: approved_account_id,
+            approvalId: approval_id,
+        });
+    }
+
+    @call
+    //approve an account ID to transfer a token on your behalf
+    nft_approve({ token_id, account_id, msg }) {
+        return internalNftApprove({
+            contract: this,
+            tokenId: token_id,
+            accountId: account_id,
+            msg: msg,
+        });
+    }
+
+    /*
+        ROYALTY
+    */
+    @view
+    //calculates the payout for a token given the passed in balance. This is a view method
+    nft_payout({ token_id, balance, max_len_payout }) {
+        return internalNftPayout({
+            contract: this,
+            tokenId: token_id,
+            balance: balance,
+            maxLenPayout: max_len_payout,
+        });
+    }
+
+    @call
+    //transfers the token to the receiver ID and returns the payout object that should be payed given the passed in balance.
+    nft_transfer_payout({
+        receiver_id,
+        token_id,
+        approval_id,
+        memo,
+        balance,
+        max_len_payout,
+    }) {
+        return internalNftTransferPayout({
+            contract: this,
+            receiverId: receiver_id,
+            tokenId: token_id,
+            approvalId: approval_id,
+            memo: memo,
+            balance: balance,
+            maxLenPayout: max_len_payout,
+        });
+    }
+
+    @call
+    //approve an account ID to transfer a token on your behalf
+    nft_revoke({ token_id, account_id }) {
+        return internalNftRevoke({
+            contract: this,
+            tokenId: token_id,
+            accountId: account_id,
+        });
+    }
+
+    @call
+    //approve an account ID to transfer a token on your behalf
+    nft_revoke_all({ token_id }) {
+        return internalNftRevokeAll({ contract: this, tokenId: token_id });
+    }
+
+    /*
+        ENUMERATION
+    */
+    @view
+    //Query for the total supply of NFTs on the contract
+    nft_total_supply() {
+        return internalTotalSupply({ contract: this });
+    }
+
+    @view
+    //Query for nft tokens on the contract regardless of the owner using pagination
+    nft_tokens({ from_index, limit }) {
+        return internalNftTokens({
+            contract: this,
+            fromIndex: from_index,
+            limit: limit,
+        });
+    }
+
+    @view
+    //get the total supply of NFTs for a given owner
+    nft_tokens_for_owner({ account_id, from_index, limit }) {
+        return internalTokensForOwner({
+            contract: this,
+            accountId: account_id,
+            fromIndex: from_index,
+            limit: limit,
+        });
+    }
+
+    @view
+    //Query for all the tokens for an owner
+    nft_supply_for_owner({ account_id }) {
+        return internalSupplyForOwner({
+            contract: this,
+            accountId: account_id,
+        });
+    }
+
+    /*
+        METADATA
+    */
+    @view
+    //Query for all the tokens for an owner
+    nft_metadata() {
+        return this.metadata;
+    }
+}
+
+'''
+'''--- src/nft-contract/internal.ts ---
+import { assert, near, UnorderedSet, Vector } from "near-sdk-js";
+import { Contract, NFT_METADATA_SPEC, NFT_STANDARD_NAME } from ".";
+import { Token } from "./metadata";
+
+export function restoreOwners(collection) {
+    if (collection == null) {
+        return null;
+    }
+    return UnorderedSet.deserialize(collection as UnorderedSet);
+}
+
+export function refundDeposit(storageUsed: bigint) {
+    let requiredCost = storageUsed * near.storageByteCost().valueOf();
+    let attachedDeposit = near.attachedDeposit().valueOf();
+
+    assert(
+        attachedDeposit >= requiredCost,
+        `Must attach ${requiredCost} yoctoNear to cover storage`
+    );
+
+    let refund = attachedDeposit - requiredCost;
+    near.log(`Refunded ${refund} yoctoNear`);
+
+    if (refund > 1) {
+        const promise = near.promiseBatchCreate(near.predecessorAccountId());
+        near.promiseBatchActionTransfer(promise, refund);
+    }
+}
+
+export function internalAddTokenToOwner(
+    contract: Contract,
+    accountId: string,
+    tokenId: string
+) {
+    let tokenSet = restoreOwners(contract.tokensPerOwner.get(accountId));
+    if (tokenSet == null) {
+        tokenSet = new UnorderedSet("tokensPerOwner" + accountId.toString());
+    }
+
+    tokenSet.set(tokenId);
+
+    contract.tokensPerOwner.set(accountId, tokenSet);
+}
+
+export function assertOneYocto() {
+    assert(
+        near.attachedDeposit().toString() === "1",
+        "Requires attached deposit of exactly 1 yoctoNEAR"
+    );
+}
+
+export function internalTransfer(
+    contract: Contract,
+    senderId: string,
+    receiverId: string,
+    tokenId: string,
+    approvalId: number,
+    memo: string
+): Token {
+    let token = contract.tokensById.get(tokenId) as Token;
+    if (token == null) {
+        near.panic("no token found");
+    }
+
+    if (senderId != token.owner_id) {
+        //if the token's approved account IDs doesn't contain the sender, we panic
+        if (!token.approved_account_ids.hasOwnProperty(senderId)) {
+            near.panic("Unauthorized");
+        }
+
+        // If they included an approval_id, check if the sender's actual approval_id is the same as the one included
+        if (approvalId != null) {
+            //get the actual approval ID
+            let actualApprovalId = token.approved_account_ids[senderId];
+            //if the sender isn't in the map, we panic
+            if (actualApprovalId == null) {
+                near.panic("Sender is not approved account");
+            }
+
+            //make sure that the actual approval ID is the same as the one provided
+            assert(
+                actualApprovalId == approvalId,
+                `The actual approval_id ${actualApprovalId} is different from the given approval_id ${approvalId}`
+            );
+        }
+    }
+
+    assert(
+        token.owner_id !== receiverId,
+        "The token owner and receiver should be different"
+    );
+
+    internalRemoveTokenFromOwner(contract, token.owner_id, tokenId);
+    internalAddTokenToOwner(contract, receiverId, tokenId);
+
+    let newToken = new Token({
+        ownerId: receiverId,
+        approvedAccountIds: {},
+        nextApprovalId: token.next_approval_id,
+    });
+
+    contract.tokensById.set(tokenId, newToken);
+
+    if (memo != null) {
+        near.log(`Memo: ${memo}`);
+    }
+
+    return token;
+}
+
+export function internalRemoveTokenFromOwner(
+    contract: Contract,
+    accountId: string,
+    tokenId: string
+) {
+    let tokenSet = restoreOwners(contract.tokensPerOwner.get(accountId));
+
+    if (tokenSet == null) {
+        near.panic("Account holds no tokens");
+    }
+
+    tokenSet.remove(tokenId);
+
+    if (tokenSet.isEmpty()) {
+        contract.tokensPerOwner.remove(accountId);
+    } else {
+        contract.tokensPerOwner.set(accountId, tokenSet);
+    }
+}
+
+//Assert that the user has attached at least 1 yoctoNEAR (for security reasons and to pay for storage)
+export function assertAtLeastOneYocto() {
+    assert(
+        near.attachedDeposit().valueOf() >= BigInt(1),
+        "Requires attached deposit of at least 1 yoctoNEAR"
+    );
+}
+
+//calculate how many bytes the account ID is taking up
+export function bytesForApprovedAccountId(accountId: string): number {
+    // The extra 4 bytes are coming from Borsh serialization to store the length of the string.
+    return accountId.length + 4 + 8;
+}
+
+export function refundApprovedAccountIdsIter(
+    accountId: string,
+    approvedAccountIds: string[]
+) {
+    //get the storage total by going through and summing all the bytes for each approved account IDs
+    let storageReleased = approvedAccountIds
+        .map((e) => bytesForApprovedAccountId(e))
+        .reduce((partialSum, a) => partialSum + a, 0);
+    let amountToTransfer =
+        BigInt(storageReleased) * near.storageByteCost().valueOf();
+
+    // Send the money to the beneficiary (TODO: don't use batch actions)
+    const promise = near.promiseBatchCreate(accountId);
+    near.promiseBatchActionTransfer(promise, amountToTransfer);
+}
+
+//refund a map of approved account IDs and send the funds to the passed in account ID
+export function refundApprovedAccountIds(
+    accountId: string,
+    approvedAccountIds: { [key: string]: number }
+) {
+    //call the refundApprovedAccountIdsIter with the approved account IDs as keys
+    refundApprovedAccountIdsIter(accountId, Object.keys(approvedAccountIds));
+}
+
+'''
+'''--- src/nft-contract/metadata.ts ---
+// @ts-nocheck
+import { Contract } from ".";
+
+//defines the payout type we'll be returning as a part of the royalty standards.
+export class Payout {
+    payout: { [accountId: string]: bigint };
+    constructor({ payout }: { payout: { [accountId: string]: bigint } }) {
+        this.payout = payout;
+    }
+}
+
+export class NFTContractMetadata {
+    /*
+        FILL THIS IN
+    */
+    spec: string;
+    name: string;
+    symbol: string;
+    icon?: string;
+    base_uri?: string;
+    reference?: string;
+    reference_hash?: string;
+
+    constructor({
+        spec,
+        name,
+        symbol,
+        icon,
+        baseUri,
+        reference,
+        referenceHash,
+    }: {
+        spec: string;
+        name: string;
+        symbol: string;
+        icon?: string;
+        baseUri?: string;
+        reference?: string;
+        referenceHash?: string;
+    }) {
+        this.spec = spec; // required, essentially a version like "nft-1.0.0"
+        this.name = name; // required, ex. "Mosaics"
+        this.symbol = symbol; // required, ex. "MOSAIC"
+        this.icon = icon; // Data URL
+        this.base_uri = baseUri; // Centralized gateway known to have reliable access to decentralized storage assets referenced by `reference` or `media` URLs
+        this.reference = reference; // URL to a JSON file with more info
+        this.reference_hash = referenceHash; // Base64-encoded sha256 hash of JSON from reference field. Required if `reference` is included.
+    }
+}
+
+export class TokenMetadata {
+    /*
+        FILL THIS IN
+    */
+    title?: string;
+    description?: string;
+    media?: string;
+    media_hash?: string;
+    copies?: number;
+    issued_at?: string;
+    expires_at?: string;
+    starts_at?: string;
+    updated_at?: string;
+    extra?: string;
+    reference?: string;
+    reference_hash?: string;
+
+    constructor({
+        title,
+        description,
+        media,
+        mediaHash,
+        copies,
+        issuedAt,
+        expiresAt,
+        startsAt,
+        updatedAt,
+        extra,
+        reference,
+        referenceHash,
+    }: {
+        title?: string;
+        description?: string;
+        media?: string;
+        mediaHash?: string;
+        copies?: number;
+        issuedAt?: string;
+        expiresAt?: string;
+        startsAt?: string;
+        updatedAt?: string;
+        extra?: string;
+        reference?: string;
+        referenceHash?: string;
+    }) {
+        this.title = title; // ex. "Arch Nemesis: Mail Carrier" or "Parcel #5055"
+        this.description = description; // free-form description
+        this.media = media; // URL to associated media, preferably to decentralized, content-addressed storage
+        this.media_hash = mediaHash; // Base64-encoded sha256 hash of content referenced by the `media` field. Required if `media` is included.
+        this.copies = copies; // number of copies of this set of metadata in existence when token was minted.
+        this.issued_at = issuedAt; // ISO 8601 datetime when token was issued or minted
+        this.expires_at = expiresAt; // ISO 8601 datetime when token expires
+        this.starts_at = startsAt; // ISO 8601 datetime when token starts being valid
+        this.updated_at = updatedAt; // ISO 8601 datetime when token was last updated
+        this.extra = extra; // anything extra the NFT wants to store on-chain. Can be stringified JSON.
+        this.reference = reference; // URL to an off-chain JSON file with more info.
+        this.reference_hash = referenceHash; // Base64-encoded sha256 hash of JSON from reference field. Required if `reference` is included.
+    }
+}
+
+export class Token {
+    /*
+        FILL THIS IN
+    */
+    owner_id: string;
+    approved_account_ids: { [accountId: string]: number };
+    next_approval_id;
+    number;
+
+    constructor({
+        ownerId,
+        approvedAccountIds,
+        nextApprovalId,
+    }: {
+        ownerId: string;
+        approvedAccountIds: { [accountId: string]: number };
+        nextApprovalId: number;
+    }) {
+        //owner of the token
+        this.owner_id = ownerId;
+        this.approved_account_ids = approvedAccountIds;
+        this.next_approval_id = nextApprovalId;
+    }
+}
+
+//The Json token is what will be returned from view calls.
+export class JsonToken {
+    /*
+        FILL THIS IN
+    */
+    token_id: string;
+    owner_id: string;
+    metadata: TokenMetadata;
+    approved_account_ids: { [accountId: string]: number };
+
+    constructor({
+        tokenId,
+        ownerId,
+        metadata,
+        approvedAccountIds,
+    }: {
+        tokenId: string;
+        ownerId: string;
+        metadata: TokenMetadata;
+        approvedAccountIds: { [accountId: string]: number };
+    }) {
+        //token ID
+        this.token_id = tokenId;
+        //owner of the token
+        this.owner_id = ownerId;
+
+        //token metadata
+        this.metadata = metadata;
+        this.approved_account_ids = approvedAccountIds;
+    }
+}
+
+//get the information for a specific token ID
+export function internalNftMetadata({
+    contract,
+}: {
+    contract: Contract;
+}): NFTContractMetadata {
+    /*
+        FILL THIS IN
+    */
+    return contract.metadata;
+}
+
+'''
+'''--- src/nft-contract/mint.ts ---
+// @ts-nocheck
+import { assert, near } from "near-sdk-js";
+import { Contract, NFT_METADATA_SPEC, NFT_STANDARD_NAME } from ".";
+import { internalAddTokenToOwner, refundDeposit } from "./internal";
+import { Token, TokenMetadata } from "./metadata";
+
+export function internalMint({
+    contract,
+    tokenId,
+    metadata,
+    receiverId,
+    perpetualRoyalties,
+}: {
+    contract: Contract;
+    tokenId: string;
+    metadata: TokenMetadata;
+    receiverId: string;
+    perpetualRoyalties: { [key: string]: number };
+}): void {
+    /*
+        FILL THIS IN
+    */
+    let initialStorageUsage = near.storageUsage();
+
+    let token = new Token({
+        ownerId: receiverId,
+        approvedAccountIds: {},
+        nextApprovalId: 0,
+    });
+
+    assert(!contract.tokensById.containsKey(tokenId), "Token already exists");
+    contract.tokensById.set(tokenId, token);
+
+    contract.tokenMetadataById.set(tokenId, metadata);
+
+    internalAddTokenToOwner(contract, token.owner_id, tokenId);
+
+    let requiredStorageInBytes =
+        near.storageUsage().valueOf() - initialStorageUsage.valueOf();
+
+    refundDeposit(requiredStorageInBytes);
+}
+
+'''
+'''--- src/nft-contract/nft_core.ts ---
+// @ts-nocheck
+import { assert, bytes, near } from "near-sdk-js";
+import { Contract, NFT_METADATA_SPEC, NFT_STANDARD_NAME } from ".";
+import {
+    assertOneYocto,
+    internalAddTokenToOwner,
+    internalRemoveTokenFromOwner,
+    internalTransfer,
+    refundDeposit,
+    refundApprovedAccountIds,
+} from "./internal";
+import { JsonToken, Token, TokenMetadata } from "./metadata";
+
+const GAS_FOR_RESOLVE_TRANSFER = 40_000_000_000_000;
+const GAS_FOR_NFT_ON_TRANSFER = 35_000_000_000_000;
+
+//get the information for a specific token ID
+export function internalNftToken({
+    contract,
+    tokenId,
+}: {
+    contract: Contract;
+    tokenId: string;
+}) {
+    /*
+        FILL THIS IN
+    */
+    let token = contract.tokensById.get(tokenId);
+    if (token == null) return null;
+
+    let metadata = contract.tokenMetadataById.get(tokenId) as TokenMetadata;
+    let jsonToken = new JsonToken({
+        tokenId: tokenId,
+        metadata,
+        ownerId: token.owner_id,
+        approvedAccountIds: token.approved_account_ids,
+    });
+
+    return jsonToken;
+}
+
+//implementation of the nft_transfer method. This transfers the NFT from the current owner to the receiver.
+export function internalNftTransfer({
+    contract,
+    receiverId,
+    tokenId,
+    approvalId,
+    memo,
+}: {
+    contract: Contract;
+    receiverId: string;
+    tokenId: string;
+    approvalId: number;
+    memo: string;
+}) {
+    /*
+        FILL THIS IN
+    */
+    assertOneYocto();
+
+    let senderId = near.predecessorAccountId();
+    internalTransfer(contract, senderId, receiverId, tokenId, memo);
+    refundApprovedAccountIds(
+        previousToken.owner_id,
+        previousToken.approved_account_ids
+    );
+}
+
+//implementation of the transfer call method. This will transfer the NFT and call a method on the receiver_id contract
+export function internalNftTransferCall({
+    contract,
+    receiverId,
+    tokenId,
+    approvalId,
+    memo,
+    msg,
+}: {
+    contract: Contract;
+    receiverId: string;
+    tokenId: string;
+    approvalId: number;
+    memo: string;
+    msg: string;
+}) {
+    /*
+        FILL THIS IN
+    */
+    assertOneYocto();
+    let senderId = near.predecessorAccountId();
+
+    let previousToken = internalTransfer(
+        contract,
+        senderId,
+        receiverId,
+        tokenId,
+        memo
+    );
+
+    const promise = near.promiseBatchCreate(receiverId);
+    near.promiseBatchActionFunctionCall(
+        promise,
+        "nft_on_transfer",
+        bytes(
+            JSON.stringify({
+                sender_id: senderId,
+                previous_owner_id: previousToken.owner_id,
+                tokenId: tokenId,
+                msg,
+            })
+        ),
+        0,
+        GAS_FOR_NFT_ON_TRANSFER
+    );
+
+    near.promiseThen(
+        promise,
+        near.currentAccountId(),
+        "nft_resolve_transfer",
+        bytes(
+            JSON.stringify({
+                owner_id: previousToken.owner_id,
+                receiver_id: receiverId,
+                token_id: tokenId,
+                approved_account_ids: previousToken.approved_account_ids,
+            })
+        ),
+        0,
+        GAS_FOR_RESOLVE_TRANSFER
+    );
+
+    return near.promiseReturn(promise);
+}
+
+//resolves the cross contract call when calling nft_on_transfer in the nft_transfer_call method
+//returns true if the token was successfully transferred to the receiver_id
+export function internalResolveTransfer({
+    contract,
+    authorizedId,
+    ownerId,
+    receiverId,
+    tokenId,
+    approvedAccountIds,
+    memo,
+}: {
+    contract: Contract;
+    authorizedId: string;
+    ownerId: string;
+    receiverId: string;
+    tokenId: string;
+    approvedAccountIds: { [key: string]: number };
+    memo: string;
+}) {
+    /*
+        FILL THIS IN
+    */
+
+    assert(
+        near.currentAccountId() === near.predecessorAccountId(),
+        "Only the contract itself can call this method"
+    );
+
+    let result = near.promiseResult(0);
+    if (typeof result === "string") {
+        if (result === "false") {
+            refundApprovedAccountIds(ownerId, approvedAccountIds);
+            return true;
+        }
+    }
+
+    let token = contract.tokensById.get(tokenId) as Token;
+    if (token !== null) {
+        if (token.owner_id != receiverId) {
+            refundApprovedAccountIds(ownerId, approvedAccountIds);
+            return true;
+        }
+    } else {
+        return true;
+    }
+
+    internalRemoveTokenFromOwner(contract, receiverId, tokenId);
+    internalAddTokenToOwner(contract, ownerId, tokenId);
+    refundApprovedAccountIds(receiverId, token.approved_account_ids);
+
+    token.owner_id = ownerId;
+
+    contract.tokensById.set(tokenId, token);
+    return false;
+}
+
+'''
+'''--- src/nft-contract/royalty.ts ---
+// @ts-nocheck
+import { assert, near } from "near-sdk-js";
+import { Contract, NFT_METADATA_SPEC, NFT_STANDARD_NAME } from ".";
+import { assertAtLeastOneYocto, assertOneYocto, bytesForApprovedAccountId, internalAddTokenToOwner, internalTransfer, refundDeposit, refundApprovedAccountIds, refundApprovedAccountIdsIter, royaltyToPayout } from "./internal";
+import { Token } from "./metadata";
+
+//calculates the payout for a token given the passed in balance. This is a view method
+export function internalNftPayout({
+    contract,
+    tokenId,
+    balance,
+    maxLenPayout
+}:{
+    contract: Contract, 
+    tokenId: string,
+    balance: bigint, 
+    maxLenPayout: number,
+}): { payout: {[key: string]: string }} {
+    /*
+        FILL THIS IN
+    */
+}
+
+//transfers the token to the receiver ID and returns the payout object that should be payed given the passed in balance. 
+export function internalNftTransferPayout({
+    contract,
+    receiverId,
+    tokenId,
+    approvalId,
+    memo,
+    balance,
+    maxLenPayout
+}:{
+    contract: Contract, 
+    receiverId: string, 
+    tokenId: string,
+    approvalId: number,
+    memo: string,
+    balance: bigint,
+    maxLenPayout: number,
+}): { payout: {[key: string]: string }} {
+    /*
+        FILL THIS IN
+    */
+}
+'''
+'''--- tsconfig.json ---
+{
+    "compilerOptions": {
+        "experimentalDecorators": true,
+        "target": "es5",
+        "noEmit": true
+    },
+    "exclude": [
+        "node_modules"
+    ],
+}
+'''

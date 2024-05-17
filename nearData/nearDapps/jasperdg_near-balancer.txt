@@ -1,0 +1,1922 @@
+*GitHub Repository "jasperdg/near-balancer"*
+
+'''--- Cargo.toml ---
+[package]
+name = "flux-amm"
+version = "0.1.0"
+authors = ["jasperdg <jasperdegooijer@gmail.com>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+borsh = "*"
+near-sdk = "^2.0.0"
+uint = { version = "0.8.5", default-features = false }
+wee_alloc = { version = "0.4.5", default-features = false, features = [] }
+
+[profile.release]
+codegen-units = 1
+overflow-checks = true
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+
+[dev-dependencies]
+lazy_static = "1.4.0"
+quickcheck = "0.9"
+quickcheck_macros = "0.9"
+log = "0.4"
+env_logger = { version = "0.7.1", default-features = false }
+near-crypto = { git = "https://github.com/nearprotocol/nearcore.git" }
+near-primitives = { git = "https://github.com/nearprotocol/nearcore.git" }
+near-runtime-standalone = { git = "https://github.com/nearprotocol/nearcore.git" }
+
+'''
+'''--- scripts/build.sh ---
+RUSTFLAGS='-C link-arg=-s' cargo +stable build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/flux_amm.wasm ./res/
+
+'''
+'''--- scripts/test.sh ---
+bash ./scripts/build.sh 
+cargo test -p flux-amm -- --nocapture
+'''
+'''--- src/constants.rs ---
+pub const TOKEN_DENOM: u128 = 1_000_000_000_000_000_000;
+
+pub const MIN_FEE: u128= TOKEN_DENOM / 1_000_000;
+pub const MAX_FEE: u128 = TOKEN_DENOM / 10;
+
+pub const MIN_BOUND_TOKENS: u64 = 2;
+pub const MAX_BOUND_TOKENS: u64 = 8;
+
+pub const MAX_WEIGHT: u128 = TOKEN_DENOM * 50;
+pub const MIN_WEIGHT: u128 = TOKEN_DENOM;
+pub const MIN_BALANCE: u128 = TOKEN_DENOM / 1_000_000_000_000;
+
+pub const MAX_TOTAL_WEIGHT: u128 = TOKEN_DENOM * 50;
+pub const EXIT_FEE: u128 = 0;
+
+pub const INIT_POOL_SUPPLY: u128 = TOKEN_DENOM * 100;
+pub const MAX_IN_RATIO: u128 = TOKEN_DENOM / 2;
+
+pub const MIN_POW_BASE: u128 = 1;
+pub const MAX_POW_BASE: u128 = (2 * TOKEN_DENOM) - 1;
+pub const POW_PRECISION: u128 = TOKEN_DENOM / 10_000_000_000;
+
+'''
+'''--- src/lib.rs ---
+#![warn(clippy::all, clippy::pedantic)]
+#![allow(dead_code, clippy::struct_excessive_bools, clippy::ptr_arg, clippy::tabs_in_doc_comments, clippy::too_many_arguments)]
+#[cfg(feature = "wee_alloc")]
+
+#[global_allocator]
+static ALLOC: wee_alloc::WeeAlloc = wee_alloc::WeeAlloc::INIT;
+
+#[macro_use]
+#[allow(dead_code)]
+mod pool_factory;
+mod pool;
+mod token;
+mod constants;
+mod math;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(test)]
+mod tests;
+'''
+'''--- src/logger.rs ---
+// NEW_POOL env log
+
+// NEW_OWNER
+
+// LOG_SWAP
+// LOG_JOIN
+// LOG_EXIT
+// LOG_CALL
+
+'''
+'''--- src/math.rs ---
+use crate::constants::{
+    TOKEN_DENOM,
+    MIN_POW_BASE,
+    MAX_POW_BASE,
+    POW_PRECISION
+};
+use uint::construct_uint;
+
+construct_uint! {
+    /// 256-bit unsigned integer.
+    pub struct u256(4);
+}
+
+/**********************************************************************************************
+// calcSpotPrice                                                                             //
+// sP = spotPrice                                                                            //
+// bI = tokenBalanceIn                ( bI / wI )         1                                  //
+// bO = tokenBalanceOut         sP =  -----------  *  ----------                             //
+// wI = tokenWeightIn                 ( bO / wO )     ( 1 - sF )                             //
+// wO = tokenWeightOut                                                                       //
+// sF = swapFee                                                                              //
+**********************************************************************************************/
+
+pub fn calc_spot_price(
+    token_balance_in: u128,
+    token_weight_in: u128,
+    token_balance_out: u128,
+    token_weight_out: u128,
+    swap_fee: u128
+) -> u128 {
+    let numer = div_u128(token_balance_in, token_weight_in);
+    let denom = div_u128(token_balance_out, token_weight_out);
+    let ratio = div_u128(numer, denom);
+    let scale = div_u128(TOKEN_DENOM, TOKEN_DENOM - swap_fee);
+
+    mul_u128(ratio, scale)
+}
+
+/**********************************************************************************************
+// calcOutGivenIn                                                                            //
+// aO = tokenAmountOut                                                                       //
+// bO = tokenBalanceOut                                                                      //
+// bI = tokenBalanceIn              /      /            bI             \    (wI / wO) \      //
+// aI = tokenAmountIn    aO = bO * |  1 - | --------------------------  | ^            |     //
+// wI = tokenWeightIn               \      \ ( bI + ( aI * ( 1 - sF )) /              /      //
+// wO = tokenWeightOut                                                                       //
+// sF = swapFee                                                                              //
+**********************************************************************************************/
+
+pub fn calc_out_given_in(
+    token_balance_in: u128,
+    token_weight_in: u128,
+    token_balance_out: u128,
+    token_weight_out: u128,
+    token_amount_in: u128,
+    swap_fee: u128
+) -> u128 {
+    let weight_ratio = div_u128(token_weight_in, token_weight_out);
+    let mut adjusted_in = TOKEN_DENOM - swap_fee;
+    adjusted_in = mul_u128(token_amount_in, adjusted_in);
+    let y = div_u128(token_balance_in, token_balance_in + adjusted_in);
+    let pow_res = pow_u128(y, weight_ratio);
+    let balance_out_ratio = TOKEN_DENOM - pow_res;
+    
+    
+    mul_u128(token_balance_out, balance_out_ratio)
+}
+
+/*** Internal math helper functions ***/
+fn btoi(a: u128) -> u128 {
+    a / TOKEN_DENOM
+}
+
+fn floor_u128(a: u128) -> u128 {
+    btoi(a) * TOKEN_DENOM
+}
+
+fn sub_sign(a: u128, b: u128) -> (u128, bool) {
+    if a >= b {
+        (a - b, false)
+    } else {
+        (b- a, true)
+    }
+}
+
+fn pow_i_u128(mut a: u128, mut n: u128) -> u128 {
+    let mut z = if n % 2 == 0 { TOKEN_DENOM } else { a };
+    n /= 2;
+    while n != 0 {
+        a = mul_u128(a, a);
+        if n % 2 != 0 {
+            z = mul_u128(z, a);
+        }
+        n /= 2;
+    }
+    z
+}
+
+fn pow_approx (base: u128, exp: u128, precision: u128) -> u128 {
+    let a = exp;
+    let (x, xneg) = sub_sign(base, TOKEN_DENOM);
+    let mut term = TOKEN_DENOM;
+    let mut sum = term;
+    let mut negative = false;
+
+    // term(k) = numer / denom 
+    //         = (product(a - i - 1, i=1-->k) * x^k) / (k!)
+    // each iteration, multiply previous term by (a-(k-1)) * x / k
+    // continue until term is less than precision
+
+    let mut i = 1;
+    while term >= precision {
+        let bigK = i * TOKEN_DENOM;
+        let (c, cneg) = sub_sign(a, bigK - TOKEN_DENOM);
+
+        term = mul_u128(term, mul_u128(c, x));
+        term = div_u128(term, bigK);
+        if term == 0 { break; }
+
+        if xneg { negative = !negative };
+        if cneg { negative = !negative };
+        if negative {
+            sum -= term;
+        }
+         else {
+             sum += term;
+         }
+        i += 1;
+    }
+
+    sum
+}
+
+/*** operators that take decimals into account ***/
+
+pub fn pow_u128(
+    base: u128, 
+    exp: u128
+) -> u128 {
+    assert!(base >= MIN_POW_BASE, "ERR_MIN_POW_BASE");
+    assert!(base <= MAX_POW_BASE, "ERR_MAX_POW_BASE");
+
+    let whole = floor_u128(base);
+    let remain = exp - whole;
+
+    let whole_pow = pow_i_u128(base, btoi(whole));
+
+    if remain == 0 {
+        return whole_pow
+    }
+
+    let partial_result = pow_approx(base, remain, POW_PRECISION);
+
+    mul_u128(whole_pow, partial_result)
+}
+
+pub fn div_u128(a: u128, b: u128) -> u128 {
+    let a_u256 = u256::from(a);
+    let token_denom_u256 = u256::from(TOKEN_DENOM);
+
+    let c0 = a_u256 * token_denom_u256;
+
+    let c1 = c0 + (b / 2);
+
+    (c1 / b).as_u128()
+}
+
+pub fn mul_u128(a: u128, b: u128) -> u128 {
+    let a_u256 = u256::from(a);
+    let b_u256 = u256::from(b);
+    let token_denom_u256 = u256::from(TOKEN_DENOM);
+
+    let c0: u256 = a_u256 * b_u256;
+
+    let c1 = c0 + (token_denom_u256 / 2);
+
+    (c1 / token_denom_u256).as_u128()
+}
+'''
+'''--- src/pool.rs ---
+use std::cmp::Ordering;
+use near_sdk::{
+    env,
+    json_types::{
+        U128
+    },
+    AccountId,
+    borsh::{
+        BorshDeserialize, BorshSerialize
+    },
+    collections::{
+        UnorderedMap,
+        Vector
+    }
+};
+
+use crate::constants::{
+    MAX_BOUND_TOKENS, 
+    MIN_BOUND_TOKENS,
+    MAX_FEE,
+    MIN_FEE,
+    MIN_WEIGHT,
+    MAX_WEIGHT,
+    EXIT_FEE,
+    MIN_BALANCE,
+    MAX_TOTAL_WEIGHT,
+    INIT_POOL_SUPPLY,
+    MAX_IN_RATIO
+};
+
+use crate::math;
+use crate::token::FungibleTokenVault;
+
+#[derive(BorshDeserialize, BorshSerialize, Debug)]
+pub struct Record {
+    pub bound: bool, // is this token record bound to the pool
+    pub index: u64, // index of this record in list of records
+    pub denorm: u128, // denormalized weight of this token 
+    pub balance: u128, // pool balance of this token
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Pool {
+    id: u64,
+    total_weight: u128,
+    swap_fee: u128,
+    finalized: bool,
+    controller: AccountId,
+    token: FungibleTokenVault,
+    pub records: UnorderedMap<AccountId, Record>,
+    pub tokens: Vector<AccountId>
+}
+
+impl Pool {
+    /**
+     * @notice Creates new `Pool` instance
+     * @param swap_fee The 
+     */
+    pub fn new(
+        sender: AccountId, 
+        id: u64, 
+        swap_fee: u128
+    ) -> Self {
+        assert!(swap_fee <= MAX_FEE, "ERR_MAX_FEE");
+        // assert!(swap_fee >= MIN_FEE, "ERR_MIN_FEE"); // TODO: Turn on
+
+        Self {
+            id,
+            total_weight: 0,
+            swap_fee,
+            finalized: false,
+            controller: sender,
+            token: FungibleTokenVault::new(id),
+            records: UnorderedMap::new(format!("records:{}", id).as_bytes().to_vec()),
+            tokens: Vector::new(format!("tokens:{}", id).as_bytes().to_vec()),
+        }
+    }
+
+    pub fn is_finalized(&self) -> bool { 
+        self.finalized
+    }
+
+    pub fn is_bound(&self, token_account_id: &AccountId) -> bool {
+        match self.records.get(token_account_id) {
+            Some(record) => record.bound,
+            None => false
+        }
+    }
+
+    pub fn get_controller(&self) -> AccountId {
+        self.controller.to_string()
+    }
+
+    pub fn get_num_tokens(&self) -> u64 {
+        self.tokens.len()
+    }
+
+    pub fn get_current_tokens(&self) -> Vec<AccountId> {
+        self.tokens.to_vec()
+    }
+
+    pub fn get_final_tokens(&self) -> Vec<AccountId> {
+        assert!(self.finalized, "ERR_NOT_FINALIZED");
+        self.tokens.to_vec()
+    }
+
+    pub fn get_balance(&self, token_account_id: &AccountId) -> u128 {
+        self.records
+            .get(token_account_id)
+            .expect("ERR_NO_RECORD")
+            .balance
+    }
+
+    pub fn get_pool_token_balance(&self, account_id: &AccountId) -> u128 {
+        self.token.get_balance(account_id)
+    }
+ 
+    pub fn get_pool_token_total_supply(&self) -> u128 {
+        self.token.total_supply()
+    }
+
+    pub fn get_swap_fee(&self) -> u128 {
+        self.swap_fee
+    }
+
+    pub fn finalize(&mut self, sender: &AccountId) {
+        assert!(!self.finalized, "ERR_IS_FINALIZED");
+        assert!(self.get_num_tokens() >= MIN_BOUND_TOKENS, "ERR_MIN_TOKENS");
+        assert_eq!(sender, &self.controller, "ERR_NO_CONTROLLER");
+
+        self.finalized = true;
+        self.token.mint(INIT_POOL_SUPPLY, sender);
+    }
+
+    pub fn bind(&mut self, 
+        sender: &AccountId, 
+        token_account_id: &AccountId, 
+        denorm: u128, 
+        balance: u128
+    ) {
+        assert_eq!(sender, &self.controller, "ERR_NO_CONTROLLER");
+        assert!(env::is_valid_account_id(token_account_id.as_bytes()), "ERR_INVALID_ACCOUNT_ID");
+        assert!(!self.is_bound(&token_account_id), "ERR_is_BOUND");
+        assert!(!self.finalized, "ERR_IS_FINALIZED");
+        assert!(self.get_num_tokens() < MAX_BOUND_TOKENS, "ERR_MAX_TOKENS");
+        
+        let new_record = Record {
+            bound: true,
+            index: self.get_num_tokens(),
+            denorm: 0,
+            balance: 0
+        };
+        
+        self.records.insert(token_account_id, &new_record);
+        self.tokens.push(token_account_id);
+        self.rebind(sender, token_account_id, denorm, balance);
+    }
+    
+    pub fn rebind(
+        &mut self, 
+        sender: &AccountId, 
+        token_account_id: &AccountId, 
+        denorm: u128, 
+        balance: u128
+    ) {
+        assert_eq!(sender, &self.controller, "ERR_NO_CONTROLLER");
+        assert!(env::is_valid_account_id(token_account_id.as_bytes()), "ERR_INVALID_ACCOUNT_ID");
+        assert!(self.is_bound(token_account_id), "ERR_NOT_BOUND");
+        assert!(!self.finalized, "ERR_IS_FINALIZED");
+        
+        assert!(denorm >= MIN_WEIGHT, "ERR_MIN_WEIGHT");
+        assert!(denorm <= MAX_WEIGHT, "ERR_MAX_WEIGHT");
+        assert!(balance >= MIN_BALANCE, "ERR_MIN_BALANCE");
+        
+        let mut record = self.records.get(token_account_id).expect("ERR_NO_RECORD");
+        
+        let old_weight = record.denorm;
+        match denorm.cmp(&old_weight) {
+            Ordering::Greater => {
+                self.total_weight += denorm - old_weight;
+                assert!(self.total_weight <= MAX_TOTAL_WEIGHT, "ERR_MAX_TOTAL_WEIGHT");
+            },
+            Ordering::Less => {
+                self.total_weight -= old_weight - denorm;
+            }, 
+            Ordering::Equal => ()
+        };
+
+        record.denorm = denorm;
+
+        // let old_balance = record.balance;
+        record.balance = balance;
+
+        self.records.insert(token_account_id, &record);
+        
+        // match balance.cmp(&old_balance) {
+        //     Ordering::Greater => {
+        //         // Transfer from user to this contract 
+        //         // token(token_account_id).transfer_from(env::predecessor_account(), old_balance - balance)
+        //     },
+        //     Ordering::Less => {
+        //         // let token_balance_withdraw = old_balance - balance;
+        //         // let token_exit_fee = token_balance_withdraw * EXIT_FEE; // TODO: do we need this?
+
+        //         // Transfer from contract to this user
+        //         // token(token_account_id).transfer(env::predecessor_account(), token_balance_withdraw - token_exit_fee)
+        //     },
+        //     Ordering::Equal => ()
+        // }
+        
+    }
+
+    pub fn unbind(
+        &mut self, 
+        sender: &AccountId, 
+        token_account_id: &AccountId
+    ) {
+        assert_eq!(sender, &self.controller, "ERR_NO_CONTROLLER");
+        assert!(self.is_bound(token_account_id), "ERR_NOT_BOUND");
+        assert!(!self.finalized, "ERR_IS_FINALIZED");
+
+        let record = self.records.get(token_account_id).expect("ERR_NO_RECORD");
+
+        // let token_balance = record.balance;
+        // let token_exit_fee = record.balance * EXIT_FEE;
+
+        self.total_weight -= record.denorm;
+        
+        let index = record.index;
+        self.tokens.swap_remove(index);
+        self.records.remove(token_account_id);
+
+        // token(token_account_id).transfer(env::predecessor_account(), token_balance - token_exit_fee)
+    }
+
+    // TODO: Gulp function requires async balance checks, will only work when pools are sharded
+
+    pub fn get_spot_price(
+        &self, 
+        token_in: &AccountId, 
+        token_out: &AccountId
+    ) -> u128 {
+        assert!(self.is_bound(token_in), "ERR_NOT_BOUND");
+        assert!(self.is_bound(token_out), "ERR_NOT_BOUND");
+        let record_in = self.records.get(token_in).expect("ERR_NO_RECORD");
+        let record_out = self.records.get(token_out).expect("ERR_NO_RECORD");
+
+        math::calc_spot_price(record_in.balance, record_in.denorm, record_out.balance, record_out.denorm, self.swap_fee)
+    }
+
+    pub fn get_spot_price_sans_fee(
+        &self, 
+        token_in: &AccountId, 
+        token_out: &AccountId
+    ) -> u128 {
+        assert!(self.is_bound(token_in), "ERR_NOT_BOUND");
+        assert!(self.is_bound(token_out), "ERR_NOT_BOUND");
+        let record_in = self.records.get(token_in).expect("ERR_NO_RECORD");
+        let record_out = self.records.get(token_out).expect("ERR_NO_RECORD");
+
+        math::calc_spot_price(record_in.balance, record_in.denorm, record_out.balance, record_out.denorm, 0)
+    }
+
+    pub fn join_pool(
+        &mut self,
+        sender: &AccountId,
+        pool_amount_out: u128,
+        max_amounts_in: Vec<U128>
+    ) {
+        assert!(self.finalized, "ERR_NOT_FINALIZED");
+        assert_eq!(max_amounts_in.len() as u64, self.get_num_tokens(), "ERR_AMOUNTS_LEN");
+
+        let pool_total = self.token.total_supply();
+        let ratio = math::div_u128(pool_amount_out, pool_total);
+        assert_ne!(ratio, 0, "ERR_MATH_APPROX");
+
+        for (i, token) in self.tokens.iter().enumerate() {
+            let mut record = self.records
+                .get(&token)
+                .expect("ERR_NO_RECORD");
+
+            let balance = record.balance;
+            
+            let token_amount_in = math::mul_u128(ratio, balance);
+
+            assert_ne!(token_amount_in, 0, "ERR_MATH_APPROX");
+            assert!(token_amount_in <= u128::from(max_amounts_in[i]), "ERR_LIMIT_IN");
+
+            record.balance += token_amount_in;
+            
+            self.records.insert(&token, &record);
+
+            // TODO: Transfer tokens in from user
+        }
+
+        self.token.mint(pool_amount_out, sender);
+    }
+
+    pub fn exit_pool(
+        &mut self,
+        sender: &AccountId,
+        pool_amount_in: u128,
+        min_amounts_out: Vec<U128>
+    ) {
+        assert!(self.finalized, "ERR_NOT_FINALIZED");
+        assert_eq!(min_amounts_out.len() as u64, self.get_num_tokens(), "ERR_AMOUNTS_LEN");
+
+        let pool_total = self.token.total_supply();
+        let exit_fee = math::mul_u128(pool_amount_in, EXIT_FEE);
+        let pool_amount_in_min_exit_fee = pool_amount_in - exit_fee;
+        let ratio = math::div_u128(pool_amount_in_min_exit_fee, pool_total);
+        assert_ne!(ratio, 0, "ERR_MATH_APPROX");
+
+        // Make sure this method is called by on_vault_received I think? 
+        // Burn `pool_amount_in` pool_tokens 
+        // TODO: Temp burn fn
+        self.token.faux_burn(pool_amount_in);
+        for (i, token) in self.tokens.iter().enumerate() {
+            let mut record = self.records
+                .get(&token)
+                .expect("ERR_NO_RECORD");
+            let balance = record.balance;
+            let token_amount_out = math::mul_u128(ratio, balance);
+            
+            assert_ne!(token_amount_out, 0, "ERR_MATH_APPROX");
+            assert!(token_amount_out >= u128::from(min_amounts_out[i]), "ERR_LIMIT_OUT");
+
+            record.balance -= token_amount_out;
+
+            self.records.insert(&token, &record);
+            // Transfer token to user
+        }
+    }
+
+    pub fn swap_exact_amount_in(
+        &mut self,
+        sender: &AccountId,
+        token_in: &AccountId,
+        token_amount_in: u128,
+        token_out: &AccountId,
+        min_amount_out: u128,
+        max_price: u128
+    ) -> (u128, u128) {
+        assert!(self.is_bound(token_in), "ERR_NOT_BOUND");
+        assert!(self.is_bound(token_out), "ERR_NOT_BOUND");
+        assert!(self.finalized, "ERR_NOT_FINALIZED");
+
+        let mut in_record = self.records.get(token_in).expect("ERR_NO_RECORD");
+        let mut out_record = self.records.get(token_out).expect("ERR_NO_RECORD");
+
+        assert!(token_amount_in <= math::mul_u128(in_record.balance, MAX_IN_RATIO), "ERR_MAX_IN_RATIO");
+
+        let spot_price_before = math::calc_spot_price(
+            in_record.balance, 
+            in_record.denorm, 
+            out_record.balance, 
+            out_record.denorm, 
+            self.swap_fee
+        );
+        
+        assert!(spot_price_before <= max_price, "ERR_BAD_LIMIT_PRICE");
+        
+        let token_amount_out = math::calc_out_given_in(
+            in_record.balance,
+            in_record.denorm,
+            out_record.balance,
+            out_record.denorm,
+            token_amount_in, 
+            self.swap_fee
+        );
+
+        assert!(token_amount_out >= min_amount_out, "ERR_LIMIT_OUT");
+
+        in_record.balance += token_amount_in;
+        out_record.balance -= token_amount_out;
+
+        let spot_price_after = math::calc_spot_price(
+            in_record.balance, 
+            in_record.denorm, 
+            out_record.balance, 
+            out_record.denorm, 
+            self.swap_fee
+        );
+        
+        assert!(spot_price_after >= spot_price_before, "ERR_MATH_APPROX");
+        assert!(spot_price_after <= max_price, "ERR_LIMIT_PRICE");
+        assert!(spot_price_before <= math::div_u128(token_amount_in, token_amount_out), "ERR_MATH_APPROX");
+
+        // TODO: LOG swap
+        // TODO: transfer in_token from sender to contract
+        // TODO: transfer out_token from contract to sender
+        self.records.insert(&token_in, &in_record);
+        self.records.insert(&token_out, &out_record);
+        (token_amount_out, spot_price_after)
+    }
+}
+
+'''
+'''--- src/pool_factory.rs ---
+use near_sdk::{
+    near_bindgen,
+    json_types::{
+        U128, 
+        U64
+    },
+    AccountId, 
+    env,
+    collections::{
+        UnorderedMap
+    },
+    borsh::{
+        BorshDeserialize,
+        BorshSerialize
+    }
+};
+
+use crate::pool::Pool;
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct PoolFactory {
+    owner: AccountId, // The owner of the contract
+    nonce: u64, // Incrementing number that's used to define a pool's id
+    pools: UnorderedMap<u64, Pool> // Maps pool ids to pool
+}
+
+/** 
+ * @notice implement `Default` for `PoolFactory` - allowing for a default state to be set
+ * @panics if the contract hasn't been initialized yet, there is no default state
+ */
+impl Default for PoolFactory {
+    fn default() -> Self {
+        panic!("ERR_CONTRACT_NOT_INITIATED")
+    }
+}
+
+#[near_bindgen]
+impl PoolFactory {
+
+    /**
+     * @notice Initialize the contract by setting the owner
+     * @param owner The `account_id` that's going to have owner privileges
+     */
+    #[init]
+    pub fn init(owner: AccountId) -> Self {
+        assert!(!env::state_exists(), "ERR_CONTRACT_IS_INITIALIZED");
+        assert!(env::is_valid_account_id(owner.as_bytes()), "ERR_INVALID_ACCOUNT_ID");
+        
+        Self {
+            owner: owner,
+            nonce: 0,
+            pools: UnorderedMap::new(b"pools".to_vec())
+        }
+    }
+
+    /**
+     * @return the `account_id` of the current owner
+     */
+    pub fn get_owner(&self) -> &AccountId {
+        &self.owner
+    }
+
+    /**
+     * @return returns the `account_id` of the current owner
+     */
+    pub fn get_nonce(&self) -> U64 {
+        self.nonce.into()
+    }
+
+    /*** POOL_GETTERS ***/
+
+    pub fn get_pool_token_total_supply(
+        &self, 
+        pool_id: U64
+    ) -> U128 {
+        let pool = self.pools.get(&pool_id.into()).expect("ERR_NO_POOL");
+        pool.get_pool_token_total_supply().into()
+    }
+
+    pub fn get_pool_token_balance(
+        &self, 
+        pool_id: U64, 
+        account_id: &AccountId
+    ) -> U128 {
+        let pool = self.pools.get(&pool_id.into()).expect("ERR_NO_POOL");
+        pool.get_pool_token_balance(account_id).into()
+    }
+    
+    pub fn pool_exists(&self, pool_id: U64) -> bool {
+        match self.pools.get(&pool_id.into()) {
+            Some(_pool) => true,
+            None => false
+        }
+    }
+
+    pub fn pool_is_finalized(&self, pool_id: U64) -> bool { 
+        let pool = self.pools.get(&pool_id.into()).expect("ERR_NO_POOL");
+        pool.is_finalized()
+    }
+
+    pub fn pool_token_is_bound(&self, token_account_id: &AccountId, pool_id: U64) -> bool {
+        let pool = self.pools.get(&pool_id.into()).expect("ERR_NO_POOL");
+        pool.records
+            .get(token_account_id)
+            .expect("ERR_NO_RECORD")
+            .bound
+    }
+
+    pub fn get_pool_num_tokens(&self, pool_id: U64) -> U64 {
+        let pool = self.pools.get(&pool_id.into()).expect("ERR_NO_POOL");
+        pool.tokens.len().into()
+    }
+
+    pub fn get_pool_current_tokens(&self, pool_id: U64) -> Vec<AccountId> {
+        let pool = self.pools.get(&pool_id.into()).expect("ERR_NO_POOL");
+        pool.tokens.to_vec()
+    }
+
+    pub fn get_pool_final_tokens(&self, pool_id: U64) -> Vec<AccountId> {
+        let pool = self.pools.get(&pool_id.into()).expect("ERR_NO_POOL");
+        assert!(pool.is_finalized(), "ERR_NOT_FINALIZED");
+        pool.tokens.to_vec()
+    }
+
+    pub fn get_pool_balance(
+        &self, 
+        pool_id: U64,
+        token_account_id: &AccountId
+    ) -> U128 {
+        let pool = self.pools.get(&pool_id.into()).expect("ERR_NO_POOL");
+        pool.records
+            .get(token_account_id)
+            .expect("ERR_NO_RECORD")
+            .balance
+            .into()
+    }
+
+    pub fn pool_get_swap_fee(&self, pool_id: U64) -> U128 {
+        let pool = self.pools.get(&pool_id.into()).expect("ERR_NO_POOL");
+        pool.get_swap_fee().into()
+    }
+
+    /**
+     * @notice allows the previous owner to set a new owner
+     * @param new_owner the `account_id` of the new owner
+     * @panics if the signer of this tx is not the previous owner
+     * @panics if `new_owner` is not a valid account id
+     */
+    pub fn set_owner(&mut self, new_owner: AccountId) {
+        assert_eq!(env::predecessor_account_id(), self.owner, "ERR_NOT_OWNER");
+        assert!(env::is_valid_account_id(new_owner.as_bytes()), "ERR_INVALID_ACCOUNT_ID");
+        
+        self.owner = new_owner;
+    }
+
+    /**
+     * @notice creates new token pool
+     * @param
+     * @return the new pool's id 
+     */ 
+    pub fn new_pool(&mut self, swap_fee: U128) -> U64 {
+        self.nonce += 1;
+        let new_pool = Pool::new(env::predecessor_account_id(), self.nonce, u128::from(swap_fee));
+        self.pools.insert(&self.nonce, &new_pool);
+        self.nonce.into()
+    }
+
+    /*** POOL SETTERS ***/
+
+    pub fn finalize_pool(&mut self, pool_id: U64) {
+        let mut pool = self.pools.get(&pool_id.into()).expect("ERR_NO_POOL");
+        pool.finalize(&env::predecessor_account_id());
+        self.pools.insert(&pool_id.into(), &pool);
+    }
+
+    pub fn bind_pool(
+        &mut self, 
+        pool_id: U64,
+        token_account_id: &AccountId,
+        denorm: U128,
+        balance: U128
+    ) {
+        let mut pool = self.pools.get(&pool_id.into()).expect("ERR_NO_POOL");
+        pool.bind(
+            &env::predecessor_account_id(),
+            token_account_id,
+            u128::from(denorm),
+            u128::from(balance)
+        );
+        self.pools.insert(&pool_id.into(), &pool);
+    }
+
+    pub fn rebind_pool(
+        &mut self, 
+        pool_id: U64,
+        token_account_id: &AccountId,
+        denorm: U128,
+        balance: U128
+    ) {
+        let mut pool = self.pools.get(&pool_id.into()).expect("ERR_NO_POOL");
+        pool.rebind(
+            &env::predecessor_account_id(),
+            token_account_id,
+            u128::from(denorm),
+            u128::from(balance)
+        );
+        self.pools.insert(&pool_id.into(), &pool);
+    }
+
+    pub fn unbind_pool(
+        &mut self, 
+        pool_id: U64,
+        token_account_id: &AccountId,
+    ) {
+        let mut pool = self.pools.get(&pool_id.into()).expect("ERR_NO_POOL");
+        pool.unbind(
+            &env::predecessor_account_id(),
+            token_account_id
+        );
+        self.pools.insert(&pool_id.into(), &pool);
+    }
+
+    pub fn get_pool_spot_price(
+        &self,
+        pool_id: U64,
+        token_in: &AccountId,
+        token_out: &AccountId,
+    ) -> U128 {
+        let pool = self.pools.get(&pool_id.into()).expect("ERR_NO_POOL");
+        pool.get_spot_price(token_in, token_out).into()
+    }
+
+    pub fn get_pool_spot_price_sans_fee(
+        &self,
+        pool_id: U64,
+        token_in: &AccountId,
+        token_out: &AccountId,
+    ) -> U128 {
+        let pool = self.pools.get(&pool_id.into()).expect("ERR_NO_POOL");
+        pool.get_spot_price_sans_fee(token_in, token_out).into()
+    }
+
+    pub fn join_pool(
+        &mut self,
+        pool_id: U64,
+        pool_amount_out: U128,
+        max_amounts_in: Vec<U128>,
+    ) {
+        let mut pool = self.pools.get(&pool_id.into()).expect("ERR_NO_POOL");
+        pool.join_pool(
+            &env::predecessor_account_id(), 
+            pool_amount_out.into(),
+            max_amounts_in
+        );
+        self.pools.insert(&pool_id.into(), &pool);
+    }
+
+    pub fn exit_pool(
+        &mut self,
+        pool_id: U64,
+        pool_amount_in: U128,
+        min_amounts_out: Vec<U128>,
+    ) {
+        let mut pool = self.pools.get(&pool_id.into()).expect("ERR_NO_POOL");
+        pool.exit_pool(
+            &env::predecessor_account_id(), 
+            pool_amount_in.into(),
+            min_amounts_out
+        );
+        self.pools.insert(&pool_id.into(), &pool);
+    }
+
+    pub fn swap_exact_amount_in(
+        &mut self, 
+        pool_id: U64,
+        token_in: &AccountId,
+        token_amount_in: U128,
+        token_out: &AccountId,
+        min_amount_out: U128,
+        max_price: U128
+    ) -> (U128, U128) {
+        let mut pool = self.pools.get(&pool_id.into()).expect("ERR_NO_POOL");
+        let (token_amount_out, spot_price_after) = pool.swap_exact_amount_in(
+            &env::predecessor_account_id(),
+            token_in,
+            token_amount_in.into(),
+            token_out,
+            min_amount_out.into(),
+            max_price.into()
+        );
+
+        self.pools.insert(&pool_id.into(), &pool);
+
+        (token_amount_out.into(), spot_price_after.into())
+    }
+}
+'''
+'''--- src/tests.rs ---
+use near_sdk::{
+    AccountId, 
+    VMContext, 
+    testing_env, 
+    MockedBlockchain, 
+    json_types::{
+        U128, 
+        U64
+    }
+};
+
+use crate::pool_factory::PoolFactory;
+
+fn alice() -> String {
+    "alice".to_string()
+}
+
+fn bob() -> String {
+    "bob".to_string()
+}
+
+fn carol() -> String {
+    "carol".to_string()
+}
+
+fn token_a() -> String {
+    "t1".to_string()
+}
+
+fn token_b() -> String {
+    "t2".to_string()
+}
+
+fn token_c() -> String {
+    "t3".to_string()
+}
+
+fn to_token_denom(amt: u128) -> u128 {
+    amt * 10_u128.pow(18)
+}
+
+fn swap_fee() -> U128 {
+    U128(to_token_denom(3) / 1000)
+}
+
+fn get_context(
+    predecessor_account_id: AccountId, 
+    block_timestamp: u64
+) -> VMContext {
+
+    VMContext {
+        current_account_id: alice(),
+        signer_account_id: bob(),
+        signer_account_pk: vec![0, 1, 2],
+        predecessor_account_id,
+        input: vec![],
+        block_index: 0,
+        epoch_height: 0,
+        account_balance: 0,
+        is_view: false,
+        storage_usage: 10000,
+        block_timestamp,
+        account_locked_balance: 0,
+        attached_deposit: 0,
+        prepaid_gas: 10_u64.pow(16),
+        random_seed: vec![0, 1, 2],
+        output_data_receivers: vec![],
+    }
+}
+
+mod factory_tests;
+mod pool_initiation_test;
+mod pricing_tests;
+mod dynamic_pool_tests;
+mod swap_tests;
+mod init_tests;
+mod math_tests;
+'''
+'''--- src/tests/dynamic_pool_tests.rs ---
+use super::*;
+use crate::constants::{
+    INIT_POOL_SUPPLY
+};
+
+fn create_even_pool() -> (PoolFactory, U64) {
+    let context = get_context(alice(), 0);
+    testing_env!(context);
+    let mut contract = PoolFactory::init(alice());
+    
+    let pool_id = contract.new_pool(swap_fee());
+
+    // Token a is stable coin worth $1
+    contract.bind_pool(
+        pool_id,
+        &token_a(),
+        U128(to_token_denom(20)),
+        U128(to_token_denom(100))
+    );
+
+    // Token b is governance token worth $200
+    contract.bind_pool(
+        pool_id,
+        &token_b(),
+        U128(to_token_denom(10)),
+        U128(to_token_denom(1))
+    );
+    contract.finalize_pool(pool_id);
+
+    (contract, pool_id)
+}
+
+#[test]
+fn test_pool_join() {
+    let  (mut contract, pool_id) = create_even_pool();
+
+    let price_a: u128 = contract.get_pool_spot_price_sans_fee(pool_id, &token_b(), &token_a()).into();
+    let price_b: u128 = contract.get_pool_spot_price_sans_fee(pool_id, &token_a(), &token_b()).into();
+
+    let expected_price_a = to_token_denom(2) / 100;
+    let expected_price_b = to_token_denom(50);
+
+    assert_eq!(expected_price_a, price_a);
+    assert_eq!(expected_price_b, price_b);
+
+    testing_env!(get_context(bob(), 0));
+
+    let pool_amount_out = to_token_denom(100);
+    let max_amounts_in = vec![U128(to_token_denom(100)), U128(to_token_denom(1))];
+    contract.join_pool(pool_id, U128(pool_amount_out), max_amounts_in);
+
+    let expected_total_supply = to_token_denom(200);
+    let total_supply: u128 = contract.get_pool_token_total_supply(pool_id).into();
+    assert_eq!(total_supply, expected_total_supply);
+
+    /* Test Pool Token balances */
+    let owner_pool_tokens: u128 = contract.get_pool_token_balance(pool_id, &alice()).into();
+    let joined_pool_tokens: u128 = contract.get_pool_token_balance(pool_id, &bob()).into();
+    
+    assert_eq!(owner_pool_tokens, INIT_POOL_SUPPLY);
+    assert_eq!(joined_pool_tokens, INIT_POOL_SUPPLY);
+
+    /* Test pooled tokens balances */
+    let pool_dai_balance: u128 = contract.get_pool_balance(pool_id, &token_a()).into();
+    let pool_mkr_balance: u128 = contract.get_pool_balance(pool_id, &token_b()).into();
+
+    let expected_pool_dai_balance = to_token_denom(200);
+    let expected_pool_mkr_balance = to_token_denom(2);
+
+    assert_eq!(pool_dai_balance, expected_pool_dai_balance);
+    assert_eq!(pool_mkr_balance, expected_pool_mkr_balance);
+}
+
+#[test]
+fn test_pool_exit() {
+    let  (mut contract, pool_id) = create_even_pool();
+
+    let price_a: u128 = contract.get_pool_spot_price_sans_fee(pool_id, &token_b(), &token_a()).into();
+    let price_b: u128 = contract.get_pool_spot_price_sans_fee(pool_id, &token_a(), &token_b()).into();
+
+    let expected_price_a = to_token_denom(2) / 100;
+    let expected_price_b = to_token_denom(50);
+
+    assert_eq!(expected_price_a, price_a);
+    assert_eq!(expected_price_b, price_b);
+
+    testing_env!(get_context(bob(), 0));
+
+    let pool_amount_out = to_token_denom(100);
+    let max_amounts_in = vec![U128(to_token_denom(100)), U128(to_token_denom(1))];
+    contract.join_pool(pool_id, U128(pool_amount_out), max_amounts_in);
+
+    let owner_pool_tokens: u128 = contract.get_pool_token_balance(pool_id, &alice()).into();
+    let joined_pool_tokens: u128 = contract.get_pool_token_balance(pool_id, &bob()).into();
+    
+    assert_eq!(owner_pool_tokens, INIT_POOL_SUPPLY);
+    assert_eq!(joined_pool_tokens, INIT_POOL_SUPPLY);
+
+    let pool_tokens_in = U128(to_token_denom(100));
+    let min_amounts_out = vec![U128(to_token_denom(100)), U128(to_token_denom(1))];
+
+    /* Test exit */
+    contract.exit_pool(pool_id, pool_tokens_in, min_amounts_out);
+
+    let owner_pool_tokens_after_exit: u128 = contract.get_pool_token_balance(pool_id, &alice()).into();
+    // TODO: check if pool tokens are burned correctly
+    // let joined_pool_tokens_after_exit: u128 = contract.get_pool_token_balance(pool_id, &bob()).into();
+    
+    assert_eq!(owner_pool_tokens_after_exit, INIT_POOL_SUPPLY);
+    // assert_eq!(joined_pool_tokens_after_exit, 0); // First need to implement burn / internal_transfers
+
+    /* Test pooled tokens balances */
+    let pool_dai_balance: u128 = contract.get_pool_balance(pool_id, &token_a()).into();
+    let pool_mkr_balance: u128 = contract.get_pool_balance(pool_id, &token_b()).into();
+
+    let expected_pool_dai_balance = to_token_denom(100);
+    let expected_pool_mkr_balance = to_token_denom(1);
+
+    assert_eq!(pool_dai_balance, expected_pool_dai_balance);
+    assert_eq!(pool_mkr_balance, expected_pool_mkr_balance);
+}
+'''
+'''--- src/tests/factory_tests.rs ---
+use super::*;
+
+#[test]
+fn test_ownership_transfering() {
+    let context = get_context(alice(), 0);
+    testing_env!(context);
+    let mut contract = PoolFactory::init(alice());
+
+    let owner = contract.get_owner();
+    assert_eq!(owner, &alice());
+
+    contract.set_owner(bob());
+
+    let new_owner = contract.get_owner();
+    assert_eq!(new_owner, &bob());
+}
+
+#[test]
+#[should_panic(expected = "ERR_NOT_OWNER")]
+fn test_forbidden_ownership_transfering() {
+    let context = get_context(alice(), 0);
+    testing_env!(context);
+    let mut contract = PoolFactory::init(bob());
+
+    let owner = contract.get_owner();
+    assert_eq!(owner, &bob());
+
+    contract.set_owner(bob());
+}
+
+#[test]
+fn test_id_increment() {
+    let context = get_context(alice(), 0);
+    testing_env!(context);
+    let mut contract = PoolFactory::init(alice());
+
+    let init_nonce = u64::from(contract.get_nonce());
+    contract.new_pool(swap_fee());
+    let new_nonce = u64::from(contract.get_nonce());
+
+    assert_eq!(init_nonce + 1, new_nonce);
+}
+
+#[test]
+fn test_pool_creation() {
+    let context = get_context(alice(), 0);
+    testing_env!(context);
+    let mut contract = PoolFactory::init(alice());
+
+    let pool_id = contract.new_pool(swap_fee());
+    assert_eq!(u64::from(pool_id), 1);
+
+    assert!(contract.pool_exists(pool_id));
+}
+'''
+'''--- src/tests/init_tests.rs ---
+use super::*;
+
+#[test]
+fn test_contract_initiation() {
+    let context = get_context(alice(), 0);
+    testing_env!(context);
+    PoolFactory::init(alice());
+}
+
+#[test]
+#[should_panic(expected = "ERR_INVALID_ACCOUNT_ID")]
+fn test_contract_initiation_invalid_account_id() {
+    let context = get_context(alice(), 0);
+    testing_env!(context);
+    PoolFactory::init("{}adjkbjksd_".to_string());
+}
+'''
+'''--- src/tests/math_tests.rs ---
+use super::*;
+use crate::math;
+
+#[test]
+fn test_pow() {
+    let pow_of_2 = math::pow_u128(2, 2);
+    
+    assert_eq!(pow_of_2, 4);
+}
+'''
+'''--- src/tests/pool_initiation_test.rs ---
+use super::*;
+
+use crate::constants::{
+    INIT_POOL_SUPPLY
+};
+
+#[test]
+fn pool_initial_state_test() {
+    let context = get_context(alice(), 0);
+    testing_env!(context);
+    let mut contract = PoolFactory::init(alice());
+
+    let pool_id = contract.new_pool(swap_fee());
+    assert_eq!(contract.pool_is_finalized(pool_id), false);
+    assert_eq!(u64::from(contract.get_pool_num_tokens(pool_id)), 0);
+    assert_eq!(contract.get_pool_current_tokens(pool_id).len(), 0);
+    assert_eq!(contract.get_pool_current_tokens(pool_id).len(), 0);
+}
+
+#[test]
+fn bind_and_finalize_valid_pool() {
+    let context = get_context(alice(), 0);
+    testing_env!(context);
+    let mut contract = PoolFactory::init(alice());
+    
+    let pool_id = contract.new_pool(swap_fee());
+
+    contract.bind_pool(
+        pool_id,
+        &token_a(),
+        U128(to_token_denom(5)),
+        U128(to_token_denom(1000))
+    );
+
+    contract.bind_pool(
+        pool_id,
+        &token_b(),
+        U128(to_token_denom(5)),
+        U128(to_token_denom(1000))
+    );
+
+    contract.finalize_pool(pool_id);
+
+    let tokens = contract.get_pool_final_tokens(pool_id);
+    assert_eq!(tokens.len(), 2);
+}
+
+#[test]
+fn bind_rebind_finalize_valid_pool() {
+    let context = get_context(alice(), 0);
+    testing_env!(context);
+    let mut contract = PoolFactory::init(alice());
+    
+    let pool_id = contract.new_pool(swap_fee());
+
+    // Bind token_a
+    contract.bind_pool(
+        pool_id,
+        &token_a(),
+        U128(to_token_denom(5)),
+        U128(to_token_denom(1000))
+    );
+
+    // Bind token_b
+    contract.bind_pool(
+        pool_id,
+        &token_b(),
+        U128(to_token_denom(5)),
+        U128(to_token_denom(1000))
+    );
+
+    // Rebind token_a
+    contract.rebind_pool(
+        pool_id,
+        &token_b(),
+        U128(to_token_denom(10)),
+        U128(to_token_denom(300))
+    );
+
+    contract.finalize_pool(pool_id);
+
+    let tokens = contract.get_pool_final_tokens(pool_id);
+    assert_eq!(tokens.len(), 2);
+
+    let balance_b = contract.get_pool_balance(pool_id, &token_b());
+
+    assert_eq!(balance_b, U128(to_token_denom(300)));
+
+    let owner_pool_tokens: u128 = contract.get_pool_token_balance(pool_id, &alice()).into();
+    assert_eq!(owner_pool_tokens, INIT_POOL_SUPPLY);
+}
+
+#[test]
+#[should_panic(expected = "ERR_NO_POOL")]
+fn get_non_existing_pool_info_test() {
+    let context = get_context(alice(), 0);
+    testing_env!(context);
+    let contract = PoolFactory::init(alice());
+    assert_eq!(contract.pool_is_finalized(U64(1)), false);
+}
+
+#[test]
+#[should_panic(expected = "ERR_NOT_FINALIZED")]
+fn pool_final_tokens_fail_test() {
+    let context = get_context(alice(), 0);
+    testing_env!(context);
+    let mut contract = PoolFactory::init(alice());
+
+    let pool_id = contract.new_pool(swap_fee());
+    contract.get_pool_final_tokens(pool_id);
+}
+
+// Bind
+// TODO: Test invalid token account id
+// TODO: Test rebinding through bind
+// TODO: Test finalized Pool binding
+// TODO: Test binding after num_tokens >= MAX_BOUND_TOKENS
+
+// Rebind
+// TODO: Test rebind existing binding
+// TODO: Test invalid token account id
+// TODO: Test rebinding unbound token
+// TODO: Test rebinding finalized pool
+// TODO: Test denorm and balance bound assertions (min weight, max weight, min balance)
+
+// Unbind
+// TODO: Test Unbind
+// TODO: Test Unbinding unbound token
+// TODO: Test unbinding for finalized pool
+
+// Finalize edge cases
+// TODO: finalize pool from not controller
+// TODO: finalize a finalized pool
+// TODO: finalize a pool with < 2 tokens
+
+'''
+'''--- src/tests/pricing_tests.rs ---
+use super::*;
+use crate::math;
+
+#[test]
+fn test_finalized_even_pool_pricing_sans_fee() {
+    let context = get_context(alice(), 0);
+    testing_env!(context);
+    let mut contract = PoolFactory::init(alice());
+    
+    let pool_id = contract.new_pool(swap_fee());
+
+    contract.bind_pool(
+        pool_id,
+        &token_a(),
+        U128(to_token_denom(10)),
+        U128(to_token_denom(1000))
+    );
+
+    contract.bind_pool(
+        pool_id,
+        &token_b(),
+        U128(to_token_denom(10)),
+        U128(to_token_denom(1000))
+    );
+
+    let price_token_a = contract.get_pool_spot_price_sans_fee(pool_id, &token_b(), &token_a());
+    let price_token_b = contract.get_pool_spot_price_sans_fee(pool_id, &token_a(), &token_b());
+
+    let expected_spot_price = U128(to_token_denom(1));
+    assert_eq!(price_token_a, expected_spot_price);
+    assert_eq!(price_token_b, expected_spot_price);
+}
+
+#[test]
+fn test_finalized_uneven_pool_pricing_sans_fee() {
+    let context = get_context(alice(), 0);
+    testing_env!(context);
+    let mut contract = PoolFactory::init(alice());
+    
+    let pool_id = contract.new_pool(swap_fee());
+
+    // Token a is stable coin worth $1
+    contract.bind_pool(
+        pool_id,
+        &token_a(),
+        U128(to_token_denom(20)),
+        U128(to_token_denom(100))
+    );
+
+    // Token b is governance token worth $200
+    contract.bind_pool(
+        pool_id,
+        &token_b(),
+        U128(to_token_denom(10)),
+        U128(to_token_denom(1))
+    );
+
+    let price_a: u128 = contract.get_pool_spot_price_sans_fee(pool_id, &token_b(), &token_a()).into();
+    let price_b: u128 = contract.get_pool_spot_price_sans_fee(pool_id, &token_a(), &token_b()).into();
+
+    let expected_price_a = to_token_denom(2) / 100;
+    let expected_price_b = to_token_denom(50);
+
+    assert_eq!(expected_price_a, price_a);
+    assert_eq!(expected_price_b, price_b);
+}
+
+#[test]
+fn test_finalized_uneven_pool_pricing() {
+    let context = get_context(alice(), 0);
+    testing_env!(context);
+    let mut contract = PoolFactory::init(alice());
+    
+    let pool_id = contract.new_pool(swap_fee());
+
+    // Token a is stable coin worth $1
+    contract.bind_pool(
+        pool_id,
+        &token_a(),
+        U128(to_token_denom(20)),
+        U128(to_token_denom(100))
+    );
+
+    // Token b is governance token worth $200
+    contract.bind_pool(
+        pool_id,
+        &token_b(),
+        U128(to_token_denom(10)),
+        U128(to_token_denom(1))
+    );
+
+    let price_a: u128 = contract.get_pool_spot_price(pool_id, &token_b(), &token_a()).into();
+    let price_b: u128 = contract.get_pool_spot_price(pool_id, &token_a(), &token_b()).into();
+
+    let swap_fee_u128: u128 = swap_fee().into();
+    let scale = math::div_u128(to_token_denom(1), to_token_denom(1) - swap_fee_u128);
+
+    let expected_price_a = math::div_u128(to_token_denom(2) / 100, scale);
+    let expected_price_b = math::div_u128(to_token_denom(50), scale);
+
+    assert_eq!(expected_price_a, price_a);
+    assert_eq!(expected_price_b, price_b);
+}
+
+fn create_uneven_pool() -> (PoolFactory, U64) {
+    let context = get_context(alice(), 0);
+    testing_env!(context);
+    let mut contract = PoolFactory::init(alice());
+    
+    let pool_id = contract.new_pool(swap_fee());
+
+    // Token a is stable coin worth $1
+    contract.bind_pool(
+        pool_id,
+        &token_a(),
+        U128(to_token_denom(20)),
+        U128(to_token_denom(100))
+    );
+
+    // Token b is governance token worth $200
+    contract.bind_pool(
+        pool_id,
+        &token_b(),
+        U128(to_token_denom(10)),
+        U128(to_token_denom(1))
+    );
+    
+    // Token b is governance token worth $200
+    contract.bind_pool(
+        pool_id,
+        &token_c(),
+        U128(to_token_denom(10)),
+        U128(to_token_denom(10))
+    );
+    contract.finalize_pool(pool_id);
+
+    (contract, pool_id)
+}
+
+#[test]
+fn test_pricing_amt_in_uneven_pool() {
+    let  (mut contract, pool_id) = create_uneven_pool();
+    let tokens_in = to_token_denom(25);
+
+    /*** verify base state pricing ***/
+    let expected_a_to_b_spot_price = to_token_denom(50);
+    let expected_a_to_c_spot_price = to_token_denom(5);
+
+    let expected_b_to_a_spot_price = to_token_denom(2) / 100;
+    let expected_b_to_c_spot_price = to_token_denom(1) / 10;
+
+    let expected_c_to_a_spot_price = to_token_denom(2) / 10;
+    let expected_c_to_b_spot_price = to_token_denom(10);
+
+    let a_to_b_spot_price: u128 = contract.get_pool_spot_price_sans_fee(pool_id, &token_a(), &token_b()).into();
+    let a_to_c_spot_price: u128 = contract.get_pool_spot_price_sans_fee(pool_id, &token_a(), &token_c()).into();
+    
+    let b_to_a_spot_price: u128 = contract.get_pool_spot_price_sans_fee(pool_id, &token_b(), &token_a()).into();
+    let b_to_c_spot_price: u128 = contract.get_pool_spot_price_sans_fee(pool_id, &token_b(), &token_c()).into();
+    
+    let c_to_a_spot_price: u128 = contract.get_pool_spot_price_sans_fee(pool_id, &token_c(), &token_a()).into();
+    let c_to_b_spot_price: u128 = contract.get_pool_spot_price_sans_fee(pool_id, &token_c(), &token_b()).into();
+
+    assert_eq!(expected_a_to_b_spot_price, a_to_b_spot_price);
+    assert_eq!(expected_a_to_c_spot_price, a_to_c_spot_price);
+    
+    assert_eq!(expected_b_to_a_spot_price, b_to_a_spot_price);
+    assert_eq!(expected_b_to_c_spot_price, b_to_c_spot_price);
+
+    assert_eq!(expected_c_to_a_spot_price, c_to_a_spot_price);
+    assert_eq!(expected_c_to_b_spot_price, c_to_b_spot_price);
+
+}
+'''
+'''--- src/tests/swap_tests.rs ---
+use super::*;
+
+fn create_even_pool() -> (PoolFactory, U64) {
+    let context = get_context(alice(), 0);
+    testing_env!(context);
+    let mut contract = PoolFactory::init(alice());
+    
+    let pool_id = contract.new_pool(swap_fee());
+
+    // Token a is stable coin worth $1
+    contract.bind_pool(
+        pool_id,
+        &token_a(),
+        U128(to_token_denom(10)),
+        U128(to_token_denom(100))
+    );
+
+    // Token b is governance token worth $200
+    contract.bind_pool(
+        pool_id,
+        &token_b(),
+        U128(to_token_denom(10)),
+        U128(to_token_denom(1))
+    );
+    contract.finalize_pool(pool_id);
+
+    (contract, pool_id)
+}
+
+#[test]
+fn test_swap_exact_amt_in_even_pool() {
+    let  (mut contract, pool_id) = create_even_pool();
+    let tokens_in = to_token_denom(25);
+
+    let (tokens_out, spot_price_after) = contract.swap_exact_amount_in(
+        pool_id,
+        &token_a(),
+        U128(tokens_in),
+        &token_b(),
+        U128(0),
+        U128(to_token_denom(1000))
+    );
+
+    // TODO: Add math to calculate expected result (verified in js for now)
+    let expected_tokens_out = 199519711827096258; 
+    let expected_spot_price_after = 156626128385155466808;
+
+    assert_eq!(U128(expected_tokens_out), tokens_out);
+    assert_eq!(expected_spot_price_after, u128::from(spot_price_after));
+}
+
+fn create_uneven_pool() -> (PoolFactory, U64) {
+    let context = get_context(alice(), 0);
+    testing_env!(context);
+    let mut contract = PoolFactory::init(alice());
+    
+    let pool_id = contract.new_pool(U128(0));
+
+    // Token a is stable coin worth $1
+    contract.bind_pool(
+        pool_id,
+        &token_a(),
+        U128(to_token_denom(20)),
+        U128(to_token_denom(200))
+    );
+
+    // Token b is a token worth $0.5
+    contract.bind_pool(
+        pool_id,
+        &token_b(),
+        U128(to_token_denom(10)),
+        U128(to_token_denom(50))
+    );
+    
+    // Token c is a token worth 0.5
+    contract.bind_pool(
+        pool_id,
+        &token_c(),
+        U128(to_token_denom(10)),
+        U128(to_token_denom(50))
+    );
+    contract.finalize_pool(pool_id);
+
+    (contract, pool_id)
+}
+
+#[test]
+fn test_swap_exact_amt_in_uneven_pool() {
+    let  (mut contract, pool_id) = create_uneven_pool();
+    let tokens_in = to_token_denom(10);
+
+    /*** verify base state pricing ***/
+    let expected_a_to_b_spot_price = to_token_denom(5) / 10;
+    let expected_a_to_c_spot_price = to_token_denom(5) / 10;
+
+    let a_to_b_spot_price: u128 = contract.get_pool_spot_price_sans_fee(pool_id, &token_a(), &token_b()).into();
+    let a_to_c_spot_price: u128 = contract.get_pool_spot_price_sans_fee(pool_id, &token_a(), &token_c()).into();
+
+    assert_eq!(expected_a_to_b_spot_price, a_to_b_spot_price);
+    assert_eq!(expected_a_to_c_spot_price, a_to_c_spot_price);
+
+    let (tokens_out, spot_price_after) = contract.swap_exact_amount_in(
+        pool_id,
+        &token_a(),
+        U128(tokens_in),
+        &token_b(),
+        U128(0),
+        U128(to_token_denom(1000))
+    );
+
+    /*** verify post swap pricing ***/
+    let expected_a_to_b_spot_price = 805255000000000000;
+    let expected_a_to_c_spot_price = to_token_denom(55) / 100;
+
+    let a_to_b_spot_price: u128 = contract.get_pool_spot_price_sans_fee(pool_id, &token_a(), &token_b()).into();
+    let a_to_c_spot_price: u128 = contract.get_pool_spot_price_sans_fee(pool_id, &token_a(), &token_c()).into();
+
+    assert_eq!(expected_a_to_b_spot_price, a_to_b_spot_price);
+    assert_eq!(expected_a_to_c_spot_price, a_to_c_spot_price);
+
+}
+'''
+'''--- src/token.rs ---
+use near_sdk::{
+    serde_json,
+    json_types::{
+        U128,
+    },
+    serde::{
+        Serialize,
+        Deserialize,
+    },
+    ext_contract,
+    AccountId,
+    Gas,
+    Balance,
+    collections::{
+		LookupMap,
+	},
+    Promise,
+    env,
+    borsh::{
+        self,
+        BorshDeserialize,
+        BorshSerialize,
+    },
+};
+
+use serde_json::json;
+
+const GAS_BASE_COMPUTE: Gas = 5_000_000_000_000;
+const GAS_FOR_CALLBACK: Gas = GAS_BASE_COMPUTE;
+const GAS_FOR_PROMISE: Gas = 5_000_000_000_000;
+const GAS_FOR_DATA_DEPENDENCY: Gas = 10_000_000_000_000;
+const GAS_FOR_REMAINING_COMPUTE: Gas = 2 * GAS_FOR_PROMISE + GAS_FOR_DATA_DEPENDENCY + GAS_BASE_COMPUTE;
+
+/// Safe identifier.
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Copy)]
+#[serde(crate = "near_sdk::serde")]
+pub struct VaultId(pub u64);
+
+impl VaultId {
+    pub fn next(&self) -> Self {
+        Self(self.0 + 1)
+    }
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Vault {
+    pub sender_id: AccountId,
+    pub receiver_id: AccountId,
+    pub balance: Balance,
+}
+
+#[ext_contract(ext_token_receiver)]
+trait ExtTokenReceiver {
+    fn on_receive_with_vault(
+        &mut self,
+        sender_id: AccountId,
+        amount: U128,
+        vault_id: VaultId,
+        payload: String,
+    ) -> Promise;
+}
+
+#[ext_contract(ext_self)]
+trait ExtSelf {
+    fn resolve_vault(&mut self, vault_id: VaultId, sender_id: AccountId) -> U128;
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Token {
+    pub accounts: LookupMap<AccountId, Balance>,
+    pub total_supply: Balance,
+}
+
+impl Token {
+    pub fn new(pool_id: u64) -> Self {
+        Self {
+            total_supply: 0,
+            accounts: LookupMap::new(format!("balance:token:{}", pool_id).as_bytes().to_vec()),
+        }
+    }
+
+    pub fn mint(&mut self, amount: u128, account_id: &AccountId) {
+        self.total_supply += amount;
+        let account_balance = self.accounts.get(account_id).unwrap_or(0);
+        let new_balance = account_balance + amount;
+        self.accounts.insert(account_id, &new_balance);
+    }
+
+    pub fn faux_burn(&mut self, amount: u128) {
+        self.total_supply -= amount;
+    }
+
+    pub fn deposit(&mut self, receiver_id: &AccountId, amount: u128) {
+        assert!(amount > 0, "Cannot deposit 0 or lower");
+
+        let receiver_balance = self.accounts.get(&receiver_id).unwrap_or(0);
+        self.accounts.insert(&receiver_id, &(receiver_balance + amount));
+    }
+
+    pub fn withdraw(&mut self, sender_id: &AccountId, amount: u128) {
+        let sender_balance = self.accounts.get(&sender_id).unwrap_or(0);
+
+        assert!(amount > 0, "Cannot withdraw 0 or lower");
+        assert!(sender_balance >= amount, "Not enough balance");
+
+        self.accounts.insert(&sender_id, &(sender_balance - amount));
+    }
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct FungibleTokenVault {
+    token: Token,
+    vaults: LookupMap<VaultId, Vault>,
+    next_vault_id: VaultId,
+}
+
+impl Default for FungibleTokenVault {
+    fn default() -> Self {
+        panic!("Contract should be initialized before usage")
+    }
+}
+
+impl FungibleTokenVault {
+    pub fn new(pool_id: u64) -> Self {
+        Self {
+            token: Token::new(pool_id),
+            vaults: LookupMap::new(format!("vault:token:{}", pool_id).as_bytes().to_vec()),
+            next_vault_id: VaultId(0),
+        }
+    }
+
+    pub fn get_balance(&self, account_id: &AccountId) -> u128 {
+        self.token.accounts.get(account_id).unwrap_or(0)
+    }
+
+    pub fn total_supply(&self) -> u128 {
+        self.token.total_supply
+    }
+
+    pub fn mint(&mut self, amount: u128, account_id: &AccountId) {
+        self.token.mint(amount, account_id);
+    }
+
+    pub fn faux_burn(&mut self, amount: u128) {
+        self.token.faux_burn(amount);
+    }
+
+    pub fn transfer_unsafe(&mut self, receiver_id: &AccountId, amount: u128) {
+        self.token.withdraw(&env::predecessor_account_id(), amount);
+        self.token.deposit(receiver_id, amount);
+    }
+
+    pub fn transfer_with_safe(&mut self, receiver_id: &AccountId, amount: u128, payload: String) -> Promise {
+        let gas_to_receiver = env::prepaid_gas().saturating_sub(GAS_FOR_REMAINING_COMPUTE + GAS_FOR_CALLBACK);
+        let vault_id = self.next_vault_id;
+        let sender_id = env::predecessor_account_id();
+
+        self.token.withdraw(&sender_id, amount);
+        self.next_vault_id = vault_id.next();
+
+        let vault = Vault {
+            balance: amount,
+            sender_id: sender_id.to_string(),
+            receiver_id: receiver_id.to_string(),
+        };
+
+        self.vaults.insert(&vault_id, &vault);
+
+        ext_token_receiver::on_receive_with_vault(
+            sender_id.to_string(), 
+            U128(amount),
+            vault_id, 
+            payload,
+            &receiver_id,
+            0,
+            gas_to_receiver,
+        )
+        .then(ext_self::resolve_vault(
+            vault_id,
+            sender_id,
+            &env::current_account_id(),
+            0,
+            GAS_FOR_CALLBACK,
+        ))
+    }
+
+    pub fn resolve_vault(&mut self, vault_id: VaultId, sender_id: &AccountId) -> u128 {
+        assert_eq!(env::current_account_id(), env::predecessor_account_id(), "Private method can only be called by contract");
+
+        let vault = self.vaults.remove(&vault_id).expect("Vault does not exist");
+
+        env::log(json!({
+            "type": U128(vault.balance),
+        }).to_string().as_bytes());
+
+        if vault.balance > 0 {
+            self.token.deposit(sender_id, vault.balance);
+        }
+
+        vault.balance
+    }
+
+    pub fn withdraw_from_vault(&mut self, vault_id: VaultId, receiver_id: &AccountId, amount: u128) {
+        env::log(json!({
+            "type": "Withdrawing money"
+        }).to_string().as_bytes());
+
+        let mut vault = self.vaults.get(&vault_id).expect("Vault does not exist");
+        assert!(env::predecessor_account_id() == vault.receiver_id, "Access of vault denied");
+        
+        let amount_to_withdraw: u128 = amount;
+        assert!(amount_to_withdraw < vault.balance, "Not enough balance inside vault");
+
+        vault.balance -= amount_to_withdraw;
+        self.vaults.insert(&vault_id, &vault);
+        self.token.deposit(receiver_id, amount);
+    }
+}
+'''

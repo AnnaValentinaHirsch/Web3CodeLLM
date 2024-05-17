@@ -1,0 +1,2813 @@
+*GitHub Repository "PiparHQ/merchant"*
+
+'''--- Cargo.toml ---
+[package]
+name = "pipar_store"
+version = "0.1.0"
+authors = ["Pipar LTD <onyedika.edewor@pipar.xyz>"]
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "4.0.0"
+serde_json = "1.0"
+
+[profile.release]
+codegen-units=1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+
+'''
+'''--- README.md ---
+Merchant Store Smart Contract For Pipar Marketplace
+===================================================
+'''
+'''--- build.sh ---
+#!/bin/bash
+set -e && RUSTFLAGS='-C link-arg=-s' cargo build --target wasm32-unknown-unknown --release && mkdir -p ../out && cp target/wasm32-unknown-unknown/release/*.wasm ../out/series.wasm
+'''
+'''--- src/affiliate.rs ---
+use crate::*;
+
+#[near_bindgen]
+impl Contract {
+    //Requests from affiliates
+    #[payable]
+    pub fn affiliate_request(&mut self, id: U64, affiliate_id: AccountId) {
+        // Measure the initial storage being used on the contract
+        let initial_storage_usage = env::storage_usage();
+
+        let check_existing = self
+            .affiliate_requests
+            .iter()
+            .position(|a| {
+                a.account_id == affiliate_id
+                    && a.series_id == id
+            })
+            .unwrap_or_else(|| 11111111);
+
+        match self.affiliate_requests.get(check_existing as u64) {
+            Some(a) => panic!("Already applied to become an affiliate: {:?}", a),
+            None => {
+                // Get the series and how many tokens currently exist (edition number = cur_len + 1)
+                let series = self.series_by_id.get(&id.0).expect("Not a series");
+
+                assert!(series.affiliate.is_some(), "This series does not accept affiliate");
+
+                assert!(env::attached_deposit() > ONE_YOCTO, "Must attach upto 0.1 near to this call");
+
+                //specify the token struct that contains the owner ID
+                let request = AffiliatesRequests {
+                    // Affiliate account ID
+                    account_id: affiliate_id,
+                    // SERIES ID of product
+                    series_id: id.clone(),
+                    // Status of request
+                    approved: false,
+                };
+
+                self.affiliate_requests.push(&request);
+
+                //calculate the required storage which was the used - initial
+                let required_storage_in_bytes = env::storage_usage() - initial_storage_usage;
+
+                // refund storage used
+                refund_deposit(required_storage_in_bytes);
+            }
+        }
+    }
+
+    pub fn approve_affiliate(&mut self, id: U64, affiliate_id: AccountId, percentage: u32) -> Option<AffiliatesRequests> {
+        self.assert_contract_owner();
+
+        let index = self
+            .affiliate_requests
+            .iter()
+            .position(|a| {
+                a.account_id == affiliate_id
+                    && a.series_id == id
+                && a.approved == false
+            })
+            .unwrap_or_else(|| 11111111);
+
+        match self.affiliate_requests.get(index as u64) {
+            Some(a) => {
+                let series = self.series_by_id.get(&id.0).expect("Not a series");
+
+                if let Some(mut affix) = series.affiliate {
+                    assert!(
+                        affix.contains_key(&affiliate_id),
+                        "Affiliateer is already approved for this product"
+                    );
+                    affix.insert(affiliate_id, percentage);
+                }
+
+                {
+                    self.affiliate_requests.replace(
+                        index as u64,
+                        &AffiliatesRequests {
+                            account_id: a.account_id,
+                            series_id: a.series_id,
+                            approved: true,
+                        },
+                    );
+                }
+                let affiliate = self.affiliate_requests.get(index.clone() as u64);
+
+                return affiliate
+            }
+            None => panic!("Couldn't find affiliate or affiliate already exists"),
+        }
+    }
+
+    pub fn get_affiliates(&self) -> Vec<AffiliatesRequests> {
+        let affiliates: Vec<AffiliatesRequests> = self.affiliate_requests.iter().map(|x| x).collect();
+
+        affiliates
+    }
+}
+'''
+'''--- src/approval.rs ---
+use crate::*;
+use near_sdk::ext_contract;
+
+pub trait NonFungibleTokenCore {
+    //approve an account ID to transfer a token on your behalf
+    fn nft_approve(&mut self, token_id: TokenId, account_id: AccountId, msg: Option<String>);
+
+    //check if the passed in account has access to approve the token ID
+    fn nft_is_approved(
+        &self,
+        token_id: TokenId,
+        approved_account_id: AccountId,
+        approval_id: Option<u64>,
+    ) -> bool;
+
+    //revoke a specific account from transferring the token on your behalf
+    fn nft_revoke(&mut self, token_id: TokenId, account_id: AccountId);
+
+    //revoke all accounts from transferring the token on your behalf
+    fn nft_revoke_all(&mut self, token_id: TokenId);
+}
+
+#[ext_contract(ext_non_fungible_approval_receiver)]
+trait NonFungibleTokenApprovalsReceiver {
+    //cross contract call to an external contract that is initiated during nft_approve
+    fn nft_on_approve(
+        &mut self,
+        token_id: TokenId,
+        owner_id: AccountId,
+        approval_id: u64,
+        msg: String,
+    );
+}
+
+#[near_bindgen]
+impl NonFungibleTokenCore for Contract {
+    //allow a specific account ID to approve a token on your behalf
+    #[payable]
+    fn nft_approve(&mut self, token_id: TokenId, account_id: AccountId, msg: Option<String>) {
+        /*
+            assert at least one yocto for security reasons - this will cause a redirect to the NEAR wallet.
+            The user needs to attach enough to pay for storage on the contract
+        */
+        assert_at_least_one_yocto();
+
+        //get the token object from the token ID
+        let mut token = self.tokens_by_id.get(&token_id).expect("No token");
+
+        //make sure that the person calling the function is the owner of the token
+        assert_eq!(
+            &env::predecessor_account_id(),
+            &token.owner_id,
+            "Predecessor must be the token owner."
+        );
+
+        //get the next approval ID if we need a new approval
+        let approval_id: u64 = token.next_approval_id;
+
+        //check if the account has been approved already for this token
+        let is_new_approval = token
+            .approved_account_ids
+            //insert returns none if the key was not present.
+            .insert(account_id.clone(), approval_id)
+            //if the key was not present, .is_none() will return true so it is a new approval.
+            .is_none();
+
+        //if it was a new approval, we need to calculate how much storage is being used to add the account.
+        let storage_used = if is_new_approval {
+            bytes_for_approved_account_id(&account_id)
+        //if it was not a new approval, we used no storage.
+        } else {
+            0
+        };
+
+        //increment the token's next approval ID by 1
+        token.next_approval_id += 1;
+        //insert the token back into the tokens_by_id collection
+        self.tokens_by_id.insert(&token_id, &token);
+
+        //refund any excess storage attached by the user. If the user didn't attach enough, panic
+        refund_deposit(storage_used);
+
+        //if some message was passed into the function, we initiate a cross contract call on the
+        //account we're giving access to.
+        if let Some(msg) = msg {
+            // Defaulting GAS weight to 1, no attached deposit, and no static GAS to attach.
+            ext_non_fungible_approval_receiver::ext(account_id)
+                .nft_on_approve(token_id, token.owner_id, approval_id, msg)
+                .as_return();
+        }
+    }
+
+    //check if the passed in account has access to approve the token ID
+    fn nft_is_approved(
+        &self,
+        token_id: TokenId,
+        approved_account_id: AccountId,
+        approval_id: Option<u64>,
+    ) -> bool {
+        //get the token object from the token_id
+        let token = self.tokens_by_id.get(&token_id).expect("No token");
+
+        //get the approval number for the passed in account ID
+        let approval = token.approved_account_ids.get(&approved_account_id);
+
+        //if there was some approval ID found for the account ID
+        if let Some(approval) = approval {
+            //if a specific approval_id was passed into the function
+            if let Some(approval_id) = approval_id {
+                //return if the approval ID passed in matches the actual approval ID for the account
+                approval_id == *approval
+                //if there was no approval_id passed into the function, we simply return true
+            } else {
+                true
+            }
+            //if there was no approval ID found for the account ID, we simply return false
+        } else {
+            false
+        }
+    }
+
+    //revoke a specific account from transferring the token on your behalf
+    #[payable]
+    fn nft_revoke(&mut self, token_id: TokenId, account_id: AccountId) {
+        //assert that the user attached exactly 1 yoctoNEAR for security reasons
+        assert_one_yocto();
+        //get the token object using the passed in token_id
+        let mut token = self.tokens_by_id.get(&token_id).expect("No token");
+
+        //get the caller of the function and assert that they are the owner of the token
+        let predecessor_account_id = env::predecessor_account_id();
+        assert_eq!(&predecessor_account_id, &token.owner_id);
+
+        //if the account ID was in the token's approval, we remove it and the if statement logic executes
+        if token.approved_account_ids.remove(&account_id).is_some() {
+            //refund the funds released by removing the approved_account_id to the caller of the function
+            refund_approved_account_ids_iter(predecessor_account_id, [account_id].iter());
+
+            //insert the token back into the tokens_by_id collection with the account_id removed from the approval list
+            self.tokens_by_id.insert(&token_id, &token);
+        }
+    }
+
+    //revoke all accounts from transferring the token on your behalf
+    #[payable]
+    fn nft_revoke_all(&mut self, token_id: TokenId) {
+        //assert that the caller attached exactly 1 yoctoNEAR for security
+        assert_one_yocto();
+
+        //get the token object from the passed in token ID
+        let mut token = self.tokens_by_id.get(&token_id).expect("No token");
+        //get the caller and make sure they are the owner of the tokens
+        let predecessor_account_id = env::predecessor_account_id();
+        assert_eq!(&predecessor_account_id, &token.owner_id);
+
+        //only revoke if the approved account IDs for the token is not empty
+        if !token.approved_account_ids.is_empty() {
+            //refund the approved account IDs to the caller of the function
+            refund_approved_account_ids(predecessor_account_id, &token.approved_account_ids);
+            //clear the approved account IDs
+            token.approved_account_ids.clear();
+            //insert the token back into the tokens_by_id collection with the approved account IDs cleared
+            self.tokens_by_id.insert(&token_id, &token);
+        }
+    }
+}
+
+'''
+'''--- src/enumeration.rs ---
+use crate::*;
+use crate::nft_core::NonFungibleTokenCore;
+
+/// Struct to return in views to query for specific data related to a series
+#[derive(BorshDeserialize, BorshSerialize, Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct JsonSeries {
+    series_id: u64,
+    // Metadata including title, num copies etc.. that all tokens will derive from
+    metadata: TokenMetadata,
+    // colors of this product
+    colors: HashMap<String, u32>,
+    // Royalty used for all tokens in the collection
+    royalty: Option<HashMap<AccountId, u32>>,
+    // Token price
+    price: Option<Balance>,
+    // Owner of the collection
+    owner_id: AccountId,
+}
+
+#[near_bindgen]
+impl Contract {
+    //Query for the total supply of NFTs on the contract
+    pub fn nft_total_supply(&self) -> U128 {
+        //return the length of the tokens by id
+        U128(self.tokens_by_id.len() as u128)
+    }
+
+    //Query for nft tokens on the contract regardless of the owner using pagination
+    pub fn nft_tokens(&self, from_index: Option<U128>, limit: Option<u64>) -> Vec<JsonToken> {
+        //where to start pagination - if we have a from_index, we'll use that - otherwise start from 0 index
+        let start = u128::from(from_index.unwrap_or(U128(0)));
+
+        //iterate through each token using an iterator
+        self.tokens_by_id
+            .keys()
+            //skip to the index we specified in the start variable
+            .skip(start as usize)
+            //take the first "limit" elements in the vector. If we didn't specify a limit, use 50
+            .take(limit.unwrap_or(50) as usize)
+            //we'll map the token IDs which are strings into Json Tokens
+            .map(|token_id| self.nft_token(token_id.clone()).unwrap())
+            //since we turned the keys into an iterator, we need to turn it back into a vector to return
+            .collect()
+    }
+
+    //get the total supply of NFTs for a given owner
+    pub fn nft_supply_for_owner(&self, account_id: AccountId) -> U128 {
+        //get the set of tokens for the passed in owner
+        let tokens_for_owner_set = self.tokens_per_owner.get(&account_id);
+
+        //if there is some set of tokens, we'll return the length as a U128
+        if let Some(tokens_for_owner_set) = tokens_for_owner_set {
+            U128(tokens_for_owner_set.len() as u128)
+        } else {
+            //if there isn't a set of tokens for the passed in account ID, we'll return 0
+            U128(0)
+        }
+    }
+
+    //Query for all the tokens for an owner
+    pub fn nft_tokens_for_owner(
+        &self,
+        account_id: AccountId,
+        from_index: Option<U128>,
+        limit: Option<u64>,
+    ) -> Vec<JsonToken> {
+        //get the set of tokens for the passed in owner
+        let tokens_for_owner_set = self.tokens_per_owner.get(&account_id);
+        //if there is some set of tokens, we'll set the tokens variable equal to that set
+        let tokens = if let Some(tokens_for_owner_set) = tokens_for_owner_set {
+            tokens_for_owner_set
+        } else {
+            //if there is no set of tokens, we'll simply return an empty vector.
+            return vec![];
+        };
+
+        //where to start pagination - if we have a from_index, we'll use that - otherwise start from 0 index
+        let start = u128::from(from_index.unwrap_or(U128(0)));
+
+        //iterate through the keys vector
+        tokens
+            .iter()
+            //skip to the index we specified in the start variable
+            .skip(start as usize)
+            //take the first "limit" elements in the vector. If we didn't specify a limit, use 50
+            .take(limit.unwrap_or(50) as usize)
+            //we'll map the token IDs which are strings into Json Tokens
+            .map(|token_id| self.nft_token(token_id.clone()).unwrap())
+            //since we turned the keys into an iterator, we need to turn it back into a vector to return
+            .collect()
+    }
+
+    // Get the total supply of series on the contract
+    pub fn get_series_total_supply(&self) -> u64 {
+        self.series_by_id.len()
+    }
+
+    // Paginate through all the series on the contract and return the a vector of JsonSeries
+    pub fn get_series(&self, from_index: Option<U128>, limit: Option<u64>) -> Vec<JsonSeries> {
+        //where to start pagination - if we have a from_index, we'll use that - otherwise start from 0 index
+        let start = u128::from(from_index.unwrap_or(U128(0)));
+
+        //iterate through each series using an iterator
+        self.series_by_id
+            .keys()
+            //skip to the index we specified in the start variable
+            .skip(start as usize)
+            //take the first "limit" elements in the vector. If we didn't specify a limit, use 50
+            .take(limit.unwrap_or(50) as usize)
+            //we'll map the series IDs which are strings into Json Series
+            .map(|series_id| self.get_series_details(series_id.clone()).unwrap())
+            //since we turned the keys into an iterator, we need to turn it back into a vector to return
+            .collect()
+    }
+
+    // get info for a specific series
+    pub fn get_series_details(&self, id: u64) -> Option<JsonSeries> {
+        //get the series from the map
+        let series = self.series_by_id.get(&id);
+        //if there is some series, we'll return the series
+        if let Some(series) = series {
+            Some(JsonSeries {
+                series_id: id,
+                metadata: series.metadata,
+                colors: series.colors,
+                royalty: series.royalty,
+                price: series.price,
+                owner_id: series.owner_id,
+            })
+        } else {
+            //if there isn't a series, we'll return None
+            None
+        }
+    }
+
+    //get the total supply of NFTs on a current series
+    pub fn nft_supply_for_series(&self, id: u64) -> U128 {
+        //get the series
+        let series = self.series_by_id.get(&id);
+
+        //if there is some series, get the length of the tokens. Otherwise return -
+        if let Some(series) = series {
+            U128(series.tokens.len() as u128)
+        } else {
+            U128(0)
+        }
+    }
+
+    /// Paginate through NFTs within a given series 
+    pub fn nft_tokens_for_series(
+        &self,
+        id: u64,
+        from_index: Option<U128>,
+        limit: Option<u64>,
+    ) -> Vec<JsonToken> {
+        // Get the series and its tokens
+        let series = self.series_by_id.get(&id);
+        let tokens = if let Some(series) = series {
+            series.tokens
+        } else {
+            return vec![];
+        };
+
+        //where to start pagination - if we have a from_index, we'll use that - otherwise start from 0 index
+        let start = u128::from(from_index.unwrap_or(U128(0)));
+
+        //iterate through the tokens
+        tokens
+            .iter()
+            //skip to the index we specified in the start variable
+            .skip(start as usize)
+            //take the first "limit" elements in the vector. If we didn't specify a limit, use 50
+            .take(limit.unwrap_or(50) as usize)
+            //we'll map the token IDs which are strings into Json Tokens
+            .map(|token_id| self.nft_token(token_id.clone()).unwrap())
+            //since we turned the keys into an iterator, we need to turn it back into a vector to return
+            .collect()
+    }
+}
+
+'''
+'''--- src/events.rs ---
+use std::fmt;
+
+use near_sdk::serde::{Deserialize, Serialize};
+
+/// Enum that represents the data type of the EventLog.
+/// The enum can either be an NftMint or an NftTransfer.
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "event", content = "data")]
+#[serde(rename_all = "snake_case")]
+#[serde(crate = "near_sdk::serde")]
+#[non_exhaustive]
+pub enum EventLogVariant {
+    NftMint(Vec<NftMintLog>),
+    NftTransfer(Vec<NftTransferLog>),
+}
+
+/// Interface to capture data about an event
+///
+/// Arguments:
+/// * `standard`: name of standard e.g. nep171
+/// * `version`: e.g. 1.0.0
+/// * `event`: associate event data
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct EventLog {
+    pub standard: String,
+    pub version: String,
+
+    // `flatten` to not have "event": {<EventLogVariant>} in the JSON, just have the contents of {<EventLogVariant>}.
+    #[serde(flatten)]
+    pub event: EventLogVariant,
+}
+
+impl fmt::Display for EventLog {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_fmt(format_args!(
+            "EVENT_JSON:{}",
+            &serde_json::to_string(self).map_err(|_| fmt::Error)?
+        ))
+    }
+}
+
+/// An event log to capture token minting
+///
+/// Arguments
+/// * `owner_id`: "account.near"
+/// * `token_ids`: ["1", "abc"]
+/// * `memo`: optional message
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct NftMintLog {
+    pub owner_id: String,
+    pub token_ids: Vec<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
+}
+
+/// An event log to capture token transfer
+///
+/// Arguments
+/// * `authorized_id`: approved account to transfer
+/// * `old_owner_id`: "owner.near"
+/// * `new_owner_id`: "receiver.near"
+/// * `token_ids`: ["1", "12345abc"]
+/// * `memo`: optional message
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct NftTransferLog {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorized_id: Option<String>,
+
+    pub old_owner_id: String,
+    pub new_owner_id: String,
+    pub token_ids: Vec<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nep_format_vector() {
+        let expected = r#"EVENT_JSON:{"standard":"nep171","version":"1.0.0","event":"nft_mint","data":[{"owner_id":"foundation.near","token_ids":["aurora","proximitylabs"]},{"owner_id":"user1.near","token_ids":["meme"]}]}"#;
+        let log = EventLog {
+            standard: "nep171".to_string(),
+            version: "1.0.0".to_string(),
+            event: EventLogVariant::NftMint(vec![
+                NftMintLog {
+                    owner_id: "foundation.near".to_owned(),
+                    token_ids: vec!["aurora".to_string(), "proximitylabs".to_string()],
+                    memo: None,
+                },
+                NftMintLog {
+                    owner_id: "user1.near".to_owned(),
+                    token_ids: vec!["meme".to_string()],
+                    memo: None,
+                },
+            ]),
+        };
+        assert_eq!(expected, log.to_string());
+    }
+
+    #[test]
+    fn nep_format_mint() {
+        let expected = r#"EVENT_JSON:{"standard":"nep171","version":"1.0.0","event":"nft_mint","data":[{"owner_id":"foundation.near","token_ids":["aurora","proximitylabs"]}]}"#;
+        let log = EventLog {
+            standard: "nep171".to_string(),
+            version: "1.0.0".to_string(),
+            event: EventLogVariant::NftMint(vec![NftMintLog {
+                owner_id: "foundation.near".to_owned(),
+                token_ids: vec!["aurora".to_string(), "proximitylabs".to_string()],
+                memo: None,
+            }]),
+        };
+        assert_eq!(expected, log.to_string());
+    }
+
+    #[test]
+    fn nep_format_transfer_all_fields() {
+        let expected = r#"EVENT_JSON:{"standard":"nep171","version":"1.0.0","event":"nft_transfer","data":[{"authorized_id":"market.near","old_owner_id":"user1.near","new_owner_id":"user2.near","token_ids":["token"],"memo":"Go Team!"}]}"#;
+        let log = EventLog {
+            standard: "nep171".to_string(),
+            version: "1.0.0".to_string(),
+            event: EventLogVariant::NftTransfer(vec![NftTransferLog {
+                authorized_id: Some("market.near".to_string()),
+                old_owner_id: "user1.near".to_string(),
+                new_owner_id: "user2.near".to_string(),
+                token_ids: vec!["token".to_string()],
+                memo: Some("Go Team!".to_owned()),
+            }]),
+        };
+        assert_eq!(expected, log.to_string());
+    }
+}
+
+'''
+'''--- src/factory.rs ---
+use crate::*;
+
+#[derive(Serialize, Deserialize, BorshDeserialize, BorshSerialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct FtData {
+    owner_id: AccountId,
+    total_supply: U128,
+    name: String,
+    symbol: String,
+    icon: String,
+}
+
+#[near_bindgen]
+impl Contract {
+    #[payable]
+    pub fn deploy_token(
+        &mut self,
+        total_supply: U128,
+        name: String,
+        symbol: String,
+        icon: String,
+    ) -> Promise {
+        assert!(
+            env::attached_deposit() > TOKEN_BALANCE,
+            "To cover the storage required for your ft contract, you need to attach at least {} yoctoNEAR to this transaction.",
+            TOKEN_BALANCE
+        );
+        self.assert_contract_token_false();
+        self.assert_contract_owner();
+        let current_account = env::current_account_id().to_string();
+        let subaccount: AccountId = format!("ft.{current_account}").parse().unwrap();
+        assert!(
+            env::is_valid_account_id(subaccount.as_bytes()),
+            "Invalid subaccount"
+        );
+        let init_args = serde_json::to_vec(&FtData {
+            owner_id: env::current_account_id(),
+            total_supply,
+            name,
+            symbol,
+            icon,
+        })
+            .unwrap();
+
+        Promise::new(subaccount.clone())
+            .create_account()
+            .add_full_access_key(env::signer_account_pk())
+            .transfer(TOKEN_BALANCE.into())
+            .deploy_contract(include_bytes!("../wasm/pipar_fungible_token.wasm").to_vec())
+            .function_call(
+                "new_default_meta".to_owned(),
+                init_args,
+                NO_DEPOSIT,
+                GAGAS,
+            )
+            .then(Self::ext(env::current_account_id()).deploy_token_callback(
+                env::predecessor_account_id(),
+                env::attached_deposit().into(),
+            ))
+    }
+
+    #[private]
+    pub fn deploy_token_callback(&mut self, token_creator_id: AccountId, attached_deposit: U128) {
+        let attached_deposit: u128 = attached_deposit.into();
+        if is_promise_success() {
+            self.token = true;
+            env::log_str("Successful token deployment")
+        } else {
+            Promise::new(token_creator_id).transfer(attached_deposit);
+            env::log_str("failed token deployment")
+        }
+    }
+
+}
+'''
+'''--- src/internal.rs ---
+use crate::*;
+use near_sdk::CryptoHash;
+use std::mem::size_of;
+use near_sdk::json_types::U64;
+
+//convert the royalty percentage and amount to pay into a payout (U128)
+pub(crate) fn royalty_to_payout(royalty_percentage: u32, amount_to_pay: Balance) -> U128 {
+    U128(royalty_percentage as u128 * amount_to_pay / 10_000u128)
+}
+
+//calculate how many bytes the account ID is taking up
+pub(crate) fn bytes_for_approved_account_id(account_id: &AccountId) -> u64 {
+    // The extra 4 bytes are coming from Borsh serialization to store the length of the string.
+    account_id.as_str().len() as u64 + 4 + size_of::<u64>() as u64
+}
+
+//refund the storage taken up by passed in approved account IDs and send the funds to the passed in account ID.
+pub(crate) fn refund_approved_account_ids_iter<'a, I>(
+    account_id: AccountId,
+    approved_account_ids: I, //the approved account IDs must be passed in as an iterator
+) -> Promise
+where
+    I: Iterator<Item = &'a AccountId>,
+{
+    //get the storage total by going through and summing all the bytes for each approved account IDs
+    let storage_released: u64 = approved_account_ids
+        .map(bytes_for_approved_account_id)
+        .sum();
+    //transfer the account the storage that is released
+    Promise::new(account_id).transfer(Balance::from(storage_released) * env::storage_byte_cost())
+}
+
+//refund a map of approved account IDs and send the funds to the passed in account ID
+pub(crate) fn refund_approved_account_ids(
+    account_id: AccountId,
+    approved_account_ids: &HashMap<AccountId, u64>,
+) -> Promise {
+    //call the refund_approved_account_ids_iter with the approved account IDs as keys
+    refund_approved_account_ids_iter(account_id, approved_account_ids.keys())
+}
+
+//used to generate a unique prefix in our storage collections (this is to avoid data collisions)
+pub(crate) fn hash_account_id(account_id: &String) -> CryptoHash {
+    //get the default hash
+    let mut hash = CryptoHash::default();
+    //we hash the account ID and return it
+    hash.copy_from_slice(&env::sha256(account_id.as_bytes()));
+    hash
+}
+
+//used to make sure the user attached exactly 1 yoctoNEAR
+pub(crate) fn assert_one_yocto() {
+    assert_eq!(
+        env::attached_deposit(),
+        1,
+        "Requires attached deposit of exactly 1 yoctoNEAR",
+    )
+}
+
+//Assert that the user has attached at least 1 yoctoNEAR (for security reasons and to pay for storage)
+pub(crate) fn assert_at_least_one_yocto() {
+    assert!(
+        env::attached_deposit() >= 1,
+        "Requires attached deposit of at least 1 yoctoNEAR",
+    )
+}
+
+//refund the initial deposit based on the amount of storage that was used up
+pub(crate) fn refund_deposit(storage_used: u64) {
+    //get how much it would cost to store the information
+    let required_cost = env::storage_byte_cost() * Balance::from(storage_used);
+    //get the attached deposit
+    let attached_deposit = env::attached_deposit();
+
+    //make sure that the attached deposit is greater than or equal to the required cost
+    assert!(
+        required_cost <= attached_deposit,
+        "Must attach {} yoctoNEAR to cover storage",
+        required_cost,
+    );
+
+    //get the refund amount from the attached deposit - required cost
+    let refund = attached_deposit - required_cost;
+
+    //if the refund is greater than 1 yocto NEAR, we refund the predecessor that amount
+    if refund > 1 {
+        Promise::new(env::signer_account_id()).transfer(refund);
+    }
+}
+
+impl Contract {
+
+    //approve pipar marketplace to be able to transfer token
+    pub(crate) fn internal_approve_token_marketplace(
+        &mut self,
+        account_id: &AccountId,
+        token_id: &TokenId,
+    ) {
+        //get the token object from the token ID
+        let mut token = self.tokens_by_id.get(&token_id).expect("No token");
+
+        //get the next approval ID if we need a new approval
+        let approval_id: u64 = token.next_approval_id;
+
+        //check if the account has been approved already for this token
+        let is_new_approval = token
+            .approved_account_ids
+            //insert returns none if the key was not present.
+            .insert(account_id.clone(), approval_id)
+            //if the key was not present, .is_none() will return true so it is a new approval.
+            .is_none();
+
+        //increment the token's next approval ID by 1
+        token.next_approval_id += 1;
+
+        //insert the token back into the tokens_by_id collection
+        self.tokens_by_id.insert(&token_id, &token);
+
+    }
+
+    //add a token to the set of tokens an owner has
+    pub(crate) fn internal_add_token_to_owner(
+        &mut self,
+        account_id: &AccountId,
+        token_id: &TokenId,
+    ) {
+        //get the set of tokens for the given account
+        let mut tokens_set = self.tokens_per_owner.get(account_id).unwrap_or_else(|| {
+            //if the account doesn't have any tokens, we create a new unordered set
+            UnorderedSet::new(
+                StorageKey::TokenPerOwnerInner {
+                    //we get a new unique prefix for the collection
+                    account_id_hash: hash_account_id(&account_id.to_string()),
+                }
+                .try_to_vec()
+                .unwrap(),
+            )
+        });
+
+        //we insert the token ID into the set
+        tokens_set.insert(token_id);
+
+        //we insert that set for the given account ID.
+        self.tokens_per_owner.insert(account_id, &tokens_set);
+    }
+
+    //remove a token from an owner (internal method and can't be called directly via CLI).
+    pub(crate) fn internal_remove_token_from_owner(
+        &mut self,
+        account_id: &AccountId,
+        token_id: &TokenId,
+    ) {
+        //we get the set of tokens that the owner has
+        let mut tokens_set = self
+            .tokens_per_owner
+            .get(account_id)
+            //if there is no set of tokens for the owner, we panic with the following message:
+            .expect("Token should be owned by the sender");
+
+        //we remove the the token_id from the set of tokens
+        tokens_set.remove(token_id);
+
+        //if the token set is now empty, we remove the owner from the tokens_per_owner collection
+        if tokens_set.is_empty() {
+            self.tokens_per_owner.remove(account_id);
+        } else {
+            //if the token set is not empty, we simply insert it back for the account ID.
+            self.tokens_per_owner.insert(account_id, &tokens_set);
+        }
+    }
+
+    //transfers the NFT to the receiver_id (internal method and can't be called directly via CLI).
+    pub(crate) fn internal_transfer(
+        &mut self,
+        sender_id: &AccountId,
+        receiver_id: &AccountId,
+        token_id: &TokenId,
+        //we introduce an approval ID so that people with that approval ID can transfer the token
+        approval_id: Option<u64>,
+        memo: Option<String>,
+    ) -> Token {
+        //get the token object by passing in the token_id
+        let token = self.tokens_by_id.get(token_id).expect("No token");
+
+        //if the sender doesn't equal the owner, we check if the sender is in the approval list
+        if sender_id != &token.owner_id {
+            //if the token's approved account IDs doesn't contain the sender, we panic
+            if !token.approved_account_ids.contains_key(sender_id) {
+                env::panic_str("Unauthorized");
+            }
+
+            // If they included an approval_id, check if the sender's actual approval_id is the same as the one included
+            if let Some(enforced_approval_id) = approval_id {
+                //get the actual approval ID
+                let actual_approval_id = token
+                    .approved_account_ids
+                    .get(sender_id)
+                    //if the sender isn't in the map, we panic
+                    .expect("Sender is not approved account");
+
+                //make sure that the actual approval ID is the same as the one provided
+                assert_eq!(
+                    actual_approval_id, &enforced_approval_id,
+                    "The actual approval_id {} is different from the given approval_id {}",
+                    actual_approval_id, enforced_approval_id,
+                );
+            }
+        }
+
+        //we make sure that the sender isn't sending the token to themselves
+        assert_ne!(
+            &token.owner_id, receiver_id,
+            "The token owner and the receiver should be different"
+        );
+
+        //we remove the token from it's current owner's set
+        self.internal_remove_token_from_owner(&token.owner_id, token_id);
+        //we then add the token to the receiver_id's set
+        self.internal_add_token_to_owner(receiver_id, token_id);
+
+        //we create a new token struct
+        let new_token = Token {
+            series_id: token.series_id,
+            owner_id: receiver_id.clone(),
+            //reset the approval account IDs
+            approved_account_ids: Default::default(),
+            next_approval_id: token.next_approval_id,
+        };
+        //insert that new token into the tokens_by_id, replacing the old entry
+        self.tokens_by_id.insert(token_id, &new_token);
+
+        //if there was some memo attached, we log it.
+        if let Some(memo) = memo.as_ref() {
+            env::log_str(&format!("Memo: {}", memo).to_string());
+        }
+
+        // Default the authorized ID to be None for the logs.
+        let mut authorized_id = None;
+        //if the approval ID was provided, set the authorized ID equal to the sender
+        if approval_id.is_some() {
+            authorized_id = Some(sender_id.to_string());
+        }
+
+        // Construct the transfer log as per the events standard.
+        let nft_transfer_log: EventLog = EventLog {
+            // Standard name ("nep171").
+            standard: NFT_STANDARD_NAME.to_string(),
+            // Version of the standard ("nft-1.0.0").
+            version: NFT_METADATA_SPEC.to_string(),
+            // The data related with the event stored in a vector.
+            event: EventLogVariant::NftTransfer(vec![NftTransferLog {
+                // The optional authorized account ID to transfer the token on behalf of the old owner.
+                authorized_id,
+                // The old owner's account ID.
+                old_owner_id: token.owner_id.to_string(),
+                // The account ID of the new owner of the token.
+                new_owner_id: receiver_id.to_string(),
+                // A vector containing the token IDs as strings.
+                token_ids: vec![token_id.to_string()],
+                // An optional memo to include.
+                memo,
+            }]),
+        };
+
+        // Log the serialized json.
+        env::log_str(&nft_transfer_log.to_string());
+
+        //return the previous token object that was transferred.
+        token
+    }
+}
+
+'''
+'''--- src/lib.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::{LazyOption, LookupMap, LookupSet, UnorderedMap, UnorderedSet, Vector};
+use near_sdk::json_types::{Base64VecU8, U128, U64};
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{
+    env, near_bindgen, require, AccountId, Balance, BorshStorageKey, CryptoHash, PanicOnDefault,
+    Promise, PromiseOrValue, is_promise_success, Gas,
+};
+use std::collections::HashMap;
+
+pub use crate::approval::*;
+pub use crate::events::*;
+use crate::internal::*;
+pub use crate::metadata::*;
+pub use crate::nft_core::*;
+pub use crate::owner::*;
+pub use crate::royalty::*;
+pub use crate::series::*;
+pub use crate::factory::*;
+pub use crate::reward::*;
+pub use crate::affiliate::*;
+
+mod approval;
+mod enumeration;
+mod events;
+mod internal;
+mod metadata;
+mod nft_core;
+mod owner;
+mod royalty;
+mod series;
+mod factory;
+mod reward;
+mod affiliate;
+
+/// This spec can be treated like a version of the standard.
+pub const NFT_METADATA_SPEC: &str = "1.0.0";
+/// This is the name of the NFT standard we're using
+pub const NFT_STANDARD_NAME: &str = "nep171";
+
+// cost of deploying FT token
+pub const TOKEN_BALANCE: u128 = 4_000_000_000_000_000_000_000_000;
+
+// 0.1 near in yocto
+pub const ONE_YOCTO: u128 = 10_000_000_000_000_000_000_000;
+
+// Attach 0 near token
+pub const NO_DEPOSIT: Balance = 0;
+
+// gas calculation
+pub const fn tgas(n: u64) -> Gas {
+    Gas(n * 10u64.pow(12))
+}
+
+// Genereal gas to use for cross contract calls
+pub const GAGAS: Gas = tgas(35 + 5);
+
+// Represents the series type. All tokens will derive this data.
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Series {
+    // Metadata including title, num copies etc.. that all tokens will derive from
+    metadata: TokenMetadata,
+    // colors of this product
+    colors: HashMap<String, u32>,
+    // Royalty used for all tokens in the collection
+    royalty: Option<HashMap<AccountId, u32>>,
+    // List of affiliates for all the tokens in this series collection
+    affiliate: Option<HashMap<AccountId, u32>>,
+    // Set of tokens in the collection
+    tokens: UnorderedSet<TokenId>,
+    // What is the price of each token in this series? If this is specified, when minting,
+    // Users will need to attach enough $NEAR to cover the price.
+    price: Option<Balance>,
+    // Owner of the collection
+    owner_id: AccountId,
+}
+
+pub type SeriesId = u64;
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Contract {
+    //contract owner
+    pub owner_id: AccountId,
+
+    //marketplace contract id
+    pub marketplace_contract_id: AccountId,
+
+    //store token boolean
+    pub token: bool,
+
+    //cost of deploying a token
+    pub token_cost: U128,
+
+    //affiliate requests
+    pub affiliate_requests: Vector<AffiliatesRequests>,
+
+    //approved minters
+    pub approved_minters: LookupSet<AccountId>,
+
+    //approved users that can create series
+    pub approved_creators: LookupSet<AccountId>,
+
+    //Map the collection ID (stored in Token obj) to the collection data
+    pub series_by_id: UnorderedMap<SeriesId, Series>,
+
+    //keeps track of the token struct for a given token ID
+    pub tokens_by_id: UnorderedMap<TokenId, Token>,
+
+    //keeps track of all the token IDs for a given account
+    pub tokens_per_owner: LookupMap<AccountId, UnorderedSet<TokenId>>,
+
+    //keeps track of tokens currently locked pending transaction completion
+    pub tokens_locked: LookupSet<String>,
+
+    //keeps track of the metadata for the contract
+    pub metadata: LazyOption<NFTContractMetadata>,
+}
+
+/// Helper structure for keys of the persistent collections.
+#[derive(BorshSerialize, BorshStorageKey)]
+pub enum StorageKey {
+    ApprovedMinters,
+    ApprovedCreators,
+    ApprovedAffiliates,
+    PendingAffiliates,
+    SeriesById,
+    SeriesByIdInner { account_id_hash: CryptoHash },
+    TokensPerOwner,
+    TokenPerOwnerInner { account_id_hash: CryptoHash },
+    TokensById,
+    TokensLocked,
+    NFTContractMetadata,
+}
+
+#[near_bindgen]
+impl Contract {
+    /*
+        initialization function (can only be called once).
+        this initializes the contract with default metadata so the
+        user doesn't have to manually type metadata.
+    */
+    #[init]
+    pub fn new_default_meta(owner_id: AccountId, marketplace_contract_id: AccountId, name: String, symbol: String, icon: Option<String>, bg_icon: Option<String>, category: Option<String>, description: Option<String>, facebook: Option<String>, twitter: Option<String>, instagram: Option<String>, tiktok: Option<String>, youtube: Option<String>, zip: Option<String>, city: Option<String>, state: Option<String>, country: Option<String>) -> Self {
+        //calls the other function "new: with some default metadata and the owner_id passed in
+        Self::new(
+            owner_id,
+            marketplace_contract_id,
+            NFTContractMetadata {
+                spec: "nft-1.0.0".to_string(),
+                name: name,
+                symbol: symbol,
+                icon: icon,
+                bg_icon: bg_icon,
+                category: category,
+                description: description,
+                facebook: facebook,
+                twitter: twitter,
+                instagram: instagram,
+                tiktok: tiktok,
+                youtube: youtube,
+                zip: zip,
+                city: city,
+                state: state,
+                country: country,
+                base_uri: None,
+                reference: None,
+                reference_hash: None,
+            },
+        )
+    }
+
+    /*
+        initialization function (can only be called once).
+        this initializes the contract with metadata that was passed in and
+        the owner_id.
+    */
+    #[init]
+    pub fn new(owner_id: AccountId, marketplace_contract_id: AccountId, metadata: NFTContractMetadata) -> Self {
+        // Create the approved minters set and insert the owner
+        let mut approved_minters =
+            LookupSet::new(StorageKey::ApprovedMinters.try_to_vec().unwrap());
+        approved_minters.insert(&owner_id);
+        approved_minters.insert(&marketplace_contract_id);
+
+        // Create the approved creators set and insert the owner
+        let mut approved_creators =
+            LookupSet::new(StorageKey::ApprovedCreators.try_to_vec().unwrap());
+        approved_creators.insert(&owner_id);
+        
+        // Create a variable of type Self with all the fields initialized.
+        let this = Self {
+            approved_minters,
+            approved_creators,
+            affiliate_requests: Vector::new(StorageKey::PendingAffiliates.try_to_vec().unwrap()),
+            series_by_id: UnorderedMap::new(StorageKey::SeriesById.try_to_vec().unwrap()),
+            //Storage keys are simply the prefixes used for the collections. This helps avoid data collision
+            tokens_per_owner: LookupMap::new(StorageKey::TokensPerOwner.try_to_vec().unwrap()),
+            tokens_by_id: UnorderedMap::new(StorageKey::TokensById.try_to_vec().unwrap()),
+            tokens_locked: LookupSet::new(StorageKey::TokensLocked.try_to_vec().unwrap()),
+            //set the &owner_id field equal to the passed in owner_id.
+            owner_id,
+            //set the &marketplace_id field equal to the passed in marketplace_id.
+            marketplace_contract_id,
+            token: false,
+            token_cost: U128::from(TOKEN_BALANCE),
+            metadata: LazyOption::new(
+                StorageKey::NFTContractMetadata.try_to_vec().unwrap(),
+                Some(&metadata),
+            ),
+        };
+
+        //return the Contract object
+        this
+    }
+
+    pub fn assert_store_owner(&self) -> bool {
+        return if env::signer_account_id() == self.owner_id {
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn get_store_owner(&self) -> AccountId {
+        self.owner_id.clone()
+    }
+
+    pub fn get_token_cost(&self) -> u128 {
+        self.token_cost.into()
+    }
+
+    pub fn has_token(&self) -> bool {
+        self.token.into()
+    }
+
+    /// Ensure that the caller is the owner of the contract
+    pub fn assert_contract_owner(&mut self) {
+        assert_eq!(self.owner_id, env::predecessor_account_id(), "only contract owner")
+    }
+
+    /// Ensure that the caller is the marketplace id
+    pub fn assert_marketplace_contract(&mut self) {
+        assert_eq!(self.marketplace_contract_id, env::predecessor_account_id(), "only marketplace contract")
+    }
+
+    /// Ensure that store has not deployed FT token before
+    pub fn assert_contract_token_false(&mut self) {
+        assert_eq!(
+            false, self.token,
+            "Store owner has already deployed a token"
+        )
+    }
+
+    //unlock a locked token
+    pub fn unlock_token(
+        &mut self,
+        token_id: &TokenId,
+    ) {
+        //ensure smart contract is only called by pipar marketplace
+        self.assert_marketplace_contract();
+        //remove the token
+        assert_eq!(self.tokens_locked.remove(token_id), true);
+    }
+
+    // Send all the non storage funds to the series owner
+    pub fn marketplace_series_callback(&mut self, id: U64, storage_used: u64, price_per_token: Balance, store_owner: AccountId, owner_id: AccountId, token_id: String, attached_deposit: U128, affiliate: Option<AccountId>) -> MarketplaceData {
+        //ensure smart contract is only called by pipar marketplace
+        self.assert_marketplace_contract();
+        //get how much it would cost to store the information
+        let required_cost = env::storage_byte_cost() * Balance::from(storage_used);
+        //get the attached deposit
+        let attached_deposit: Balance = attached_deposit.into();
+
+        //make sure that the attached deposit is greater than or equal to the required cost
+        assert!(
+            attached_deposit >= required_cost + price_per_token,
+            "Must attach {} yoctoNEAR to cover storage and price per token {}",
+            required_cost,
+            price_per_token
+        );
+
+        // Get the series
+        let series = self.series_by_id.get(&id.0).expect("Not a series");
+
+        if let Some(affiliateer) = affiliate {
+            // Ensure the passed in affiliate is approved by the owner
+            if let Some(affix) = series.affiliate {
+                assert!(
+                    affix.contains_key(&affiliateer),
+                    "Affiliateer was not approved"
+                );
+                if let Some(percentage) = affix.get(&affiliateer) {
+                        let res = MarketplaceData {
+                            price: price_per_token,
+                            affiliate: true,
+                            affiliate_id: Some(affiliateer.clone()),
+                            affiliate_percentage: Some(percentage.clone()),
+                            token_id,
+                            token_owner: owner_id,
+                            store_owner,
+                        };
+
+                        res
+                } else {
+                    let res = MarketplaceData {
+                        price: price_per_token,
+                        affiliate: false,
+                        affiliate_id: None,
+                        affiliate_percentage: None,
+                        token_id,
+                        token_owner: owner_id,
+                        store_owner,
+                    };
+
+                    res
+                }
+            } else {
+                let res = MarketplaceData {
+                    price: price_per_token,
+                    affiliate: false,
+                    affiliate_id: None,
+                    affiliate_percentage: None,
+                    token_id,
+                    token_owner: owner_id,
+                    store_owner,
+                };
+
+                res
+            }
+        } else {
+            let res = MarketplaceData {
+                price: price_per_token,
+                affiliate: false,
+                affiliate_id: None,
+                affiliate_percentage: None,
+                token_id,
+                token_owner: owner_id,
+                store_owner,
+            };
+
+            res
+        }
+    }
+
+}
+'''
+'''--- src/metadata.rs ---
+use crate::*;
+pub type TokenId = String;
+//defines the payout type we'll be returning as a part of the royalty standards.
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Payout {
+    pub payout: HashMap<AccountId, U128>,
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone)]
+#[serde(crate = "near_sdk::serde")]
+pub struct NFTContractMetadata {
+    pub spec: String,              // required, essentially a version like "nft-1.0.0"
+    pub name: String,              // required, ex. "PUMA"
+    pub symbol: String,            // required, ex. "PMA"
+    pub icon: Option<String>,      // logo image for store
+    pub bg_icon: Option<String>,   // background image for store
+    pub category: Option<String>,  // category of store
+    pub description: Option<String>, // description of store
+    pub facebook: Option<String>,   // facebook page social media link
+    pub twitter: Option<String>,    // twitter page social media link
+    pub instagram: Option<String>,  // instagram page social media link
+    pub tiktok: Option<String>,     // tiktok page social media link
+    pub youtube: Option<String>,    // youtube page social media link
+    pub zip: Option<String>,        // store location zip
+    pub city: Option<String>,       // city location of store
+    pub state: Option<String>,      // state location of store
+    pub country: Option<String>,    // country location of store
+    pub base_uri: Option<String>, // Centralized gateway known to have reliable access to decentralized storage assets referenced by `reference` or `media` URLs
+    pub reference: Option<String>, // URL to a JSON file with more info
+    pub reference_hash: Option<Base64VecU8>, // Base64-encoded sha256 hash of JSON from reference field. Required if `reference` is included.
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct TokenMetadata {
+    pub title: Option<String>, // ex. "Arch Nemesis: Mail Carrier" or "Parcel #5055"
+    pub description: String, // free-form description
+    pub media: String, // URL to associated media, preferably to decentralized, content-addressed storage
+    pub media_hash: Option<Base64VecU8>, // Base64-encoded sha256 hash of content referenced by the `media` field. Required if `media` is included.
+    pub copies: Option<u64>, // number of copies of this set of metadata in existence when token was minted.
+    pub buy_timeout: u64, // time seller agrees to fulfil an order to a buyer else the buyer gets refunded
+    pub is_discount: bool, // does the seller want to give the buyer a discount on this purchase
+    pub discount_percent: u64, // upto to what percentage %?
+    pub token_amount_per_unit: U128, // number of tokens to give up by the buyer before accessing this discount
+    pub is_reward: bool, // does the seller want to reward a buyer with a it's store tokens after successfully purchasing this product
+    pub reward_amount_per_unit: U128, // amount of token to give the buyer after purchasing this product
+    pub is_custom_user: bool, // is this series collection made for a particular user?
+    pub user: Option<String>, // if yes, what is the ID of that user
+    pub issued_at: Option<u64>, // When token was issued or minted, Unix epoch in milliseconds
+    pub expires_at: Option<u64>, // When token expires, Unix epoch in milliseconds
+    pub starts_at: Option<u64>, // When token starts being valid, Unix epoch in milliseconds
+    pub updated_at: Option<u64>, // When token was last updated, Unix epoch in milliseconds
+    pub extra: Option<String>, // anything extra the NFT wants to store on-chain. Can be stringified JSON.
+    pub reference: Option<String>, // URL to an off-chain JSON file with more info.
+    pub reference_hash: Option<Base64VecU8>, // Base64-encoded sha256 hash of JSON from reference field. Required if `reference` is included.
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Token {
+    // Series that the token belongs to
+    pub series_id: u64,
+    //owner of the token
+    pub owner_id: AccountId,
+    //list of approved account IDs that have access to transfer the token. This maps an account ID to an approval ID
+    pub approved_account_ids: HashMap<AccountId, u64>,
+    //the next approval ID to give out.
+    pub next_approval_id: u64,
+}
+
+//The Json token is what will be returned from view calls.
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct JsonToken {
+    // Series that the token belongs to
+    pub series_id: u64,
+    //token ID
+    pub token_id: TokenId,
+    //owner of the token
+    pub owner_id: AccountId,
+    //token metadata
+    pub metadata: TokenMetadata,
+    // colors of this product
+    pub colors: HashMap<String, u32>,
+    //list of approved account IDs that have access to transfer the token. This maps an account ID to an approval ID
+    pub approved_account_ids: HashMap<AccountId, u64>,
+    //keep track of the royalty percentages for the token in a hash map
+    pub royalty: Option<HashMap<AccountId, u32>>,
+    //keep track of the price for the token
+    pub price: Option<Balance>,
+}
+
+#[derive(Serialize, Deserialize, BorshDeserialize, BorshSerialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct StorageData {
+    pub account_id: AccountId,
+    pub registration_only: bool,
+}
+
+#[derive(Serialize, Deserialize, BorshDeserialize, BorshSerialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct TokenData {
+    pub receiver_id: AccountId,
+    pub amount: U128,
+    pub memo: String,
+}
+
+// Represents the series type. All tokens will derive this data.
+#[derive(Serialize, Deserialize, BorshDeserialize, BorshSerialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct AffiliatesRequests {
+    // Affiliate account ID
+    pub account_id: AccountId,
+    // SERIES ID of product
+    pub series_id: U64,
+    // Status of request
+    pub approved: bool,
+}
+
+#[derive(Serialize, Deserialize, BorshDeserialize, BorshSerialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct MarketplaceData {
+    pub price: Balance,
+    pub affiliate: bool,
+    pub affiliate_id: Option<AccountId>,
+    pub affiliate_percentage: Option<u32>,
+    pub token_id: String,
+    pub token_owner: AccountId,
+    pub store_owner: AccountId,
+}
+
+pub trait NonFungibleTokenMetadata {
+    //view call for returning the contract metadata
+    fn nft_metadata(&self) -> NFTContractMetadata;
+}
+
+#[near_bindgen]
+impl NonFungibleTokenMetadata for Contract {
+    fn nft_metadata(&self) -> NFTContractMetadata {
+        self.metadata.get().unwrap()
+    }
+}
+
+'''
+'''--- src/nft_core.rs ---
+use crate::*;
+use near_sdk::{ext_contract, Gas, PromiseResult};
+
+const GAS_FOR_RESOLVE_TRANSFER: Gas = Gas(10_000_000_000_000);
+const GAS_FOR_NFT_ON_TRANSFER: Gas = Gas(25_000_000_000_000);
+
+pub trait NonFungibleTokenCore {
+    //transfers an NFT to a receiver ID
+    fn nft_transfer(
+        &mut self,
+        receiver_id: AccountId,
+        token_id: TokenId,
+        //we introduce an approval ID so that people with that approval ID can transfer the token
+        approval_id: Option<u64>,
+        memo: Option<String>,
+    );
+
+    //transfers an NFT to a receiver and calls a function on the receiver ID's contract
+    /// Returns `true` if the token was transferred from the sender's account.
+    fn nft_transfer_call(
+        &mut self,
+        receiver_id: AccountId,
+        token_id: TokenId,
+        //we introduce an approval ID so that people with that approval ID can transfer the token
+        approval_id: Option<u64>,
+        memo: Option<String>,
+        msg: String,
+    ) -> PromiseOrValue<bool>;
+
+    //get information about the NFT token passed in
+    fn nft_token(&self, token_id: TokenId) -> Option<JsonToken>;
+}
+
+#[ext_contract(ext_non_fungible_token_receiver)]
+trait NonFungibleTokenReceiver {
+    //Method stored on the receiver contract that is called via cross contract call when nft_transfer_call is called
+    /// Returns `true` if the token should be returned back to the sender.
+    fn nft_on_transfer(
+        &mut self,
+        sender_id: AccountId,
+        previous_owner_id: AccountId,
+        token_id: TokenId,
+        msg: String,
+    ) -> Promise;
+}
+
+#[ext_contract(ext_self)]
+/*
+    resolves the promise of the cross contract call to the receiver contract
+    this is stored on THIS contract and is meant to analyze what happened in the cross contract call when nft_on_transfer was called
+    as part of the nft_transfer_call method
+*/
+trait NonFungibleTokenResolver {
+    fn nft_resolve_transfer(
+        &mut self,
+        //we introduce an authorized ID for logging the transfer event
+        authorized_id: Option<String>,
+        owner_id: AccountId,
+        receiver_id: AccountId,
+        token_id: TokenId,
+        //we introduce the approval map so we can keep track of what the approvals were before the transfer
+        approved_account_ids: HashMap<AccountId, u64>,
+        //we introduce a memo for logging the transfer event
+        memo: Option<String>,
+    ) -> bool;
+}
+
+#[near_bindgen]
+impl NonFungibleTokenCore for Contract {
+    //implementation of the nft_transfer method. This transfers the NFT from the current owner to the receiver.
+    #[payable]
+    fn nft_transfer(
+        &mut self,
+        receiver_id: AccountId,
+        token_id: TokenId,
+        //we introduce an approval ID so that people with that approval ID can transfer the token
+        approval_id: Option<u64>,
+        memo: Option<String>,
+    ) {
+        //assert that the user attached exactly 1 yoctoNEAR. This is for security and so that the user will be redirected to the NEAR wallet.
+        assert_one_yocto();
+        //Confirm tokenId is not locked
+        assert!(
+            self.tokens_locked.contains(&token_id),
+            "Token is currently locked, try again later"
+        );
+        //get the sender to transfer the token from the sender to the receiver
+        let sender_id = env::predecessor_account_id();
+
+        //call the internal transfer method and get back the previous token so we can refund the approved account IDs
+        let previous_token =
+            self.internal_transfer(&sender_id, &receiver_id, &token_id, approval_id, memo);
+
+        //we refund the owner for releasing the storage used up by the approved account IDs
+        refund_approved_account_ids(
+            previous_token.owner_id.clone(),
+            &previous_token.approved_account_ids,
+        );
+    }
+
+    //implementation of the transfer call method. This will transfer the NFT and call a method on the receiver_id contract
+    #[payable]
+    fn nft_transfer_call(
+        &mut self,
+        receiver_id: AccountId,
+        token_id: TokenId,
+        //we introduce an approval ID so that people with that approval ID can transfer the token
+        approval_id: Option<u64>,
+        memo: Option<String>,
+        msg: String,
+    ) -> PromiseOrValue<bool> {
+        //assert that the user attached exactly 1 yocto for security reasons.
+        assert_one_yocto();
+
+        //Confirm tokenId is not locked
+        assert!(
+            self.tokens_locked.contains(&token_id),
+            "Token is currently locked, try again later"
+        );
+
+        //get the sender ID
+        let sender_id = env::predecessor_account_id();
+
+        //transfer the token and get the previous token object
+        let previous_token = self.internal_transfer(
+            &sender_id,
+            &receiver_id,
+            &token_id,
+            approval_id,
+            memo.clone(),
+        );
+
+        //default the authorized_id to none
+        let mut authorized_id = None;
+        //if the sender isn't the owner of the token, we set the authorized ID equal to the sender.
+        if sender_id != previous_token.owner_id {
+            authorized_id = Some(sender_id.to_string());
+        }
+
+        // Initiating receiver's call and the callback
+        // Defaulting GAS weight to 1, no attached deposit, and static GAS equal to the GAS for nft on transfer.
+        ext_non_fungible_token_receiver::ext(receiver_id.clone())
+            .with_static_gas(GAS_FOR_NFT_ON_TRANSFER)
+            .nft_on_transfer(
+                sender_id,
+                previous_token.owner_id.clone(),
+                token_id.clone(),
+                msg,
+            )
+            // We then resolve the promise and call nft_resolve_transfer on our own contract
+            .then(
+                // Defaulting GAS weight to 1, no attached deposit, and static GAS equal to the GAS for resolve transfer
+                Self::ext(env::current_account_id())
+                    .with_static_gas(GAS_FOR_RESOLVE_TRANSFER)
+                    .nft_resolve_transfer(
+                        authorized_id, // we introduce an authorized ID so that we can log the transfer
+                        previous_token.owner_id,
+                        receiver_id,
+                        token_id,
+                        previous_token.approved_account_ids,
+                        memo, // we introduce a memo for logging in the events standard
+                    ),
+            )
+            .into()
+    }
+
+    //get the information for a specific token ID
+    fn nft_token(&self, token_id: TokenId) -> Option<JsonToken> {
+        //if there is some token ID in the tokens_by_id collection
+        if let Some(token) = self.tokens_by_id.get(&token_id) {
+            // Get the series information
+            let cur_series = self
+                .series_by_id
+                .get(&token.series_id)
+                .expect("Not a series");
+            // Get the metadata for the series
+            let mut metadata = cur_series.metadata;
+
+            // Get the edition number and series ID
+            let split: Vec<&str> = token_id.split(":").collect();
+            let edition_number = split[1];
+            // If there is a title for the NFT, add the token ID to it.
+            if let Some(title) = metadata.title {
+                metadata.title = Some(format!("{} - {}", title, edition_number));
+            } else {
+                // If there is no title, we simply create one based on the series number and edition number
+                metadata.title = Some(format!("Series {} : Edition {}", split[0], split[1]));
+            }
+
+            //we return the JsonToken (wrapped by Some since we return an option)
+            Some(JsonToken {
+                series_id: token.series_id,
+                token_id,
+                owner_id: token.owner_id,
+                metadata,
+                colors: cur_series.colors,
+                price: cur_series.price,
+                approved_account_ids: token.approved_account_ids,
+                royalty: cur_series.royalty,
+            })
+        } else {
+            //if there wasn't a token ID in the tokens_by_id collection, we return None
+            None
+        }
+    }
+}
+
+#[near_bindgen]
+impl NonFungibleTokenResolver for Contract {
+    //resolves the cross contract call when calling nft_on_transfer in the nft_transfer_call method
+    //returns true if the token was successfully transferred to the receiver_id
+    #[private]
+    fn nft_resolve_transfer(
+        &mut self,
+        //we introduce an authorized ID for logging the transfer event
+        authorized_id: Option<String>,
+        owner_id: AccountId,
+        receiver_id: AccountId,
+        token_id: TokenId,
+        //we introduce the approval map so we can keep track of what the approvals were before the transfer
+        approved_account_ids: HashMap<AccountId, u64>,
+        //we introduce a memo for logging the transfer event
+        memo: Option<String>,
+    ) -> bool {
+        // Whether receiver wants to return token back to the sender, based on `nft_on_transfer`
+        // call result.
+        if let PromiseResult::Successful(value) = env::promise_result(0) {
+            //As per the standard, the nft_on_transfer should return whether we should return the token to it's owner or not
+            if let Ok(return_token) = near_sdk::serde_json::from_slice::<bool>(&value) {
+                //if we need don't need to return the token, we simply return true meaning everything went fine
+                if !return_token {
+                    /*
+                        since we've already transferred the token and nft_on_transfer returned false, we don't have to
+                        revert the original transfer and thus we can just return true since nothing went wrong.
+                    */
+                    //we refund the owner for releasing the storage used up by the approved account IDs
+                    refund_approved_account_ids(owner_id, &approved_account_ids);
+                    return true;
+                }
+            }
+        }
+
+        //get the token object if there is some token object
+        let mut token = if let Some(token) = self.tokens_by_id.get(&token_id) {
+            if token.owner_id != receiver_id {
+                //we refund the owner for releasing the storage used up by the approved account IDs
+                refund_approved_account_ids(owner_id, &approved_account_ids);
+                // The token is not owner by the receiver anymore. Can't return it.
+                return true;
+            }
+            token
+        //if there isn't a token object, it was burned and so we return true
+        } else {
+            //we refund the owner for releasing the storage used up by the approved account IDs
+            refund_approved_account_ids(owner_id, &approved_account_ids);
+            return true;
+        };
+
+        //we remove the token from the receiver
+        self.internal_remove_token_from_owner(&receiver_id.clone(), &token_id);
+        //we add the token to the original owner
+        self.internal_add_token_to_owner(&owner_id, &token_id);
+
+        //we change the token struct's owner to be the original owner
+        token.owner_id = owner_id.clone();
+
+        //we refund the receiver any approved account IDs that they may have set on the token
+        refund_approved_account_ids(receiver_id.clone(), &token.approved_account_ids);
+        //reset the approved account IDs to what they were before the transfer
+        token.approved_account_ids = approved_account_ids;
+
+        //we inset the token back into the tokens_by_id collection
+        self.tokens_by_id.insert(&token_id, &token);
+
+        /*
+            We need to log that the NFT was reverted back to the original owner.
+            The old_owner_id will be the receiver and the new_owner_id will be the
+            original owner of the token since we're reverting the transfer.
+        */
+        let nft_transfer_log: EventLog = EventLog {
+            // Standard name ("nep171").
+            standard: NFT_STANDARD_NAME.to_string(),
+            // Version of the standard ("nft-1.0.0").
+            version: NFT_METADATA_SPEC.to_string(),
+            // The data related with the event stored in a vector.
+            event: EventLogVariant::NftTransfer(vec![NftTransferLog {
+                // The optional authorized account ID to transfer the token on behalf of the old owner.
+                authorized_id,
+                // The old owner's account ID.
+                old_owner_id: receiver_id.to_string(),
+                // The account ID of the new owner of the token.
+                new_owner_id: owner_id.to_string(),
+                // A vector containing the token IDs as strings.
+                token_ids: vec![token_id.to_string()],
+                // An optional memo to include.
+                memo,
+            }]),
+        };
+
+        //we perform the actual logging
+        env::log_str(&nft_transfer_log.to_string());
+
+        //return false
+        false
+    }
+}
+
+'''
+'''--- src/owner.rs ---
+use crate::*;
+
+#[near_bindgen]
+impl Contract {
+    /// Add a specified account as an approved minter
+    pub fn add_approved_minter(&mut self, account_id: AccountId) {
+        self.assert_contract_owner();
+        self.approved_minters.insert(&account_id);
+    }
+
+    /// Remove a specified account as an approved minter
+    pub fn remove_approved_minter(&mut self, account_id: AccountId) {
+        self.assert_contract_owner();
+        self.approved_minters.remove(&account_id);
+    }
+
+    /// Check if a specified account is an approved minter
+    pub fn is_approved_minter(&self, account_id: AccountId) -> bool {
+        self.approved_minters.contains(&account_id)
+    }
+
+    /// Add a specified account as an approved creator
+    pub fn add_approved_creator(&mut self, account_id: AccountId) {
+        self.assert_contract_owner();
+        self.approved_creators.insert(&account_id);
+    }
+
+    /// Remove a specified account as an approved creator
+    pub fn remove_approved_creator(&mut self, account_id: AccountId) {
+        self.assert_contract_owner();
+        self.approved_creators.remove(&account_id);
+    }
+
+    /// Check if a specified account is an approved creator
+    pub fn is_approved_creator(&self, account_id: AccountId) -> bool {
+        self.approved_creators.contains(&account_id)
+    }
+}
+
+'''
+'''--- src/reward.rs ---
+use crate::*;
+// use near_sdk::ext_contract;
+
+#[near_bindgen]
+impl Contract {
+    pub fn reward_with_token(
+        &mut self,
+        id: U64, receiver_id: AccountId,
+    ) -> Promise {
+        //ensure smart contract is only called by pipar marketplace
+        self.assert_marketplace_contract();
+        //confirm seller has a token deployed
+        assert_eq!(
+            true, self.token,
+            "Store owner has not deployed a token yet"
+        );
+
+        // Get the series and how many tokens currently exist (edition number = cur_len + 1)
+        let mut series = self.series_by_id.get(&id.0).expect("Not a series");
+
+        assert_eq!(series.metadata.is_reward, true, "There's no token reward for this product");
+
+        let token_quantity = series.metadata.reward_amount_per_unit;
+        let mem = format!("Thank You for Shopping at {:?}!", env::current_account_id());
+        let current_account = env::current_account_id().to_string();
+        let token_account: AccountId = format!("ft.{current_account}").parse().unwrap();
+        let storage_args = serde_json::to_vec(&StorageData {
+            account_id: receiver_id.clone(),
+            registration_only: false,
+        })
+            .unwrap();
+
+        let token_args = serde_json::to_vec(&TokenData {
+            receiver_id: receiver_id.clone(),
+            amount: token_quantity,
+            memo: mem,
+        })
+            .unwrap();
+
+        Promise::new(token_account.clone())
+            .function_call(
+                "storage_deposit".to_owned(),
+                storage_args,
+                ONE_YOCTO,
+                GAGAS,
+            )
+            .function_call(
+                "ft_transfer".to_owned(),
+                token_args,
+                NO_DEPOSIT,
+                GAGAS,
+            )
+            .then(
+                Self::ext(env::current_account_id())
+                    .reward_with_token_callback(token_quantity.clone()),
+            )
+    }
+
+    #[private]
+    pub fn reward_with_token_callback(&self, token_quantity: U128) -> String {
+        let token: u128 = token_quantity.into();
+        if is_promise_success() {
+            let res = format!("Sent {token} token successfully!");
+
+            res
+        } else {
+            let res = format!("failed sending token");
+
+            res
+        }
+    }
+}
+'''
+'''--- src/royalty.rs ---
+use crate::*;
+
+pub trait NonFungibleTokenCore {
+    //calculates the payout for a token given the passed in balance. This is a view method
+    fn nft_payout(&self, token_id: TokenId, balance: U128, max_len_payout: u32) -> Payout;
+
+    //transfers the token to the receiver ID and returns the payout object that should be payed given the passed in balance.
+    fn nft_transfer_payout(
+        &mut self,
+        receiver_id: AccountId,
+        token_id: TokenId,
+        approval_id: u64,
+        memo: Option<String>,
+        balance: U128,
+        max_len_payout: u32,
+    ) -> Payout;
+}
+
+#[near_bindgen]
+impl NonFungibleTokenCore for Contract {
+    //calculates the payout for a token given the passed in balance. This is a view method
+    fn nft_payout(&self, token_id: TokenId, balance: U128, max_len_payout: u32) -> Payout {
+        //get the token object
+        let token = self.tokens_by_id.get(&token_id).expect("No token");
+
+        //get the owner of the token
+        let owner_id = token.owner_id;
+        //keep track of the total perpetual royalties
+        let mut total_perpetual = 0;
+        //get the u128 version of the passed in balance (which was U128 before)
+        let balance_u128 = u128::from(balance);
+        //keep track of the payout object to send back
+        let mut payout_object = Payout {
+            payout: HashMap::new(),
+        };
+        //get the royalty object from series
+        let cur_series = self
+            .series_by_id
+            .get(&token.series_id)
+            .expect("Not a series");
+
+        // If the series doesn't have a royalty, we'll return an a payout object that just includes the owner
+        let royalty_option = cur_series.royalty;
+        if royalty_option.is_none() {
+            let mut payout = HashMap::new();
+            payout.insert(owner_id, balance);
+            return Payout {
+                payout: payout
+            };
+        }
+        // Otherwise, we will get the royalty object from the series
+        let royalty = royalty_option.unwrap();
+
+        //make sure we're not paying out to too many people (GAS limits this)
+        assert!(
+            royalty.len() as u32 <= max_len_payout,
+            "Market can&not payout to that many receivers"
+        );
+
+        //go through each key and value in the royalty object
+        for (k, v) in royalty.iter() {
+            //get the key
+            let key = k.clone();
+            //only insert into the payout if the key isn't the token owner (we add their payout at the end)
+            if key != owner_id {
+                //
+                payout_object
+                    .payout
+                    .insert(key, royalty_to_payout(*v, balance_u128));
+                total_perpetual += *v;
+            }
+        }
+
+        // payout to previous owner who gets 100% - total perpetual royalties
+        payout_object.payout.insert(
+            owner_id,
+            royalty_to_payout(10000 - total_perpetual, balance_u128),
+        );
+
+        //return the payout object
+        payout_object
+    }
+
+    //transfers the token to the receiver ID and returns the payout object that should be payed given the passed in balance.
+    #[payable]
+    fn nft_transfer_payout(
+        &mut self,
+        receiver_id: AccountId,
+        token_id: TokenId,
+        approval_id: u64,
+        memo: Option<String>,
+        balance: U128,
+        max_len_payout: u32,
+    ) -> Payout {
+        //assert that the user attached 1 yocto NEAR for security reasons
+        assert_one_yocto();
+        //get the sender ID
+        let sender_id = env::predecessor_account_id();
+        //transfer the token to the passed in receiver and get the previous token object back
+        let previous_token =
+            self.internal_transfer(&sender_id, &receiver_id, &token_id, Some(approval_id), memo);
+
+        //refund the previous token owner for the storage used up by the previous approved account IDs
+        refund_approved_account_ids(
+            previous_token.owner_id.clone(),
+            &previous_token.approved_account_ids,
+        );
+
+        //get the owner of the token
+        let owner_id = previous_token.owner_id;
+        //keep track of the total perpetual royalties
+        let mut total_perpetual = 0;
+        //get the u128 version of the passed in balance (which was U128 before)
+        let balance_u128 = u128::from(balance);
+        //keep track of the payout object to send back
+        let mut payout_object = Payout {
+            payout: HashMap::new(),
+        };
+
+        //get the royalty object from series
+        let cur_series = self
+            .series_by_id
+            .get(&previous_token.series_id)
+            .expect("Not a series");
+
+        // If the series doesn't have a royalty, we'll return an a payout object that just includes the owner
+        let royalty_option = cur_series.royalty;
+        if royalty_option.is_none() {
+            let mut payout = HashMap::new();
+            payout.insert(owner_id, balance);
+            return Payout {
+                payout: payout
+            };
+        }
+        // Otherwise, we will get the royalty object from the series
+        let royalty = royalty_option.unwrap();
+
+        //make sure we're not paying out to too many people (GAS limits this)
+        assert!(
+            royalty.len() as u32 <= max_len_payout,
+            "Market cannot payout to that many receivers"
+        );
+
+        //go through each key and value in the royalty object
+        for (k, v) in royalty.iter() {
+            //get the key
+            let key = k.clone();
+            //only insert into the payout if the key isn't the token owner (we add their payout at the end)
+            if key != owner_id {
+                //
+                payout_object
+                    .payout
+                    .insert(key, royalty_to_payout(*v, balance_u128));
+                total_perpetual += *v;
+            }
+        }
+
+        // payout to previous owner who gets 100% - total perpetual royalties
+        payout_object.payout.insert(
+            owner_id,
+            royalty_to_payout(10000 - total_perpetual, balance_u128),
+        );
+
+        //return the payout object
+        payout_object
+    }
+}
+
+'''
+'''--- src/series.rs ---
+use near_sdk::json_types::U64;
+
+use crate::*;
+
+#[near_bindgen]
+impl Contract {
+    /// Create a new series. The caller must be an approved creator. All tokens in the series will inherit the same metadata
+    /// If copies are set in the metadata, it will enforce that only that number of NFTs can be minted. If not, unlimited NFTs can be minted.
+    /// If a title is set in the metadata, enumeration methods will return the `${title} - ${edition}` else, `${series_id} - ${edition}`
+    /// All token IDs internally are stored as `${series_id}:${edition}`
+    /// Caller must attach enough $NEAR to cover storage.
+    #[payable]
+    pub fn create_series(
+        &mut self,
+        metadata: TokenMetadata,
+        colors: HashMap<String, u32>,
+        royalty: Option<HashMap<AccountId, u32>>,
+        price: Option<U128>
+    ) {
+        // Measure the initial storage being used on the contract
+        let initial_storage_usage = env::storage_usage();
+
+        // Ensure the caller is an approved creator
+        let caller = env::predecessor_account_id();
+        require!(
+            self.approved_creators.contains(&caller) == true,
+            "only approved creators can add a type"
+        );
+
+        let id: u64 = self.series_by_id.len() + 1;
+
+        // Insert the series and ensure it doesn't already exist
+        require!(
+            self.series_by_id
+                .insert(
+                    &id,
+                    &Series {
+                        metadata,
+                        affiliate: Some(HashMap::new()),
+                        colors,
+                        royalty,
+                        tokens: UnorderedSet::new(StorageKey::SeriesByIdInner {
+                            // We get a new unique prefix for the collection
+                            account_id_hash: hash_account_id(&format!(
+                                "{}{}",
+                                id, caller
+                            )),
+                        }),
+                        owner_id: caller,
+                        price: price.map(|p| p.into()),
+                    }
+                )
+                .is_none(),
+            "collection ID already exists"
+        );
+
+        //calculate the required storage which was the used - initial
+        let required_storage_in_bytes = env::storage_usage() - initial_storage_usage;
+
+        //refund any excess storage if the user attached too much. Panic if they didn't attach enough to cover the required.
+        refund_deposit(required_storage_in_bytes);
+    }
+
+    /// Mint a new NFT that is part of a series. The caller must be an approved minter.
+    /// The series ID must exist and if the metadata specifies a copy limit, you cannot exceed it.
+    #[payable]
+    pub fn nft_mint(&mut self, id: U64, receiver_id: AccountId, attached_deposit: U128, color: String, affiliate: Option<AccountId>) {
+        // Measure the initial storage being used on the contract
+        let initial_storage_usage = env::storage_usage();
+
+        // Get the series and how many tokens currently exist (edition number = cur_len + 1)
+        let mut series = self.series_by_id.get(&id.0).expect("Not a series");
+        
+        // Check if the series has a price per token. If it does, ensure the caller has attached at least that amount
+        let mut price_per_token = 0; 
+        if let Some(price) = series.price {
+            price_per_token = price;
+            require!(attached_deposit.0 > price_per_token, "Need to attach at least enough to cover price");
+        // If the series doesn't have a price, ensure the caller is an approved minter.
+        } else {
+            // Ensure the caller is an approved minter
+            let predecessor = env::predecessor_account_id();
+            assert!(
+                self.approved_minters.contains(&predecessor),
+                "Not approved minter"
+            );
+        }
+
+        let cur_len = series.tokens.len();
+        // Ensure we haven't overflowed on the number of copies minted
+        if let Some(copies) = series.metadata.copies {
+            require!(
+                cur_len < copies,
+                "cannot mint anymore NFTs for the given series. Limit reached"
+            );
+        }
+
+        assert!(
+            series.colors.contains_key(&color),
+            "Color is not present"
+        );
+
+        if let Some(cur_color_len) = series.colors.get(&color) {
+            assert!(
+                cur_color_len >= &1,
+                "This color for product is not available, choose another color"
+            );
+
+            series.colors.insert(color, cur_color_len - &1);
+        }
+
+        // The token ID is stored internally as `${series_id}:${edition}`
+        let token_id = format!("{}:{}", id.0, cur_len + 1);
+        series.tokens.insert(&token_id);
+        self.series_by_id.insert(&id.0, &series);
+
+        //specify the token struct that contains the owner ID
+        let token = Token {
+            // Series ID that the token belongs to
+            series_id: id.0,
+            //set the owner ID equal to the receiver ID passed into the function
+            owner_id: receiver_id,
+            //we set the approved account IDs to the default value (an empty map)
+            approved_account_ids: Default::default(),
+            //the next approval ID is set to 0
+            next_approval_id: 0,
+        };
+
+        //insert the token ID and token struct and make sure that the token doesn't exist
+        require!(
+            self.tokens_by_id.insert(&token_id, &token).is_none(),
+            "Token already exists"
+        );
+
+        //call the internal method for adding the token to the owner
+        self.internal_add_token_to_owner(&token.owner_id, &token_id);
+
+        let marketplace_id = self.marketplace_contract_id.clone();
+
+        //call the internal method for approving marketplace to transfer token
+        self.internal_approve_token_marketplace(&marketplace_id, &token_id);
+
+        //Lock the token pending marketplace transaction completion
+        assert_eq!(self.tokens_locked.insert(&token_id), true);
+
+        // Construct the mint log as per the events standard.
+        let nft_mint_log: EventLog = EventLog {
+            // Standard name ("nep171").
+            standard: NFT_STANDARD_NAME.to_string(),
+            // Version of the standard ("nft-1.0.0").
+            version: NFT_METADATA_SPEC.to_string(),
+            // The data related with the event stored in a vector.
+            event: EventLogVariant::NftMint(vec![NftMintLog {
+                // Owner of the token.
+                owner_id: token.owner_id.to_string(),
+                // Vector of token IDs that were minted.
+                token_ids: vec![token_id.to_string()],
+                // An optional memo to include.
+                memo: None,
+            }]),
+        };
+
+        // Log the serialized json.
+        env::log_str(&nft_mint_log.to_string());
+
+        //calculate the required storage which was the used - initial
+        let required_storage_in_bytes = env::storage_usage() - initial_storage_usage;
+
+        // refund storage used
+        // refund_deposit(required_storage_in_bytes);
+
+        // If there's some price for the token, we'll payout the series owner. Otherwise, refund the excess deposit for storage to the caller
+        if price_per_token > 0 {
+            self.marketplace_series_callback(id.clone(), required_storage_in_bytes, price_per_token, self.owner_id.clone(), series.owner_id, token_id, attached_deposit.clone(), affiliate);
+        } else {
+            refund_deposit(required_storage_in_bytes);
+        }
+    }
+}
+
+'''
+'''--- target/.rustc_info.json ---
+{"rustc_fingerprint":14131669119602318747,"outputs":{"15729799797837862367":{"success":true,"status":"","code":0,"stdout":"___\nlib___.rlib\nlib___.dylib\nlib___.dylib\nlib___.a\nlib___.dylib\n/Users/onyedikaedewor/.rustup/toolchains/stable-aarch64-apple-darwin\noff\npacked\nunpacked\n___\ndebug_assertions\npanic=\"unwind\"\nproc_macro\ntarget_abi=\"\"\ntarget_arch=\"aarch64\"\ntarget_endian=\"little\"\ntarget_env=\"\"\ntarget_family=\"unix\"\ntarget_feature=\"aes\"\ntarget_feature=\"crc\"\ntarget_feature=\"dit\"\ntarget_feature=\"dotprod\"\ntarget_feature=\"dpb\"\ntarget_feature=\"dpb2\"\ntarget_feature=\"fcma\"\ntarget_feature=\"fhm\"\ntarget_feature=\"flagm\"\ntarget_feature=\"fp16\"\ntarget_feature=\"frintts\"\ntarget_feature=\"jsconv\"\ntarget_feature=\"lor\"\ntarget_feature=\"lse\"\ntarget_feature=\"neon\"\ntarget_feature=\"paca\"\ntarget_feature=\"pacg\"\ntarget_feature=\"pan\"\ntarget_feature=\"pmuv3\"\ntarget_feature=\"ras\"\ntarget_feature=\"rcpc\"\ntarget_feature=\"rcpc2\"\ntarget_feature=\"rdm\"\ntarget_feature=\"sb\"\ntarget_feature=\"sha2\"\ntarget_feature=\"sha3\"\ntarget_feature=\"ssbs\"\ntarget_feature=\"v8.1a\"\ntarget_feature=\"v8.2a\"\ntarget_feature=\"v8.3a\"\ntarget_feature=\"v8.4a\"\ntarget_feature=\"vh\"\ntarget_has_atomic\ntarget_has_atomic=\"128\"\ntarget_has_atomic=\"16\"\ntarget_has_atomic=\"32\"\ntarget_has_atomic=\"64\"\ntarget_has_atomic=\"8\"\ntarget_has_atomic=\"ptr\"\ntarget_has_atomic_equal_alignment=\"128\"\ntarget_has_atomic_equal_alignment=\"16\"\ntarget_has_atomic_equal_alignment=\"32\"\ntarget_has_atomic_equal_alignment=\"64\"\ntarget_has_atomic_equal_alignment=\"8\"\ntarget_has_atomic_equal_alignment=\"ptr\"\ntarget_has_atomic_load_store\ntarget_has_atomic_load_store=\"128\"\ntarget_has_atomic_load_store=\"16\"\ntarget_has_atomic_load_store=\"32\"\ntarget_has_atomic_load_store=\"64\"\ntarget_has_atomic_load_store=\"8\"\ntarget_has_atomic_load_store=\"ptr\"\ntarget_os=\"macos\"\ntarget_pointer_width=\"64\"\ntarget_thread_local\ntarget_vendor=\"apple\"\nunix\n","stderr":""},"4614504638168534921":{"success":true,"status":"","code":0,"stdout":"rustc 1.69.0 (84c898d65 2023-04-16)\nbinary: rustc\ncommit-hash: 84c898d65adf2f39a5a98507f1fe0ce10a2b8dbc\ncommit-date: 2023-04-16\nhost: aarch64-apple-darwin\nrelease: 1.69.0\nLLVM version: 15.0.7\n","stderr":""},"14524029166799264133":{"success":true,"status":"","code":0,"stdout":"___.wasm\nlib___.rlib\n___.wasm\nlib___.a\n/Users/onyedikaedewor/.rustup/toolchains/stable-aarch64-apple-darwin\noff\n___\ndebug_assertions\npanic=\"abort\"\nproc_macro\ntarget_arch=\"wasm32\"\ntarget_endian=\"little\"\ntarget_env=\"\"\ntarget_family=\"wasm\"\ntarget_has_atomic=\"16\"\ntarget_has_atomic=\"32\"\ntarget_has_atomic=\"64\"\ntarget_has_atomic=\"8\"\ntarget_has_atomic=\"ptr\"\ntarget_os=\"unknown\"\ntarget_pointer_width=\"32\"\ntarget_vendor=\"unknown\"\n","stderr":"warning: dropping unsupported crate type `dylib` for target `wasm32-unknown-unknown`\n\nwarning: dropping unsupported crate type `proc-macro` for target `wasm32-unknown-unknown`\n\nwarning: 2 warnings emitted\n\n"}},"successes":{}}
+'''
+'''--- target/debug/.fingerprint/Inflector-e80133f0d873a89e/lib-inflector.json ---
+{"rustc":4041371938568725036,"features":"[]","target":894124792023433695,"profile":8626402512162920248,"path":3013233323467025743,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/Inflector-e80133f0d873a89e/dep-lib-inflector"}}],"rustflags":[],"metadata":6849597462678386541,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/ahash-0ea456d44955ceb2/build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"[]","target":2297296889237502566,"profile":8626402512162920248,"path":14014071913029522051,"deps":[[16079472387499994964,"version_check",false,4854173320755796750]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/ahash-0ea456d44955ceb2/dep-build-script-build-script-build"}}],"rustflags":[],"metadata":6548036084630991988,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/ahash-146413374edcc6be/lib-ahash.json ---
+{"rustc":4041371938568725036,"features":"[]","target":295758560010665018,"profile":8987646332441898785,"path":6073155738240102520,"deps":[[4424799446218848649,"once_cell",false,13157731012407737153],[6564554279330852038,"build_script_build",false,17848498641088756830],[12202314575583203756,"getrandom",false,5926453146219644795]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/ahash-146413374edcc6be/dep-lib-ahash"}}],"rustflags":[],"metadata":6548036084630991988,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/ahash-75de2a8567409b0a/run-build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"","target":0,"profile":0,"path":0,"deps":[[6564554279330852038,"build_script_build",false,3612074828588559836]],"local":[{"RerunIfChanged":{"output":"debug/build/ahash-75de2a8567409b0a/output","paths":["build.rs"]}}],"rustflags":[],"metadata":0,"config":0,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/arrayref-c13f4daf9141ff10/lib-arrayref.json ---
+{"rustc":4041371938568725036,"features":"[]","target":13658717622884259089,"profile":8987646332441898785,"path":441133678399138486,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/arrayref-c13f4daf9141ff10/dep-lib-arrayref"}}],"rustflags":[],"metadata":5065701478231546975,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/arrayvec-4b25329b5c477333/lib-arrayvec.json ---
+{"rustc":4041371938568725036,"features":"[]","target":9102904644320696625,"profile":8987646332441898785,"path":5780539239216039222,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/arrayvec-4b25329b5c477333/dep-lib-arrayvec"}}],"rustflags":[],"metadata":5019420986621020735,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/arrayvec-5ed8e9a0f838a07f/lib-arrayvec.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"std\"]","target":9102904644320696625,"profile":8987646332441898785,"path":1242694683857140496,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/arrayvec-5ed8e9a0f838a07f/dep-lib-arrayvec"}}],"rustflags":[],"metadata":5019420986621020735,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/autocfg-3936825b0293837c/lib-autocfg.json ---
+{"rustc":4041371938568725036,"features":"[]","target":14886237245231788030,"profile":8626402512162920248,"path":1308378635592291436,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/autocfg-3936825b0293837c/dep-lib-autocfg"}}],"rustflags":[],"metadata":13102859075309379048,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/base64-0c3f16fadc1da635/lib-base64.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"std\"]","target":16778825523953873731,"profile":8987646332441898785,"path":12150124450276780942,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/base64-0c3f16fadc1da635/dep-lib-base64"}}],"rustflags":[],"metadata":13936919950537592407,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/base64-7f77bc7365859151/lib-base64.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"std\"]","target":16778825523953873731,"profile":8987646332441898785,"path":9578453517093470947,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/base64-7f77bc7365859151/dep-lib-base64"}}],"rustflags":[],"metadata":13936919950537592407,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/bitvec-83ca9af5df3aa113/lib-bitvec.json ---
+{"rustc":4041371938568725036,"features":"[\"alloc\", \"std\"]","target":6701579296773358966,"profile":8987646332441898785,"path":1720627950626038729,"deps":[[188905226975056936,"radium",false,2392858705125080900],[6290779380211241362,"tap",false,3788371561978158711],[7789681275229131466,"wyz",false,1477290888102055789],[15433456967963170366,"funty",false,7051349826240036755]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/bitvec-83ca9af5df3aa113/dep-lib-bitvec"}}],"rustflags":[],"metadata":6379644401324879731,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/blake2-3042a9a886fcdf87/lib-blake2.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"std\"]","target":12927166087276115034,"profile":8987646332441898785,"path":12298269215860114554,"deps":[[6014497622236959678,"opaque_debug",false,6187187540341452882],[8884615759848737972,"crypto_mac",false,18104792079496557175],[12829070662860118430,"digest",false,18020473100866099150]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/blake2-3042a9a886fcdf87/dep-lib-blake2"}}],"rustflags":[],"metadata":2523818277111752649,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/block-buffer-102429723281fa2e/lib-block-buffer.json ---
+{"rustc":4041371938568725036,"features":"[]","target":2661632913477203689,"profile":8987646332441898785,"path":359836920712429733,"deps":[[9665562089965330559,"generic_array",false,16505117335682560374]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/block-buffer-102429723281fa2e/dep-lib-block-buffer"}}],"rustflags":[],"metadata":15558279325495868285,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/block-buffer-20b3646e53e662e8/lib-block-buffer.json ---
+{"rustc":4041371938568725036,"features":"[]","target":2661632913477203689,"profile":8987646332441898785,"path":11118943081233035770,"deps":[[9665562089965330559,"generic_array",false,16505117335682560374]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/block-buffer-20b3646e53e662e8/dep-lib-block-buffer"}}],"rustflags":[],"metadata":5573904726092117450,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/borsh-1168a506675739d0/lib-borsh.json ---
+{"rustc":4041371938568725036,"features":"[\"const-generics\", \"default\", \"rc\", \"std\"]","target":5127993436019407528,"profile":8987646332441898785,"path":18383659375555553486,"deps":[[1759060122986695407,"borsh_derive",false,14407568056235267160],[16284710795702459458,"hashbrown",false,8289588702435391391]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/borsh-1168a506675739d0/dep-lib-borsh"}}],"rustflags":[],"metadata":7032358266178414993,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/borsh-derive-f416a1eeafdb6031/lib-borsh-derive.json ---
+{"rustc":4041371938568725036,"features":"[]","target":14484299583844374162,"profile":8626402512162920248,"path":7018531728809881168,"deps":[[2345288959107110519,"borsh_schema_derive_internal",false,5397359034854229644],[3971538142687143787,"proc_macro_crate",false,17700447026520277124],[4795167122555208633,"proc_macro2",false,6740026448694036056],[8324001644593655249,"borsh_derive_internal",false,7935996276389177430],[17143850428905299221,"syn",false,4214620575965312635]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/borsh-derive-f416a1eeafdb6031/dep-lib-borsh-derive"}}],"rustflags":[],"metadata":6341613096556135379,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/borsh-derive-internal-2c4448ac5ffebae2/lib-borsh-derive-internal.json ---
+{"rustc":4041371938568725036,"features":"[]","target":9985232031898684131,"profile":8626402512162920248,"path":3770438619788102196,"deps":[[4795167122555208633,"proc_macro2",false,6740026448694036056],[5184402248973381138,"quote",false,11518320847341303531],[17143850428905299221,"syn",false,4214620575965312635]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/borsh-derive-internal-2c4448ac5ffebae2/dep-lib-borsh-derive-internal"}}],"rustflags":[],"metadata":6341613096556135379,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/borsh-schema-derive-internal-81458834846d6b34/lib-borsh-schema-derive-internal.json ---
+{"rustc":4041371938568725036,"features":"[]","target":15664144342437137661,"profile":8626402512162920248,"path":11103434683369536612,"deps":[[4795167122555208633,"proc_macro2",false,6740026448694036056],[5184402248973381138,"quote",false,11518320847341303531],[17143850428905299221,"syn",false,4214620575965312635]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/borsh-schema-derive-internal-81458834846d6b34/dep-lib-borsh-schema-derive-internal"}}],"rustflags":[],"metadata":7685215035480038221,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/bs58-a1ee981bf5fa2a05/lib-bs58.json ---
+{"rustc":4041371938568725036,"features":"[\"alloc\", \"default\", \"std\"]","target":18352831503079783019,"profile":8987646332441898785,"path":1907088928371418049,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/bs58-a1ee981bf5fa2a05/dep-lib-bs58"}}],"rustflags":[],"metadata":13637435404263704389,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/byte-slice-cast-e98726a35bb6c61f/lib-byte-slice-cast.json ---
+{"rustc":4041371938568725036,"features":"[\"std\"]","target":6808208250546668251,"profile":8987646332441898785,"path":15127496248170349884,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/byte-slice-cast-e98726a35bb6c61f/dep-lib-byte-slice-cast"}}],"rustflags":[],"metadata":4028636240650239297,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/byteorder-c1f379e1522f1ef6/lib-byteorder.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"i128\", \"std\"]","target":7579581527673517627,"profile":8987646332441898785,"path":12572383542954577331,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/byteorder-c1f379e1522f1ef6/dep-lib-byteorder"}}],"rustflags":[],"metadata":5398730104718078656,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/bytesize-e9bb087e1eaabb72/lib-bytesize.json ---
+{"rustc":4041371938568725036,"features":"[\"default\"]","target":5760977173082594167,"profile":8987646332441898785,"path":315334700359933075,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/bytesize-e9bb087e1eaabb72/dep-lib-bytesize"}}],"rustflags":[],"metadata":12146819253632092093,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/c2-chacha-f22e8ea2f9962c5e/lib-c2-chacha.json ---
+{"rustc":4041371938568725036,"features":"[\"cipher\", \"default\", \"rustcrypto_api\", \"std\"]","target":3305040737512747465,"profile":8987646332441898785,"path":4856795655719014079,"deps":[[4511957894497802922,"ppv_lite86",false,15645371408001593499],[7120793223608721021,"cipher",false,14385164609386866833]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/c2-chacha-f22e8ea2f9962c5e/dep-lib-c2-chacha"}}],"rustflags":[],"metadata":12544136120782019599,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/cc-7f8e6df7ed2cade2/lib-cc.json ---
+{"rustc":4041371938568725036,"features":"[]","target":15023190189141807623,"profile":8626402512162920248,"path":14529081664296644657,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/cc-7f8e6df7ed2cade2/dep-lib-cc"}}],"rustflags":[],"metadata":5862599371499774553,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/cfg-if-1cc4882d2e315207/lib-cfg-if.json ---
+{"rustc":4041371938568725036,"features":"[]","target":10623512480563079566,"profile":8987646332441898785,"path":14225678164042683367,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/cfg-if-1cc4882d2e315207/dep-lib-cfg-if"}}],"rustflags":[],"metadata":8462187951337715540,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/cfg-if-30d7f2d28beeeb1b/lib-cfg-if.json ---
+{"rustc":4041371938568725036,"features":"[]","target":10623512480563079566,"profile":8987646332441898785,"path":13211242751477108532,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/cfg-if-30d7f2d28beeeb1b/dep-lib-cfg-if"}}],"rustflags":[],"metadata":8462187951337715540,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/cfg-if-7372481e614c58dd/lib-cfg-if.json ---
+{"rustc":4041371938568725036,"features":"[]","target":10623512480563079566,"profile":8626402512162920248,"path":14225678164042683367,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/cfg-if-7372481e614c58dd/dep-lib-cfg-if"}}],"rustflags":[],"metadata":8462187951337715540,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/chrono-3f3ed1eb1a4be3f9/lib-chrono.json ---
+{"rustc":4041371938568725036,"features":"[\"clock\", \"default\", \"iana-time-zone\", \"js-sys\", \"oldtime\", \"serde\", \"std\", \"time\", \"wasm-bindgen\", \"wasmbind\", \"winapi\"]","target":11745563112108967737,"profile":8987646332441898785,"path":2636138373186060964,"deps":[[2169378189951667729,"iana_time_zone",false,13534018619146495111],[5744217960993662405,"serde",false,8922752736421132827],[8121635694596382552,"num_traits",false,8225706909722191583],[14585307122936621441,"time",false,10401030757488176772]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/chrono-3f3ed1eb1a4be3f9/dep-lib-chrono"}}],"rustflags":[],"metadata":9803565982372010724,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/cipher-3fdc9af8c4abdfb9/lib-cipher.json ---
+{"rustc":4041371938568725036,"features":"[]","target":12819517308274213455,"profile":8987646332441898785,"path":9640031504212167800,"deps":[[9665562089965330559,"generic_array",false,16505117335682560374]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/cipher-3fdc9af8c4abdfb9/dep-lib-cipher"}}],"rustflags":[],"metadata":8273356103737446388,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/convert_case-5edeb42cc79bfdbf/lib-convert_case.json ---
+{"rustc":4041371938568725036,"features":"[]","target":13988420919824902104,"profile":8626402512162920248,"path":9912316738629319912,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/convert_case-5edeb42cc79bfdbf/dep-lib-convert_case"}}],"rustflags":[],"metadata":8130279976740482636,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/core-foundation-sys-0ae7d9beeb7d3b58/lib-core-foundation-sys.json ---
+{"rustc":4041371938568725036,"features":"[]","target":6095274920289913569,"profile":8987646332441898785,"path":7393560177886870946,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/core-foundation-sys-0ae7d9beeb7d3b58/dep-lib-core-foundation-sys"}}],"rustflags":[],"metadata":7246173313922784557,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/cpufeatures-317cb3e604dbdcfa/lib-cpufeatures.json ---
+{"rustc":4041371938568725036,"features":"[]","target":12245745790804801655,"profile":8987646332441898785,"path":13028875512750013761,"deps":[[2798846484360888381,"libc",false,8458598860795332170]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/cpufeatures-317cb3e604dbdcfa/dep-lib-cpufeatures"}}],"rustflags":[],"metadata":5592991748584184974,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/crunchy-0322e332b3ec8289/lib-crunchy.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"limit_128\", \"std\"]","target":10037286194704498616,"profile":8987646332441898785,"path":13638550783508951529,"deps":[[15144909498828475009,"build_script_build",false,905047904864975789]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/crunchy-0322e332b3ec8289/dep-lib-crunchy"}}],"rustflags":[],"metadata":5553159513701433177,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/crunchy-1e4810b237e7579b/build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"limit_128\", \"std\"]","target":8188216131759486267,"profile":8626402512162920248,"path":2284881126581841934,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/crunchy-1e4810b237e7579b/dep-build-script-build-script-build"}}],"rustflags":[],"metadata":5553159513701433177,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/crunchy-6050ff8e1cd01d84/run-build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"","target":0,"profile":0,"path":0,"deps":[[15144909498828475009,"build_script_build",false,17154761460007827953]],"local":[{"Precalculated":"0.2.2"}],"rustflags":[],"metadata":0,"config":0,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/crypto-common-fbd876bb7100e04c/lib-crypto-common.json ---
+{"rustc":4041371938568725036,"features":"[\"std\"]","target":2257523260353492199,"profile":8987646332441898785,"path":15986139979588077558,"deps":[[9665562089965330559,"generic_array",false,16505117335682560374],[11395083745183091805,"typenum",false,17570423918404289898]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/crypto-common-fbd876bb7100e04c/dep-lib-crypto-common"}}],"rustflags":[],"metadata":3401955368041756111,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/crypto-mac-2ec09d725d6bdcbd/lib-crypto-mac.json ---
+{"rustc":4041371938568725036,"features":"[\"std\"]","target":1084682306982316767,"profile":8987646332441898785,"path":4865244766767747083,"deps":[[9665562089965330559,"generic_array",false,16505117335682560374],[11652100930071167282,"subtle",false,11544673083748013477]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/crypto-mac-2ec09d725d6bdcbd/dep-lib-crypto-mac"}}],"rustflags":[],"metadata":2483852330705237446,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/curve25519-dalek-b5037398d7577b7d/lib-curve25519-dalek.json ---
+{"rustc":4041371938568725036,"features":"[\"alloc\", \"default\", \"std\", \"u64_backend\"]","target":9193775365486874731,"profile":8987646332441898785,"path":17703424971518937300,"deps":[[486069622437963759,"byteorder",false,814480072115569638],[7879775654530620242,"zeroize",false,6762281149261480810],[11652100930071167282,"subtle",false,11544673083748013477],[11761531122794857361,"rand_core",false,820268434750482734],[12829070662860118430,"digest",false,18020473100866099150]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/curve25519-dalek-b5037398d7577b7d/dep-lib-curve25519-dalek"}}],"rustflags":[],"metadata":4666180542459884904,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/derive_more-c9233a087f5c9746/lib-derive_more.json ---
+{"rustc":4041371938568725036,"features":"[\"add\", \"add_assign\", \"as_mut\", \"as_ref\", \"constructor\", \"convert_case\", \"default\", \"deref\", \"deref_mut\", \"display\", \"error\", \"from\", \"from_str\", \"index\", \"index_mut\", \"into\", \"into_iterator\", \"is_variant\", \"iterator\", \"mul\", \"mul_assign\", \"not\", \"rustc_version\", \"sum\", \"try_into\", \"unwrap\"]","target":6509599423921459844,"profile":8626402512162920248,"path":14808012298688156269,"deps":[[4795167122555208633,"proc_macro2",false,6740026448694036056],[5184402248973381138,"quote",false,11518320847341303531],[9614823402458505899,"convert_case",false,2325103366234493610],[17143850428905299221,"syn",false,4214620575965312635]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/derive_more-c9233a087f5c9746/dep-lib-derive_more"}}],"rustflags":[],"metadata":8950704488499756937,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/digest-4fedda34bb2d75d0/lib-digest.json ---
+{"rustc":4041371938568725036,"features":"[\"alloc\", \"std\"]","target":15504360929955102184,"profile":8987646332441898785,"path":10222266774284516026,"deps":[[9665562089965330559,"generic_array",false,16505117335682560374]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/digest-4fedda34bb2d75d0/dep-lib-digest"}}],"rustflags":[],"metadata":5974257212182257802,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/digest-7db87c22153058bf/lib-digest.json ---
+{"rustc":4041371938568725036,"features":"[\"alloc\", \"block-buffer\", \"core-api\", \"default\", \"std\"]","target":15504360929955102184,"profile":8987646332441898785,"path":12458918009061645102,"deps":[[15349877456970498084,"crypto_common",false,11575551744992510758],[18291355527327864993,"block_buffer",false,3569638781637703297]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/digest-7db87c22153058bf/dep-lib-digest"}}],"rustflags":[],"metadata":2664789385760777065,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/dyn-clone-d2e27b301c705649/lib-dyn-clone.json ---
+{"rustc":4041371938568725036,"features":"[]","target":456433028138942822,"profile":8987646332441898785,"path":3131574480035369083,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/dyn-clone-d2e27b301c705649/dep-lib-dyn-clone"}}],"rustflags":[],"metadata":10939357194659760099,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/easy-ext-7a928631cacd1e93/lib-easy-ext.json ---
+{"rustc":4041371938568725036,"features":"[]","target":17015224937156141358,"profile":8626402512162920248,"path":12297428786682066596,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/easy-ext-7a928631cacd1e93/dep-lib-easy-ext"}}],"rustflags":[],"metadata":12123150640952772219,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/ed25519-961d1528f0b9cbc5/lib-ed25519.json ---
+{"rustc":4041371938568725036,"features":"[\"std\"]","target":18170347052797393979,"profile":8987646332441898785,"path":7569037138078570733,"deps":[[13425634913538847917,"signature",false,9742444439820396959]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/ed25519-961d1528f0b9cbc5/dep-lib-ed25519"}}],"rustflags":[],"metadata":10784947986374962029,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/ed25519-dalek-52b3cf0fc124abc5/lib-ed25519-dalek.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"rand\", \"serde_crate\", \"std\", \"u64_backend\"]","target":10283645625438885884,"profile":8987646332441898785,"path":13796878861084672134,"deps":[[288937492735761168,"sha2",false,3572965489698496560],[2174722005733178090,"ed25519",false,2893960222645399259],[5744217960993662405,"serde_crate",false,8922752736421132827],[6730075568351986827,"curve25519_dalek",false,4896231541912837580],[7879775654530620242,"zeroize",false,6762281149261480810],[14778545527639897399,"rand",false,6151211051116055315]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/ed25519-dalek-52b3cf0fc124abc5/dep-lib-ed25519-dalek"}}],"rustflags":[],"metadata":14415899641967170644,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/equivalent-ea0d860523f0903a/lib-equivalent.json ---
+{"rustc":4041371938568725036,"features":"[]","target":5369500857569226296,"profile":8626402512162920248,"path":10569692380377202602,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/equivalent-ea0d860523f0903a/dep-lib-equivalent"}}],"rustflags":[],"metadata":4899064301576391224,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/fixed-hash-b8a524a08d9fc683/lib-fixed-hash.json ---
+{"rustc":4041371938568725036,"features":"[\"byteorder\", \"rand\", \"rustc-hex\", \"std\"]","target":11927488339380359092,"profile":8987646332441898785,"path":6690003229853455555,"deps":[[486069622437963759,"byteorder",false,814480072115569638],[5910892534286594076,"rand",false,822911918794005151],[6476817338883840430,"static_assertions",false,16734876218364865062],[13370790239003944599,"rustc_hex",false,195080667160046343]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/fixed-hash-b8a524a08d9fc683/dep-lib-fixed-hash"}}],"rustflags":[],"metadata":13792661670533051741,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/funty-5c293ef059cd9097/lib-funty.json ---
+{"rustc":4041371938568725036,"features":"[]","target":3041465511605302338,"profile":8987646332441898785,"path":11487366101277585252,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/funty-5c293ef059cd9097/dep-lib-funty"}}],"rustflags":[],"metadata":9237712608396048968,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/generic-array-14d371e49e7d702d/build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"[\"more_lengths\"]","target":8188216131759486267,"profile":8626402512162920248,"path":13449494624260285316,"deps":[[16079472387499994964,"version_check",false,4854173320755796750]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/generic-array-14d371e49e7d702d/dep-build-script-build-script-build"}}],"rustflags":[],"metadata":3504643559825856545,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/generic-array-46aa735c1d9d8d90/run-build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"","target":0,"profile":0,"path":0,"deps":[[9665562089965330559,"build_script_build",false,6737441431865088122]],"local":[{"Precalculated":"0.14.7"}],"rustflags":[],"metadata":0,"config":0,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/generic-array-d7bfb0603b875341/lib-generic_array.json ---
+{"rustc":4041371938568725036,"features":"[\"more_lengths\"]","target":1954542678444077814,"profile":8987646332441898785,"path":8763520633395138050,"deps":[[9665562089965330559,"build_script_build",false,17399812065335148403],[11395083745183091805,"typenum",false,17570423918404289898]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/generic-array-d7bfb0603b875341/dep-lib-generic_array"}}],"rustflags":[],"metadata":3504643559825856545,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/getrandom-6a73bb18c9683d61/build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"[\"std\"]","target":2297296889237502566,"profile":8626402512162920248,"path":3520204443026690733,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/getrandom-6a73bb18c9683d61/dep-build-script-build-script-build"}}],"rustflags":[],"metadata":12606519392706294666,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/getrandom-7d34e7d8dbe9731d/lib-getrandom.json ---
+{"rustc":4041371938568725036,"features":"[\"std\"]","target":16789414514566550411,"profile":8987646332441898785,"path":7736020893353488693,"deps":[[2452538001284770427,"cfg_if",false,9122851156399048806],[2798846484360888381,"libc",false,8458598860795332170]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/getrandom-7d34e7d8dbe9731d/dep-lib-getrandom"}}],"rustflags":[],"metadata":12606519392706294666,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/getrandom-a020d3a53d85421e/run-build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"","target":0,"profile":0,"path":0,"deps":[[6453573393678185459,"build_script_build",false,15954988963293682139]],"local":[{"Precalculated":"0.1.16"}],"rustflags":[],"metadata":0,"config":0,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/getrandom-c28c71914f7477d9/lib-getrandom.json ---
+{"rustc":4041371938568725036,"features":"[\"std\"]","target":16789414514566550411,"profile":8987646332441898785,"path":14561335568585312658,"deps":[[2452538001284770427,"cfg_if",false,9122851156399048806],[2798846484360888381,"libc",false,8458598860795332170],[6453573393678185459,"build_script_build",false,1825330895018134811]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/getrandom-c28c71914f7477d9/dep-lib-getrandom"}}],"rustflags":[],"metadata":12606519392706294666,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/hashbrown-7302087157b4c8e7/lib-hashbrown.json ---
+{"rustc":4041371938568725036,"features":"[\"ahash\", \"default\", \"inline-more\"]","target":11240190406153278838,"profile":8987646332441898785,"path":9300327319422677477,"deps":[[6564554279330852038,"ahash",false,10359048096649378115]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/hashbrown-7302087157b4c8e7/dep-lib-hashbrown"}}],"rustflags":[],"metadata":6228333144549390726,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/hashbrown-f8a5b34dd80811fd/lib-hashbrown.json ---
+{"rustc":4041371938568725036,"features":"[\"raw\"]","target":2387001741810630927,"profile":8626402512162920248,"path":11610658639174370370,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/hashbrown-f8a5b34dd80811fd/dep-lib-hashbrown"}}],"rustflags":[],"metadata":6228333144549390726,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/heck-f53c7857da10975a/lib-heck.json ---
+{"rustc":4041371938568725036,"features":"[\"default\"]","target":11271119367433188140,"profile":8626402512162920248,"path":13717533852066350496,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/heck-f53c7857da10975a/dep-lib-heck"}}],"rustflags":[],"metadata":4968006677088137060,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/hex-fb12a001e1673ece/lib-hex.json ---
+{"rustc":4041371938568725036,"features":"[\"alloc\", \"default\", \"std\"]","target":2806462642998046779,"profile":8987646332441898785,"path":12928293058578672215,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/hex-fb12a001e1673ece/dep-lib-hex"}}],"rustflags":[],"metadata":14751499657425910276,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/iana-time-zone-b0919317c75cf72a/lib-iana-time-zone.json ---
+{"rustc":4041371938568725036,"features":"[\"fallback\"]","target":14189373027157833265,"profile":8987646332441898785,"path":18370016031308816152,"deps":[[11136748990336542442,"core_foundation_sys",false,5980220833696284158]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/iana-time-zone-b0919317c75cf72a/dep-lib-iana-time-zone"}}],"rustflags":[],"metadata":14816295700462397125,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/impl-codec-d2ec6bbba2dbf9b9/lib-impl-codec.json ---
+{"rustc":4041371938568725036,"features":"[\"std\"]","target":9931327379393627303,"profile":8987646332441898785,"path":4666131897597413896,"deps":[[397054333907348796,"parity_scale_codec",false,18068293522411699569]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/impl-codec-d2ec6bbba2dbf9b9/dep-lib-impl-codec"}}],"rustflags":[],"metadata":5277811016856928684,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/impl-trait-for-tuples-914bf5e96206cd03/lib-impl-trait-for-tuples.json ---
+{"rustc":4041371938568725036,"features":"[]","target":7437455607898735753,"profile":8626402512162920248,"path":9289417721458775671,"deps":[[4795167122555208633,"proc_macro2",false,6740026448694036056],[5184402248973381138,"quote",false,11518320847341303531],[17143850428905299221,"syn",false,4214620575965312635]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/impl-trait-for-tuples-914bf5e96206cd03/dep-lib-impl-trait-for-tuples"}}],"rustflags":[],"metadata":5996218443431542618,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/indexmap-1d50fbf8846ab25c/lib-indexmap.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"std\"]","target":2462882088093504370,"profile":8626402512162920248,"path":13447116791098062821,"deps":[[13683300460408477979,"equivalent",false,11062360531499326940],[17754313664244986564,"hashbrown",false,14098235551575535367]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/indexmap-1d50fbf8846ab25c/dep-lib-indexmap"}}],"rustflags":[],"metadata":17706083020874861743,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/itoa-48345fbcae012e71/lib-itoa.json ---
+{"rustc":4041371938568725036,"features":"[]","target":17114873591667335244,"profile":8987646332441898785,"path":8833388905873697109,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/itoa-48345fbcae012e71/dep-lib-itoa"}}],"rustflags":[],"metadata":851671291587502216,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/keccak-e294fd1d5314e1dd/lib-keccak.json ---
+{"rustc":4041371938568725036,"features":"[]","target":2079549898976005017,"profile":8987646332441898785,"path":8933290776958688182,"deps":[[8708877435334478611,"cpufeatures",false,9021900601485565475]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/keccak-e294fd1d5314e1dd/dep-lib-keccak"}}],"rustflags":[],"metadata":17580716165873092201,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/lazy_static-f922ee928b4d529a/lib-lazy_static.json ---
+{"rustc":4041371938568725036,"features":"[\"spin\", \"spin_no_std\"]","target":1623840821729021818,"profile":8987646332441898785,"path":9729735984393672996,"deps":[[15752510154921626426,"spin",false,6057765998952367425]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/lazy_static-f922ee928b4d529a/dep-lib-lazy_static"}}],"rustflags":[],"metadata":111743654650316589,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/libc-2d2cc7e09de2199b/run-build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"","target":0,"profile":0,"path":0,"deps":[[2798846484360888381,"build_script_build",false,14571526361695823175]],"local":[{"RerunIfChanged":{"output":"debug/build/libc-2d2cc7e09de2199b/output","paths":["build.rs"]}}],"rustflags":[],"metadata":0,"config":0,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/libc-57eb845a56a45465/build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"std\"]","target":8188216131759486267,"profile":8626402512162920248,"path":14983907806140942190,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/libc-57eb845a56a45465/dep-build-script-build-script-build"}}],"rustflags":[],"metadata":14998826085014762512,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/libc-ee78d775f691ab1e/lib-libc.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"std\"]","target":1307715644349195660,"profile":8987646332441898785,"path":9325081785458617536,"deps":[[2798846484360888381,"build_script_build",false,71110909322188234]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/libc-ee78d775f691ab1e/dep-lib-libc"}}],"rustflags":[],"metadata":14998826085014762512,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/memory_units-65568a0325aa157f/lib-memory_units.json ---
+{"rustc":4041371938568725036,"features":"[]","target":14318584593297629915,"profile":8987646332441898785,"path":14463143007811748037,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/memory_units-65568a0325aa157f/dep-lib-memory_units"}}],"rustflags":[],"metadata":16366510313631463741,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/near-abi-2ec0e8a98f4f402a/lib-near-abi.json ---
+{"rustc":4041371938568725036,"features":"[\"__chunked-entries\"]","target":3772619746852673170,"profile":8987646332441898785,"path":14160993065361507768,"deps":[[5744217960993662405,"serde",false,8922752736421132827],[9409617104836426353,"semver",false,8177011230591255334],[13434381959712907675,"borsh",false,7297589618764822524],[13519362093482305381,"schemars",false,5642174617768817509]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/near-abi-2ec0e8a98f4f402a/dep-lib-near-abi"}}],"rustflags":[],"metadata":2664010391987966176,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/near-account-id-e6cc965963d6d8de/lib-near-account-id.json ---
+{"rustc":4041371938568725036,"features":"[\"borsh\", \"default\", \"internal_unstable\", \"serde\"]","target":1112919889467187854,"profile":8987646332441898785,"path":17883870011890138540,"deps":[[5744217960993662405,"serde",false,8922752736421132827],[13434381959712907675,"borsh",false,7297589618764822524]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/near-account-id-e6cc965963d6d8de/dep-lib-near-account-id"}}],"rustflags":[],"metadata":6147166356502881175,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/near-crypto-75943256abadd40c/lib-near-crypto.json ---
+{"rustc":4041371938568725036,"features":"[]","target":8139541167423765329,"profile":8987646332441898785,"path":4723357568132458343,"deps":[[2141327583381695929,"near_account_id",false,1959382813294597264],[2481462472726891783,"derive_more",false,17067664216757880132],[2616446206962060492,"thiserror",false,16817279444299684525],[2711478123133662383,"bs58",false,12254039849285076121],[4424799446218848649,"once_cell",false,13157731012407737153],[4748012609204464776,"arrayref",false,14440624089418254155],[5744217960993662405,"serde",false,8922752736421132827],[6730075568351986827,"curve25519_dalek",false,4896231541912837580],[7588362918154833280,"blake2",false,14365490987773229118],[7704765042583084768,"secp256k1",false,4964084188709521034],[11351592370471351887,"c2_chacha",false,17348077856398130287],[11652100930071167282,"subtle",false,11544673083748013477],[11761531122794857361,"rand_core",false,820268434750482734],[13434381959712907675,"borsh",false,7297589618764822524],[14242825848293686207,"primitive_types",false,14016662461084421250],[14778545527639897399,"rand",false,6151211051116055315],[16009384535734781723,"serde_json",false,6720321150121479075],[16541512147832429655,"ed25519_dalek",false,8922320911146424970]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/near-crypto-75943256abadd40c/dep-lib-near-crypto"}}],"rustflags":[],"metadata":12117534483879381657,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/near-primitives-core-d3e464049b28fbad/lib-near-primitives-core.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"protocol_feature_alt_bn128\"]","target":2344394982970728828,"profile":8987646332441898785,"path":4754373447396768051,"deps":[[2141327583381695929,"near_account_id",false,1959382813294597264],[2481462472726891783,"derive_more",false,17067664216757880132],[2711478123133662383,"bs58",false,12254039849285076121],[5276859243446452557,"strum",false,13571992492259909144],[5744217960993662405,"serde",false,8922752736421132827],[7262467505971810787,"sha2",false,7875707277487543443],[11928408529930203077,"num_rational",false,5274048215300035351],[13434381959712907675,"borsh",false,7297589618764822524],[14594032103777070403,"base64",false,17790581935017226602]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/near-primitives-core-d3e464049b28fbad/dep-lib-near-primitives-core"}}],"rustflags":[],"metadata":5142335245828182684,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/near-primitives-d6d89eef7bf6c1ac/lib-near-primitives.json ---
+{"rustc":4041371938568725036,"features":"[]","target":4604409214736594808,"profile":8987646332441898785,"path":2492449324388123940,"deps":[[486069622437963759,"byteorder",false,814480072115569638],[2481462472726891783,"derive_more",false,17067664216757880132],[2586768231193208483,"near_vm_errors",false,5766368731815090092],[2616446206962060492,"thiserror",false,16817279444299684525],[4424799446218848649,"once_cell",false,13157731012407737153],[4485243235582659819,"hex",false,8439640585145902176],[4954895508850935142,"near_crypto",false,8992529674400058743],[5211592845914903421,"smart_default",false,8467209639459284868],[5276859243446452557,"strum",false,13571992492259909144],[5385186903921993813,"bytesize",false,7903119193608910990],[5610977137992594292,"near_rpc_error_macro",false,16958559208884214121],[5744217960993662405,"serde",false,8922752736421132827],[7546918406050397588,"reed_solomon_erasure",false,13835719691735838457],[8996812700995868408,"near_primitives_core",false,17038684706539477505],[10957551418120553867,"chrono",false,15003149038724016389],[11928408529930203077,"num_rational",false,5274048215300035351],[13434381959712907675,"borsh",false,7297589618764822524],[14242825848293686207,"primitive_types",false,14016662461084421250],[14678326912100390537,"easy_ext",false,14118021376523531389],[14778545527639897399,"rand",false,6151211051116055315],[16009384535734781723,"serde_json",false,6720321150121479075]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/near-primitives-d6d89eef7bf6c1ac/dep-lib-near-primitives"}}],"rustflags":[],"metadata":8957259720546107715,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/near-rpc-error-core-fc57b0aa33e606f5/lib-near-rpc-error-core.json ---
+{"rustc":4041371938568725036,"features":"[]","target":16926289585757093748,"profile":8626402512162920248,"path":563371909504873889,"deps":[[5184402248973381138,"quote",false,11518320847341303531],[5744217960993662405,"serde",false,16466678340802018753],[17143850428905299221,"syn",false,4214620575965312635]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/near-rpc-error-core-fc57b0aa33e606f5/dep-lib-near-rpc-error-core"}}],"rustflags":[],"metadata":8565167639935453145,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/near-rpc-error-macro-49134a363dc3b239/lib-near-rpc-error-macro.json ---
+{"rustc":4041371938568725036,"features":"[]","target":1212076242871055603,"profile":8626402512162920248,"path":14561003824694925541,"deps":[[5744217960993662405,"serde",false,16466678340802018753],[13787844107785009363,"near_rpc_error_core",false,1338136561475043254],[17143850428905299221,"syn",false,4214620575965312635]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/near-rpc-error-macro-49134a363dc3b239/dep-lib-near-rpc-error-macro"}}],"rustflags":[],"metadata":8565167639935453145,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/near-sdk-dad30d35fc0d6f83/lib-near-sdk.json ---
+{"rustc":4041371938568725036,"features":"[\"abi\", \"default\", \"legacy\", \"near-abi\", \"near-crypto\", \"near-primitives\", \"near-primitives-core\", \"near-vm-logic\", \"schemars\", \"unit-testing\", \"wee_alloc\"]","target":11925494537554991322,"profile":8987646332441898785,"path":13815538443503230387,"deps":[[2711478123133662383,"bs58",false,12254039849285076121],[2748724984193634118,"near_abi",false,4394887235867624489],[3178493835647231921,"wee_alloc",false,18298858714097008126],[4424799446218848649,"once_cell",false,13157731012407737153],[4790332501662844689,"base64",false,4212069089092284235],[4954895508850935142,"near_crypto",false,8992529674400058743],[5744217960993662405,"serde",false,8922752736421132827],[5932706134621176765,"near_vm_logic",false,646948956404068666],[8996812700995868408,"near_primitives_core",false,17038684706539477505],[9608617076544306583,"near_sys",false,9973572762317439223],[13195315199838120338,"near_sdk_macros",false,2247677055724693087],[13434381959712907675,"borsh",false,7297589618764822524],[13519362093482305381,"schemars",false,5642174617768817509],[14899769415963221159,"near_primitives",false,18272972657141973963],[16009384535734781723,"serde_json",false,6720321150121479075]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/near-sdk-dad30d35fc0d6f83/dep-lib-near-sdk"}}],"rustflags":[],"metadata":9215943102709044213,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/near-sdk-macros-5d6cc0e32b26ad32/lib-near-sdk-macros.json ---
+{"rustc":4041371938568725036,"features":"[\"abi\"]","target":16568417427542612,"profile":8626402512162920248,"path":7855060346571709536,"deps":[[4795167122555208633,"proc_macro2",false,6740026448694036056],[5184402248973381138,"quote",false,11518320847341303531],[7454270075138479745,"inflector",false,13107660487227571843],[17143850428905299221,"syn",false,4214620575965312635]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/near-sdk-macros-5d6cc0e32b26ad32/dep-lib-near-sdk-macros"}}],"rustflags":[],"metadata":9520434766592551999,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/near-sys-fe41686c1c2c82f0/lib-near-sys.json ---
+{"rustc":4041371938568725036,"features":"[]","target":4927594367761543910,"profile":8987646332441898785,"path":16295254487981392708,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/near-sys-fe41686c1c2c82f0/dep-lib-near-sys"}}],"rustflags":[],"metadata":14904885344401450229,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/near-vm-errors-a2847bbfdcfef355/lib-near-vm-errors.json ---
+{"rustc":4041371938568725036,"features":"[\"protocol_feature_alt_bn128\"]","target":18069981547234658038,"profile":8987646332441898785,"path":7453576295577497205,"deps":[[2141327583381695929,"near_account_id",false,1959382813294597264],[5610977137992594292,"near_rpc_error_macro",false,16958559208884214121],[5744217960993662405,"serde",false,8922752736421132827],[13434381959712907675,"borsh",false,7297589618764822524]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/near-vm-errors-a2847bbfdcfef355/dep-lib-near-vm-errors"}}],"rustflags":[],"metadata":8179371643365061792,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/near-vm-logic-5afe57f408e6486f/lib-near-vm-logic.json ---
+{"rustc":4041371938568725036,"features":"[\"bn\", \"default\", \"protocol_feature_alt_bn128\"]","target":6965730565760654885,"profile":8987646332441898785,"path":319195984498161972,"deps":[[486069622437963759,"byteorder",false,814480072115569638],[2141327583381695929,"near_account_id",false,1959382813294597264],[2586768231193208483,"near_vm_errors",false,5766368731815090092],[2711478123133662383,"bs58",false,12254039849285076121],[4790332501662844689,"base64",false,4212069089092284235],[4954895508850935142,"near_crypto",false,8992529674400058743],[5744217960993662405,"serde",false,8922752736421132827],[7262467505971810787,"sha2",false,7875707277487543443],[8996812700995868408,"near_primitives_core",false,17038684706539477505],[11631693908364750144,"ripemd",false,9309856910553687590],[12558261799987326271,"bn",false,13892426332191934395],[13434381959712907675,"borsh",false,7297589618764822524],[14899769415963221159,"near_primitives",false,18272972657141973963],[16401311334194785499,"sha3",false,7532088941038081684]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/near-vm-logic-5afe57f408e6486f/dep-lib-near-vm-logic"}}],"rustflags":[],"metadata":5606999395439952070,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/num-bigint-10cada73a2856123/run-build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"","target":0,"profile":0,"path":0,"deps":[[7201007571111540716,"build_script_build",false,4371059994784921151]],"local":[{"RerunIfChanged":{"output":"debug/build/num-bigint-10cada73a2856123/output","paths":["build.rs"]}}],"rustflags":[],"metadata":0,"config":0,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/num-bigint-ba46fa44fc1222cd/build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"[\"std\"]","target":2297296889237502566,"profile":8626402512162920248,"path":986321195288061482,"deps":[[14832468857926148571,"autocfg",false,14463923081152150719]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/num-bigint-ba46fa44fc1222cd/dep-build-script-build-script-build"}}],"rustflags":[],"metadata":10601054166942238371,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/num-bigint-da03afbaff77d9c6/lib-num-bigint.json ---
+{"rustc":4041371938568725036,"features":"[\"std\"]","target":2482347320759620647,"profile":8987646332441898785,"path":16249717384200624906,"deps":[[1494750142361447113,"num_integer",false,7524748128900621436],[7201007571111540716,"build_script_build",false,9484766042267410843],[8121635694596382552,"num_traits",false,8225706909722191583]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/num-bigint-da03afbaff77d9c6/dep-lib-num-bigint"}}],"rustflags":[],"metadata":10601054166942238371,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/num-integer-51afd3190b5476b7/build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"[\"i128\", \"std\"]","target":8188216131759486267,"profile":8626402512162920248,"path":11049313027618247222,"deps":[[14832468857926148571,"autocfg",false,14463923081152150719]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/num-integer-51afd3190b5476b7/dep-build-script-build-script-build"}}],"rustflags":[],"metadata":58200369117550911,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/num-integer-bc3d41f9e551238c/run-build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"","target":0,"profile":0,"path":0,"deps":[[1494750142361447113,"build_script_build",false,4869830599993129732]],"local":[{"RerunIfChanged":{"output":"debug/build/num-integer-bc3d41f9e551238c/output","paths":["build.rs"]}}],"rustflags":[],"metadata":0,"config":0,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/num-integer-eff989353409442e/lib-num-integer.json ---
+{"rustc":4041371938568725036,"features":"[\"i128\", \"std\"]","target":3383076079041854775,"profile":8987646332441898785,"path":11430373887535332376,"deps":[[1494750142361447113,"build_script_build",false,1757614389367291171],[8121635694596382552,"num_traits",false,8225706909722191583]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/num-integer-eff989353409442e/dep-lib-num-integer"}}],"rustflags":[],"metadata":58200369117550911,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/num-rational-479e7f733c15ad37/lib-num-rational.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"num-bigint\", \"num-bigint-std\", \"serde\", \"std\"]","target":15205359493017569073,"profile":8987646332441898785,"path":4321949047677148474,"deps":[[1494750142361447113,"num_integer",false,7524748128900621436],[5744217960993662405,"serde",false,8922752736421132827],[7201007571111540716,"num_bigint",false,1460278306669542495],[8121635694596382552,"num_traits",false,8225706909722191583],[11928408529930203077,"build_script_build",false,11644206151874619956]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/num-rational-479e7f733c15ad37/dep-lib-num-rational"}}],"rustflags":[],"metadata":18311408697950330488,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/num-rational-47ca0984fed0294d/build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"num-bigint\", \"num-bigint-std\", \"serde\", \"std\"]","target":2297296889237502566,"profile":8626402512162920248,"path":3560525343735672286,"deps":[[14832468857926148571,"autocfg",false,14463923081152150719]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/num-rational-47ca0984fed0294d/dep-build-script-build-script-build"}}],"rustflags":[],"metadata":18311408697950330488,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/num-rational-62e125b49c275883/run-build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"","target":0,"profile":0,"path":0,"deps":[[11928408529930203077,"build_script_build",false,6913969666480575593]],"local":[{"RerunIfChanged":{"output":"debug/build/num-rational-62e125b49c275883/output","paths":["build.rs"]}}],"rustflags":[],"metadata":0,"config":0,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/num-traits-1274095eb20247e7/build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"[\"i128\", \"std\"]","target":8188216131759486267,"profile":8626402512162920248,"path":5557634065482292909,"deps":[[14832468857926148571,"autocfg",false,14463923081152150719]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/num-traits-1274095eb20247e7/dep-build-script-build-script-build"}}],"rustflags":[],"metadata":14621636500951049976,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/num-traits-67c608e60482db69/run-build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"","target":0,"profile":0,"path":0,"deps":[[8121635694596382552,"build_script_build",false,8599931164963256587]],"local":[{"RerunIfChanged":{"output":"debug/build/num-traits-67c608e60482db69/output","paths":["build.rs"]}}],"rustflags":[],"metadata":0,"config":0,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/num-traits-de7bfecb7da142b4/lib-num-traits.json ---
+{"rustc":4041371938568725036,"features":"[\"i128\", \"std\"]","target":17353777023780688859,"profile":8987646332441898785,"path":11619406592598452297,"deps":[[8121635694596382552,"build_script_build",false,634435645006641635]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/num-traits-de7bfecb7da142b4/dep-lib-num-traits"}}],"rustflags":[],"metadata":14621636500951049976,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/once_cell-43a9c7b59790676b/lib-once_cell.json ---
+{"rustc":4041371938568725036,"features":"[\"alloc\", \"default\", \"race\", \"std\"]","target":14856186769647684053,"profile":8626402512162920248,"path":1895959781459164086,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/once_cell-43a9c7b59790676b/dep-lib-once_cell"}}],"rustflags":[],"metadata":14177539708254521827,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/once_cell-6c76acca5e158921/lib-once_cell.json ---
+{"rustc":4041371938568725036,"features":"[\"alloc\", \"default\", \"race\", \"std\"]","target":14856186769647684053,"profile":8987646332441898785,"path":1895959781459164086,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/once_cell-6c76acca5e158921/dep-lib-once_cell"}}],"rustflags":[],"metadata":14177539708254521827,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/opaque-debug-a3337a4b35c8c00e/lib-opaque-debug.json ---
+{"rustc":4041371938568725036,"features":"[]","target":7371314991062858825,"profile":8987646332441898785,"path":11476040408988571726,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/opaque-debug-a3337a4b35c8c00e/dep-lib-opaque-debug"}}],"rustflags":[],"metadata":8060500437326165382,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/parity-scale-codec-28c91308536b173b/lib-parity-scale-codec.json ---
+{"rustc":4041371938568725036,"features":"[\"bitvec\", \"chain-error\", \"max-encoded-len\", \"parity-scale-codec-derive\", \"serde\", \"std\"]","target":18009624782468700923,"profile":8987646332441898785,"path":10172602956342417374,"deps":[[5744217960993662405,"serde",false,8922752736421132827],[6780837041381009114,"parity_scale_codec_derive",false,8807188502223999422],[7203772136960224430,"arrayvec",false,11933532887852968175],[8865365780650178877,"bitvec",false,1246751705472152513],[15445385477726562306,"impl_trait_for_tuples",false,9761381387104425795],[15874152742692298584,"byte_slice_cast",false,6025130776387166970]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/parity-scale-codec-28c91308536b173b/dep-lib-parity-scale-codec"}}],"rustflags":[],"metadata":11875060396614366296,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/parity-scale-codec-derive-5987aeb7787708cf/lib-parity-scale-codec-derive.json ---
+{"rustc":4041371938568725036,"features":"[\"max-encoded-len\"]","target":14504831501163380313,"profile":8626402512162920248,"path":5897559809616332398,"deps":[[4795167122555208633,"proc_macro2",false,6740026448694036056],[5184402248973381138,"quote",false,11518320847341303531],[17003263645728167380,"proc_macro_crate",false,14038420588761341455],[17143850428905299221,"syn",false,4214620575965312635]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/parity-scale-codec-derive-5987aeb7787708cf/dep-lib-parity-scale-codec-derive"}}],"rustflags":[],"metadata":14884885833291977123,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/parity-secp256k1-51329ce022143282/run-build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"","target":0,"profile":0,"path":0,"deps":[[7704765042583084768,"build_script_build",false,4668653426820593825]],"local":[{"RerunIfEnvChanged":{"var":"CC_aarch64-apple-darwin","val":null}},{"RerunIfEnvChanged":{"var":"CC_aarch64_apple_darwin","val":null}},{"RerunIfEnvChanged":{"var":"HOST_CC","val":null}},{"RerunIfEnvChanged":{"var":"CC","val":null}},{"RerunIfEnvChanged":{"var":"CFLAGS_aarch64-apple-darwin","val":null}},{"RerunIfEnvChanged":{"var":"CFLAGS_aarch64_apple_darwin","val":null}},{"RerunIfEnvChanged":{"var":"HOST_CFLAGS","val":null}},{"RerunIfEnvChanged":{"var":"CFLAGS","val":null}},{"RerunIfEnvChanged":{"var":"CRATE_CC_NO_DEFAULTS","val":null}},{"RerunIfEnvChanged":{"var":"CC_aarch64-apple-darwin","val":null}},{"RerunIfEnvChanged":{"var":"CC_aarch64_apple_darwin","val":null}},{"RerunIfEnvChanged":{"var":"HOST_CC","val":null}},{"RerunIfEnvChanged":{"var":"CC","val":null}},{"RerunIfEnvChanged":{"var":"CFLAGS_aarch64-apple-darwin","val":null}},{"RerunIfEnvChanged":{"var":"CFLAGS_aarch64_apple_darwin","val":null}},{"RerunIfEnvChanged":{"var":"HOST_CFLAGS","val":null}},{"RerunIfEnvChanged":{"var":"CFLAGS","val":null}},{"RerunIfEnvChanged":{"var":"CRATE_CC_NO_DEFAULTS","val":null}},{"RerunIfEnvChanged":{"var":"AR_aarch64-apple-darwin","val":null}},{"RerunIfEnvChanged":{"var":"AR_aarch64_apple_darwin","val":null}},{"RerunIfEnvChanged":{"var":"HOST_AR","val":null}},{"RerunIfEnvChanged":{"var":"AR","val":null}},{"RerunIfEnvChanged":{"var":"ARFLAGS_aarch64-apple-darwin","val":null}},{"RerunIfEnvChanged":{"var":"ARFLAGS_aarch64_apple_darwin","val":null}},{"RerunIfEnvChanged":{"var":"HOST_ARFLAGS","val":null}},{"RerunIfEnvChanged":{"var":"ARFLAGS","val":null}}],"rustflags":[],"metadata":0,"config":0,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/parity-secp256k1-730eca21e68640b3/lib-secp256k1.json ---
+{"rustc":4041371938568725036,"features":"[\"default\"]","target":17470044212437035966,"profile":8987646332441898785,"path":3467173578410535505,"deps":[[7704765042583084768,"build_script_build",false,13938845258655157337],[13133975285667102737,"arrayvec",false,3992180890026233830],[14778545527639897399,"rand",false,6151211051116055315]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/parity-secp256k1-730eca21e68640b3/dep-lib-secp256k1"}}],"rustflags":[],"metadata":9768936618333975934,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/parity-secp256k1-7b9f7592437e7b25/build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"[\"default\"]","target":8188216131759486267,"profile":8626402512162920248,"path":10703347857867290937,"deps":[[11311719388751911026,"cfg_if",false,8284191021706889252],[13608427820910047331,"cc",false,11648945283535763968]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/parity-secp256k1-7b9f7592437e7b25/dep-build-script-build-script-build"}}],"rustflags":[],"metadata":9768936618333975934,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/pipar_store-acbff1c277e708fc/lib-pipar_store.json ---
+{"rustc":4041371938568725036,"features":"[]","target":9674508108527710369,"profile":17483045194147818835,"path":17523903030608720598,"deps":[[14706394349651137205,"near_sdk",false,6737660088354491239],[16009384535734781723,"serde_json",false,6720321150121479075]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/pipar_store-acbff1c277e708fc/dep-lib-pipar_store"}}],"rustflags":[],"metadata":15676885369341846485,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/pipar_store-d4b08b0e01d5dd10/test-lib-pipar_store.json ---
+{"rustc":4041371938568725036,"features":"[]","target":9674508108527710369,"profile":11506243869495082934,"path":17523903030608720598,"deps":[[14706394349651137205,"near_sdk",false,6737660088354491239],[16009384535734781723,"serde_json",false,6720321150121479075]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/pipar_store-d4b08b0e01d5dd10/dep-test-lib-pipar_store"}}],"rustflags":[],"metadata":15676885369341846485,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/ppv-lite86-acd224a756fd208c/lib-ppv-lite86.json ---
+{"rustc":4041371938568725036,"features":"[\"simd\", \"std\"]","target":602634026009422966,"profile":8987646332441898785,"path":8376335797529919322,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/ppv-lite86-acd224a756fd208c/dep-lib-ppv-lite86"}}],"rustflags":[],"metadata":14155036307809790115,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/primitive-types-069c17cb7f597ed3/lib-primitive-types.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"impl-codec\", \"std\"]","target":7171438785384587657,"profile":8987646332441898785,"path":14182822171353956027,"deps":[[1048698513431552377,"fixed_hash",false,10819464401641272436],[2354418988992935079,"impl_codec",false,9893480945112756085],[6802633723977166222,"uint",false,14032492969145627988]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/primitive-types-069c17cb7f597ed3/dep-lib-primitive-types"}}],"rustflags":[],"metadata":14754221332772532696,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/proc-macro-crate-2fcc90dba2f8adaf/lib-proc-macro-crate.json ---
+{"rustc":4041371938568725036,"features":"[]","target":12659122973440766864,"profile":8626402512162920248,"path":2058852138637243093,"deps":[[4424799446218848649,"once_cell",false,1985263085871339306],[5203266618020648742,"toml_edit",false,8644213732353706606]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/proc-macro-crate-2fcc90dba2f8adaf/dep-lib-proc-macro-crate"}}],"rustflags":[],"metadata":4875023412952309093,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/proc-macro-crate-f021ab89088df26e/lib-proc-macro-crate.json ---
+{"rustc":4041371938568725036,"features":"[]","target":7474588766210387923,"profile":8626402512162920248,"path":2480701498796501052,"deps":[[6554997584025100622,"toml",false,8958939422754931190]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/proc-macro-crate-f021ab89088df26e/dep-lib-proc-macro-crate"}}],"rustflags":[],"metadata":4875023412952309093,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/proc-macro2-08f586a118d95ee2/build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"proc-macro\"]","target":2297296889237502566,"profile":8626402512162920248,"path":6387819951147822810,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/proc-macro2-08f586a118d95ee2/dep-build-script-build-script-build"}}],"rustflags":[],"metadata":7635439851376710101,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/proc-macro2-172b2919012ba177/run-build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"","target":0,"profile":0,"path":0,"deps":[[4795167122555208633,"build_script_build",false,15450523883423301434]],"local":[{"RerunIfChanged":{"output":"debug/build/proc-macro2-172b2919012ba177/output","paths":["build.rs"]}}],"rustflags":[],"metadata":0,"config":0,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/proc-macro2-3b1bcd019f70cd98/lib-proc-macro2.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"proc-macro\"]","target":12374149067109351262,"profile":8626402512162920248,"path":5364579632529541619,"deps":[[4795167122555208633,"build_script_build",false,1701463780419363534],[8794757893971332981,"unicode_ident",false,10909192443668266061]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/proc-macro2-3b1bcd019f70cd98/dep-lib-proc-macro2"}}],"rustflags":[],"metadata":7635439851376710101,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/quote-325d01d8306a3eb2/lib-quote.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"proc-macro\"]","target":10824007166531090010,"profile":8626402512162920248,"path":16533386556346786260,"deps":[[4795167122555208633,"proc_macro2",false,6740026448694036056],[5184402248973381138,"build_script_build",false,10937042983014768057]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/quote-325d01d8306a3eb2/dep-lib-quote"}}],"rustflags":[],"metadata":2717943770976187624,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/quote-7b6e73978ac0b6ef/build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"proc-macro\"]","target":2297296889237502566,"profile":8626402512162920248,"path":10181635773825167091,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/quote-7b6e73978ac0b6ef/dep-build-script-build-script-build"}}],"rustflags":[],"metadata":2717943770976187624,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/quote-ca0d5a0d3167125f/run-build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"","target":0,"profile":0,"path":0,"deps":[[5184402248973381138,"build_script_build",false,12907355757799884303]],"local":[{"RerunIfChanged":{"output":"debug/build/quote-ca0d5a0d3167125f/output","paths":["build.rs"]}}],"rustflags":[],"metadata":0,"config":0,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/radium-6dd089b3862f651e/run-build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"","target":0,"profile":0,"path":0,"deps":[[188905226975056936,"build_script_build",false,18086161151853101934]],"local":[{"Precalculated":"0.6.2"}],"rustflags":[],"metadata":0,"config":0,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/radium-83d04fdd0665788c/lib-radium.json ---
+{"rustc":4041371938568725036,"features":"[]","target":8067319890566194752,"profile":8987646332441898785,"path":17956747319450930653,"deps":[[188905226975056936,"build_script_build",false,15764779635543475897]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/radium-83d04fdd0665788c/dep-lib-radium"}}],"rustflags":[],"metadata":13584132765049742942,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/radium-f89e6679aacd06d2/build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"[]","target":2297296889237502566,"profile":8626402512162920248,"path":1026449598318871991,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/radium-f89e6679aacd06d2/dep-build-script-build-script-build"}}],"rustflags":[],"metadata":13584132765049742942,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/rand-1856dd7ce07b7cbc/lib-rand.json ---
+{"rustc":4041371938568725036,"features":"[\"alloc\", \"getrandom\", \"libc\", \"rand_chacha\", \"std\"]","target":17786277519600763311,"profile":8987646332441898785,"path":10121232567674108740,"deps":[[1565494060434293766,"rand_core",false,2017543025548599138],[2798846484360888381,"libc",false,8458598860795332170],[12017018019769837221,"rand_chacha",false,8664326145539827033]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/rand-1856dd7ce07b7cbc/dep-lib-rand"}}],"rustflags":[],"metadata":16964019146302480911,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/rand-9b9dfa87bbb4d1c8/lib-rand.json ---
+{"rustc":4041371938568725036,"features":"[\"alloc\", \"default\", \"getrandom\", \"getrandom_package\", \"libc\", \"std\"]","target":17786277519600763311,"profile":8987646332441898785,"path":13218288235026370078,"deps":[[2798846484360888381,"libc",false,8458598860795332170],[6453573393678185459,"getrandom_package",false,12022373072287215689],[11761531122794857361,"rand_core",false,820268434750482734],[15629295216311830669,"rand_chacha",false,5851366239456442350]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/rand-9b9dfa87bbb4d1c8/dep-lib-rand"}}],"rustflags":[],"metadata":7119169968661360791,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/rand_chacha-9fbbcb62c25aa148/lib-rand_chacha.json ---
+{"rustc":4041371938568725036,"features":"[\"std\"]","target":3291831172522752161,"profile":8987646332441898785,"path":13566535874019819751,"deps":[[1565494060434293766,"rand_core",false,2017543025548599138],[4511957894497802922,"ppv_lite86",false,15645371408001593499]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/rand_chacha-9fbbcb62c25aa148/dep-lib-rand_chacha"}}],"rustflags":[],"metadata":2235018391756195449,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/rand_chacha-bec625f92f57e942/lib-rand_chacha.json ---
+{"rustc":4041371938568725036,"features":"[\"std\"]","target":3291831172522752161,"profile":8987646332441898785,"path":15671138620130464798,"deps":[[4511957894497802922,"ppv_lite86",false,15645371408001593499],[11761531122794857361,"rand_core",false,820268434750482734]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/rand_chacha-bec625f92f57e942/dep-lib-rand_chacha"}}],"rustflags":[],"metadata":4815341205625856913,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/rand_core-0872be3c5c3200ba/lib-rand_core.json ---
+{"rustc":4041371938568725036,"features":"[\"alloc\", \"getrandom\", \"std\"]","target":3042383198953219556,"profile":8987646332441898785,"path":4158753641088166782,"deps":[[12202314575583203756,"getrandom",false,5926453146219644795]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/rand_core-0872be3c5c3200ba/dep-lib-rand_core"}}],"rustflags":[],"metadata":3275543247315060703,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/rand_core-541c95c45ecc393d/lib-rand_core.json ---
+{"rustc":4041371938568725036,"features":"[\"alloc\", \"getrandom\", \"std\"]","target":3042383198953219556,"profile":8987646332441898785,"path":5643240756846474426,"deps":[[6453573393678185459,"getrandom",false,12022373072287215689]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/rand_core-541c95c45ecc393d/dep-lib-rand_core"}}],"rustflags":[],"metadata":3036601509445419820,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/reed-solomon-erasure-7053241e968cb1b9/lib-reed-solomon-erasure.json ---
+{"rustc":4041371938568725036,"features":"[\"default\"]","target":14858778984349257557,"profile":8987646332441898785,"path":14760480053089600214,"deps":[[1135290295914584130,"smallvec",false,11498569481392623987],[7546918406050397588,"build_script_build",false,13301786840531299988]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/reed-solomon-erasure-7053241e968cb1b9/dep-lib-reed-solomon-erasure"}}],"rustflags":[],"metadata":18181909252143981725,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/reed-solomon-erasure-88fcd5d11b5cbe2b/run-build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"","target":0,"profile":0,"path":0,"deps":[[7546918406050397588,"build_script_build",false,18334855088391424489]],"local":[{"Precalculated":"4.0.2"}],"rustflags":[],"metadata":0,"config":0,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/reed-solomon-erasure-efe9a6831b061980/build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"[\"default\"]","target":2297296889237502566,"profile":8626402512162920248,"path":4816074484979411667,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/reed-solomon-erasure-efe9a6831b061980/dep-build-script-build-script-build"}}],"rustflags":[],"metadata":18181909252143981725,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/ripemd-f8c74091c0056f0b/lib-ripemd.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"std\"]","target":1613712687734081624,"profile":8987646332441898785,"path":12548512925810913218,"deps":[[8784844846616271080,"digest",false,575809361638893368]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/ripemd-f8c74091c0056f0b/dep-lib-ripemd"}}],"rustflags":[],"metadata":14578198798605781854,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/rustc-hex-7cde8fc5dbf5ad74/lib-rustc-hex.json ---
+{"rustc":4041371938568725036,"features":"[\"std\"]","target":12485990117678741081,"profile":8987646332441898785,"path":6787254328363541180,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/rustc-hex-7cde8fc5dbf5ad74/dep-lib-rustc-hex"}}],"rustflags":[],"metadata":11278451656052502128,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/rustversion-b3a61a41f09e36a6/run-build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"","target":0,"profile":0,"path":0,"deps":[[10558230389875899965,"build_script_build",false,18201948774557664230]],"local":[{"RerunIfChanged":{"output":"debug/build/rustversion-b3a61a41f09e36a6/output","paths":["build/build.rs"]}}],"rustflags":[],"metadata":0,"config":0,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/rustversion-c5bbcbc909b16387/build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"[]","target":2297296889237502566,"profile":8626402512162920248,"path":8399407715829923069,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/rustversion-c5bbcbc909b16387/dep-build-script-build-script-build"}}],"rustflags":[],"metadata":11946384680894284015,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/rustversion-e89fbe7185e070ac/lib-rustversion.json ---
+{"rustc":4041371938568725036,"features":"[]","target":8237524127607741655,"profile":8626402512162920248,"path":727565099658525610,"deps":[[10558230389875899965,"build_script_build",false,15537537224072701572]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/rustversion-e89fbe7185e070ac/dep-lib-rustversion"}}],"rustflags":[],"metadata":11946384680894284015,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/ryu-6537036c019955a8/lib-ryu.json ---
+{"rustc":4041371938568725036,"features":"[]","target":13901881936739684103,"profile":8987646332441898785,"path":8686427226106072515,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/ryu-6537036c019955a8/dep-lib-ryu"}}],"rustflags":[],"metadata":10387617312689919117,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/schemars-60d408c2179e5ff1/build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"derive\", \"impl_json_schema\", \"schemars_derive\"]","target":2297296889237502566,"profile":8626402512162920248,"path":8069210542860665737,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/schemars-60d408c2179e5ff1/dep-build-script-build-script-build"}}],"rustflags":[],"metadata":11679674351051169359,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/schemars-6c0ece18e3f13da0/lib-schemars.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"derive\", \"impl_json_schema\", \"schemars_derive\"]","target":16218395617641602000,"profile":8987646332441898785,"path":11901691636574490301,"deps":[[5744217960993662405,"serde",false,8922752736421132827],[12284957066765035870,"dyn_clone",false,10910021001732348304],[13519362093482305381,"build_script_build",false,13986516228262296478],[13685478631301934036,"schemars_derive",false,12793354605008587352],[16009384535734781723,"serde_json",false,6720321150121479075]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/schemars-6c0ece18e3f13da0/dep-lib-schemars"}}],"rustflags":[],"metadata":11679674351051169359,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/schemars-a738730651ae1951/run-build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"","target":0,"profile":0,"path":0,"deps":[[13519362093482305381,"build_script_build",false,10076968041502376929]],"local":[{"Precalculated":"0.8.12"}],"rustflags":[],"metadata":0,"config":0,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/schemars_derive-48f323cbbcda1f41/lib-schemars_derive.json ---
+{"rustc":4041371938568725036,"features":"[]","target":6818468949020714808,"profile":8626402512162920248,"path":6185448653730175598,"deps":[[4795167122555208633,"proc_macro2",false,6740026448694036056],[5184402248973381138,"quote",false,11518320847341303531],[15472200400644609968,"serde_derive_internals",false,8633483996448867283],[17143850428905299221,"syn",false,4214620575965312635]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/schemars_derive-48f323cbbcda1f41/dep-lib-schemars_derive"}}],"rustflags":[],"metadata":17573214762644668264,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/semver-058cc4b94d2e30e6/run-build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"","target":0,"profile":0,"path":0,"deps":[[9409617104836426353,"build_script_build",false,3287395310673714905]],"local":[{"RerunIfChanged":{"output":"debug/build/semver-058cc4b94d2e30e6/output","paths":["build.rs"]}}],"rustflags":[],"metadata":0,"config":0,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/semver-0b5402e1103ab6ad/build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"std\"]","target":2297296889237502566,"profile":8626402512162920248,"path":2651186331044259717,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/semver-0b5402e1103ab6ad/dep-build-script-build-script-build"}}],"rustflags":[],"metadata":7480721012031345649,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/semver-5774ecc6d1c897d6/lib-semver.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"std\"]","target":1855717086744217893,"profile":8987646332441898785,"path":2500038203091048794,"deps":[[9409617104836426353,"build_script_build",false,9896147020965837164]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/semver-5774ecc6d1c897d6/dep-lib-semver"}}],"rustflags":[],"metadata":7480721012031345649,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/serde-043578ca7e169bd2/lib-serde.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"derive\", \"serde_derive\", \"std\"]","target":329308647890466032,"profile":8626402512162920248,"path":5586946110735752869,"deps":[[5744217960993662405,"build_script_build",false,12222300039453984806],[16684406654794867144,"serde_derive",false,15147955326371783260]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/serde-043578ca7e169bd2/dep-lib-serde"}}],"rustflags":[],"metadata":3767376778934503013,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/serde-11e2f49771ab6554/run-build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"","target":0,"profile":0,"path":0,"deps":[[5744217960993662405,"build_script_build",false,2660376092032080070]],"local":[{"RerunIfChanged":{"output":"debug/build/serde-11e2f49771ab6554/output","paths":["build.rs"]}}],"rustflags":[],"metadata":0,"config":0,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/serde-34e192e7879d3f35/run-build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"","target":0,"profile":0,"path":0,"deps":[[5744217960993662405,"build_script_build",false,4852356079645502862]],"local":[{"RerunIfChanged":{"output":"debug/build/serde-34e192e7879d3f35/output","paths":["build.rs"]}}],"rustflags":[],"metadata":0,"config":0,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/serde-385477f7320e8c7a/build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"derive\", \"rc\", \"serde_derive\", \"std\"]","target":8188216131759486267,"profile":8626402512162920248,"path":4245382829298853192,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/serde-385477f7320e8c7a/dep-build-script-build-script-build"}}],"rustflags":[],"metadata":3767376778934503013,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/serde-842bc66b7f1eb134/build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"derive\", \"serde_derive\", \"std\"]","target":8188216131759486267,"profile":8626402512162920248,"path":4245382829298853192,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/serde-842bc66b7f1eb134/dep-build-script-build-script-build"}}],"rustflags":[],"metadata":3767376778934503013,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/serde-8a16bd8235b2f2fa/lib-serde.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"derive\", \"rc\", \"serde_derive\", \"std\"]","target":329308647890466032,"profile":8987646332441898785,"path":5586946110735752869,"deps":[[5744217960993662405,"build_script_build",false,7941453377196258673],[16684406654794867144,"serde_derive",false,15147955326371783260]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/serde-8a16bd8235b2f2fa/dep-lib-serde"}}],"rustflags":[],"metadata":3767376778934503013,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/serde_derive-7d8373340457b830/lib-serde_derive.json ---
+{"rustc":4041371938568725036,"features":"[\"default\"]","target":17975654915224872304,"profile":8626402512162920248,"path":3288917792441812753,"deps":[[4795167122555208633,"proc_macro2",false,6740026448694036056],[5184402248973381138,"quote",false,11518320847341303531],[11119112416681730077,"syn",false,8241952620883253069]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/serde_derive-7d8373340457b830/dep-lib-serde_derive"}}],"rustflags":[],"metadata":14452199383429553764,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/serde_derive_internals-9eeea32b23032ca2/lib-serde_derive_internals.json ---
+{"rustc":4041371938568725036,"features":"[]","target":10801114250991275972,"profile":8626402512162920248,"path":8401100268042942762,"deps":[[4795167122555208633,"proc_macro2",false,6740026448694036056],[5184402248973381138,"quote",false,11518320847341303531],[17143850428905299221,"syn",false,4214620575965312635]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/serde_derive_internals-9eeea32b23032ca2/dep-lib-serde_derive_internals"}}],"rustflags":[],"metadata":7691849674774261228,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/serde_json-1ead7b7b9774179f/lib-serde_json.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"std\"]","target":14732558418354827613,"profile":8987646332441898785,"path":6853122647746890991,"deps":[[4033808502136257490,"itoa",false,18446007351464182403],[5744217960993662405,"serde",false,8922752736421132827],[16009384535734781723,"build_script_build",false,325210238112310854],[16373751122992612718,"ryu",false,11792259252382451949]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/serde_json-1ead7b7b9774179f/dep-lib-serde_json"}}],"rustflags":[],"metadata":16261601059619201932,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/serde_json-29f8d346b66dbca0/build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"std\"]","target":2297296889237502566,"profile":8626402512162920248,"path":7636135993600604978,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/serde_json-29f8d346b66dbca0/dep-build-script-build-script-build"}}],"rustflags":[],"metadata":16261601059619201932,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/serde_json-32cf63492bb02aad/run-build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"","target":0,"profile":0,"path":0,"deps":[[16009384535734781723,"build_script_build",false,6757125959780332290]],"local":[{"RerunIfChanged":{"output":"debug/build/serde_json-32cf63492bb02aad/output","paths":["build.rs"]}}],"rustflags":[],"metadata":0,"config":0,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/sha2-41ad12c6639ba0e7/lib-sha2.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"std\"]","target":6041420389508982234,"profile":8987646332441898785,"path":9528389644170417303,"deps":[[2452538001284770427,"cfg_if",false,9122851156399048806],[8708877435334478611,"cpufeatures",false,9021900601485565475],[8784844846616271080,"digest",false,575809361638893368]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/sha2-41ad12c6639ba0e7/dep-lib-sha2"}}],"rustflags":[],"metadata":13125521705435454745,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/sha2-d95acb25a943160f/lib-sha2.json ---
+{"rustc":4041371938568725036,"features":"[\"std\"]","target":6041420389508982234,"profile":8987646332441898785,"path":13507374934213548947,"deps":[[2452538001284770427,"cfg_if",false,9122851156399048806],[5380073082773161146,"block_buffer",false,8342616677178260090],[6014497622236959678,"opaque_debug",false,6187187540341452882],[8708877435334478611,"cpufeatures",false,9021900601485565475],[12829070662860118430,"digest",false,18020473100866099150]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/sha2-d95acb25a943160f/dep-lib-sha2"}}],"rustflags":[],"metadata":13125521705435454745,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/sha3-91239e5aa44b5cf3/lib-sha3.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"std\"]","target":17735848975723662600,"profile":8987646332441898785,"path":13243790591290714020,"deps":[[8784844846616271080,"digest",false,575809361638893368],[17850633121171198749,"keccak",false,17326608072685750417]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/sha3-91239e5aa44b5cf3/dep-lib-sha3"}}],"rustflags":[],"metadata":14642484976072726362,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/signature-3b44bc0765318baf/lib-signature.json ---
+{"rustc":4041371938568725036,"features":"[\"std\"]","target":13175919239257514164,"profile":8987646332441898785,"path":10435957431180708234,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/signature-3b44bc0765318baf/dep-lib-signature"}}],"rustflags":[],"metadata":3639813390204373107,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/smallvec-cf249ee32454c859/lib-smallvec.json ---
+{"rustc":4041371938568725036,"features":"[]","target":15021638563153388439,"profile":8987646332441898785,"path":16217276770966550342,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/smallvec-cf249ee32454c859/dep-lib-smallvec"}}],"rustflags":[],"metadata":15767570753543272391,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/smart-default-aebdd7c15dbb5ec9/lib-smart-default.json ---
+{"rustc":4041371938568725036,"features":"[]","target":5136326791199682166,"profile":8626402512162920248,"path":4062853399833828625,"deps":[[4795167122555208633,"proc_macro2",false,6740026448694036056],[5184402248973381138,"quote",false,11518320847341303531],[17143850428905299221,"syn",false,4214620575965312635]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/smart-default-aebdd7c15dbb5ec9/dep-lib-smart-default"}}],"rustflags":[],"metadata":14558014737287565990,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/spin-1eada6c21182491e/lib-spin.json ---
+{"rustc":4041371938568725036,"features":"[]","target":1472938512845949657,"profile":8987646332441898785,"path":13165908235958353587,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/spin-1eada6c21182491e/dep-lib-spin"}}],"rustflags":[],"metadata":6620005600999123125,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/static_assertions-a6e951094df62b70/lib-static_assertions.json ---
+{"rustc":4041371938568725036,"features":"[]","target":4661364776663884960,"profile":8987646332441898785,"path":13778807617324132371,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/static_assertions-a6e951094df62b70/dep-lib-static_assertions"}}],"rustflags":[],"metadata":16420956093413671072,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/strum-aec86fc3adb5c6a1/lib-strum.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"derive\", \"std\", \"strum_macros\"]","target":17081374028075893283,"profile":8987646332441898785,"path":961436332395292145,"deps":[[1446301735678115251,"strum_macros",false,1002413505151039946]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/strum-aec86fc3adb5c6a1/dep-lib-strum"}}],"rustflags":[],"metadata":11680211291368566339,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/strum_macros-5048e0ba0fa4a9df/lib-strum_macros.json ---
+{"rustc":4041371938568725036,"features":"[]","target":12061214918595282268,"profile":8626402512162920248,"path":11466984126692531274,"deps":[[4795167122555208633,"proc_macro2",false,6740026448694036056],[5184402248973381138,"quote",false,11518320847341303531],[10558230389875899965,"rustversion",false,10974215101421246645],[11709930968028960932,"heck",false,16924924731974342644],[17143850428905299221,"syn",false,4214620575965312635]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/strum_macros-5048e0ba0fa4a9df/dep-lib-strum_macros"}}],"rustflags":[],"metadata":11680211291368566339,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/subtle-705566a687a5fcaa/lib-subtle.json ---
+{"rustc":4041371938568725036,"features":"[\"default\", \"i128\", \"std\"]","target":3031033441136664259,"profile":8987646332441898785,"path":10330947150372643369,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/subtle-705566a687a5fcaa/dep-lib-subtle"}}],"rustflags":[],"metadata":9136318916805708739,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/syn-239286cdeabdb889/run-build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"","target":0,"profile":0,"path":0,"deps":[[17143850428905299221,"build_script_build",false,2450785978156533304]],"local":[{"Precalculated":"1.0.109"}],"rustflags":[],"metadata":0,"config":0,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/syn-7a8dc973d4ce2cb6/build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"[\"clone-impls\", \"default\", \"derive\", \"extra-traits\", \"fold\", \"full\", \"parsing\", \"printing\", \"proc-macro\", \"quote\", \"visit\"]","target":2297296889237502566,"profile":8626402512162920248,"path":1658858633237344127,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/syn-7a8dc973d4ce2cb6/dep-build-script-build-script-build"}}],"rustflags":[],"metadata":6886477143387768027,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/syn-c5f6c7dc24b7db29/lib-syn.json ---
+{"rustc":4041371938568725036,"features":"[\"clone-impls\", \"default\", \"derive\", \"extra-traits\", \"fold\", \"full\", \"parsing\", \"printing\", \"proc-macro\", \"quote\", \"visit\"]","target":8516813339728780372,"profile":8626402512162920248,"path":4833793754491438020,"deps":[[4795167122555208633,"proc_macro2",false,6740026448694036056],[5184402248973381138,"quote",false,11518320847341303531],[8794757893971332981,"unicode_ident",false,10909192443668266061],[17143850428905299221,"build_script_build",false,3264419135392554248]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/syn-c5f6c7dc24b7db29/dep-lib-syn"}}],"rustflags":[],"metadata":6886477143387768027,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/syn-f73d634c51382ee8/lib-syn.json ---
+{"rustc":4041371938568725036,"features":"[\"clone-impls\", \"default\", \"derive\", \"extra-traits\", \"full\", \"parsing\", \"printing\", \"proc-macro\", \"quote\", \"visit\"]","target":9229941241798225847,"profile":8626402512162920248,"path":8653269314386138983,"deps":[[4795167122555208633,"proc_macro2",false,6740026448694036056],[5184402248973381138,"quote",false,11518320847341303531],[8794757893971332981,"unicode_ident",false,10909192443668266061]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/syn-f73d634c51382ee8/dep-lib-syn"}}],"rustflags":[],"metadata":6886477143387768027,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/tap-eaedd486a44964e7/lib-tap.json ---
+{"rustc":4041371938568725036,"features":"[]","target":15858538858624274805,"profile":8987646332441898785,"path":11868898579086604877,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/tap-eaedd486a44964e7/dep-lib-tap"}}],"rustflags":[],"metadata":6574141762495208141,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/thiserror-2edee1b7d05273f7/build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"[]","target":2297296889237502566,"profile":8626402512162920248,"path":10700594505476133876,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/thiserror-2edee1b7d05273f7/dep-build-script-build-script-build"}}],"rustflags":[],"metadata":11722078131081488174,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/thiserror-702ac101d09cc068/lib-thiserror.json ---
+{"rustc":4041371938568725036,"features":"[]","target":8157378315893091620,"profile":8987646332441898785,"path":7521918691534685796,"deps":[[2616446206962060492,"build_script_build",false,12442208404439821819],[17101550905474661629,"thiserror_impl",false,4063491876862222228]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/thiserror-702ac101d09cc068/dep-lib-thiserror"}}],"rustflags":[],"metadata":11722078131081488174,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/thiserror-d70f0c6d16a46703/run-build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"","target":0,"profile":0,"path":0,"deps":[[2616446206962060492,"build_script_build",false,13004867311434994166]],"local":[{"Precalculated":"1.0.40"}],"rustflags":[],"metadata":0,"config":0,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/thiserror-impl-452caf318aafdea8/lib-thiserror-impl.json ---
+{"rustc":4041371938568725036,"features":"[]","target":1479381930127311920,"profile":8626402512162920248,"path":10512087847565650146,"deps":[[4795167122555208633,"proc_macro2",false,6740026448694036056],[5184402248973381138,"quote",false,11518320847341303531],[11119112416681730077,"syn",false,8241952620883253069]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/thiserror-impl-452caf318aafdea8/dep-lib-thiserror-impl"}}],"rustflags":[],"metadata":14048383283908260854,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/time-71d0c09981794c75/lib-time.json ---
+{"rustc":4041371938568725036,"features":"[]","target":5868266217181056409,"profile":8987646332441898785,"path":2398117376967732110,"deps":[[2798846484360888381,"libc",false,8458598860795332170]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/time-71d0c09981794c75/dep-lib-time"}}],"rustflags":[],"metadata":8937303733317455548,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/toml-6935792611f22c18/lib-toml.json ---
+{"rustc":4041371938568725036,"features":"[\"default\"]","target":12757549743382924349,"profile":8626402512162920248,"path":6455420571809477902,"deps":[[5744217960993662405,"serde",false,16466678340802018753]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/toml-6935792611f22c18/dep-lib-toml"}}],"rustflags":[],"metadata":13437692833141290973,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/toml_datetime-4a5291c26fbeb8a6/lib-toml_datetime.json ---
+{"rustc":4041371938568725036,"features":"[]","target":14371082279898781439,"profile":8626402512162920248,"path":10407857133623582293,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/toml_datetime-4a5291c26fbeb8a6/dep-lib-toml_datetime"}}],"rustflags":[],"metadata":4457034034663589510,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/toml_edit-3f532429235ab58a/lib-toml_edit.json ---
+{"rustc":4041371938568725036,"features":"[\"default\"]","target":2019625632009298928,"profile":8626402512162920248,"path":13147161217350344337,"deps":[[743430741442777269,"toml_datetime",false,1728636443512448758],[6016697943151911368,"indexmap",false,11965790357163956053],[16937909260220998165,"winnow",false,15563148832841471003]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/toml_edit-3f532429235ab58a/dep-lib-toml_edit"}}],"rustflags":[],"metadata":17436163843096124214,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/typenum-4c28b1aa938baf81/run-build-script-build-script-main.json ---
+{"rustc":4041371938568725036,"features":"","target":0,"profile":0,"path":0,"deps":[[11395083745183091805,"build_script_main",false,12463623152585511045]],"local":[{"RerunIfChanged":{"output":"debug/build/typenum-4c28b1aa938baf81/output","paths":["build/main.rs"]}}],"rustflags":[],"metadata":0,"config":0,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/typenum-6a8b853b5be3561d/lib-typenum.json ---
+{"rustc":4041371938568725036,"features":"[]","target":1667919871804902043,"profile":8987646332441898785,"path":12809583214811234421,"deps":[[11395083745183091805,"build_script_main",false,917008092678072548]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/typenum-6a8b853b5be3561d/dep-lib-typenum"}}],"rustflags":[],"metadata":5976975242777358168,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/typenum-7c52df23ac9e694f/build-script-build-script-main.json ---
+{"rustc":4041371938568725036,"features":"[]","target":9021408344364460610,"profile":8626402512162920248,"path":4029879135381106505,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/typenum-7c52df23ac9e694f/dep-build-script-build-script-main"}}],"rustflags":[],"metadata":5976975242777358168,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/uint-5f5583b2a7345354/lib-uint.json ---
+{"rustc":4041371938568725036,"features":"[\"std\"]","target":7672966471245941834,"profile":8987646332441898785,"path":9378365793774079741,"deps":[[486069622437963759,"byteorder",false,814480072115569638],[4485243235582659819,"hex",false,8439640585145902176],[6476817338883840430,"static_assertions",false,16734876218364865062],[15144909498828475009,"crunchy",false,7981562233796996205]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/uint-5f5583b2a7345354/dep-lib-uint"}}],"rustflags":[],"metadata":7122085937130173941,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/unicode-ident-1a7a93f5f418835f/lib-unicode-ident.json ---
+{"rustc":4041371938568725036,"features":"[]","target":7243519288898877878,"profile":8626402512162920248,"path":15488244355573018334,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/unicode-ident-1a7a93f5f418835f/dep-lib-unicode-ident"}}],"rustflags":[],"metadata":1159190378059262574,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/version_check-9f5b1902f3f8fdcd/lib-version_check.json ---
+{"rustc":4041371938568725036,"features":"[]","target":1907215788979932987,"profile":8626402512162920248,"path":3777410472503454081,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/version_check-9f5b1902f3f8fdcd/dep-lib-version_check"}}],"rustflags":[],"metadata":14847206692933921638,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/wee_alloc-8edfc0e4af906ee2/build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"[]","target":8188216131759486267,"profile":8626402512162920248,"path":8631794219194456534,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/wee_alloc-8edfc0e4af906ee2/dep-build-script-build-script-build"}}],"rustflags":[],"metadata":11837593470300214873,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/wee_alloc-b939c7b00afe81d3/run-build-script-build-script-build.json ---
+{"rustc":4041371938568725036,"features":"","target":0,"profile":0,"path":0,"deps":[[3178493835647231921,"build_script_build",false,12256119235892557487]],"local":[{"RerunIfChanged":{"output":"debug/build/wee_alloc-b939c7b00afe81d3/output","paths":["./Cargo.toml","./build.rs","./src/lib.rs","./src/imp_static_array.rs"]}},{"RerunIfEnvChanged":{"var":"WEE_ALLOC_STATIC_ARRAY_BACKEND_BYTES","val":null}}],"rustflags":[],"metadata":0,"config":0,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/wee_alloc-c99bc597947bcdce/lib-wee_alloc.json ---
+{"rustc":4041371938568725036,"features":"[]","target":4386990340108308755,"profile":8987646332441898785,"path":13670176379219152412,"deps":[[1429323848562539564,"memory_units",false,15871908149189374770],[2798846484360888381,"libc",false,8458598860795332170],[3178493835647231921,"build_script_build",false,15763520981285122739],[11311719388751911026,"cfg_if",false,11488744769838718953]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/wee_alloc-c99bc597947bcdce/dep-lib-wee_alloc"}}],"rustflags":[],"metadata":11837593470300214873,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/winnow-302c038725304bb7/lib-winnow.json ---
+{"rustc":4041371938568725036,"features":"[\"alloc\", \"default\", \"std\"]","target":1434475815273837950,"profile":8626402512162920248,"path":6962772512292166057,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/winnow-302c038725304bb7/dep-lib-winnow"}}],"rustflags":[],"metadata":7482876514514569712,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/wyz-65fe601d21da6e6a/lib-wyz.json ---
+{"rustc":4041371938568725036,"features":"[\"alloc\"]","target":3227559903989411901,"profile":8987646332441898785,"path":13272974287897671077,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/wyz-65fe601d21da6e6a/dep-lib-wyz"}}],"rustflags":[],"metadata":18109821273324682741,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/zeroize-792461883bb3affb/lib-zeroize.json ---
+{"rustc":4041371938568725036,"features":"[\"alloc\", \"zeroize_derive\"]","target":12104206478143992192,"profile":8987646332441898785,"path":5850585916533900089,"deps":[[17194429470758112918,"zeroize_derive",false,5337670124740877225]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/zeroize-792461883bb3affb/dep-lib-zeroize"}}],"rustflags":[],"metadata":4317945585732210332,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/zeroize_derive-05852810e6099ec6/lib-zeroize_derive.json ---
+{"rustc":4041371938568725036,"features":"[]","target":2076303734171676484,"profile":8626402512162920248,"path":6349014367686316540,"deps":[[4795167122555208633,"proc_macro2",false,6740026448694036056],[5184402248973381138,"quote",false,11518320847341303531],[11119112416681730077,"syn",false,8241952620883253069]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/zeroize_derive-05852810e6099ec6/dep-lib-zeroize_derive"}}],"rustflags":[],"metadata":7526780439083680197,"config":2202906307356721367,"compile_kind":0}
+'''
+'''--- target/debug/.fingerprint/zeropool-bn-f69a8e71a2fae23e/lib-zeropool-bn.json ---
+{"rustc":4041371938568725036,"features":"[\"borsh\", \"default\", \"std\"]","target":3307770964703969394,"profile":8987646332441898785,"path":2378152277155960411,"deps":[[486069622437963759,"byteorder",false,814480072115569638],[5910892534286594076,"rand",false,822911918794005151],[6685014296130524576,"lazy_static",false,15381349704087460475],[13370790239003944599,"rustc_hex",false,195080667160046343],[13434381959712907675,"borsh",false,7297589618764822524],[15144909498828475009,"crunchy",false,7981562233796996205]],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/zeropool-bn-f69a8e71a2fae23e/dep-lib-zeropool-bn"}}],"rustflags":[],"metadata":3962099761543278488,"config":2202906307356721367,"compile_kind":0}
+'''

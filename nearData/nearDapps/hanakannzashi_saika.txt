@@ -1,0 +1,1575 @@
+*GitHub Repository "hanakannzashi/saika"*
+
+'''--- Cargo.toml ---
+[package]
+name = "saika"
+version = "1.0.0"
+edition = "2021"
+authors = ["cornflower.near"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+near-sdk = "4.0.0"
+near-contract-standards = "=4.0.0"
+
+[profile.release]
+codegen-units = 1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+
+'''
+'''--- README.md ---
+# Saika Red Packet
+
+### Red Packet on NEAR
+
+Support Token：
+* NEAR
+* FungibleToken
+
+Red Packet Type：
+* Average
+* Rondom
+
+## Methods
+```rust
+fn create_near_red_packet(
+    &mut self,
+    public_key: PublicKey,
+    split: usize,
+    split_mod: SplitMod,
+    msg: Option<String>,
+    white_list: Option<HashSet<AccountId>>
+);
+
+fn claim_red_packet(&mut self, claimer_id: AccountId) -> U128;
+
+fn refund(&mut self, public_key: PublicKey) -> U128;
+
+fn remove_history(&mut self, public_key: PublicKey);
+
+fn clear_history(&mut self);
+```
+
+## View Methods
+```rust
+fn get_red_packets_by_owner_id(&self, owner_id: AccountId) -> Vec<RedPacketView>;
+
+fn get_pks_by_owner_id(&self, owner_id: AccountId) -> HashSet<PublicKey>;
+
+fn get_red_packet_by_pk(&self, public_key: PublicKey) -> Option<RedPacketView>;
+```
+
+## FungibleTokenReceiver
+```rust
+fn ft_on_transfer(&mut self, sender_id: AccountId, amount: U128, msg: String) -> PromiseOrValue<U128>;
+```
+
+## StorageManagement
+```rust
+fn storage_deposit(
+    &mut self,
+    account_id: Option<AccountId>,
+    registration_only: Option<bool>,
+) -> StorageBalance;
+
+fn storage_withdraw(&mut self, amount: Option<U128>) -> StorageBalance;
+
+fn storage_unregister(&mut self, force: Option<bool>) -> bool;
+
+fn storage_balance_bounds(&self) -> StorageBalanceBounds;
+
+fn storage_balance_of(&self, account_id: AccountId) -> Option<StorageBalance>;
+```
+
+'''
+'''--- src/constants.rs ---
+use near_sdk::{Balance, Gas};
+
+pub const MAX_RED_PACKET_SPLIT: usize = 100;
+pub const MAX_RED_PACKET_MSG_LEN: usize = 100;
+
+pub const ONE_YOCTO: Balance = 1;
+
+pub const GAS_FOR_FT_TRANSFER: Gas = Gas(10_000_000_000_000);
+pub const GAS_FOR_RESOLVE_CLAIM_FUNGIBLE_TOKEN_RED_PACKET: Gas = Gas(20_000_000_000_000);
+'''
+'''--- src/cross_other.rs ---
+#[allow(unused_imports)]
+use near_sdk::{AccountId, ext_contract};
+use near_sdk::json_types::U128;
+use near_sdk::{Promise, PublicKey};
+
+#[ext_contract(ext_ft)]
+trait ExtFt {
+    #[payable]
+    fn ft_transfer(&mut self, receiver_id: AccountId, amount: U128, memo: Option<String>);
+}
+
+#[ext_contract(ext_helper)]
+trait ExtHelper {
+    #[payable]
+    fn create_account(&mut self, new_account_id: AccountId, new_public_key: PublicKey) -> Promise;
+}
+'''
+'''--- src/cross_self.rs ---
+#[allow(unused_imports)]
+use near_sdk::{AccountId, ext_contract};
+use near_sdk::json_types::U128;
+use near_sdk::PublicKey;
+
+#[ext_contract(ext_self)]
+trait ExtSelf {
+    #[private]
+    fn resolve_claim_fungible_token_red_packet(
+        &mut self,
+        claimer_id: AccountId,
+        owner_id: AccountId,
+        amount: U128,
+        token_id: AccountId,
+        public_key: PublicKey
+    );
+}
+'''
+'''--- src/dynamic_storage_management/account_storage.rs ---
+use super::StorageUsageChange;
+
+use std::cmp::min;
+use near_sdk::{env, Balance, StorageUsage};
+use near_sdk::borsh::{self,BorshDeserialize,BorshSerialize};
+use near_sdk::json_types::U128;
+
+#[derive(BorshDeserialize,BorshSerialize)]
+pub struct AccountStorage {
+    storage_usage: StorageUsage,
+    storage_balance: Balance
+}
+
+impl AccountStorage {
+    pub fn reset_storage_usage(&mut self) {
+        self.storage_usage = 0;
+    }
+
+    pub fn update_storage_usage(&mut self, storage_usage_change: StorageUsageChange) {
+        let storage_usage = StorageUsageChange::from(self.storage_usage);
+        let new_storage_usage = storage_usage + storage_usage_change;
+        if new_storage_usage > 0 {
+            self.storage_usage = StorageUsage::try_from(new_storage_usage).unwrap();
+        } else {
+            self.storage_usage = 0;
+        }
+    }
+
+    pub fn deposit_storage_balance(&mut self, amount: Balance) {
+        self.storage_balance += amount;
+    }
+
+    pub fn withdraw_storage_balance(&mut self, amount: Option<U128>) -> Balance {
+        let amount = amount.unwrap_or(U128(u128::MAX));
+        let (total, used) = self.storage_balance();
+        if total <= used {
+            return 0;
+        };
+        let available_amount = total - used;
+        let withdraw_amount = min(available_amount, amount.0);
+        self.storage_balance -= withdraw_amount;
+        withdraw_amount
+    }
+
+    pub fn storage_balance(&self) -> (Balance, Balance) {
+        let total = self.storage_balance;
+        let used = Balance::from(self.storage_usage) * env::storage_byte_cost();
+        (total, used)
+    }
+}
+
+impl Default for AccountStorage {
+    fn default() -> Self {
+        Self {
+            storage_usage: 0,
+            storage_balance: 0
+        }
+    }
+}
+'''
+'''--- src/dynamic_storage_management/dynamic_storage_basic.rs ---
+use near_sdk::{AccountId, Balance};
+use near_sdk::json_types::U128;
+
+pub trait DynamicStorageBasic {
+    fn register_account(&mut self, account_id: AccountId, deposit_balance: Balance);
+
+    fn unregister_account(&mut self, account_id: &AccountId) -> Balance;
+
+    fn deposit_storage_balance(&mut self, account_id: &AccountId, deposit_balance: Balance);
+
+    fn withdraw_storage_balance(&mut self, account_id: &AccountId, amount: Option<U128>) -> Balance;
+
+    fn register_account_or_deposit_storage_balance(&mut self, account_id: AccountId, deposit_balance: Balance);
+
+    fn account_registered(&self, account_id: &AccountId) -> bool;
+
+    fn enough_storage_balance(&self, account_id: &AccountId) -> bool;
+
+    fn storage_balance(&self, account_id: &AccountId) -> Option<(Balance, Balance)>;
+
+    fn assert_no_registration(&self, account_id: &AccountId);
+
+    fn assert_registration(&self, account_id: &AccountId);
+
+    fn assert_storage_balance(&self, account_id: &AccountId);
+}
+'''
+'''--- src/dynamic_storage_management/dynamic_storage_core.rs ---
+use near_sdk::AccountId;
+
+pub trait DynamicStorageCore {
+    fn start_measure_storage(&mut self);
+
+    fn stop_measure_storage(&mut self);
+
+    fn update_storage_usage(&mut self, account_id: &AccountId);
+
+    fn stop_measure_and_update_storage_usage(&mut self, account_id: &AccountId);
+}
+'''
+'''--- src/dynamic_storage_management/dynamic_storage_manager.rs ---
+use super::storage_measurement::StorageMeasurement;
+use super::account_storage::AccountStorage;
+use super::errors::{ERROR_ACCOUNT_ALREADY_REGISTERED, ERROR_ACCOUNT_NOT_REGISTERED};
+
+use near_sdk::{AccountId, Balance, IntoStorageKey, require};
+use near_sdk::borsh::{self,BorshDeserialize,BorshSerialize};
+use near_sdk::collections::LookupMap;
+use near_sdk::json_types::U128;
+use crate::dynamic_storage_management::dynamic_storage_basic::DynamicStorageBasic;
+use crate::dynamic_storage_management::dynamic_storage_core::DynamicStorageCore;
+use crate::dynamic_storage_management::errors::ERROR_NOT_ENOUGH_STORAGE_BALANCE;
+
+#[derive(BorshDeserialize,BorshSerialize)]
+pub struct DynamicStorageManager {
+    /// Storage usage of accounts
+    accounts: LookupMap<AccountId, AccountStorage>,
+    /// Measuring storage usage and saving the storage usage change
+    #[borsh_skip]
+    storage_measurement: StorageMeasurement
+}
+
+impl DynamicStorageManager {
+    pub fn new<S>(key_prefix: S) -> Self where S: IntoStorageKey {
+        Self {
+            accounts: LookupMap::new(key_prefix),
+            storage_measurement: StorageMeasurement::default()
+        }
+    }
+}
+
+impl DynamicStorageBasic for DynamicStorageManager {
+    /// Register account with any storage balance.
+    /// The storage usage change caused by this method has been calculated.
+    /// Panic when account is already registered.
+    fn register_account(&mut self, account_id: AccountId, amount: Balance) {
+        if self.account_registered(&account_id) {
+            panic!("{}", ERROR_ACCOUNT_ALREADY_REGISTERED);
+        };
+        let mut account_storage = AccountStorage::default();
+        account_storage.deposit_storage_balance(amount);
+
+        self.start_measure_storage();
+        self.accounts.insert(&account_id, &account_storage);
+        self.stop_measure_and_update_storage_usage(&account_id);
+    }
+    /// Unregister account.
+    /// Return remaining balance.
+    /// Panic when account is not registered.
+    fn unregister_account(&mut self, account_id: &AccountId) -> Balance {
+        let mut account_storage = self.accounts
+            .get(account_id)
+            .expect(ERROR_ACCOUNT_NOT_REGISTERED);
+        account_storage.reset_storage_usage();
+        let withdraw_amount = account_storage.withdraw_storage_balance(None);
+        self.accounts.remove(account_id);
+        withdraw_amount
+    }
+    /// Deposit more storage balance.
+    /// Panic when account is not registered.
+    fn deposit_storage_balance(&mut self, account_id: &AccountId, amount: Balance) {
+        let mut account_storage = self.accounts
+            .get(account_id)
+            .expect(ERROR_ACCOUNT_NOT_REGISTERED);
+        account_storage.deposit_storage_balance(amount);
+        self.accounts.insert(account_id, &account_storage);
+    }
+    /// Withdraw storage balance.
+    /// If amount is [None] or amount is greater than available balance,
+    /// withdraw available balance, else withdraw amount.
+    /// Return withdraw balance.
+    /// Panic when account is not registered.
+    fn withdraw_storage_balance(&mut self, account_id: &AccountId, amount: Option<U128>) -> Balance {
+        let mut account_storage = self.accounts
+            .get(account_id)
+            .expect(ERROR_ACCOUNT_NOT_REGISTERED);
+        let withdraw_amount = account_storage.withdraw_storage_balance(amount);
+        self.accounts.insert(account_id, &account_storage);
+        withdraw_amount
+    }
+    /// Register account if it is not registered, else deposit more storage balance
+    fn register_account_or_deposit_storage_balance(&mut self, account_id: AccountId, amount: Balance) {
+        if !self.account_registered(&account_id) {
+            self.register_account(account_id, amount);
+        } else {
+            self.deposit_storage_balance(&account_id, amount);
+        }
+    }
+    /// Whether account is registered.
+    fn account_registered(&self, account_id: &AccountId) -> bool {
+        self.accounts.get(account_id).is_some()
+    }
+    /// Whether account has enough balance to recover storage usage.
+    /// If account is not registered or storage balance is not enough, return false, else return true.
+    fn enough_storage_balance(&self, account_id: &AccountId) -> bool {
+        match self.storage_balance(account_id) {
+            None => false,
+            Some((total, used)) => total >= used
+        }
+    }
+    /// Get storage balance.
+    /// If account is not registered, return [None], else return tuple (total, used).
+    /// Note: used storage balance may be greater than total due to changing storage prices or incorrect storage ownership.
+    fn storage_balance(&self, account_id: &AccountId) -> Option<(Balance, Balance)> {
+        Some(self.accounts.get(account_id)?.storage_balance())
+    }
+
+    fn assert_no_registration(&self, account_id: &AccountId) {
+        require!(!self.account_registered(account_id), ERROR_ACCOUNT_ALREADY_REGISTERED);
+    }
+
+    fn assert_registration(&self, account_id: &AccountId) {
+        require!(self.account_registered(account_id), ERROR_ACCOUNT_NOT_REGISTERED);
+    }
+
+    fn assert_storage_balance(&self, account_id: &AccountId) {
+        require!(self.enough_storage_balance(account_id), ERROR_NOT_ENOUGH_STORAGE_BALANCE);
+    }
+}
+
+impl DynamicStorageCore for DynamicStorageManager {
+    /// Start measure storage, it will save current contract storage usage and set measurement pending.
+    /// Panic when repeated start measurement.
+    fn start_measure_storage(&mut self) {
+        self.storage_measurement.start();
+    }
+    /// Stop measure storage, it will calculate and save the storage change from the latest start to the present and set measurement idle.
+    /// Panic when missing start measurement.
+    fn stop_measure_storage(&mut self) {
+        self.storage_measurement.stop();
+    }
+    /// Update storage usage, then reset measurement.
+    /// Panic when 1.Account is not registered. 2.Measurement is pending.
+    fn update_storage_usage(&mut self, account_id: &AccountId) {
+        let mut account_storage = self.accounts
+            .get(account_id)
+            .expect(ERROR_ACCOUNT_NOT_REGISTERED);
+        let storage_usage_change = self.storage_measurement.storage_usage_change();
+        if storage_usage_change != 0 {
+            account_storage.update_storage_usage(storage_usage_change);
+            self.accounts.insert(account_id, &account_storage);
+        }
+        self.storage_measurement.reset();
+    }
+    /// Stop measure storage and update storage usage immediately, then reset measurement.
+    /// Panic when 1.Account is not registered 2.Missing start measurement 3.Measurement is pending.
+    fn stop_measure_and_update_storage_usage(&mut self, account_id: &AccountId) {
+        self.stop_measure_storage();
+        self.update_storage_usage(account_id);
+    }
+}
+'''
+'''--- src/dynamic_storage_management/errors.rs ---
+pub const ERROR_ACCOUNT_ALREADY_REGISTERED: &str = "Error: Account is already registered.";
+pub const ERROR_ACCOUNT_NOT_REGISTERED: &str = "Error: Account is not registered.";
+pub const ERROR_NOT_ENOUGH_STORAGE_BALANCE: &str = "Error: Not enough storage balance";
+
+pub const ERROR_MISSING_START_STORAGE_MEASUREMENT: &str = "Error: Missing start storage measurement. Consider starting the storage measurement.";
+pub const ERROR_REPEATED_START_STORAGE_MEASUREMENT: &str = "Error: Repeated start storage measurement. Consider stopping the last storage measurement.";
+pub const ERROR_PENDING_STORAGE_MEASUREMENT: &str = "Error: Pending storage measurement. Consider stopping the storage measurement.";
+
+'''
+'''--- src/dynamic_storage_management/mod.rs ---
+//! # Example
+//! ```
+//! #[near_bindgen]
+//! #[derive(BorshDeserialize, BorshSerialize)]
+//! struct StatusMessage {
+//!     records: LookupMap<AccountId, String>,
+//!     // add storage manager field
+//!     storage_manager: DynamicStorageManager
+//! }
+//!
+//! #[near_bindgen]
+//! impl StatusMessage {
+//!     // register method
+//!     #[payable]
+//!     pub fn register_account(&mut self, account_id: AccountId) {
+//!         let amount = env::attached_deposit();
+//!         require!(amount > 0, "No balance for storage");
+//!         self.storage_manager.assert_no_registration(&account_id);
+//!         self.storage_manager.register_account(account_id, amount);
+//!     }
+//!
+//!     // storage change method
+//!     pub fn set_status(&mut self, message: String) {
+//!         self.storage_manager.assert_registration(&account_id);
+//!         // start
+//!         self.storage_manager.start_measure_storage();
+//!         // your storage change operation
+//!         self.records.insert(&account_id, &message);
+//!         // stop and update
+//!         self.storage_manager.stop_measure_and_update_storage_usage(&account_id);
+//!         self.storage_manager.assert_storage_balance(&account_id);
+//!     }
+//! }
+//! ```
+
+mod dynamic_storage_manager;
+pub use dynamic_storage_manager::DynamicStorageManager;
+
+mod account_storage;
+mod storage_measurement;
+mod errors;
+
+mod dynamic_storage_core;
+pub use dynamic_storage_core::DynamicStorageCore;
+
+mod dynamic_storage_basic;
+pub use dynamic_storage_basic::DynamicStorageBasic;
+
+type StorageUsageChange = i128;
+'''
+'''--- src/dynamic_storage_management/storage_measurement.rs ---
+use super::StorageUsageChange;
+use super::errors::{ERROR_REPEATED_START_STORAGE_MEASUREMENT, ERROR_MISSING_START_STORAGE_MEASUREMENT, ERROR_PENDING_STORAGE_MEASUREMENT};
+
+use near_sdk::{env, StorageUsage};
+
+enum MeasurementState {
+    Pending,
+    Idle
+}
+
+pub struct StorageMeasurement {
+    storage_usage_reference: StorageUsage,
+    storage_usage_change: StorageUsageChange,
+    state: MeasurementState
+}
+
+impl StorageMeasurement {
+    pub fn reset(&mut self) {
+        self.storage_usage_reference = 0;
+        self.storage_usage_change = 0;
+        self.state = MeasurementState::Idle;
+    }
+
+    pub fn start(&mut self) {
+        match self.state {
+            MeasurementState::Pending => {
+                panic!("{}", ERROR_REPEATED_START_STORAGE_MEASUREMENT);
+            }
+            MeasurementState::Idle => {
+                self.storage_usage_reference = env::storage_usage();
+                self.state = MeasurementState::Pending;
+            }
+        }
+    }
+
+    pub fn stop(&mut self) {
+        match self.state {
+            MeasurementState::Pending => {
+                self.storage_usage_change +=
+                    StorageUsageChange::from(env::storage_usage()) -
+                        StorageUsageChange::from(self.storage_usage_reference);
+                self.storage_usage_reference = 0;
+                self.state = MeasurementState::Idle;
+            }
+            MeasurementState::Idle => {
+                panic!("{}", ERROR_MISSING_START_STORAGE_MEASUREMENT);
+            }
+        }
+    }
+
+    pub fn storage_usage_change(&self) -> StorageUsageChange {
+        match self.state {
+            MeasurementState::Pending => {
+                panic!("{}", ERROR_PENDING_STORAGE_MEASUREMENT)
+            }
+            MeasurementState::Idle => {
+                self.storage_usage_change
+            }
+        }
+    }
+}
+
+impl Default for StorageMeasurement {
+    fn default() -> Self {
+        Self {
+            storage_usage_reference: 0,
+            storage_usage_change: 0,
+            state: MeasurementState::Idle
+        }
+    }
+}
+'''
+'''--- src/enums.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::serde::{Serialize,Deserialize};
+use near_sdk::BorshStorageKey;
+
+#[derive(BorshStorageKey,BorshSerialize)]
+pub enum StorageKey {
+    RedPackets,
+    Owners,
+    DynamicStorageManager
+}
+
+#[derive(BorshDeserialize,BorshSerialize,Serialize,Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub enum Token {
+    NEAR,
+    FungibleToken
+}
+
+#[derive(BorshDeserialize,BorshSerialize,Serialize,Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub enum SplitMod {
+    Average,
+    Random
+}
+'''
+'''--- src/errors.rs ---
+pub const ERR_01_NO_MATCHING_RED_PACKET: &str = "ERROR_01: No matching red packet";
+pub const ERR_02_NO_PERMISSION_TO_RED_PACKET: &str = "ERROR_02: No Permission to red packet";
+pub const ERR_03_RED_PACKET_NOT_RUN_OUT: &str = "ERROR_03: Red packet does not run out";
+pub const ERR_04_INVALID_PARAMETER: &str = "ERROR_04: Invalid red packet parameter exists";
+pub const ERR_05_NOT_UNIQUE_PUBLIC_KEY: &str = "ERROR_05: Red packet with the same public key exists";
+pub const ERR_07_NO_DOUBLE_CLAIM: &str = "ERROR_07: No double claim";
+pub const ERR_08_CLAIMER_NOT_IN_WHITE_LIST: &str = "ERROR_08: Claimer is not in the white list of red packet";
+pub const ERR_09_CLAIM_FT_RED_PACKET_FAILED: &str = "ERROR_09: Failed to claim fungible token red packet";
+
+pub const ERR_11_WRONG_RECEIVER_MESSAGE: &str = "ERROR_11: Wrong receiver message";
+
+pub const ERR_24_NO_STORAGE_BALANCE_BOUNDS: &str = "ERROR_24: This contract does not have storage balance bounds. Depending on dynamic storage usage";
+'''
+'''--- src/impl_fungible_token_receiver.rs ---
+use crate::Contract;
+use crate::ContractExt;
+use crate::errors::*;
+use crate::enums::SplitMod;
+
+use std::collections::HashSet;
+use near_contract_standards::fungible_token::receiver::FungibleTokenReceiver;
+use near_sdk::{AccountId, PromiseOrValue, near_bindgen, serde_json, env, PublicKey};
+use near_sdk::json_types::U128;
+use near_sdk::serde::Deserialize;
+
+#[near_bindgen]
+impl FungibleTokenReceiver for Contract {
+    fn ft_on_transfer(&mut self, sender_id: AccountId, amount: U128, msg: String) -> PromiseOrValue<U128> {
+        if msg.is_empty() {
+            PromiseOrValue::Value(amount)
+        } else {
+            let receiver_message = serde_json::from_str::<ReceiverMessage>(msg.as_str())
+                .expect(ERR_11_WRONG_RECEIVER_MESSAGE);
+            match receiver_message {
+                ReceiverMessage::FungibleTokenRedPacket {
+                    public_key,
+                    split,
+                    split_mod,
+                    msg,
+                    white_list
+                } => {
+                    self.internal_create_fungible_token_red_packet(
+                        env::predecessor_account_id(),
+                        sender_id,
+                        amount,
+                        public_key,
+                        split,
+                        split_mod,
+                        msg,
+                        white_list
+                    )
+                }
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(crate = "near_sdk::serde", untagged)]
+pub enum ReceiverMessage {
+    FungibleTokenRedPacket {
+        public_key: PublicKey,
+        split: usize,
+        split_mod: SplitMod,
+        msg: Option<String>,
+        white_list: Option<HashSet<AccountId>>
+    }
+}
+
+'''
+'''--- src/impl_saika_red_packet.rs ---
+use crate::enums::*;
+use crate::utils::*;
+use crate::dynamic_storage_management::{DynamicStorageBasic, DynamicStorageCore};
+use crate::errors::*;
+use crate::red_packet::RedPacket;
+use crate::Contract;
+use crate::ContractExt;
+use crate::red_packet_view::{parse_red_packet_view, RedPacketView};
+use crate::saika_red_packet::SaikaRedPacket;
+use crate::cross_other::*;
+
+use std::collections::HashSet;
+use near_sdk::{AccountId, env, near_bindgen, PublicKey, PromiseOrValue, require, Balance, Promise};
+use near_sdk::json_types::{U128};
+
+const ONE_NEAR: u128 = 1_000_000_000_000_000_000_000_000;
+
+#[near_bindgen]
+impl SaikaRedPacket for Contract {
+    /// create a near red packet
+    #[payable]
+    fn create_near_red_packet(
+        &mut self,
+        public_key: PublicKey,
+        split: usize,
+        split_mod: SplitMod,
+        msg: Option<String>,
+        white_list: Option<HashSet<AccountId>>
+    ) {
+        self.internal_create_near_red_packet(
+            env::predecessor_account_id(),
+            env::attached_deposit(),
+            public_key.clone(),
+            split,
+            split_mod,
+            msg,
+            white_list
+        );
+
+        // used for near official linkdrop
+        Promise::new(env::current_account_id())
+            .add_access_key(
+                public_key,
+                250_000_000_000_000_000_000_000,
+                env::current_account_id(),
+                "create_account_and_claim".into()
+            );
+    }
+    /// claim near red Packet and fungible token red packet with private key
+    fn claim_red_packet(&mut self, claimer_id: AccountId) -> U128 {
+        self.internal_claim_red_packet(claimer_id, false)
+    }
+    /// refund balance
+    fn refund(&mut self, public_key: PublicKey) -> U128 {
+        self.internal_refund(public_key)
+    }
+    /// remove red packet run out
+    fn remove_history(&mut self, public_key: PublicKey) {
+        self.internal_remove_history(public_key)
+    }
+    /// remove all red packet run out
+    fn clear_history(&mut self) {
+        self.internal_clear_history();
+    }
+    /// view owner's red packets detail
+    fn get_red_packets_by_owner_id(&self, owner_id: AccountId) -> Vec<RedPacketView> {
+        self.owners.get(&owner_id)
+            .unwrap_or(HashSet::new())
+            .into_iter()
+            .map(|public_key|{
+                let red_packet = self.red_packets
+                    .get(&public_key)
+                    .unwrap();
+                parse_red_packet_view(red_packet, public_key)
+            })
+            .collect()
+    }
+    /// view owner's red packet public keys
+    fn get_pks_by_owner_id(&self, owner_id: AccountId) -> HashSet<PublicKey> {
+        self.owners.get(&owner_id).unwrap_or(HashSet::new())
+    }
+    /// view the red packet detail related to public key
+    fn get_red_packet_by_pk(&self, public_key: PublicKey) -> Option<RedPacketView> {
+        let red_packet = self.red_packets.get(&public_key)?;
+        Some(parse_red_packet_view(red_packet, public_key))
+    }
+
+    /// used for near official linkdrop
+    fn get_key_balance(&self, key: PublicKey) -> U128 {
+        let red_packet = self.red_packets
+            .get(&key)
+            .expect(ERR_01_NO_MATCHING_RED_PACKET);
+        if red_packet.current_balance.0 == 0 {
+            panic!("Red Packet is run out");
+        }
+        match red_packet.token {
+            Token::NEAR => red_packet.current_balance,
+            Token::FungibleToken => unimplemented!("This method only support native NEAR")
+        }
+    }
+
+    /// used for near official linkdrop
+    fn create_account_and_claim(&mut self, new_account_id: AccountId, new_public_key: PublicKey) -> Promise {
+        let claim_amount = self.internal_claim_red_packet(new_account_id.clone(), true);
+        if claim_amount.0 == 0 {
+            panic!("Red Packet is run out");
+        }
+        ext_helper::ext(self.helper_contract_id.clone())
+            .with_attached_deposit(claim_amount.0)
+            .create_account(new_account_id, new_public_key)
+    }
+}
+
+impl Contract {
+    pub fn internal_create_near_red_packet(
+        &mut self,
+        owner_id: AccountId,
+        amount: Balance,
+        public_key: PublicKey,
+        split: usize,
+        split_mod: SplitMod,
+        msg: Option<String>,
+        white_list: Option<HashSet<AccountId>>
+    ) {
+        self.assert_before_creation(amount, &public_key, &owner_id);
+
+        let near_red_packet = RedPacket::new_valid(
+            Token::NEAR,
+            None,
+            owner_id.clone(),
+            amount.into(),
+            split,
+            split_mod,
+            msg,
+            white_list
+        ).unwrap();
+
+        self.measure_start();
+        self.add_red_packet(owner_id.clone(), public_key, near_red_packet);
+        self.measure_end(&owner_id);
+
+        self.assert_after_creation(&owner_id);
+    }
+
+    pub fn internal_create_fungible_token_red_packet(
+        &mut self,
+        token_id: AccountId,
+        owner_id: AccountId,
+        amount: U128,
+        public_key: PublicKey,
+        split: usize,
+        split_mod: SplitMod,
+        msg: Option<String>,
+        white_list: Option<HashSet<AccountId>>
+    ) -> PromiseOrValue<U128> {
+        self.assert_before_creation(amount.0, &public_key, &owner_id);
+
+        let ft_red_packet = RedPacket::new_valid(
+            Token::FungibleToken,
+            Some(token_id),
+            owner_id.clone(),
+            amount,
+            split,
+            split_mod,
+            msg,
+            white_list,
+        ).unwrap();
+
+        self.measure_start();
+        self.add_red_packet(owner_id.clone(), public_key, ft_red_packet);
+        self.measure_end(&owner_id);
+
+        self.assert_after_creation(&owner_id);
+
+        PromiseOrValue::Value(U128(0))
+    }
+
+    pub fn internal_claim_red_packet(&mut self, claimer_id: AccountId, create: bool) -> U128 {
+        let public_key = env::signer_account_pk();
+        let mut red_packet = self.red_packets
+            .get(&public_key)
+            .expect(ERR_01_NO_MATCHING_RED_PACKET);
+
+        let min_sub = match red_packet.token {
+            Token::NEAR => Some(ONE_NEAR / 10), // 0.1 NEAR
+            Token::FungibleToken => None
+        };
+
+        let claim_amount = red_packet.virtual_claim(claimer_id.clone(), min_sub).unwrap();
+
+        self.measure_start();
+        self.red_packets.insert(&public_key, &red_packet);
+        self.measure_end(&red_packet.owner_id);
+
+        if claim_amount.0 != 0 {
+            match red_packet.token {
+                Token::NEAR => {
+                    if create {
+                        // create new account
+                        // not implemented in this method
+                    } else {
+                        transfer(claimer_id, claim_amount.0);
+                    }
+                },
+                Token::FungibleToken => {
+                    if create {
+                        panic!("Fungible Token can not be used to create account")
+                    } else {
+                        transfer_ft_with_resolve_claim_fungible_token_red_packet(
+                            claimer_id,
+                            claim_amount,
+                            red_packet.token_id.clone().unwrap(),
+                            red_packet.owner_id,
+                            public_key
+                        );
+                    }
+                }
+            };
+        };
+
+        claim_amount
+    }
+
+    pub fn internal_refund(&mut self, public_key: PublicKey) -> U128 {
+        let owner_id = env::predecessor_account_id();
+
+        let mut red_packet = self.red_packets
+            .get(&public_key)
+            .expect(ERR_01_NO_MATCHING_RED_PACKET);
+        let refund_amount = red_packet.virtual_refund(owner_id.clone()).unwrap();
+
+        self.measure_start();
+        self.red_packets.insert(&public_key, &red_packet);
+        self.measure_end(&owner_id);
+
+        if refund_amount.0 != 0 {
+            match red_packet.token {
+                Token::NEAR => {
+                    transfer(owner_id, refund_amount.0);
+                },
+                Token::FungibleToken => {
+                    transfer_ft(owner_id, refund_amount, red_packet.token_id.unwrap());
+                }
+            }
+        }
+
+        refund_amount
+    }
+
+    pub fn internal_remove_history(&mut self, public_key: PublicKey) {
+        let owner_id = env::predecessor_account_id();
+
+        self.measure_start();
+        self.remove_red_packet(&public_key,&owner_id,false);
+        self.measure_end(&owner_id);
+    }
+
+    pub fn internal_clear_history(&mut self) {
+        let owner_id = env::predecessor_account_id();
+
+        self.measure_start();
+        self.clear_red_packets(&owner_id,false);
+        self.measure_end(&owner_id);
+    }
+}
+
+impl Contract {
+    pub fn add_red_packet(
+        &mut self,
+        owner_id: AccountId,
+        public_key: PublicKey,
+        red_packet: RedPacket
+    ) {
+        let mut public_keys = self.owners.get(&owner_id).unwrap_or(HashSet::new());
+        public_keys.insert(public_key.clone());
+        self.owners.insert(&owner_id, &public_keys);
+        self.red_packets.insert(&public_key, &red_packet);
+    }
+
+    pub fn remove_red_packet(&mut self, public_key: &PublicKey, owner_id: &AccountId, force: bool) {
+        match self.red_packets.get(public_key) {
+            None => {
+                return;
+            }
+            Some(red_packet) => {
+                if *owner_id != red_packet.owner_id {
+                    panic!("{}", ERR_02_NO_PERMISSION_TO_RED_PACKET);
+                };
+                if !red_packet.is_run_out() && !force {
+                    panic!("{}", ERR_03_RED_PACKET_NOT_RUN_OUT);
+                };
+
+                let mut public_keys = self.owners.get(&owner_id).unwrap();
+                public_keys.remove(public_key);
+
+                if public_keys.is_empty() {
+                    self.owners.remove(owner_id);
+                } else {
+                    self.owners.insert(owner_id, &public_keys);
+                }
+                self.red_packets.remove(public_key);
+            }
+        };
+    }
+
+    pub fn clear_red_packets(&mut self, owner_id: &AccountId, force: bool) {
+        match self.owners.get(owner_id) {
+            None => {
+                return;
+            }
+            Some(mut public_keys) => {
+                public_keys.retain(|public_key| {
+                    let red_packet = self.red_packets.get(public_key).unwrap();
+                    let is_run_out = red_packet.is_run_out();
+                    if is_run_out || force {
+                        self.red_packets.remove(public_key);
+                    };
+                    !is_run_out && !force
+                });
+
+                if public_keys.is_empty() {
+                    self.owners.remove(owner_id);
+                } else {
+                    self.owners.insert(owner_id, &public_keys);
+                }
+            }
+        };
+    }
+
+    pub fn red_packet_count(&self, owner_id: &AccountId) -> (usize, usize) {
+        let mut total = 0;
+        let mut run_out = 0;
+
+        match self.owners.get(owner_id) {
+            None => (),
+            Some(public_keys) => {
+                total = public_keys.len();
+                for public_key in public_keys {
+                    let red_packet = self.red_packets.get(&public_key).unwrap();
+                    if red_packet.is_run_out() {
+                        run_out += 1;
+                    };
+                };
+            }
+        };
+        (total, run_out)
+    }
+
+    pub fn all_red_packets_run_out(&self, owner_id: &AccountId) -> bool {
+        let count = self.red_packet_count(owner_id);
+        count.0 == count.1
+    }
+
+    pub fn unique_public_key(&self, public_key: &PublicKey) -> bool {
+        self.red_packets.get(public_key).is_none()
+    }
+
+    pub fn measure_start(&mut self) {
+        self.storage_manager.start_measure_storage();
+    }
+
+    pub fn measure_end(&mut self, account_id: &AccountId) {
+        self.storage_manager.stop_measure_and_update_storage_usage(account_id);
+    }
+
+    pub fn assert_unique_public_key(&self, public_key: &PublicKey) {
+        require!(self.unique_public_key(public_key), ERR_05_NOT_UNIQUE_PUBLIC_KEY);
+    }
+
+    pub fn assert_before_creation(&self, amount: Balance, public_key: &PublicKey, account_id: &AccountId) {
+        assert_zero_deposit(amount);
+        self.storage_manager.assert_registration(account_id);
+        self.storage_manager.assert_storage_balance(account_id);
+        self.assert_unique_public_key(public_key);
+    }
+
+    pub fn assert_after_creation(&self, account_id: &AccountId) {
+        self.storage_manager.assert_storage_balance(account_id);
+    }
+}
+
+'''
+'''--- src/impl_saika_red_packet_resolver.rs ---
+use crate::Contract;
+use crate::ContractExt;
+use crate::errors::*;
+use crate::utils::transfer_ft;
+use crate::saika_red_packet_resolver::SaikaRedPacketResolver;
+
+use near_sdk::{AccountId, is_promise_success, log, near_bindgen, PublicKey};
+use near_sdk::json_types::U128;
+
+#[near_bindgen]
+impl SaikaRedPacketResolver for Contract {
+    #[private]
+    fn resolve_claim_fungible_token_red_packet(
+        &mut self,
+        claimer_id: AccountId,
+        owner_id: AccountId,
+        amount: U128,
+        token_id: AccountId,
+        public_key: PublicKey
+    ) {
+        if !is_promise_success() {
+            log!("{}", ERR_09_CLAIM_FT_RED_PACKET_FAILED);
+            if let Some(mut red_packet) = self.red_packets.get(&public_key) {
+                red_packet.failed_claimer(claimer_id, amount);
+                self.red_packets.insert(&public_key, &red_packet);
+            };
+            log!("Refund balance to red packet owner, owner id: {}, amount: {}, token id: {}", owner_id, amount.0, token_id);
+            transfer_ft(owner_id, amount, token_id);
+        } else {
+            log!("Success claim fungible token red packet, amount: {}, token id: {}", amount.0, token_id);
+        }
+    }
+}
+'''
+'''--- src/impl_storage_management.rs ---
+use crate::Contract;
+use crate::ContractExt;
+use crate::dynamic_storage_management::DynamicStorageBasic;
+use crate::errors::*;
+use crate::utils::{assert_zero_deposit, transfer};
+
+use near_contract_standards::storage_management::{StorageBalance, StorageBalanceBounds, StorageManagement};
+use near_sdk::{near_bindgen, AccountId, env, assert_one_yocto};
+use near_sdk::json_types::U128;
+
+#[near_bindgen]
+impl StorageManagement for Contract {
+    #[payable]
+    fn storage_deposit(&mut self, account_id: Option<AccountId>, registration_only: Option<bool>) -> StorageBalance {
+        self.internal_storage_deposit(account_id, registration_only)
+    }
+
+    fn storage_withdraw(&mut self, amount: Option<U128>) -> StorageBalance {
+        self.internal_storage_withdraw(env::predecessor_account_id(), amount)
+    }
+
+    #[payable]
+    fn storage_unregister(&mut self, force: Option<bool>) -> bool {
+        self.internal_storage_unregister(force)
+    }
+
+    fn storage_balance_bounds(&self) -> StorageBalanceBounds {
+        self.internal_storage_balance_bounds()
+    }
+
+    fn storage_balance_of(&self, account_id: AccountId) -> Option<StorageBalance> {
+        self.internal_storage_balance_of(account_id)
+    }
+}
+
+impl Contract {
+    fn internal_storage_deposit(&mut self, account_id: Option<AccountId>, registration_only: Option<bool>) -> StorageBalance {
+        let account_id = account_id.unwrap_or(env::predecessor_account_id());
+        let registration_only = registration_only.unwrap_or(false);
+        let amount = env::attached_deposit();
+
+        assert_zero_deposit(amount);
+
+        if registration_only {
+            self.storage_manager.assert_no_registration(&account_id);
+            self.storage_manager.register_account(account_id.clone(), amount);
+        } else {
+            self.storage_manager.register_account_or_deposit_storage_balance(account_id.clone(), amount);
+        };
+
+        self.internal_storage_balance_of(account_id).unwrap()
+    }
+
+    fn internal_storage_withdraw(&mut self, account_id: AccountId, amount: Option<U128>) -> StorageBalance {
+        self.storage_manager.assert_registration(&account_id);
+
+        let withdraw_amount = self.storage_manager.withdraw_storage_balance(&account_id, amount);
+        if withdraw_amount > 0 {
+            transfer(account_id.clone(), withdraw_amount);
+        };
+
+        self.internal_storage_balance_of(account_id).unwrap()
+    }
+
+    fn internal_storage_unregister(&mut self, force: Option<bool>) -> bool {
+        assert_one_yocto();
+        let account_id = env::predecessor_account_id();
+        let force = force.unwrap_or(false);
+
+        self.storage_manager.assert_registration(&account_id);
+
+        if self.all_red_packets_run_out(&account_id) || force {
+            self.clear_red_packets(&account_id, force);
+            let withdraw_balance = self.storage_manager.unregister_account(&account_id);
+            if withdraw_balance > 0 {
+                transfer(account_id, withdraw_balance);
+            };
+            return true
+        };
+
+        false
+    }
+
+    pub fn internal_storage_balance_bounds(&self) -> StorageBalanceBounds {
+        panic!("{}", ERR_24_NO_STORAGE_BALANCE_BOUNDS);
+    }
+
+    pub fn internal_storage_balance_of(&self, account_id: AccountId) -> Option<StorageBalance> {
+        let (total, used) = self.storage_manager.storage_balance(&account_id)?;
+        let available;
+        if used >= total {
+            available = 0;
+        } else {
+            available = total - used;
+        };
+        Some(
+            StorageBalance {
+                total: total.into(),
+                available: available.into()
+            }
+        )
+    }
+}
+'''
+'''--- src/lib.rs ---
+mod red_packet;
+mod constants;
+mod utils;
+mod enums;
+mod cross_other;
+mod impl_fungible_token_receiver;
+mod errors;
+mod impl_storage_management;
+mod dynamic_storage_management;
+mod cross_self;
+mod saika_red_packet_resolver;
+mod impl_saika_red_packet;
+mod red_packet_view;
+mod saika_red_packet;
+mod impl_saika_red_packet_resolver;
+
+use crate::dynamic_storage_management::DynamicStorageManager;
+use crate::enums::StorageKey;
+use crate::red_packet::RedPacket;
+
+use std::collections::HashSet;
+use near_sdk::collections::{UnorderedMap};
+use near_sdk::{AccountId, PublicKey, PanicOnDefault, near_bindgen, env};
+use near_sdk::borsh::{self, BorshDeserialize,BorshSerialize};
+
+#[near_bindgen]
+#[derive(BorshDeserialize,BorshSerialize,PanicOnDefault)]
+struct OldContract {
+    red_packets: UnorderedMap<PublicKey, RedPacket>,
+    owners: UnorderedMap<AccountId, HashSet<PublicKey>>,
+    storage_manager: DynamicStorageManager
+}
+
+#[near_bindgen]
+#[derive(BorshDeserialize,BorshSerialize,PanicOnDefault)]
+struct Contract {
+    red_packets: UnorderedMap<PublicKey, RedPacket>,
+    owners: UnorderedMap<AccountId, HashSet<PublicKey>>,
+    storage_manager: DynamicStorageManager,
+    helper_contract_id: AccountId
+}
+
+#[near_bindgen]
+impl Contract {
+    #[init]
+    #[private]
+    pub fn init(helper_contract_id: AccountId) -> Self {
+        Self {
+            red_packets: UnorderedMap::new(StorageKey::RedPackets),
+            owners: UnorderedMap::new(StorageKey::Owners),
+            storage_manager: DynamicStorageManager::new(StorageKey::DynamicStorageManager),
+            helper_contract_id
+        }
+    }
+
+    #[init(ignore_state)]
+    #[private]
+    pub fn upgrade(helper_contract_id: AccountId) -> Self {
+        let contract = env::state_read::<OldContract>().unwrap();
+        Self {
+            red_packets: contract.red_packets,
+            owners: contract.owners,
+            storage_manager: contract.storage_manager,
+            helper_contract_id
+        }
+    }
+}
+'''
+'''--- src/red_packet.rs ---
+use crate::constants::*;
+use crate::utils::*;
+use crate::errors::*;
+use crate::enums::{SplitMod, Token};
+
+use std::collections::{HashMap, HashSet};
+use near_sdk::{AccountId, env};
+use near_sdk::json_types::{U128, U64};
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::serde::Serialize;
+
+#[derive(BorshDeserialize,BorshSerialize,Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct RedPacket {
+    pub token: Token,
+    pub token_id: Option<AccountId>,
+    pub owner_id: AccountId,
+    pub init_balance: U128,
+    pub current_balance: U128,
+    pub refunded_balance: U128,
+    pub init_split: usize,
+    pub current_split: usize,
+    pub split_mod: SplitMod,
+    pub msg: Option<String>,
+    pub white_list: Option<HashSet<AccountId>>,
+    pub claimers: HashMap<AccountId, U128>,
+    pub failed_claimers: HashMap<AccountId, U128>,
+    pub create_timestamp: U64,
+    pub run_out_timestamp: Option<U64>
+}
+
+impl RedPacket {
+    pub fn new_valid(
+        token: Token,
+        token_id: Option<AccountId>,
+        owner_id: AccountId,
+        amount: U128,
+        split: usize,
+        split_mod: SplitMod,
+        msg: Option<String>,
+        white_list: Option<HashSet<AccountId>>
+    ) -> Result<Self, &'static str> {
+        let red_packet = Self {
+            token,
+            token_id,
+            owner_id,
+            init_balance: amount,
+            current_balance: amount,
+            refunded_balance: U128(0),
+            init_split: split,
+            current_split: split,
+            split_mod,
+            msg,
+            white_list,
+            claimers: HashMap::new(),
+            failed_claimers: HashMap::new(),
+            create_timestamp: U64(env::block_timestamp()),
+            run_out_timestamp: None
+        };
+        if !red_packet.is_valid() {
+            return Err(ERR_04_INVALID_PARAMETER);
+        };
+        Ok(red_packet)
+    }
+
+    pub fn is_run_out(&self) -> bool {
+        self.current_split == 0
+    }
+
+    pub fn is_valid(&self) -> bool {
+        match self.token {
+            Token::NEAR => {
+                if self.token_id.is_some() {
+                    return false;
+                }
+            },
+            Token::FungibleToken => {
+                if self.token_id.is_none() {
+                    return false;
+                }
+            }
+        }
+
+        if self.init_split == 0 || self.init_split > MAX_RED_PACKET_SPLIT {
+            return false;
+        }
+        if self.init_balance.0 < self.init_split as u128 {
+            return false;
+        }
+        if let Some(msg) = &self.msg {
+            if msg.len() > MAX_RED_PACKET_MSG_LEN {
+                return false;
+            }
+        }
+        if let Some(wl) = &self.white_list {
+            if wl.len() != self.init_split as usize {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub fn virtual_claim(&mut self, claimer_id: AccountId, min_sub: Option<u128>) -> Result<U128, &'static str> {
+        if self.is_run_out() {
+            return Ok(U128(0));
+        };
+
+        if self.claimers.contains_key(&claimer_id) {
+            return Err(ERR_07_NO_DOUBLE_CLAIM);
+        }
+
+        if let Some(wl) = &mut self.white_list {
+            if !wl.contains(&claimer_id) {
+                return Err(ERR_08_CLAIMER_NOT_IN_WHITE_LIST);
+            } else {
+                wl.remove(&claimer_id);
+            }
+        };
+
+        let claim_amount: u128;
+
+        match self.split_mod {
+            SplitMod::Average => {
+                claim_amount = average_sub(
+                    self.current_balance.0,
+                    self.current_split
+                );
+            },
+            SplitMod::Random => {
+                claim_amount = random_sub(
+                    self.current_balance.0,
+                    self.current_split,
+                    min_sub
+                );
+            }
+        };
+
+        self.claimers.insert(claimer_id, claim_amount.into());
+        self.current_balance.0 -= claim_amount;
+        self.current_split -= 1;
+
+        if self.is_run_out() {
+            self.run_out_timestamp = Some(U64(env::block_timestamp()));
+        };
+
+        Ok(claim_amount.into())
+    }
+
+    pub fn virtual_refund(&mut self, owner_id: AccountId) -> Result<U128, &'static str> {
+        if self.is_run_out() {
+            return Ok(U128(0));
+        };
+
+        if self.owner_id != owner_id {
+            return Err(ERR_02_NO_PERMISSION_TO_RED_PACKET);
+        };
+
+        self.refunded_balance.0 += self.current_balance.0;
+        self.current_balance = U128(0);
+        self.current_split = 0;
+        if let Some(wl) = &mut self.white_list {
+            wl.clear();
+        };
+        self.run_out_timestamp = Some(U64(env::block_timestamp()));
+
+        Ok(self.refunded_balance)
+    }
+
+    pub fn failed_claimer(&mut self, claimer_id: AccountId, failed_amount: U128) {
+        self.claimers.remove(&claimer_id);
+        self.failed_claimers.insert(claimer_id, failed_amount);
+        self.refunded_balance.0 += failed_amount.0;
+    }
+}
+
+'''
+'''--- src/red_packet_view.rs ---
+use crate::enums::{SplitMod, Token};
+use crate::RedPacket;
+
+use std::collections::{HashMap, HashSet};
+use near_sdk::{AccountId, PublicKey};
+use near_sdk::json_types::{U128, U64};
+use near_sdk::serde::{Serialize,Deserialize};
+
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct RedPacketView {
+    pub public_key: PublicKey,
+    pub token: Token,
+    pub token_id: Option<AccountId>,
+    pub owner_id: AccountId,
+    pub init_balance: U128,
+    pub current_balance: U128,
+    pub refunded_balance: U128,
+    pub init_split: usize,
+    pub current_split: usize,
+    pub split_mod: SplitMod,
+    pub msg: Option<String>,
+    pub white_list: Option<HashSet<AccountId>>,
+    pub claimers: HashMap<AccountId, U128>,
+    pub failed_claimers: HashMap<AccountId, U128>,
+    pub create_timestamp: U64,
+    pub run_out_timestamp: Option<U64>,
+    pub is_run_out: bool
+}
+
+pub fn parse_red_packet_view(red_packet: RedPacket, public_key: PublicKey) -> RedPacketView {
+    RedPacketView {
+        public_key,
+        is_run_out: red_packet.is_run_out(),
+        token: red_packet.token,
+        token_id: red_packet.token_id,
+        owner_id: red_packet.owner_id,
+        init_balance: red_packet.init_balance,
+        current_balance: red_packet.current_balance,
+        refunded_balance: red_packet.refunded_balance,
+        init_split: red_packet.init_split,
+        current_split: red_packet.current_split,
+        split_mod: red_packet.split_mod,
+        msg: red_packet.msg,
+        white_list: red_packet.white_list,
+        claimers: red_packet.claimers,
+        failed_claimers: red_packet.failed_claimers,
+        create_timestamp:red_packet.create_timestamp,
+        run_out_timestamp: red_packet.run_out_timestamp
+    }
+}
+'''
+'''--- src/saika_red_packet.rs ---
+use crate::enums::SplitMod;
+use crate::red_packet_view::RedPacketView;
+
+use std::collections::HashSet;
+use near_sdk::{AccountId, Promise, PublicKey};
+use near_sdk::json_types::U128;
+
+pub trait SaikaRedPacket {
+    fn create_near_red_packet(
+        &mut self,
+        public_key: PublicKey,
+        split: usize,
+        split_mod: SplitMod,
+        msg: Option<String>,
+        white_list: Option<HashSet<AccountId>>
+    );
+
+    fn claim_red_packet(&mut self, claimer_id: AccountId) -> U128;
+
+    fn refund(&mut self, public_key: PublicKey) -> U128;
+
+    fn remove_history(&mut self, public_key: PublicKey);
+
+    fn clear_history(&mut self);
+
+    fn get_red_packets_by_owner_id(&self, owner_id: AccountId) -> Vec<RedPacketView>;
+
+    fn get_pks_by_owner_id(&self, owner_id: AccountId) -> HashSet<PublicKey>;
+
+    fn get_red_packet_by_pk(&self, public_key: PublicKey) -> Option<RedPacketView>;
+
+    fn get_key_balance(&self, key: PublicKey) -> U128;
+
+    fn create_account_and_claim(&mut self, new_account_id: AccountId, new_public_key: PublicKey) -> Promise;
+}
+'''
+'''--- src/saika_red_packet_resolver.rs ---
+use near_sdk::{AccountId, PublicKey};
+use near_sdk::json_types::U128;
+
+pub trait SaikaRedPacketResolver {
+    fn resolve_claim_fungible_token_red_packet(
+        &mut self,
+        claimer_id: AccountId,
+        owner_id: AccountId,
+        amount: U128,
+        token_id: AccountId,
+        public_key: PublicKey
+    );
+}
+
+'''
+'''--- src/utils.rs ---
+use crate::cross_other::ext_ft;
+use crate::cross_self::ext_self;
+use crate::constants::*;
+
+use std::cmp::min;
+use near_sdk::{AccountId, Balance, env, Promise, PublicKey, require};
+use near_sdk::json_types::U128;
+
+pub fn assert_zero_deposit(amount: Balance) {
+    require!(amount > 0, "Deposit amount is 0");
+}
+
+pub fn average_sub(number: u128, split: usize) -> u128 {
+    let split = u128::try_from(split).unwrap();
+    require!(number >= split, "number must >= split");
+    return number / split
+}
+
+pub fn random_sub(number: u128, split: usize, min_sub: Option<u128>) -> u128 {
+    // The closer min_sub gets to 0, the fairer it is
+    let min_sub = min_sub.unwrap_or(1);
+    let split = u128::try_from(split).unwrap();
+    require!(number >= split * min_sub, "number must >= split * min_sub, default min_sub == 1");
+    if split == 1 {
+        return number;
+    };
+    let max_sub = min(number - min_sub * (split - 1), 2 * (number / split));
+    gen_range(min_sub, max_sub + 1)
+}
+
+pub fn rand_u128() -> u128 {
+    let seed = env::random_seed();
+    let mut arr: [u8; 16] = Default::default();
+    arr.copy_from_slice(&seed[..16]);
+    u128::from_le_bytes(arr)
+}
+
+pub fn gen_range(start: u128, end: u128) -> u128 {
+    rand_u128() % (end - start) + start
+}
+
+pub fn transfer(to: AccountId, amount: Balance) -> Promise {
+    Promise::new(to).transfer(amount)
+}
+
+pub fn transfer_ft(to: AccountId, amount: U128, token_id: AccountId) -> Promise {
+    ext_ft::ext(token_id)
+        .with_attached_deposit(ONE_YOCTO)
+        .with_static_gas(GAS_FOR_FT_TRANSFER)
+        .ft_transfer(to, amount, None)
+}
+
+pub fn transfer_ft_with_resolve_claim_fungible_token_red_packet(
+    to: AccountId,
+    amount: U128,
+    token_id: AccountId,
+    owner_id: AccountId,
+    public_key: PublicKey
+) -> Promise {
+    transfer_ft(to.clone(), amount, token_id.clone())
+        .then(
+            ext_self::ext(env::current_account_id())
+                .with_static_gas(GAS_FOR_RESOLVE_CLAIM_FUNGIBLE_TOKEN_RED_PACKET)
+                .resolve_claim_fungible_token_red_packet(
+                    to,
+                    owner_id,
+                    amount,
+                    token_id,
+                    public_key
+                )
+        )
+}
+
+'''

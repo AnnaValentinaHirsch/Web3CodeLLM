@@ -1,0 +1,957 @@
+*GitHub Repository "kulame/neardex"*
+
+'''--- factory/Cargo.toml ---
+[package]
+name = "factory"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+near-sdk = "3.1.0"
+near-contract-standards = "3.1.1"
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+# Opt into extra safety checks on arithmetic operations https://stackoverflow.com/a/64136471/249801
+overflow-checks = true
+
+'''
+'''--- factory/build.sh ---
+RUSTFLAGS='-C link-arg=-s' cargo build --target wasm32-unknown-unknown --release
+near deploy --wasmFile target/wasm32-unknown-unknown/release/factory.wasm --accountId factory.kula.testnet
+
+'''
+'''--- factory/src/lib.rs ---
+use near_sdk::serde::Serialize;
+use near_sdk::{
+    borsh::{self, BorshDeserialize, BorshSerialize},
+    collections::LookupSet,
+    BorshStorageKey, PanicOnDefault,
+};
+use near_sdk::{env, ext_contract, near_bindgen, AccountId, Balance, Promise};
+use utils::sort_tokens;
+
+mod utils;
+use crate::utils::get_pair_name;
+near_sdk::setup_alloc!();
+
+#[near_bindgen]
+#[derive(BorshSerialize, BorshDeserialize, PanicOnDefault)]
+pub struct Contract {
+    pub fee_to: AccountId,
+    pub all_pairs: LookupSet<AccountId>,
+}
+
+#[derive(BorshStorageKey, BorshSerialize)]
+pub enum StorageKeys {
+    AllParis,
+}
+
+const MIN_ATTACHED_BALANCE: Balance = 1_000_000_000_000_000_000_000_000;
+
+#[ext_contract(ext_self)]
+pub trait ExtSelf {
+    fn on_pair_created(&mut self, pair_account_id: AccountId) -> bool;
+    fn on_pair_deleted(&mut self, pair_account_id: AccountId) -> bool;
+}
+
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct PairArgs {
+    token_a: AccountId,
+    token_b: AccountId,
+}
+const NO_DEPOSIT: Balance = 0;
+const ONE_YOCTO: Balance = 1;
+
+pub mod gas {
+    use near_sdk::Gas;
+
+    /// The base amount of gas for a regular execution.
+    const BASE: Gas = 25_000_000_000_000;
+    pub const PAIR_NEW: Gas = BASE * 2;
+    pub const CALLBACK: Gas = BASE * 2;
+}
+
+#[near_bindgen]
+impl Contract {
+    #[init]
+    pub fn new() -> Self {
+        Self {
+            fee_to: String::from("kula.testnet"),
+            all_pairs: LookupSet::new(StorageKeys::AllParis),
+        }
+    }
+
+    #[payable]
+    pub fn create_pair(&mut self, token_a: AccountId, token_b: AccountId) -> Promise {
+        assert!(
+            env::attached_deposit() >= MIN_ATTACHED_BALANCE,
+            "Not enough attached deposit to pair creation"
+        );
+        let (token1, token2) = sort_tokens(token_a.clone(), token_b.clone());
+        let pair_account_id = get_pair_name(token_a, token_b, env::current_account_id());
+        assert!(
+            env::is_valid_account_id(pair_account_id.as_bytes()),
+            "The pair account ID is invalid"
+        );
+        Promise::new(pair_account_id.clone())
+            .create_account()
+            .add_full_access_key(env::signer_account_pk())
+            .transfer(env::attached_deposit())
+            .deploy_contract(include_bytes!("../../res/pair.wasm").to_vec())
+            .function_call(
+                b"new".to_vec(),
+                near_sdk::serde_json::to_vec(&PairArgs {
+                    token_a: token1.clone(),
+                    token_b: token2.clone(),
+                })
+                .unwrap(),
+                NO_DEPOSIT,
+                gas::PAIR_NEW,
+            )
+            .then(ext_self::on_pair_created(
+                pair_account_id,
+                &env::current_account_id(),
+                NO_DEPOSIT,
+                gas::CALLBACK,
+            ))
+    }
+
+    #[payable]
+    pub fn delete_pair(&mut self, token_a: AccountId, token_b: AccountId) -> Promise {
+        let pair_account_id = get_pair_name(token_a, token_b, env::current_account_id());
+        assert!(
+            env::is_valid_account_id(pair_account_id.as_bytes()),
+            "The pair account ID is invalid"
+        );
+        Promise::new(pair_account_id.clone())
+            .delete_account(env::current_account_id())
+            .then(ext_self::on_pair_deleted(
+                pair_account_id,
+                &env::current_account_id(),
+                NO_DEPOSIT,
+                gas::CALLBACK,
+            ))
+    }
+
+    pub fn on_pair_created(&mut self, pair_account_id: AccountId) -> bool {
+        println!("{}", pair_account_id);
+        self.all_pairs.insert(&pair_account_id);
+        true
+    }
+
+    pub fn on_pair_deleted(&mut self, pair_account_id: AccountId) -> bool {
+        self.all_pairs.remove(&pair_account_id);
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use near_sdk::json_types::ValidAccountId;
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::testing_env;
+    use near_sdk::MockedBlockchain;
+
+    #[test]
+    fn it_works() {
+        let result = 2 + 2;
+        assert_eq!(result, 4);
+    }
+
+    pub fn ntoy(near_amount: Balance) -> Balance {
+        near_amount * 10u128.pow(24)
+    }
+    fn get_context(predecessor_account_id: ValidAccountId) -> VMContextBuilder {
+        let mut builder = VMContextBuilder::new();
+        builder
+            .current_account_id(accounts(0))
+            .signer_account_id(predecessor_account_id.clone())
+            .predecessor_account_id(predecessor_account_id)
+            .attached_deposit(ntoy(31));
+
+        builder
+    }
+    #[test]
+    fn test_new() {
+        let context = get_context(accounts(1));
+        testing_env!(context.build());
+        let mut contract = Contract::new();
+        contract.create_pair(
+            String::from("kula.kula.testnet"),
+            String::from("ayat.kula.testnet"),
+        );
+        contract.delete_pair(
+            String::from("kula.kula.testnet"),
+            String::from("ayat.kula.testnet"),
+        );
+    }
+}
+
+'''
+'''--- factory/src/utils.rs ---
+use near_sdk::AccountId;
+
+pub fn sort_tokens(token_a: AccountId, token_b: AccountId) -> (AccountId, AccountId) {
+    let token1: AccountId;
+    let token2: AccountId;
+    if token_a > token_b {
+        token1 = token_b;
+        token2 = token_a;
+    } else {
+        token1 = token_a;
+        token2 = token_b;
+    }
+    (token1, token2)
+}
+
+pub fn get_pair_name(token_a: AccountId, token_b: AccountId, master: AccountId) -> AccountId {
+    let (token1, token2) = sort_tokens(token_a, token_b);
+    let pair = format!("pair_{}.{}", token1, token2).replace(".", "-");
+    let pair_account_id = format!("{}.{}", pair, master);
+    pair_account_id
+}
+
+'''
+'''--- pair/.vscode/extensions.json ---
+{
+  "recommendations": ["Prisma.prisma"]
+}
+
+'''
+'''--- pair/.vscode/settings.json ---
+{
+  "editor.tabSize": 2,
+  "editor.detectIndentation": true,
+  "search.exclude": {
+    "package-lock.json": true
+  },
+  "editor.formatOnSave": true,
+  "editor.codeActionsOnSave": [
+    "source.addMissingImports",
+    "source.fixAll.eslint",
+    "source.organizeImports"
+  ]
+}
+
+'''
+'''--- pair/Cargo.toml ---
+[package]
+name = "pair"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+near-sdk = "3.1.0"
+near-contract-standards = "3.1.1"
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "s"
+lto = true
+debug = false
+panic = "abort"
+# Opt into extra safety checks on arithmetic operations https://stackoverflow.com/a/64136471/249801
+overflow-checks = true
+
+'''
+'''--- pair/build.sh ---
+RUSTFLAGS='-C link-arg=-s' cargo build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/pair.wasm ../res/
+
+'''
+'''--- pair/src/lib.rs ---
+use near_sdk::{
+    borsh::{self, BorshDeserialize, BorshSerialize},
+    PanicOnDefault,
+};
+
+use near_sdk::{env, near_bindgen, AccountId, Balance};
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Contract {
+    pub factory: AccountId,
+    pub token_a: AccountId,
+    pub token_b: AccountId,
+    pub reserve_a: Balance,
+    pub reserve_b: Balance,
+}
+
+#[near_bindgen]
+impl Contract {
+    #[init]
+    pub fn new(token_a: AccountId, token_b: AccountId) -> Self {
+        let factory = env::signer_account_id();
+        println!("{}", token_a);
+        let this = Self {
+            factory: factory,
+            token_a: token_a,
+            token_b: token_b,
+            reserve_a: 0,
+            reserve_b: 0,
+        };
+        this
+    }
+
+    pub fn get_reserves(&self) -> (Balance, Balance) {
+        (self.reserve_a, self.reserve_b)
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use near_sdk::json_types::ValidAccountId;
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::testing_env;
+    use near_sdk::MockedBlockchain;
+    #[test]
+    fn it_works() {
+        let result = 2 + 2;
+
+        assert_eq!(result, 4);
+    }
+
+    fn get_context(predecessor_account_id: ValidAccountId) -> VMContextBuilder {
+        let mut builder = VMContextBuilder::new();
+        builder
+            .current_account_id(accounts(0))
+            .signer_account_id(predecessor_account_id.clone())
+            .predecessor_account_id(predecessor_account_id);
+        builder
+    }
+    #[test]
+    fn test_new() {
+        let context = get_context(accounts(1));
+        testing_env!(context.build());
+        let _contract = Contract::new(accounts(2).into(), accounts(3).into());
+    }
+
+    #[test]
+    fn test_get_reverses() {
+        let context = get_context(accounts(1));
+        testing_env!(context.build());
+        let contract = Contract::new(accounts(2).into(), accounts(3).into());
+        let reserves = contract.get_reserves();
+        println!("{},{}", reserves.0, reserves.1);
+    }
+}
+
+'''
+'''--- router/.vscode/launch.json ---
+{
+    // 使用 IntelliSense 了解相关属性。 
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug",
+            "program": "${workspaceFolder}/<your program>",
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}
+'''
+'''--- router/Cargo.toml ---
+[package]
+name = "router"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+near-sdk = "3.1.0"
+near-contract-standards = "3.1.1"
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+# Opt into extra safety checks on arithmetic operations https://stackoverflow.com/a/64136471/249801
+overflow-checks = true
+
+'''
+'''--- router/build.sh ---
+RUSTFLAGS='-C link-arg=-s' cargo build --target wasm32-unknown-unknown --release
+near deploy --wasmFile target/wasm32-unknown-unknown/release/router.wasm --accountId router.kula.testnet
+
+'''
+'''--- router/docs/design.md ---
+1 开通交易所a货币地址
+2 用户给交易所转帐a货币 
+3 开通交易所b货币地址
+4 用户给交易所转帐b货币
+5 注册用户在交易所账户
+6 注册用户在交易所货币
+7 添加流动性
+'''
+'''--- router/src/account.rs ---
+use crate::*;
+use near_sdk::{assert_one_yocto, collections::UnorderedMap};
+use near_sdk::{env, AccountId, Balance, StorageUsage};
+pub const UNIT_STORAGE: StorageUsage = 256;
+
+impl Account {
+    pub fn new(account_id: &AccountId) -> Self {
+        Self {
+            near_amount: 0,
+            tokens: UnorderedMap::new(StorageKey::AccountTokens {
+                account_id: account_id.clone(),
+            }),
+            storage_used: 0,
+            account_id: account_id.clone(),
+        }
+    }
+
+    pub fn storage_usage(&self) -> Balance {
+        (UNIT_STORAGE + self.tokens.len() as u64 * UNIT_STORAGE) as u128 * env::storage_byte_cost()
+    }
+
+    pub fn storage_available(&self) -> Balance {
+        let locked = self.storage_usage();
+        if self.near_amount > locked {
+            self.near_amount - locked
+        } else {
+            0
+        }
+    }
+
+    pub fn min_storage_usage() -> Balance {
+        UNIT_STORAGE as Balance * env::storage_byte_cost()
+    }
+
+    pub fn assert_storage_usage(&self) {
+        env::log(self.storage_usage().to_string().as_bytes());
+        env::log(self.near_amount.to_string().as_bytes());
+        assert!(
+            self.storage_usage() <= self.near_amount,
+            "{}",
+            ERR11_INSUFFICIENT_STORAGE
+        )
+    }
+
+    pub fn get_tokens(&self) -> Vec<AccountId> {
+        self.tokens.keys().collect()
+    }
+
+    pub fn get_balance(&self, token_id: &AccountId) -> Option<Balance> {
+        if let Some(token_balance) = self.tokens.get(token_id) {
+            Some(token_balance)
+        } else {
+            None
+        }
+    }
+
+    pub fn register(&mut self, token_ids: &Vec<ValidAccountId>) {
+        for token_id in token_ids {
+            let t = token_id.as_ref();
+            if self.get_balance(t).is_none() {
+                self.tokens.insert(t, &0);
+            }
+        }
+    }
+
+    pub fn deposit(&mut self, token: &AccountId, amount: Balance) {
+        if let Some(x) = self.tokens.get(token) {
+            self.tokens.insert(token, &(amount + x));
+        } else {
+            self.tokens.insert(token, &amount);
+        }
+    }
+}
+
+#[near_bindgen]
+impl Contract {
+    #[payable]
+    pub fn register_tokens(&mut self, token_ids: Vec<ValidAccountId>) {
+        assert_one_yocto();
+        self.assert_contract_running();
+        let sender_id = env::predecessor_account_id();
+        let mut account = self
+            .internal_get_account(&sender_id)
+            .expect(ERR10_ACC_NOT_REGISTERED);
+        account.register(&token_ids);
+        self.internal_save_account(account);
+    }
+}
+
+'''
+'''--- router/src/errors.rs ---
+// Contract Level
+pub const ERR51_CONTRACT_PAUSED: &str = "E51: contract paused";
+pub const ERR11_INSUFFICIENT_STORAGE: &str = "E11: insufficient $NEAR storage deposit";
+
+pub const ERR10_ACC_NOT_REGISTERED: &str = "E10: account not registered";
+
+'''
+'''--- router/src/lib.rs ---
+use near_contract_standards::fungible_token::receiver::FungibleTokenReceiver;
+use near_sdk::collections::UnorderedMap;
+use near_sdk::json_types::{ValidAccountId, U128};
+use near_sdk::AccountId;
+use near_sdk::{
+    borsh::{self, BorshDeserialize, BorshSerialize},
+    env, ext_contract, near_bindgen, Balance, BorshStorageKey, PanicOnDefault, Promise,
+    PromiseOrValue, PromiseResult, StorageUsage,
+};
+use utils::{get_amount, get_pair_name};
+
+use near_sdk::collections::LookupMap;
+use near_sdk::serde::{Deserialize, Serialize};
+mod account;
+mod errors;
+mod storage_impl;
+mod utils;
+mod views;
+
+use crate::errors::*;
+
+near_sdk::setup_alloc!();
+
+#[derive(BorshStorageKey, BorshSerialize)]
+pub enum StorageKey {
+    Accounts,
+    AccountTokens { account_id: AccountId },
+}
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Account {
+    pub account_id: AccountId,
+    pub near_amount: Balance,
+    pub tokens: UnorderedMap<AccountId, Balance>,
+    pub storage_used: StorageUsage,
+}
+
+#[near_bindgen]
+#[derive(BorshSerialize, BorshDeserialize, PanicOnDefault)]
+pub struct Contract {
+    factory: AccountId,
+    accounts: LookupMap<AccountId, Account>,
+    state: RunningState,
+}
+
+#[ext_contract(ext_pair)]
+trait Pair {
+    fn get_reserves(&self) -> (Balance, Balance);
+}
+
+#[ext_contract(ext_self)]
+pub trait ExtSelf {
+    fn add_liquidity_callback(
+        &self,
+        amount_a_desired: Balance,
+        amount_b_desired: Balance,
+        pair: AccountId,
+        token_a: AccountId,
+        token_b: AccountId,
+    ) -> String;
+
+    fn ft_transfer_callback(&mut self) -> String;
+}
+
+pub mod gas {
+    use near_sdk::Gas;
+    const BASE: Gas = 10_000_000_000_000;
+    pub const CALL: Gas = BASE * 2;
+    pub const CALLBACK: Gas = BASE * 2;
+}
+
+const NO_DEPOSIT: Balance = 0;
+const ONE_YOCTO: Balance = 1;
+const MIN_STORAGE_BALANCE: Balance = 12_500_000_000_000_000_000_000;
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Eq, PartialEq, Clone)]
+#[serde(crate = "near_sdk::serde")]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Debug))]
+pub enum RunningState {
+    Running,
+    Paused,
+}
+
+#[near_bindgen]
+impl Contract {
+    #[init]
+    pub fn new() -> Self {
+        Self {
+            factory: String::from("factory.kula.testnet"),
+            accounts: LookupMap::new(StorageKey::Accounts),
+            state: RunningState::Running,
+        }
+    }
+
+    #[payable]
+    pub fn add_liquidity(
+        &mut self,
+        token_a: AccountId,
+        token_b: AccountId,
+        amount_a_desired: Balance,
+        amount_b_desired: Balance,
+    ) -> Promise {
+        let pair_address = get_pair_name(token_a.clone(), token_b.clone(), self.factory.clone());
+        println!("{}", pair_address);
+        ext_pair::get_reserves(&pair_address, 0, gas::CALL).then(ext_self::add_liquidity_callback(
+            amount_a_desired,
+            amount_b_desired,
+            pair_address,
+            token_a,
+            token_b,
+            &env::current_account_id(),
+            NO_DEPOSIT,
+            gas::CALL * 5,
+        ))
+    }
+
+    #[private]
+    pub fn add_liquidity_callback(
+        &mut self,
+        amount_a_desired: Balance,
+        amount_b_desired: Balance,
+        pair: AccountId,
+        token_a: AccountId,
+        token_b: AccountId,
+    ) -> String {
+        match env::promise_result(0) {
+            PromiseResult::NotReady => unreachable!(),
+            PromiseResult::Failed => env::panic(b"ERR_CALL_FAILED"),
+            PromiseResult::Successful(val) => "success".into(),
+        }
+    }
+}
+
+#[near_bindgen]
+impl FungibleTokenReceiver for Contract {
+    /// 当转入此账户时， 自动记录用户的账户信息和充值金额
+    #[allow(unreachable_code)]
+    fn ft_on_transfer(
+        &mut self,
+        sender_id: ValidAccountId,
+        amount: U128,
+        msg: String,
+    ) -> PromiseOrValue<U128> {
+        let token_in = env::predecessor_account_id();
+        self.internal_deposit(sender_id.as_ref(), &token_in, amount.into());
+        PromiseOrValue::Value(U128(0))
+    }
+}
+
+/// Internal methods implementation.
+impl Contract {
+    /// 判断合约是否在运行状态
+    fn assert_contract_running(&self) {
+        match self.state {
+            RunningState::Running => (),
+            _ => env::panic(ERR51_CONTRACT_PAUSED.as_bytes()),
+        };
+    }
+
+    pub fn internal_get_account(&self, account_id: &AccountId) -> Option<Account> {
+        self.accounts.get(account_id)
+    }
+
+    pub fn internal_unwrap_or_default_account(&self, account_id: &AccountId) -> Account {
+        self.internal_get_account(account_id)
+            .unwrap_or_else(|| Account::new(account_id))
+    }
+
+    pub fn internal_register_account(&mut self, account_id: &AccountId, amount: Balance) {
+        let mut account = self.internal_unwrap_or_default_account(account_id);
+        account.near_amount += amount;
+        self.internal_save_account(account);
+    }
+
+    pub fn internal_save_account(&mut self, account: Account) {
+        account.assert_storage_usage();
+        self.accounts.insert(&account.account_id.clone(), &account);
+    }
+
+    pub fn internal_storage_withdraw(&mut self, account_id: &AccountId, amount: Balance) -> u128 {
+        let mut account = self
+            .internal_get_account(account_id)
+            .expect(ERR10_ACC_NOT_REGISTERED);
+        let available = account.storage_available();
+        assert!(available > 0, "ERR_NO_STORAGE_CAN_WITHDRAW");
+        let mut withdraw_amount = amount;
+        if amount == 0 {
+            withdraw_amount = available;
+        }
+        assert!(withdraw_amount <= available, "ERR_WITHDRAW_AMOUNT_TOO_BIG");
+        account.near_amount -= withdraw_amount;
+        self.internal_save_account(account);
+        withdraw_amount
+    }
+
+    pub fn internal_deposit(
+        &mut self,
+        sender_id: &AccountId,
+        token_id: &AccountId,
+        amount: Balance,
+    ) {
+        let mut account = self
+            .internal_get_account(sender_id)
+            .expect(ERR10_ACC_NOT_REGISTERED);
+        account.deposit(token_id, amount);
+        self.internal_save_account(account);
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use near_sdk::json_types::ValidAccountId;
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::testing_env;
+    use near_sdk::MockedBlockchain;
+
+    #[test]
+    fn it_works() {
+        let result = 2 + 2;
+        assert_eq!(result, 4);
+    }
+    pub fn ntoy(near_amount: Balance) -> Balance {
+        near_amount * 10u128.pow(24)
+    }
+    fn get_context(predecessor_account_id: ValidAccountId) -> VMContextBuilder {
+        let mut builder = VMContextBuilder::new();
+        builder
+            .current_account_id(accounts(0))
+            .signer_account_id(predecessor_account_id.clone())
+            .predecessor_account_id(predecessor_account_id)
+            .attached_deposit(ntoy(31));
+        builder
+    }
+
+    #[test]
+    fn test_new() {
+        let context = get_context(accounts(1).into());
+        testing_env!(context.build());
+        let mut contract = Contract::new();
+        contract.add_liquidity(
+            String::from("kula.kula.testnet"),
+            String::from("ayat.kula.testnet"),
+            10,
+            10,
+        );
+        // test the code
+        println!("hello");
+    }
+}
+
+'''
+'''--- router/src/storage_impl.rs ---
+use crate::*;
+use near_contract_standards::storage_management::{
+    StorageBalance, StorageBalanceBounds, StorageManagement,
+};
+use near_sdk::{
+    assert_one_yocto,
+    json_types::{ValidAccountId, U128},
+};
+use near_sdk::{env, log, near_bindgen};
+use std::convert::TryInto;
+
+#[near_bindgen]
+impl StorageManagement for Contract {
+    #[payable]
+    fn storage_deposit(
+        &mut self,
+        account_id: Option<ValidAccountId>,
+        registration_only: Option<bool>,
+    ) -> StorageBalance {
+        self.assert_contract_running();
+        let amount = env::attached_deposit();
+        let account_id = account_id
+            .map(|a| a.into())
+            .unwrap_or_else(|| env::predecessor_account_id());
+        let registration_only = registration_only.unwrap_or(false);
+        let min_balance = self.storage_balance_bounds().min.0;
+        let already_registered = self.accounts.contains_key(&account_id);
+        if amount < min_balance && !already_registered {
+            env::panic(format!("deposit is less than {}", min_balance).as_bytes());
+        }
+        if registration_only {
+            if already_registered {
+                log!("ERR_ACC_REGISTERED");
+                if amount > 0 {
+                    Promise::new(env::predecessor_account_id()).transfer(amount);
+                }
+            } else {
+                self.internal_register_account(&account_id, min_balance);
+                let refund = amount - min_balance;
+                if refund > 0 {
+                    Promise::new(env::predecessor_account_id()).transfer(refund);
+                }
+            }
+        } else {
+            self.internal_register_account(&account_id, amount);
+        }
+        self.storage_balance_of(account_id.try_into().unwrap())
+            .unwrap()
+    }
+
+    #[payable]
+    fn storage_withdraw(&mut self, amount: Option<U128>) -> StorageBalance {
+        self.assert_contract_running();
+        assert_one_yocto();
+        let account_id = env::predecessor_account_id();
+        let amount = amount.unwrap_or(U128(0)).0;
+        let withdraw_amount = self.internal_storage_withdraw(&account_id, amount);
+        Promise::new(account_id.clone()).transfer(withdraw_amount);
+        self.storage_balance_of(account_id.try_into().unwrap())
+            .unwrap()
+    }
+
+    #[payable]
+    fn storage_unregister(&mut self, force: Option<bool>) -> bool {
+        self.assert_contract_running();
+        assert_one_yocto();
+        let account_id = env::predecessor_account_id();
+        if let Some(account_deposit) = self.internal_get_account(&account_id) {
+            assert!(
+                account_deposit.tokens.is_empty(),
+                "ERR_STORAGE_UNREGISTER_TOKENS_NOT_EMPTY"
+            );
+            self.accounts.remove(&account_id);
+            Promise::new(account_id.clone()).transfer(account_deposit.near_amount);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn storage_balance_bounds(&self) -> StorageBalanceBounds {
+        StorageBalanceBounds {
+            min: Account::min_storage_usage().into(),
+            max: None,
+        }
+    }
+
+    fn storage_balance_of(&self, account_id: ValidAccountId) -> Option<StorageBalance> {
+        self.internal_get_account(account_id.as_ref())
+            .map(|account| StorageBalance {
+                total: U128(account.near_amount),
+                available: U128(account.storage_available()),
+            })
+    }
+}
+
+'''
+'''--- router/src/utils.rs ---
+use near_sdk::{AccountId, Balance};
+
+pub fn sort_tokens(token_a: AccountId, token_b: AccountId) -> (AccountId, AccountId) {
+    let token1: AccountId;
+    let token2: AccountId;
+    if token_a > token_b {
+        token1 = token_b;
+        token2 = token_a;
+    } else {
+        token1 = token_a;
+        token2 = token_b;
+    }
+    (token1, token2)
+}
+
+pub fn quote(amount_a: Balance, reserve_a: Balance, reserve_b: Balance) -> Balance {
+    assert!(amount_a > 0, "INSUFFICIENT_AMOUNT");
+    assert!(reserve_a > 0, "INSUFFICIENT_LIQUIDITY");
+    assert!(reserve_b > 0, "INSUFFICIENT_LIQUIDITY");
+    amount_a * reserve_b / reserve_a
+}
+
+pub fn get_pair_name(token_a: AccountId, token_b: AccountId, master: AccountId) -> AccountId {
+    let (token1, token2) = sort_tokens(token_a, token_b);
+    let pair = format!("pair_{}.{}", token1, token2).replace(".", "-");
+    let pair_account_id = format!("{}.{}", pair, master);
+    pair_account_id
+}
+
+pub fn get_amount(
+    reverse1: Balance,
+    reverse2: Balance,
+    amount_a_desired: Balance,
+    amount_b_desired: Balance,
+) -> (Balance, Balance) {
+    let amount1;
+    let amount2;
+    if reverse1 == 0 && reverse2 == 0 {
+        amount1 = amount_a_desired;
+        amount2 = amount_b_desired;
+    } else {
+        amount1 = 0;
+        amount2 = 0;
+    }
+    (amount1, amount2)
+}
+
+'''
+'''--- router/src/views.rs ---
+use crate::*;
+use near_sdk::near_bindgen;
+use std::collections::HashMap;
+
+#[derive(Serialize, Deserialize, PartialEq)]
+#[serde(crate = "near_sdk::serde")]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Debug))]
+pub struct StorageState {
+    pub deposit: U128,
+    pub usage: U128,
+}
+
+#[near_bindgen]
+impl Contract {
+    pub fn get_user_tokens(&self, account_id: ValidAccountId) -> Vec<AccountId> {
+        self.internal_get_account(account_id.as_ref())
+            .map(|x| x.get_tokens())
+            .unwrap_or_default()
+    }
+
+    pub fn get_user_storage_state(&self, account_id: ValidAccountId) -> Option<StorageState> {
+        self.internal_get_account(account_id.as_ref())
+            .map(|x| StorageState {
+                deposit: U128(x.near_amount),
+                usage: U128(x.storage_usage()),
+            })
+    }
+
+    pub fn get_deposits(&self, account_id: ValidAccountId) -> HashMap<AccountId, U128> {
+        let wrapped_account = self.internal_get_account(account_id.as_ref());
+        if let Some(account) = wrapped_account {
+            account
+                .get_tokens()
+                .iter()
+                .map(|token| (token.clone(), U128(account.get_balance(token).unwrap())))
+                .collect()
+        } else {
+            HashMap::new()
+        }
+    }
+}
+
+'''

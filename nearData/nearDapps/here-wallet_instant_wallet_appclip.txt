@@ -1,0 +1,3445 @@
+*GitHub Repository "here-wallet/instant_wallet_appclip"*
+
+'''--- Resources/Assets.xcassets/AppIcon.appiconset/Contents.json ---
+{
+  "images" : [
+    {
+      "filename" : "1024.png",
+      "idiom" : "universal",
+      "platform" : "ios",
+      "size" : "1024x1024"
+    }
+  ],
+  "info" : {
+    "author" : "xcode",
+    "version" : 1
+  }
+}
+
+'''
+'''--- Resources/Assets.xcassets/Contents.json ---
+{
+  "info" : {
+    "author" : "xcode",
+    "version" : 1
+  }
+}
+
+'''
+'''--- Sources/AppDelegate.swift ---
+import SwiftUI
+
+@main
+class AppDelegate: UIResponder, UIApplicationDelegate {
+    let appModel = AppClipWallet()
+    var window: UIWindow?
+    
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey : Any]? = nil
+    ) -> Bool {
+        window = UIWindow(frame: UIScreen.main.bounds)
+        window?.rootViewController = AppViewController(model: appModel)
+        window?.makeKeyAndVisible()
+        return true
+    }
+    
+    func application(
+        _ application: UIApplication,
+        continue userActivity: NSUserActivity,
+        restorationHandler: @escaping ([UIUserActivityRestoring]?) -> Void
+    ) -> Bool {
+        guard
+            userActivity.activityType == NSUserActivityTypeBrowsingWeb,
+            let urlToOpen = userActivity.webpageURL
+        else { return false }
+        
+        appModel.deeplink.clear()
+        appModel.deeplink.push(url: urlToOpen)
+        return true
+    }
+}
+
+'''
+'''--- Sources/AppInfo.swift ---
+import Foundation
+
+public struct AppInfo {
+    public static let shared: AppInfo = .init()
+    
+    public var appName : String {
+        return readFromInfoPlist(withKey: "CFBundleName") ?? "Unknown"
+    }
+    
+    public var version : String {
+        return readFromInfoPlist(withKey: "CFBundleShortVersionString") ?? "Unknown"
+    }
+    
+    public var build : String {
+        return readFromInfoPlist(withKey: "CFBundleVersion") ?? "Unknown"
+    }
+    
+    public var bundleIdentifier : String {
+        return readFromInfoPlist(withKey: "CFBundleIdentifier") ?? "Unknown"
+    }
+    
+    public var hereHost : String {
+        return "api.herewallet.app"
+    }
+    
+    public var hereContract : String {
+        return "storage.herewallet.near"
+    }
+    
+    public var nearRpc : URL {
+        return URL(string: "https://rpc.mainnet.near.org")!
+    }
+    
+    public var nearWallet : String {
+        return "wallet.near.org"
+    }
+    
+    public var nearNetwork : String {
+        return "default"
+    }
+
+    public var nearDomain : String {
+        switch AppInfo.shared.nearNetwork {
+        case "default", "mainnet": return ".near"
+        case "testnet": return ".testnet"
+        default: return ".near"
+        }
+    }
+
+    // lets hold a reference to the Info.plist of the app as Dictionary
+    private let infoPlistDictionary = Bundle.main.infoDictionary
+    
+    /// Retrieves and returns associated values (of Type String) from info.Plist of the app.
+    private func readFromInfoPlist(withKey key: String) -> String? {
+        return infoPlistDictionary?[key] as? String
+    }
+}
+
+'''
+'''--- Sources/AppViewController.swift ---
+import UIKit
+import Combine
+import SwiftUI
+import NearIOSWalletUIKit
+
+enum AppRoute {
+    case loading
+    case create
+    case signed(session: UserSession)
+    
+    var userSession: UserSession? {
+        switch self {
+        case let .signed(session): return session
+        default: return nil
+        }
+    }
+}
+
+class AppClipWallet: SignInResponder {
+    @Published var route: AppRoute = .loading
+    let userRepository = WalletUserSessionRepository()
+    let deeplink = DeeplinkService()
+    
+    func load() async {
+        route = .loading
+        if let userSession = try? await userRepository.readUserSession() {
+            route = .signed(session: userSession)
+            return
+        }
+        
+        route = .create
+    }
+    
+    func logout() async {
+        deeplink.clear()
+        try? await userRepository.signOut()
+        route = .create
+    }
+    
+    func signedIn(to userSession: UserSession) {
+        route = .signed(session: userSession)
+    }
+}
+
+class AppViewController: NiblessNavigationController {
+    let model: AppClipWallet
+    let cancelBag = CancelBag()
+    
+    init(model: AppClipWallet) {
+        self.model = model
+        super.init()
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = NearIOSWalletUIKitAsset.Color.elevation0.color
+        Task { await model.load() }
+
+        model.$route
+            .receive(on: DispatchQueue.main)
+            .sink { route in
+                switch route {
+                case .loading: self.presentLoading()
+                case .create: self.presentCreateWallet()
+                case .signed(let session): self.presentSigned(session: session)
+                }
+            }
+            .store(in: cancelBag)
+    }
+    
+    func subscribe(to publisher: AnyPublisher<DeeplinkSignedIn, Never>) {
+        publisher
+            .filter(\.logout)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in Task {
+                await self?.model.logout()
+            }}
+            .store(in: cancelBag)
+        
+        publisher
+            .compactMap(\.linkPhone)
+            .receive(on: DispatchQueue.main)
+            .delay(for: 0.5, scheduler: DispatchQueue.main)
+            .sink { [weak self] link in
+                self?.presentModalAfterDismiss {
+                    self?.presentLinkPhone(link: link)
+                }
+            }
+            .store(in: cancelBag)
+        
+        publisher
+            .compactMap(\.moneyDrop)
+            .receive(on: DispatchQueue.main)
+            .delay(for: 0.5, scheduler: DispatchQueue.main)
+            .sink { [weak self] key in
+                self?.presentModalAfterDismiss {
+                    self?.presentMoneyFromLink(key: key)
+                }
+            }
+            .store(in: cancelBag)
+    }
+    
+    private func presentModalAfterDismiss(present: @escaping () -> Void) {
+        if let vc = presentedViewController {
+            vc.dismiss(animated: true) { present() }
+            return
+        }
+            
+        present()
+    }
+
+    private func presentLinkPhone(link: LinkPhoneWeb) {
+        guard let userSession = model.route.userSession else { return }
+        let api = PhoneTransferWebRepository()
+        let model = LinkPhoneModel(data: link, userSession: userSession, api: api)
+        let vc = LinkPhoneViewController(viewModel: model, analytics: nil)
+        self.topViewController?.present(vc, animated: true)
+    }
+    
+    private func presentMoneyFromLink(key: LinkDropType) {
+        guard let userSession = model.route.userSession else { return }
+        let model = MoneyFromLinkModel(key: key, userSession: userSession)
+        let vc = MoneyFromLinkViewController(viewModel: model, analytics: nil)
+        self.topViewController?.present(vc, animated: true)
+    }
+
+    func presentSigned(session: UserSession) {
+        let vc = UIHostingController(rootView: InstantWallet(userSession: session))
+        vc.view.backgroundColor = NearIOSWalletUIKitAsset.Color.elevation0.color
+        self.pushViewController(vc, animated: true)
+        
+        subscribe(to: model.deeplink.$route
+            .compactMap(\.signedIn)
+            .eraseToAnyPublisher()
+        )
+    }
+    
+    func presentLoading() {
+        let vc = SpinnerViewController()
+        vc.view.backgroundColor = NearIOSWalletUIKitAsset.Color.elevation0.color
+        self.pushViewController(vc, animated: false)
+        self.hideNavigationBar(animated: false)
+    }
+    
+    func presentCreateWallet() {
+        let model = NicknameViewModel(
+            seed: .init(),
+            userSessionRepository: model.userRepository,
+            signInResponder: model
+        )
+        let vc = NicknameGiftViewController(viewModel: model, analytics: nil)
+        self.pushViewController(vc, animated: true)
+        self.hideNavigationBar(animated: false)
+    }
+}
+
+class SpinnerViewController: UIViewController {
+    var spinner = UIActivityIndicatorView(style: .large)
+
+    override func loadView() {
+        view = UIView()
+        spinner.translatesAutoresizingMaskIntoConstraints = false
+        spinner.color = .black
+        spinner.startAnimating()
+        view.addSubview(spinner)
+
+        spinner.centerXAnchor.constraint(equalTo: view.centerXAnchor).isActive = true
+        spinner.centerYAnchor.constraint(equalTo: view.centerYAnchor).isActive = true
+    }
+}
+
+'''
+'''--- Sources/Core/AccountState.swift ---
+
+import Foundation
+import NearSwift
+
+public struct AccountState: Codable {
+    public let accountId: String?
+    public let staked: String?
+    public let locked: String
+    public let nearAmount: String
+    public let codeHash: String
+    public let storagePaidAt: Number
+    public let storageUsage: Number
+    public var wNearAmount: String
+    public var accrued: UInt128
+    
+    init(nearAccountState: NearSwift.AccountState, wNearAmount: String, accrued: UInt128) {
+        accountId = nearAccountState.accountId
+        staked = nearAccountState.staked
+        locked = nearAccountState.locked
+        nearAmount = nearAccountState.amount
+        codeHash = nearAccountState.codeHash
+        storagePaidAt = nearAccountState.storagePaidAt
+        storageUsage = nearAccountState.storageUsage
+        self.wNearAmount = wNearAmount
+        self.accrued = accrued
+    }
+}
+
+'''
+'''--- Sources/Core/BIP70.swift ---
+
+import Foundation
+
+public struct BIP70: Equatable {
+    public enum ParsingError: Error, Equatable {
+        case notSupported
+    }
+    
+    public let coin: CoinType
+    public let address: String
+    public let amount: String?
+    
+    public init(
+        coin: CoinType,
+        address: String,
+        amount: String?
+    ) {
+        self.coin = coin
+        self.address = address
+        self.amount = amount
+    }
+    
+    public static func parse(from urlComponents: URLComponents) -> Result<BIP70, ParsingError> {
+        guard
+            !urlComponents.path.isEmpty,
+            let scheme = urlComponents.scheme
+        else {
+            return .failure(.notSupported)
+        }
+        
+        switch scheme {
+        case "bitcoin":
+            let amount = urlComponents.queryItems?.first { $0.name == "amount" }?.value
+            let bip70 = BIP70(coin: .BITCOIN, address: urlComponents.path, amount: amount)
+            return .success(bip70)
+        case "near":
+            let amount = urlComponents.queryItems?.first { $0.name == "amount" }?.value
+            let bip70 = BIP70(coin: .NEAR, address: urlComponents.path, amount: amount)
+            return .success(bip70)
+        default:
+            return .failure(.notSupported)
+        }
+    }
+}
+
+'''
+'''--- Sources/Core/CancelBag.swift ---
+
+import Foundation
+import Combine
+
+public final actor CancelBag {
+    public fileprivate(set) var subscriptions = Set<AnyCancellable>()
+
+    public func cancel() {
+        subscriptions.removeAll()
+    }
+    
+    func insert(_ subscription: AnyCancellable) {
+        subscriptions.insert(subscription)
+    }
+
+    func collect(@Builder _ cancellables: () -> [AnyCancellable]) {
+        subscriptions.formUnion(cancellables())
+    }
+
+    @resultBuilder
+    struct Builder {
+        static func buildBlock(_ cancellables: AnyCancellable...) -> [AnyCancellable] {
+            return cancellables
+        }
+    }
+    
+    public init() { }
+}
+
+public extension AnyCancellable {
+
+    func store(in cancelBag: CancelBag) {
+        Task {
+            await cancelBag.insert(self)
+        }
+    }
+    
+    func store(in cancelBag: CancelBag) async {
+        await cancelBag.insert(self)
+    }
+}
+
+'''
+'''--- Sources/Core/Deeplink.swift ---
+import Foundation
+import Combine
+import UIKit
+
+public enum DeeplinkSignWeb: Equatable {
+    case signRequest(id: String)
+    case sign(arguments: [URLQueryItem])
+}
+
+public struct LinkPhoneWeb: Equatable {
+    public let phone: String
+    public let code: String
+    public let phoneId: Int
+    
+    public init?(query: [URLQueryItem]) {
+        guard
+            let phone = query.first(where: { $0.name == "phone" })?.value,
+            let code = query.first(where: { $0.name == "code" })?.value,
+            let id = query.first(where: { $0.name == "phone_id" })?.value,
+            let phoneId = Int(id)
+        else { return nil }
+        
+        self.phone = phone
+        self.phoneId = phoneId
+        self.code = code
+    }
+}
+
+public enum DeeplinkSignedIn: Equatable {
+    case signWeb(_ type: DeeplinkSignWeb)
+    case linkPhone(_ data: LinkPhoneWeb)
+    case moneyDrop(key: LinkDropType)
+    case logout
+    
+    public var signWeb: DeeplinkSignWeb? {
+        if case let .signWeb(type) = self { return type }
+        return nil
+    }
+    
+    public var linkPhone: LinkPhoneWeb? {
+        if case let .linkPhone(type) = self { return type }
+        return nil
+    }
+    
+    public var moneyDrop: LinkDropType? {
+        if case let .moneyDrop(key) = self { return key }
+        return nil
+    }
+    
+    public var logout: Bool {
+        if case .logout = self { return true }
+        return false
+    }
+}
+
+public enum DeeplinkRoute: Equatable {
+    case signedIn(_ route: DeeplinkSignedIn)
+    case none
+    
+    public var signedIn: DeeplinkSignedIn? {
+        if case let .signedIn(route) = self { return route }
+        return nil
+    }
+}
+
+public class DeeplinkService {
+    @Published public private(set) var route: DeeplinkRoute = .none
+    
+    public var routePublisher: AnyPublisher<DeeplinkRoute, Never> {
+        return self.$route.eraseToAnyPublisher()
+    }
+    
+    public init() {}
+    
+    public func push(url: URL) {
+        // TODO: remove legacy hereapp.com
+        let domains = ["hereapp.com", "herewallet.app", "phone.herewallet.app", "web.herewallet.app"]
+        guard
+            let components = URLComponents(url: url, resolvingAgainstBaseURL: true),
+            domains.contains(components.host ?? "") == true
+        else { return }
+        
+        
+        if components.host == "web.herewallet.app",
+            let item = components.queryItems?.first(where: { $0.name == "request_id" }),
+            let request = item.value
+        {
+            route = .signedIn(.signWeb(.signRequest(id: request)))
+            return
+        }
+        
+        if components.host == "phone.herewallet.app", components.path.starts(with: "/p/") {
+            let key = components.path.replacingOccurrences(of: "/p/", with: "")
+            print("phone.herewallet.app/p/", key)
+            route = .signedIn(.moneyDrop(key: .partner(key)))
+            return
+        }
+        
+        
+        print("guck", components.path)
+
+        switch components.path {
+        case "/sign_request":
+            route = .signedIn(.signWeb(.signRequest(id: components.query ?? "")))
+            break
+        
+        case "/sign":
+            route = .signedIn(.signWeb(.sign(arguments: components.queryItems ?? [])))
+            break
+            
+        case "/secret_logout_234dsndjfk3":
+            route = .signedIn(.logout)
+            break
+            
+            
+        case "/l", "/L":
+            guard
+                let items = components.queryItems,
+                let key = items.first(where: { $0.name == "key" })?.value
+            else {
+                route = .none
+                break
+            }
+
+            route = .signedIn(.moneyDrop(key: .link(key)))
+            break
+            
+        case "/receive", "/link_phone":
+            guard
+                let items = components.queryItems,
+                let data = LinkPhoneWeb(query: items)
+            else {
+                route = .none
+                break
+            }
+            
+            route = .signedIn(.linkPhone(data))
+            break
+            
+            
+        default:
+            route = .none
+            break
+        }
+    }
+    
+    public func clear() {
+        route = .none
+    }
+}
+
+'''
+'''--- Sources/Core/ErrorMessage.swift ---
+import Foundation
+import UIKit
+
+public struct ErrorMessage: Error {
+
+  // MARK: - Properties
+  public let id: UUID
+  public let title: String
+  public let message: String
+
+  // MARK: - Methods
+  public init(title: String, message: String) {
+    self.id = UUID()
+    self.title = title
+    self.message = message
+  }
+}
+
+extension ErrorMessage: Equatable {
+    public static func ==(lhs: ErrorMessage, rhs: ErrorMessage) -> Bool {
+        return lhs.id == rhs.id
+    }
+}
+
+extension ErrorMessage {
+    public init(error: Error) {
+        let title = "Something went wrong"
+        let message = error.localizedDescription
+        self.init(title: title, message: message)
+    }
+}
+
+public extension UIViewController {
+    // MARK: - Methods
+    func present(errorMessage: ErrorMessage, ok: ((UIAlertAction) -> Void)? = nil) {
+        let errorAlertController = UIAlertController(title: errorMessage.title,
+                                                     message: errorMessage.message,
+                                                     preferredStyle: .alert)
+        let okAction = UIAlertAction(title: "OK", style: .default, handler: ok)
+        errorAlertController.addAction(okAction)
+        present(errorAlertController, animated: true, completion: nil)
+    }
+}
+
+extension ErrorMessage {
+    public static let featureInProgress: ErrorMessage = .init(
+        title: "Feature in progress",
+        message: "Feature will be availabe in future release. Stay tuned🚀"
+    )
+    
+    public static let errorTryLater: ErrorMessage = .init(
+        title: "Error",
+        message: "Please try again later"
+    )
+}
+
+'''
+'''--- Sources/Core/ErrorPresentation.swift ---
+import Foundation
+
+public enum ErrorPresentation {
+    case presenting
+    case presented
+    case dismissed
+}
+
+'''
+'''--- Sources/Core/Extensions.swift ---
+import Foundation
+import UIKit
+
+public extension String {
+    var decimalValue: Decimal? {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        formatter.locale = .init(identifier: "en_US")
+        let clean = String(self.map { $0 == "," ? "." : $0 })
+        return formatter.number(from: clean)?.decimalValue
+    }
+    
+    static func random(len: Int = 8) -> String {
+        let letters: NSString = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        let randomString: NSMutableString = NSMutableString(capacity: len)
+
+        for _ in 1...len {
+            let length = UInt32 (letters.length)
+            let rand = arc4random_uniform(length)
+            randomString.appendFormat("%C", letters.character(at: Int(rand)))
+        }
+
+        return String(randomString)
+    }
+}
+
+extension String: LocalizedError {
+    public var errorDescription: String? { return self }
+}
+
+public extension Data {
+    static func random(length: Int) throws -> Data {
+        return Data((0 ..< length).map { _ in UInt8.random(in: UInt8.min ... UInt8.max) })
+    }
+}
+
+public extension UIDevice {
+    static let modelIdentifier: String = {
+        var systemInfo = utsname()
+        uname(&systemInfo)
+        let machineMirror = Mirror(reflecting: systemInfo.machine)
+        return machineMirror.children.reduce("") { identifier, element in
+            guard let value = element.value as? Int8, value != 0 else { return identifier }
+            return identifier + String(UnicodeScalar(UInt8(value)))
+        }
+    }()
+}
+
+'''
+'''--- Sources/Core/NearNickname.swift ---
+import Foundation
+import CryptoKit
+
+public enum NearAddress: Hashable {
+    
+    case raw(RawNearAddress)
+    case named(NamedNearAddress)
+    
+    public var accountId: String {
+        switch self {
+        case .raw(let rawNearAddress):
+            return rawNearAddress.address
+        case .named(let namedNearAddress):
+            return namedNearAddress.address
+        }
+    }
+    
+    public static func all(address: String) -> NearAddress? {
+        let named = named(address: address)
+        let raw = raw(address: address)
+        
+        if case let .success(named) = named {
+            return .named(named)
+        } else if case let .success(raw) = raw {
+            return .raw(raw)
+        } else {
+            return nil
+        }
+    }
+    
+    static func raw(address: String) -> Result<RawNearAddress, [RawNearAddress.ParseError]> {
+        RawNearAddress.parse(address: address)
+    }
+    static func named(address: String) -> Result<NamedNearAddress, [NamedNearAddress.ParseError]> {
+        NamedNearAddress.parse(address: address)
+    }
+}
+
+public struct RawNearAddress: Hashable {
+    
+    let address: String
+    
+    enum ParseError: CaseIterable, Error {
+        case specialSymbols
+        case length
+    }
+    
+    static func parse(address: String) -> Result<RawNearAddress, [ParseError]> {
+        let onlyCharAndNumber = address.range(of: ".*[^A-Za-z0-9].*", options: .regularExpression) == nil
+        let rigthLength = address.count == 64
+        
+        let errors = ParseError.allCases
+            .filter { error in
+                switch error {
+                case .specialSymbols: return !onlyCharAndNumber
+                case .length: return !rigthLength
+                }
+            }
+        
+        return errors.isEmpty ? .success(.init(address: address)) : .failure(errors)
+    }
+}
+
+public struct NamedNearAddress: Hashable {
+    
+    let address: String
+    
+    enum ParseError: CaseIterable, Error {
+        case notMatchPattern
+        case incorrectEnd
+        case specialSymbols
+        case length
+    }
+    
+    static func parse(address: String) -> Result<NamedNearAddress, [ParseError]> {
+        guard (2...64).contains(address.count) else {
+            return .failure([.length])
+        }
+        let regexPattern: String = "^(([a-z\\d]+[-_])*[a-z\\d]+\\.)*([a-z\\d]+[-_])*[a-z\\d]+$"
+        let correctPattern = address.range(of: regexPattern, options: .regularExpression) != nil
+        
+        let domain = AppInfo.shared.nearDomain
+        let correctEnd = address.suffix(domain.count) == domain
+        let withoutRestrictedSymbols = !(
+            address.filter { $0 == "." }.count > 1 || address.contains("@")
+        )
+        
+        let errors = ParseError.allCases
+            .filter { error in
+                switch error {
+                case .notMatchPattern: return !correctPattern
+                case .specialSymbols: return !withoutRestrictedSymbols
+                case .incorrectEnd: return !correctEnd
+                case .length: return false
+                }
+            }
+        
+        return errors.isEmpty ? .success(.init(address: address)) : .failure(errors)
+    }
+}
+
+'''
+'''--- Sources/Core/Person.swift ---
+import Foundation
+
+public struct Contacts: Codable {
+    var contacts: [Person]
+}
+
+public struct Person: Hashable, Codable {
+    public var isHereUser: Bool?
+    public let address: String
+    public let currency: CoinType
+    
+    public init(
+        isHereUser: Bool = false,
+        address: String = "",
+        currency: CoinType = .NULL
+    ) {
+        self.isHereUser = isHereUser
+        self.address = address
+        self.currency = currency
+    }
+    
+    enum CodingKeys: String, CodingKey {
+        case isHereUser = "onWallet"
+        case address = "accountId"
+        case currency
+    }
+}
+
+'''
+'''--- Sources/Core/Repositories/FtOverviewToken.swift ---
+
+import Foundation
+import NearSwift
+
+// MARK: - FtOverviewToken
+public struct FtOverviewToken: Codable, Hashable {
+    public let name, symbol, icon, contractId: String
+    public let currency: Int
+    public let tokenId: UInt
+    public let description: String
+    public let decimal: UInt
+    public var amount: Decimal
+    public let usdRate, usdRateYesterday: Decimal
+    
+    public var value: UInt128 {
+        let converter = HereCryptoConverter(decimal)
+        let value = converter.toChainFormat(amount)
+        return UInt128(stringLiteral: value.description)
+    }
+    
+    public var fiatAmount: Decimal {
+        (amount * usdRate).rounded(scale: 2, roundingMode: .bankers)
+    }
+
+    mutating public func setAmount(_ amount: Decimal) {
+        let converter = HereCryptoConverter(decimal)
+        let amount: Decimal = converter.toHumanFormat(amount.description) ?? 0
+        self.amount = amount.rounded(scale: 6, roundingMode: .bankers)
+    }
+    
+    mutating public func setAmount(_ amount: UInt128) {
+        let converter = HereCryptoConverter(decimal)
+        let amount: Decimal = converter.toHumanFormat(amount.description) ?? 0
+        self.amount = amount
+    }
+
+    public var image: Data? {
+        if let dirURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+            let fileURL = dirURL.appendingPathComponent("\(contractId).png")
+            if let data = try? Data(contentsOf: fileURL) {
+                return data
+            }
+        }
+        guard let data = NSCache.logoCache.object(forKey: symbol as NSString) else { return nil }
+        return Data(referencing: data)
+    }
+    
+    public var asyncImage: Data {
+        get async {
+            guard let data = await loadImage().value else { return .init() }
+            let nsData = NSData(data: data)
+            NSCache.logoCache.setObject(nsData, forKey: symbol as NSString)
+            if let dirURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+                let fileURL = dirURL.appendingPathComponent("\(contractId).png")
+                _ = try? data.write(to: fileURL, options: [.atomic])
+            }
+            return data
+        }
+    }
+    
+    private func loadImage() -> Task<Data?, Never> {
+        return Task(priority: .userInitiated) {
+            guard let url = URL(string: icon) else { return nil }
+            return try? Data(contentsOf: url)
+        }
+    }
+}
+
+public extension NSCache where KeyType == NSString, ObjectType == NSData {
+    static let logoCache: NSCache = .init()
+}
+
+'''
+'''--- Sources/Core/Repositories/HereKeychain.swift ---
+import Foundation
+import KeychainAccess
+import NearSwift
+
+public final actor HereKeychain: KeyStore, WalletStorage {
+    
+    let keychain: Keychain
+    
+    public init(keychainId: String = "Here Wallet") {
+        let keychain = Keychain(service: keychainId)
+        self.keychain = keychain.synchronizable(false)
+    }
+    
+    private func storageKeyForSecretKey(networkId: String, accountId: String) -> String {
+        return "\(accountId):\(networkId)"
+    }
+    
+    private func storageKeyForAccessToken(networkId: String, accountId: String) -> String {
+        return "\(accountId):\(networkId):token"
+    }
+    
+    public func get(for key: String) async throws -> String? {
+        try keychain.get(key)
+    }
+    
+    public func set(_ value: String?, for key: String) async throws {
+        if let value = value {
+            try keychain.set(value, key: key)
+        } else {
+            try keychain.remove(key)
+        }
+    }
+    
+    // MARK: - KeyStore
+    public func setKey(networkId: String, accountId: String, keyPair: KeyPair) async throws {
+        let key = storageKeyForSecretKey(networkId: networkId, accountId: accountId)
+        guard let privateKey = keyPair.toString().components(separatedBy: ":").last
+        else { return }
+        
+        try await set(privateKey, for: key)
+    }
+    
+    public func setKey(networkId: String, accountId: String, token: String) async throws {
+        let key = storageKeyForAccessToken(networkId: networkId, accountId: accountId)
+        try await set(token, for: key)
+    }
+    
+    public func getKey(networkId: String, accountId: String) async throws -> KeyPair? {
+        let key = storageKeyForSecretKey(networkId: networkId, accountId: accountId)
+        guard let privateKey = try await get(for: key) else { return nil }
+        
+        return try KeyPairEd25519(secretKey: privateKey)
+    }
+    
+    public func getAccessToken(networkId: String, accountId: String) async throws -> String? {
+        let key = storageKeyForAccessToken(networkId: networkId, accountId: accountId)
+        return try await get(for: key)
+    }
+    
+    public func removeKey(networkId: String, accountId: String) async throws {
+        let privateKey = storageKeyForSecretKey(networkId: networkId, accountId: accountId)
+        try await set(nil, for: privateKey)
+        
+        let acessTokenKey = storageKeyForAccessToken(networkId: networkId, accountId: accountId)
+        try await set(nil, for: acessTokenKey)
+    }
+    
+    public func clear() async throws {
+        try keychain.removeAll()
+    }
+    
+    public func getNetworks() async throws -> [String] {
+        var result = Set<String>()
+        for key in keychain.allKeys() {
+            if let networkId = key.components(separatedBy: ":").last {
+                result.insert(networkId)
+            }
+        }
+        return Array(result)
+    }
+    
+    public func getAccounts(networkId: String) async throws -> [String] {
+        var result = [String]()
+        for key in keychain.allKeys() {
+            let components = key.components(separatedBy: ":")
+            if let keychainNetworkId = components.last,
+               keychainNetworkId == networkId,
+               let accountId = components.first {
+                result.append(accountId)
+            }
+        }
+        return result
+    }
+    
+    public func getDeviceID() async -> String {
+        let keychain = HereKeychain(keychainId: "app.here.wallet.device.identity")
+        if let result = try? await keychain.get(for: "deviceId") {
+            return result
+        } else {
+            let deviceID: String = random().data.hexString
+            try? await keychain.set(deviceID, for: "deviceId")
+            return deviceID
+        }
+    }
+    
+    private func random() -> [UInt8] {
+        var bytes: [UInt8] = .init(repeating: 0, count: 32)
+        let result = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        guard result == errSecSuccess else { fatalError() }
+        return bytes
+    }
+}
+
+'''
+'''--- Sources/Core/Repositories/PhoneLinkWebRepository.swift ---
+import Foundation
+
+public struct LinkPhoneRequest: Codable {
+    let code: String
+    let phoneNumberId: Int
+    let nearAccountId: String
+}
+
+public class PhoneTransferWebRepository: BaseWebRepository {
+    public var session: HereHTTPClient = .shared
+    private var hashes: [String: String] = [:]
+    private let domain = "https://api.herewallet.app/api/v1"
+
+    public struct PhoneContact: Codable {
+        let name: String
+        let phone: String
+    }
+    
+    public init() {}
+    
+    public func linkPhone(_ params: LinkPhoneRequest) async throws {
+        let url = URL(string: "\(domain)/phone/allocate_near_account_id")!
+        
+        let request: URLRequest = {
+            let jsonEncoder: JSONEncoder = .init()
+            jsonEncoder.keyEncodingStrategy = .convertToSnakeCase
+            var urlRequest: URLRequest = .init(url: url, httpMethod: .post)
+            urlRequest.httpBody = try? jsonEncoder.encode(params)
+            return urlRequest
+        }()
+        
+        let _ = try await self.request(request: request)
+    }
+    
+    public func partnerDrop(key: String) async throws {
+        let url = URL(string: "\(domain)/dapp/airdrop")!
+        
+        struct Request: Codable {
+            let airdropId: String
+        }
+        
+        let request: URLRequest = {
+            let jsonEncoder: JSONEncoder = .init()
+            jsonEncoder.keyEncodingStrategy = .convertToSnakeCase
+            var urlRequest: URLRequest = .init(url: url, httpMethod: .post)
+            urlRequest.httpBody = try? jsonEncoder.encode(Request(airdropId: key))
+            print("partnerDrop", url, Request(airdropId: key))
+            return urlRequest
+        }()
+        
+        let _ = try await self.request(request: request)
+    }
+    
+    func checkContactsList(phones: [PhoneContact]) async -> [String: Bool] {
+        struct Phones: Codable {
+            let phonesExists: [String: Bool]
+        }
+        
+        guard let url = URL(string: "\(domain)/phone/check_contact_list")
+        else { return [:] }
+        
+        var request = URLRequest(url: url, httpMethod: .post)
+        request.httpBody = try? JSONEncoder().encode(["phones": phones])
+        
+        do {
+            let result: Phones = try await self.request(request: request)
+            return result.phonesExists
+        } catch {
+            print("checkContactsList", error)
+            return [:]
+        }
+    }
+    
+    func putTransferComment(tx: String, comment: String) async throws {
+        let domain = "https://api.herewallet.app/api/v1"
+        guard let url = URL(string: "\(domain)/transactions/comment")
+        else { throw "parse url error" }
+
+        var request = URLRequest(url: url, httpMethod: .post)
+        request.httpBody = try JSONEncoder().encode([
+            "transaction_hash": tx,
+            "comment": comment
+        ])
+        
+        try await self.request(request: request)
+    }
+    
+    func getPhoneHash(phone: String) async throws -> String {
+        if let hash = hashes[phone] { return hash }
+        
+        struct Hash: Codable {
+            let hash: String
+        }
+        
+        guard let url = URL(string: "\(domain)/phone/calc_phone_hash?phone=\(phone)")
+        else { throw "url parse error" }
+        
+        let request = URLRequest(url: url, httpMethod: .get)
+        let result: Hash = try await self.request(request: request)
+        hashes[phone] = result.hash
+        return result.hash
+    }
+}
+
+'''
+'''--- Sources/Core/Repositories/Remote/BackendApi.swift ---
+import Foundation
+
+enum NetworkError: Error {
+    case unexpected
+    case responseError(response: URLResponse?)
+}
+
+public enum CoinType: String, Codable {
+    case NULL
+    case NEAR
+    case BITCOIN
+    
+    var yoctoCoinExp: UInt {
+        switch self {
+        case .NEAR: return 24
+        case .BITCOIN: return 12
+        case .NULL: return 0
+        }
+    }
+}
+
+public protocol BackendAPI: BaseWebRepository {
+    func generateAccessToken(generate: GenerateAcessToken) async throws -> String
+    func getExchangeCourse(coinType: CoinType) async -> (Decimal, Decimal)
+    func wsWalletLogin(requestID: String) async throws -> String
+    func checkRegister(accountId: String) async -> Bool
+    func getFungibleTokens(accountId: String) async -> [FtOverviewToken]
+    func getABTests() async throws -> ABTests
+    func logout() async throws
+}
+
+public struct HereWebAPI: BackendAPI {
+    public var session: HereHTTPClient = .shared
+    private let endpoint = "\(AppInfo.shared.hereHost)/api/v1"
+    
+    public func getExchangeCourse(coinType: CoinType) async -> (Decimal, Decimal) {
+        let url = URL(string: "https://\(endpoint)/rate?currency=\(coinType.rawValue.uppercased())")!
+        let request = URLRequest(url: url)
+
+        guard let data: GetFiat = try? await self.request(request: request)
+        else { return (0,0) }
+
+        return (data.rate, data.yesterdayRate)
+    }
+    
+    public func wsWalletLogin(requestID: String) async throws -> String {
+        let url = URL(string: "wss://\(endpoint)/user/ws/wallet_login/\(requestID)")!
+        let ws: WebSocketStream = .init(url: url.absoluteString)
+        for try await value in ws {
+            let dict: [String: Any]
+            switch value {
+            case let .data(data):
+                let string = String(data: data, encoding: .utf8)
+                dict = try string!.asJSONToDictionary()
+            case let .string(string):
+                dict = try string.asJSONToDictionary()
+            @unknown default:
+                fatalError()
+            }
+            return dict["account_id"] as! String
+        }
+        fatalError()
+    }
+    
+    public func checkRegister(accountId: String) async -> Bool {
+        let link = "https://\(endpoint)/user?near_account_id=\(accountId)"
+        guard let url = URL(string: link) else { return false }
+        let request = URLRequest(url: url)
+        
+        do {
+            try await self.request(request: request)
+            return true
+        } catch {
+            return false
+        }
+    }
+    
+    public func logout() async throws {
+        let url = URL(string: "https://\(endpoint)/user/device/logout")!
+        print("url", url)
+        let request = URLRequest(url: url, httpMethod: .post)
+        try await self.request(request: request)
+    }
+    
+    public func getABTests() async throws -> ABTests {
+        let url = URL(string: "https://\(endpoint)/user/abtest")!
+        var request = URLRequest(url: url, httpMethod: .get)
+        let data: ABTests = try await self.request(request: request)
+        return data
+    }
+    
+    public func getFungibleTokens(accountId: String) async -> [FtOverviewToken] {
+        let url = URL(string: "https://\(endpoint)/user/fts?near_account_id=\(accountId)")!
+    
+        struct FtTokens: Codable {
+            let fts: [FtOverviewToken]
+        }
+        
+        let request = URLRequest(url: url, httpMethod: .get)
+        let data: FtTokens? = try? await self.request(request: request)
+        return data?.fts ?? []
+    }
+    
+    public func generateAccessToken(generate: GenerateAcessToken) async throws -> String {
+        struct AccessToken: Codable {
+            let token: String
+        }
+        
+        let url = URL(string: "https://\(endpoint)/user/auth")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        request.httpBody = try encoder.encode(generate)
+                
+        let result: AccessToken = try await self.request(request: request)
+        return result.token
+    }
+}
+
+// MARK: - GetFiat
+private struct GetFiat: Codable {
+    let rate, yesterdayRate: Decimal
+}
+
+public struct GenerateAcessToken: Codable {
+    let nearAccountId: String;
+    let publicKey: String;
+    let accountSign: String;
+    let deviceName: String;
+    let deviceId: String;
+}
+
+public struct ABTests: Codable {
+    let tests: [ABTest]
+    
+    public init(tests: [ABTest] = []) {
+        self.tests = tests
+    }
+
+    public func isActive(_ name: ABName) -> Bool {
+        self.get(name)?.value == true
+    }
+    
+    public func get(_ name: ABName) -> ABTest? {
+        tests.first { $0.name == name.rawValue }
+    }
+    
+    public struct ABTest: Codable {
+        let name: String
+        let value: Bool
+    }
+   
+    public enum ABName: String, Codable {
+        case phoneNumberTransfer = "phone_number_transfer"
+        case newHome = "new_home"
+        case nftAvatar = "nft_avatar"
+    }
+}
+
+struct GetUser: Codable {
+    let apyValue: Int
+    let lastAccrualTs: Double
+    let accrued: Int
+    enum CodingKeys: String, CodingKey {
+        case apyValue = "apy_value"
+        case lastAccrualTs = "last_accrual_ts"
+        case accrued
+    }
+}
+
+'''
+'''--- Sources/Core/Repositories/Remote/Base/HTTPHeader.swift ---
+import Foundation
+import UIKit
+
+public struct HTTPHeader: Hashable {
+    public let name: String
+    public let value: String
+    public init(name: String, value: String) {
+        self.name = name
+        self.value = value
+    }
+    
+    public static func userAgent(_ value: String) -> HTTPHeader {
+        HTTPHeader(name: "User-Agent", value: value)
+    }
+    
+    public static func acceptLanguage(_ value: String) -> HTTPHeader {
+        HTTPHeader(name: "Accept-Language", value: value)
+    }
+    
+    public static func acceptEncoding(_ value: String) -> HTTPHeader {
+        HTTPHeader(name: "Accept-Encoding", value: value)
+    }
+    
+    public static func timezone(_ value: String) -> HTTPHeader {
+        HTTPHeader(name: "Timezone", value: value)
+    }
+    
+    public static func contentType(_ value: String) -> HTTPHeader {
+        HTTPHeader(name: "Content-Type", value: value)
+    }
+    
+    public static func accept(_ value: String) -> HTTPHeader {
+        HTTPHeader(name: "Accept", value: value)
+    }
+}
+
+extension HTTPHeader {
+    
+    public static let `default`: [HTTPHeader] = [
+        .defaultAcceptEncoding,
+        .defaultAcceptLanguage,
+        .defaultAccept,
+        .defaultContentType,
+        .defaultUserAgent,
+        .timezone
+    ]
+    
+    public static let defaultUserAgent: HTTPHeader = {
+        let appName = AppInfo.shared.appName
+        let bundle = AppInfo.shared.bundleIdentifier
+        let appVersion = AppInfo.shared.version
+        let appBuild = AppInfo.shared.build
+
+        let osNameVersion: String = {
+            let version = ProcessInfo.processInfo.operatingSystemVersion
+            let versionString = "\(version.majorVersion).\(version.minorVersion).\(version.patchVersion)"
+            let osName: String = UIDevice.current.systemName
+
+            return "\(osName) \(versionString)"
+        }()
+
+        let userAgent = "\(appName)/\(appVersion) (\(bundle); build:\(appBuild); \(osNameVersion))"
+
+        return .userAgent(userAgent)
+    }()
+    
+    public static let defaultAcceptEncoding: HTTPHeader = {
+        let encodings: [String]
+        if #available(iOS 11.0, macOS 10.13, tvOS 11.0, watchOS 4.0, *) {
+            encodings = ["br", "gzip", "deflate"]
+        } else {
+            encodings = ["gzip", "deflate"]
+        }
+
+        return .acceptEncoding(encodings.qualityEncoded())
+    }()
+    
+    public static let defaultAcceptLanguage: HTTPHeader = .acceptLanguage(Locale.preferredLanguages.prefix(6).qualityEncoded())
+
+    public static let defaultAccept: HTTPHeader = .accept("application/json")
+    public static let defaultContentType: HTTPHeader = .contentType("application/json")
+    
+    public static let timezone: HTTPHeader = .timezone(TimeZone.autoupdatingCurrent.identifier)
+}
+
+extension Collection where Element == String {
+    func qualityEncoded() -> String {
+        enumerated().map { index, encoding in
+            let quality = 1.0 - (Double(index) * 0.1)
+            return "\(encoding);q=\(quality)"
+        }.joined(separator: ", ")
+    }
+}
+
+'''
+'''--- Sources/Core/Repositories/Remote/Base/HTTPMethod.swift ---
+import Foundation
+
+public enum HTTPMethod: String {
+    case post = "POST"
+    case get = "GET"
+    case put = "PUT"
+}
+
+'''
+'''--- Sources/Core/Repositories/Remote/BaseWebRepository.swift ---
+import Foundation
+import Accessibility
+
+public class HereHTTPClient {
+    static let shared = HereHTTPClient()
+    
+    private var authToken = ""
+    private var session: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.allowsCellularAccess = true
+        config.timeoutIntervalForRequest = 300
+        config.waitsForConnectivity = true
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.httpAdditionalHeaders = HTTPHeader.default
+            .map { ($0.name, $0.value) }
+            .reduce(into: [:], { $0[$1.0] = $1.1 })
+        
+        return URLSession(configuration: config)
+    }()
+    
+    public func setAuthToken(token: String) {
+        self.authToken = token
+    }
+    
+    public func dataTask(with _request: URLRequest, completionHandler: @escaping @Sendable (Data?, URLResponse?, Error?) -> Void) -> URLSessionDataTask {
+        var request = _request
+        request.addValue(authToken, forHTTPHeaderField: "Authorization")
+        return session.dataTask(with: request, completionHandler: completionHandler)
+    }
+}
+
+public extension URLRequest {
+    init(url: URL, httpMethod: HTTPMethod, headers: [HTTPHeader] = []) {
+        self.init(url: url)
+        self.httpMethod = httpMethod.rawValue
+        headers.forEach {
+            if allHTTPHeaderFields?[$0.name] != nil {
+                setValue($0.value, forHTTPHeaderField: $0.name)
+            } else {
+                addValue($0.value, forHTTPHeaderField: $0.name)
+            }
+        }
+    }
+}
+
+public protocol BaseWebRepository {
+    var session: HereHTTPClient { get }
+}
+
+extension BaseWebRepository {
+    public var session: HereHTTPClient { .shared }
+    var success: Range<Int> { 200 ..< 300 }
+    
+    @discardableResult
+    func request(request: URLRequest) async throws -> Data {
+        return try await withCheckedThrowingContinuation({ continuation in
+            session.dataTask(with: request) { data, response, error in                      
+                guard error == nil else {
+                    continuation.resume(throwing: error!)
+                    return
+                }
+        
+                guard
+                    let response = response as? HTTPURLResponse,
+                    self.success.contains(response.statusCode)
+                else {
+                    if let response = response as? HTTPURLResponse {
+                        continuation.resume(throwing: ServerError.code(response.statusCode, response: response))
+                    } else {
+                        continuation.resume(throwing: URLError(.badServerResponse))
+                    }
+                    return
+                }
+
+                
+                guard let data = data else {
+                    continuation.resume(throwing: ServerError.emptyData)
+                    return
+                }
+
+                continuation.resume(returning: data)
+            }.resume()
+        })
+    }
+
+    @discardableResult
+    func request<Value: Decodable>(request: URLRequest) async throws -> Value {
+        let rawData = try await self.request(request: request)
+        
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .secondsSince1970
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        
+        return try decoder.decode(Value.self, from: rawData)
+    }
+}
+
+enum ServerError: Error, CustomStringConvertible {
+    case code(_ code: Int, response: HTTPURLResponse)
+    case systemError(_ error: ErrorMessage)
+    case emptyData
+
+    var description: String {
+        switch self {
+        case let .code(code, _):
+            return "Unexpected code(\(code)) from server"
+        case .emptyData:
+            return "Unexpected response from server"
+        case let .systemError(error):
+            return error.localizedDescription
+        }
+    }
+}
+
+'''
+'''--- Sources/Core/Repositories/UserSessionRepository.swift ---
+import Foundation
+
+public protocol UserSessionRepository {
+    func readUserSession() async throws -> UserSession?
+    func signUp(mnemonic: [String], isNew: Bool) async throws -> UserSession
+    func signOut() async throws
+}
+
+'''
+'''--- Sources/Core/Repositories/WalletUserSessionRepository.swift ---
+import Foundation
+import NearSwift
+import CryptoKit
+import UIKit
+import HDWallet
+
+public class WalletUserSessionRepository: UserSessionRepository {
+    public var session: HereHTTPClient = .shared
+    private let remoteAPI: BackendAPI = HereWebAPI()
+    private let keyStore = HereKeychain()
+
+    public init() { }
+    
+    public func readUserSession() async throws -> UserSession? {
+        let networkId = AppInfo.shared.nearNetwork
+        let accounts = try? await keyStore.getAccounts(networkId: networkId)
+        guard let accountId = (accounts ?? [])?.first
+        else { return nil }
+    
+        let config = NearConfig(
+          networkId: AppInfo.shared.nearNetwork,
+          nodeUrl: AppInfo.shared.nearRpc,
+          masterAccount: nil,
+          keyPath: nil,
+          helperUrl: nil,
+          initialBalance: nil,
+          providerType: .jsonRPC(AppInfo.shared.nearRpc),
+          signerType: .inMemory(keyStore),
+          keyStore: keyStore,
+          contractName: nil,
+          walletUrl: AppInfo.shared.nearWallet
+        )
+
+        let profile = try await UserProfile(config: config, address: accountId)
+        let accessToken = try await getAccessToken(networkId: networkId, account: accountId)
+        HereHTTPClient.shared.setAuthToken(token: accessToken)
+        return UserSession(userProfile: profile)
+    }
+
+    private func getAccessToken(networkId: String, account: String) async throws -> String {
+        if let token = try? await keyStore.getAccessToken(networkId: networkId, accountId: account) {
+            return token
+        }
+        
+        let deviceId = await keyStore.getDeviceID()
+        guard let keyPair = try await keyStore.getKey(networkId: networkId, accountId: account)
+        else { throw "KeyPair is not defined" }
+        
+        let publicKey = keyPair.getPublicKey().toString()
+        let message = [UInt8]((account + deviceId).utf8)
+        let accountSign = try keyPair.sign(message: message)
+        let token = try await remoteAPI.generateAccessToken(generate: .init(
+            nearAccountId: account,
+            publicKey: publicKey,
+            accountSign: accountSign.signature.baseEncoded,
+            deviceName: UIDevice.modelIdentifier,
+            deviceId: deviceId
+        ))
+        
+        try await keyStore.setKey(networkId: networkId, accountId: account, token: token)
+        return token
+    }
+
+    public func signUp(mnemonic: [String], isNew: Bool = false) async throws -> UserSession {
+        let mnemonic = mnemonic.map { $0.lowercased() }
+        let bip39 = try BIP39(phrase: mnemonic)
+        let bip32 = try BIP32(seed: bip39.seed.data, coinType: .near)
+        let extendedPrivateKey = bip32.derived(paths: DerivationNode.nearPath)
+        let keypair = try KeyPairEd25519.fromSeed(seed: extendedPrivateKey.privateKey)
+        let defaultAddress = keypair.getPublicKey().data.data.hexString
+        let accountId = isNew
+        ? defaultAddress
+        : await loadNearName(publicKey: keypair.getPublicKey()) ?? defaultAddress
+        let entropy = try BIP39.toEntropy(mnemonic).data
+    
+        try keyStore.keychain.set(entropy, key: "entropy")
+        
+        try await keyStore.setKey(
+            networkId: AppInfo.shared.nearNetwork,
+            accountId: accountId,
+            keyPair: keypair
+        )
+        
+        let networkId = AppInfo.shared.nearNetwork
+        let config = NearConfig(
+          networkId: networkId,
+          nodeUrl: AppInfo.shared.nearRpc,
+          masterAccount: nil,
+          keyPath: nil,
+          helperUrl: nil,
+          initialBalance: nil,
+          providerType: .jsonRPC(AppInfo.shared.nearRpc),
+          signerType: .inMemory(keyStore),
+          keyStore: keyStore,
+          contractName: nil,
+          walletUrl: AppInfo.shared.nearWallet
+        )
+                
+        let profile = try await UserProfile(config: config,address: accountId)
+        let accessToken = try await getAccessToken(networkId: networkId, account: accountId)
+        HereHTTPClient.shared.setAuthToken(token: accessToken)
+        return UserSession(userProfile: profile)
+    }
+    
+    public func signOut() async throws {
+        // TODO: clear deeplink storage
+        try await AnalyticsTracker.shared.flush()
+        try await remoteAPI.logout()
+        try keyStore.keychain.removeAll()
+    }
+    
+    private func loadNearName(publicKey: PublicKey) async -> String? {
+        struct LoadNearName: Codable {
+            let users: [String]
+        }
+        
+        let defaultAddress = publicKey.data.data.hexString
+        let route = "api/v1/user/by_public_key?public_key=\(publicKey.toString())"
+        let url = URL(string: "https://\(AppInfo.shared.hereHost)/\(route)")!
+        let request = URLRequest(url: url, httpMethod: .get)
+        
+        let array: LoadNearName? = try? await self.remoteAPI.request(request: request)
+        let address = array?.users.first(where: { $0.contains(AppInfo.shared.nearDomain) })
+        
+        return address ?? defaultAddress
+    }
+}
+
+'''
+'''--- Sources/Core/UserProfile.swift ---
+import Foundation
+import NearSwift
+import BigInt
+
+public struct UserProfile {
+    
+    // MARK: Public property
+    
+    public private(set) var account: NearAccount
+    public var APY: Decimal {
+        get async {
+            _ = await account.state?.value
+            let contractAccount: ContractAccount? = try? await account.viewFunction(
+                contractId: AppInfo.shared.hereContract,
+                methodName: "get_user",
+                args: ["account_id": account.address]
+            )
+        
+            guard let contractAccount = contractAccount else { return 0.1 }
+            return .init(contractAccount.apyValue) / 10_000.0
+        }
+    }
+    
+    // MARK: Private property
+    
+    private let nearConverter = HereCryptoConverter(coin: .NEAR)
+    private let remoteApi = HereWebAPI()
+    
+    // MARK: Public methods
+    
+    public init(config: NearConfigProtocol, address: String) async throws {
+        let near = try Near(config: config)
+        let account = await NearAccount(address: address, connection: near.connection)
+        self.account = account
+    }
+    
+    public func allocateAmount(amount: UInt128) async throws {
+        await account.fetchState()
+
+        let nearAmount = account.nearAmount ?? 0
+        let reservedAmount = account.reservedAmount ?? 0
+
+        if (reservedAmount + amount) > nearAmount {
+            let near = (reservedAmount + amount) - nearAmount
+            print("[allocateAmount] try", near)
+            try await account.withdrawFromContract(amount: near)
+        }
+    }
+    
+    public func fetchStates(for accountsToUpdate: [NearAccount]) async {
+        await withTaskGroup(of: NearAccount.self) { group in
+            for account in accountsToUpdate {
+                group.addTask {
+                    _ = await account.fetchState()
+                    return account
+                }
+            }
+            await group.waitForAll()
+        }
+    }
+    
+    // MARK: Private methods
+    
+    private func fetchAccountState(for account: Account) async throws -> NearSwift.AccountState {
+        let state = try await account.state()
+        return state
+    }
+}
+
+// MARK: Equatable
+
+extension UserProfile: Equatable {
+    public static func ==(_ lhs: UserProfile, rhs: UserProfile) -> Bool {
+        lhs.account == rhs.account
+    }
+}
+
+struct ContractAccount: Codable {
+    let apyValue: UInt64
+    let lastAccuralTs: Decimal
+    let accrued: String
+    
+    var accruedUInt128: UInt128 {
+        .init(stringLiteral: accrued)
+    }
+    var date: Date {
+        let time = lastAccuralTs / pow(10,9)
+        let dTime = Double(exactly: NSDecimalNumber(decimal: time)) ?? 0.0
+        return .init(timeIntervalSince1970: dTime)
+    }
+    
+    func totalAccrued(hNearAmount: UInt128) -> UInt128 {
+        let hNear = BigUInt(stringLiteral: hNearAmount.description)
+        let inYearBigUInt = (hNear * BigUInt(integerLiteral: apyValue))
+        let inYear = Decimal(string: inYearBigUInt.description) ?? 0.0
+        let inSec = inYear / 31557600
+        let delta = Decimal(-date.timeIntervalSinceNow)
+        let totalApy = ((delta * inSec) / 10_000).rounded(scale: 0, roundingMode: .down)
+        return .init(stringLiteral: totalApy.description) + .init(stringLiteral: accrued)
+    }
+    
+    enum CodingKeys: String, CodingKey {
+        case apyValue = "apy_value"
+        case lastAccuralTs = "last_accrual_ts"
+        case accrued = "accrued"
+    }
+}
+
+'''
+'''--- Sources/Core/UserSession.swift ---
+import Foundation
+import Combine
+import NearSwift
+import HDWallet
+
+public class UserSession: ObservableObject {
+    @Published public private(set) var userProfile: UserProfile
+    @Published public private(set) var todayPrice: Decimal?
+    @Published public private(set) var tokens: [FtOverviewToken] = []
+    @Published public private(set) var apy: Decimal?
+
+    private let keyStore = HereKeychain()
+    private let remoteAPI: BackendAPI = HereWebAPI()
+    private let subscriptions = CancelBag()
+    
+    public func getMnemonic() -> [String] {
+        guard let entropy = try? keyStore.keychain.getData("entropy")
+        else { return [] }
+        return BIP39.toMnemonic(entropy.bytes)
+    }
+        
+    public init(userProfile: UserProfile) {
+        self.userProfile = userProfile
+        
+        Task {
+            let (today) = await remoteAPI.getExchangeCourse(coinType: .NEAR)
+            Task { @MainActor in self.todayPrice = today.0 }
+        }
+    
+        Task { try? await self.updateTokens() }
+        Timer.publish(every: 5, on: .main, in: .default)
+            .autoconnect()
+            .sink { [weak self] _ in
+                guard let self = self else { return }
+                Task { try? await self.updateTokens() }
+            }
+            .store(in: subscriptions)
+    }
+
+    public var nearToken: FtOverviewToken? {
+        self.tokens.first { $0.symbol == "NEAR" }
+    }
+    
+    @Sendable
+    public func updateTokens() async throws {
+        let tokens = await remoteAPI.getFungibleTokens(accountId: userProfile.account.address)
+        let _ = await userProfile.account.fetchState()
+        let amount = userProfile.account.accountAmount ?? 0
+    
+        Task { @MainActor in
+            self.tokens = tokens.map { token in
+                var token = token
+                if token.symbol == "NEAR" {
+                    token.setAmount(amount)
+                }
+                
+                return token
+            }
+        }
+
+    }
+    
+    @Sendable
+    public func updateCourse() async {
+        let (today, _) = await remoteAPI.getExchangeCourse(coinType: .NEAR)
+        todayPrice = today
+    }
+}
+
+extension UserSession: Equatable {
+    public static func ==(lhs: UserSession, rhs: UserSession) -> Bool {
+        lhs.userProfile == rhs.userProfile
+    }
+}
+
+'''
+'''--- Sources/HereCryptoConverter.swift ---
+
+import Foundation
+import BigInt
+import NearSwift
+
+public struct HereCryptoConverter: CryptoConverter {
+    private let exp: UInt
+    
+    public init(_ exp: UInt) {
+        self.exp = .init(exp)
+    }
+    
+    private var multiplier: Decimal {
+        Decimal(string: BigUInt(10).power(Int(exp)).description)!
+    }
+    
+    public init(coin: CoinType) {
+        self.exp = coin.yoctoCoinExp
+    }
+    
+    public func toChainFormat(_ human: Decimal) -> BigUInt {
+        let decimalResult = human * multiplier
+        let roundedResult = decimalResult.rounded(scale: 0, roundingMode: .bankers)
+
+        return BigUInt(roundedResult.description) ?? 0
+    }
+    
+    public func toChainFormat(_ rawString: String) -> BigUInt? {
+        BigUInt(stringLiteral: rawString)
+    }
+    public func toChainFormat(_ rawString: String) -> UInt128 {
+        UInt128(stringLiteral: rawString)
+    }
+    
+    public func toChainFormat(fiat: Decimal, course: Decimal) -> BigUInt {
+        let humanFormat = fiat / course
+        return toChainFormat(humanFormat)
+    }
+    
+    public func toHumanFormat(_ chain: BigUInt) -> Decimal {
+        let chain = Decimal(string: chain.description) ?? 0.0
+        let rawResult = chain / multiplier
+        return rawResult
+    }
+    
+    public func toHumanFormat(_ chain: UInt128) -> Decimal {
+        let chain = Decimal(string: chain.description) ?? 0.0
+        let rawResult = chain / multiplier
+        return rawResult
+    }
+    
+    public func toHumanFormat(_ chain: String) -> Decimal? {
+        guard let yctoNear: BigUInt = toChainFormat(chain) else { return nil }
+        return toHumanFormat(yctoNear)
+    }
+    
+    public func toFiat(amount: Decimal, course: Decimal) -> Decimal {
+        (amount * course)
+    }
+    
+}
+
+public extension Decimal {
+    func rounded(
+        scale: Int,
+        roundingMode: NSDecimalNumber.RoundingMode
+    ) -> Decimal {
+        var result = self
+        var copySelf = self
+        NSDecimalRound(&result, &copySelf, scale, roundingMode)
+        
+        return result
+    }
+}
+
+'''
+'''--- Sources/MoneyFromLink/MoneyFromLink.swift ---
+import Foundation
+import NearSwift
+import Combine
+import CryptoKit
+import Base58Swift
+
+public enum MoneyFromLinkModelState: String {
+    case loading
+    case success
+    case failure
+}
+
+public enum LinkDropType: Equatable {
+    case partner(_ key: String)
+    case link(_ key: String)
+}
+
+public class MoneyFromLinkModel {
+    private let userSession: UserSession
+    private let api: PhoneTransferWebRepository = .init()
+    private let key: LinkDropType
+    
+    @Published
+    private var state: MoneyFromLinkModelState = .loading
+    public var statePublisher: AnyPublisher<MoneyFromLinkModelState, Never> {
+        $state.eraseToAnyPublisher()
+    }
+    
+    public init(key: LinkDropType, userSession: UserSession) {
+        self.userSession = userSession
+        self.key = key
+    }
+    
+    public func receiveMoney() async {
+        switch key {
+        case let .link(key): await receiveLink(key: key)
+        case let .partner(key): await receivePartner(key: key)
+        }
+    }
+    
+    private func receivePartner(key: String) async {
+        state = .loading
+        do {
+            try await api.partnerDrop(key: key)
+            state = .success
+        } catch {
+            print("receivePartner", error)
+            state = .failure
+        }
+    }
+    
+    private func receiveLink(key:String) async {
+        state = .loading
+        do {
+            guard let keyData = Base58.base58Decode(key)
+            else { throw "Key decode error" }
+            
+            let hash = SHA256.hash(data: keyData)
+            let requestId = Base58.base58Encode(hash.bytes)
+
+            let account = userSession.userProfile.account
+            _ = try await account.functionCall(
+                contractId: "l.herewallet.near",
+                methodName: "receive_transfer",
+                args: [
+                    "key": key,
+                    "request_id": requestId,
+                    "account_id": account.address
+                ],
+                gas: nil,
+                amount: 0
+            )
+            
+            state = .success
+        } catch {
+            state = .failure
+        }
+    }
+}
+
+'''
+'''--- Sources/MoneyFromLink/MoneyFromLinkView.swift ---
+import Foundation
+import NearIOSWalletUIKit
+import PanModal
+import Combine
+import UIKit
+
+class MoneyFromLinkView: NiblessView {
+    private let state: MoneyFromLinkModelState
+    
+    init(state: MoneyFromLinkModelState) {
+        self.state = state
+        super.init(frame: .zero)
+        titleText.text = state.title
+        subtitle.text = state.description
+        sutupLayout()
+    }
+    
+    func sutupLayout() {
+        backgroundColor = NearIOSWalletUIKitAsset.Color.popupColor.color
+        addSubview(titleText)
+        addSubview(subtitle)
+        addSubview(picture)
+    
+        NSLayoutConstraint.activate([
+            picture.centerXAnchor.constraint(equalTo: centerXAnchor),
+            picture.centerYAnchor.constraint(equalTo: centerYAnchor, constant: -96),
+            
+            titleText.widthAnchor.constraint(equalTo: widthAnchor, constant: -32),
+            titleText.centerXAnchor.constraint(equalTo: centerXAnchor),
+            titleText.topAnchor.constraint(equalTo: picture.bottomAnchor, constant: 32),
+            subtitle.centerXAnchor.constraint(equalTo: centerXAnchor),
+            subtitle.topAnchor.constraint(equalTo: titleText.bottomAnchor, constant: 16)
+        ])
+    }
+    
+    lazy var picture: UIView = {
+        switch state {
+        case .success:
+            let image = UIImageView(image: NearIOSWalletUIKitAsset.Media.success.image)
+            image.translatesAutoresizingMaskIntoConstraints = false
+            image.contentMode = .scaleAspectFit
+            image.heightAnchor.constraint(equalToConstant: 235).isActive = true
+            return image
+
+        case .failure:
+            let image = UIImageView(image: NearIOSWalletUIKitAsset.Media.failure.image)
+            image.translatesAutoresizingMaskIntoConstraints = false
+            image.contentMode = .scaleAspectFit
+            image.heightAnchor.constraint(equalToConstant: 235).isActive = true
+            return image
+            
+        case .loading:
+            let view = UIActivityIndicatorView(style: .large)
+            view.translatesAutoresizingMaskIntoConstraints = false
+            view.startAnimating()
+            return view
+        }
+    }()
+    
+    lazy var titleText: UILabel = {
+        let label = UILabel()
+        label.font = NearIOSWalletUIKitFontFamily.CabinetGrotesk.black.font(size: 32)
+        label.textColor = NearIOSWalletUIKitAsset.Color.blackPrimary.color
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.numberOfLines = 2
+        label.textAlignment = .center
+        return label
+    }()
+    
+    lazy var subtitle: UILabel = {
+        let label = UILabel()
+        label.font = NearIOSWalletUIKitFontFamily.Manrope.regular.font(size: 16)
+        label.textColor = NearIOSWalletUIKitAsset.Color.blackPrimary.color
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.textAlignment = .center
+        label.numberOfLines = 4
+        return label
+    }()
+}
+
+extension MoneyFromLinkModelState {
+    var title: String {
+        switch self {
+        case .success: return "Successfully"
+        case .loading: return "Receiving the money..."
+        case .failure: return "Failure"
+        }
+    }
+        
+    var description: String {
+        switch self {
+        case .success: return """
+            All transfers are delivered, you can
+            hide this screen and reload your balance
+        """
+            
+        case .failure: return """
+            Failed to get money. Looks like someone
+            has already used this link.
+        """
+            
+        case .loading: return """
+            Requesting money using your link,
+            please wait...
+            """
+        }
+    }
+}
+
+'''
+'''--- Sources/MoneyFromLink/MoneyFromLinkViewController.swift ---
+import Foundation
+import NearIOSWalletUIKit
+import PanModal
+import Combine
+import UIKit
+
+public class MoneyFromLinkViewController: NiblessViewController {
+    private let viewModel: MoneyFromLinkModel
+    private let analytics: AnalyticsMoneyFromLink?
+    private let subscriptions: CancelBag = .init()
+
+    public init(viewModel: MoneyFromLinkModel, analytics: AnalyticsMoneyFromLink?) {
+        self.analytics = analytics
+        self.viewModel = viewModel
+        super.init()
+    }
+    
+    public override func loadView() {
+        view = MoneyFromLinkView(state: .loading)
+        analytics?.open()
+        
+        Task { await viewModel.receiveMoney() }
+        viewModel.statePublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] state in
+                self?.view = MoneyFromLinkView(state: state)
+                switch state {
+                case .failure: self?.analytics?.failure()
+                case .success: self?.analytics?.success()
+                case .loading: break
+                }
+            }
+            .store(in: subscriptions)
+    }
+}
+
+'''
+'''--- Sources/Nickname/NicknameAction.swift ---
+import Foundation
+import HDWallet
+
+indirect enum NicknameAction: CustomStringConvertible {
+    enum Suggestion: String, CustomStringConvertible {
+        case wrongNickname = "This nickname cannot be allocated."
+        case allocatedNickname = "This nickname has already been taken"
+        case empty = ""
+        
+        var description: String {
+            return self.rawValue
+        }
+    }
+    
+    case checkAccountIdExist(
+        _ nickname: NamedNearAddress,
+        onSuccess: (Bool) -> [NicknameAction],
+        onFailure: (Error) -> NicknameAction = { .showError($0) }
+    )
+    case allocateNickname(
+        _ nickname: NamedNearAddress,
+        onSuccess: [NicknameAction],
+        onFailure: (Error) -> [NicknameAction] = { [.showLoader(false), .showError($0)] }
+    )
+    case showError(_ error: Error)
+    case changeSuggestion(_ suggestion: Suggestion)
+    case changeContinue(_ isAvailable: Bool)
+    case showLoader(_ show: Bool)
+    case signUp(_ seed: BIP39, checkNickname: Bool = false, onFailure: (Error) -> NicknameAction = { .showError($0) })
+    
+    var description: String {
+        switch self {
+        case .checkAccountIdExist: return "Nickname: checkAccountIdExist"
+        case .allocateNickname: return "Nickname: allocateNickname"
+        case let .showError(error): return "Nickname: showError \(error)"
+        case .changeSuggestion: return "cNickname: hangeSuggestion"
+        case .changeContinue: return "Nickname: changeContinue"
+        case .showLoader: return "Nickname: showLoader"
+        case .signUp: return "Nickname: signUp"
+        }
+    }
+}
+
+'''
+'''--- Sources/Nickname/NicknameGiftVC.swift ---
+import UIKit
+import NearIOSWalletUIKit
+
+final public class NicknameGiftViewController: NiblessViewController, UITextFieldDelegate {
+    
+    private let viewModel: NicknameViewModel
+    private let subscriptions: CancelBag = .init()
+    
+    private var nicknameView: NicknameGiftView?
+    private let analytics: AnalyticsAuth?
+
+    public init(viewModel: NicknameViewModel, analytics: AnalyticsAuth?) {
+        self.viewModel = viewModel
+        self.analytics = analytics
+        super.init()
+    }
+    
+    public override func loadView() {
+        nicknameView = NicknameGiftView(frame: .zero)
+        view = nicknameView
+    }
+    
+    public override func viewDidLoad() {
+        super.viewDidLoad()
+        nicknameView?.textField.delegate = self
+        nicknameView?.buttonPublisher
+            .sink { [weak viewModel, analytics] event in
+                switch event {
+                case .continue:
+                    analytics?.nickanemGiftCreate()
+                    viewModel?.continuePressed()
+                case .skip:
+                    analytics?.nicknameGiftSkip()
+                    viewModel?.skipPressed()
+                }
+            }
+            .store(in: subscriptions)
+
+        
+        viewModel.$isContinueActive
+            .receive(on: DispatchQueue.main)
+            .assign(to: \.continueButton.isEnabled, on: nicknameView!)
+            .store(in: subscriptions)
+        
+        viewModel.$showLoader
+            .receive(on: DispatchQueue.main)
+            .sink { [weak nicknameView] in
+                nicknameView?.showLoader($0)
+            }
+            .store(in: subscriptions)
+        
+        viewModel.$suggestionText
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] in
+                self?.nicknameView?.updateErrorLabel($0)
+            }
+            .store(in: subscriptions)
+        
+        nicknameView?.textfieldPublisher
+            .compactMap { $0 }
+            .map { $0.lowercased() }
+            .compactMap { [weak self] in
+                self?.addNearEnding(substring: $0)
+            }
+            .assign(to: \.rawTextfield, on: viewModel)
+            .store(in: subscriptions)
+        
+        viewModel.errorPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] in
+                self?.analytics?.nicknameGiftFailure(error: $0.message)
+                self?.present(errorMessage: $0)
+            }
+            .store(in: subscriptions)
+    }
+    
+    public override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        nicknameView?.textField.becomeFirstResponder()
+        analytics?.nicknameGiftOpen()
+    }
+    
+    public func textField(
+        _ textField: UITextField,
+        shouldChangeCharactersIn range: NSRange,
+        replacementString string: String
+    ) -> Bool {
+        guard
+            let currentText = textField.text,
+            let stringRange = Range(range, in: currentText)
+        else {
+            return false
+        }
+        let updatedText = currentText
+            .replacingCharacters(in: stringRange, with: string)
+            .replacingOccurrences(of: AppInfo.shared.nearDomain, with: "")
+        guard !updatedText.isEmpty else {
+            textField.text = ""
+            viewModel.rawTextfield = ""
+            return true
+        }
+        guard
+            updatedText.count <= 64
+        else {
+            if updatedText.count < (textField.text?.count ?? 0) - 5 {
+                textField.text = updatedText
+            }
+            return false
+        }
+        return true
+    }
+    
+    func addNearEnding(substring: String) -> String {
+        let query = substring.replacingOccurrences(of: AppInfo.shared.nearDomain, with: "")
+        let result = self.putColourFormattedTextInTextField(
+            autocompleteResult: AppInfo.shared.nearDomain,
+            userQuery: query
+        )
+    
+        self.moveCaretToEndOfUserQueryPosition(userQuery: query)
+        return result
+    }
+    
+    func putColourFormattedTextInTextField(autocompleteResult: String, userQuery : String) -> String {
+        let colouredString: NSMutableAttributedString = .init(string: userQuery + autocompleteResult)
+        colouredString.addAttribute(
+            NSAttributedString.Key.foregroundColor,
+            value: NearIOSWalletUIKitAsset.Color.blackDisabled.color,
+            range: NSRange(location: userQuery.count, length:autocompleteResult.count)
+        )
+        
+        nicknameView?.textField.attributedText = colouredString
+        
+        return nicknameView?.textField.attributedText?.string ?? ""
+    }
+    func moveCaretToEndOfUserQueryPosition(userQuery : String) {
+        guard let textField = nicknameView?.textField else { return }
+        if let newPosition = textField.position(
+            from: textField.beginningOfDocument,
+            offset: userQuery.count
+        ) {
+            textField.selectedTextRange = textField.textRange(
+                from: newPosition,
+                to: newPosition
+            )
+        }
+    }
+}
+
+'''
+'''--- Sources/Nickname/NicknameRemoteRepository.swift ---
+import Foundation
+
+protocol NicknameRemoteRepository: BaseWebRepository {
+    func checkAccountIdExistance(nickname: NamedNearAddress) async -> Result<Bool, Error>
+    func allocateNickname(
+        nickname: NamedNearAddress,
+        publicKey: String,
+        sign: String,
+        deviceId: String
+    ) async -> Result<(), Error>
+}
+
+struct RealNicknameRemoteRepository: NicknameRemoteRepository {
+    public var session: HereHTTPClient = .shared
+
+    func checkAccountIdExistance(nickname: NamedNearAddress) async -> Result<Bool, Error> {
+        do {
+            let url = URL(string: "https://\(AppInfo.shared.hereHost)/api/v1/user/check_account_exist?near_account_id=\(nickname.address)")!
+            let request = URLRequest(url: url)
+            let accountIdExist: AccountIdExist = try await self.request(request: request)
+            return .success(accountIdExist.exist)
+        } catch {
+            return .failure(error)
+        }
+    }
+    
+    func allocateNickname(nickname: NamedNearAddress, publicKey: String, sign: String, deviceId: String) async -> Result<(), Error> {
+        do {
+            let body: AllocateUsername = .init(nearAccountID: nickname.address, publicKey: publicKey, sign: sign, deviceId: deviceId)
+            let url = URL(string: "https://\(AppInfo.shared.hereHost)/api/v1/user/create_near_username")!
+            var request = URLRequest(url: url, httpMethod: .post)
+            request.httpBody = body.data
+            try await self.request(request: request)
+            return .success(())
+        } catch {
+            return .failure(error)
+        }
+    }
+}
+
+fileprivate struct AllocateUsername: Codable {
+    let nearAccountID, publicKey, sign, deviceId: String
+    
+    enum CodingKeys: String, CodingKey {
+        case nearAccountID = "near_account_id"
+        case publicKey = "public_key"
+        case deviceId = "device_id"
+        case sign
+    }
+    
+    var data: Data? {
+        let encoder = JSONEncoder()
+        return try? encoder.encode(self)
+    }
+}
+
+fileprivate struct AccountIdExist: Codable {
+    let exist: Bool
+}
+
+'''
+'''--- Sources/Nickname/NicknameViewModel.swift ---
+import Combine
+import Foundation
+import CryptoKit
+import NearSwift
+import HDWallet
+
+extension Array: Error where Element: Error { }
+
+public protocol SignInResponder {
+    func signedIn(to: UserSession)
+}
+
+final public class NicknameViewModel: ObservableObject {
+    public var isNicknameValid: AnyPublisher<Bool, Never> {
+        nickname
+            .map {
+                switch $0 {
+                case .failure: return false
+                case .success: return true
+                }
+            }
+            .eraseToAnyPublisher()
+    }
+    @Published public private(set) var suggestionText: String = ""
+    @Published public private(set) var isContinueActive: Bool = false
+    @Published public private(set) var showLoader: Bool = false
+    
+    public var errorPublisher: AnyPublisher<ErrorMessage, Never> {
+        errorSubject
+            .eraseToAnyPublisher()
+    }
+    
+    public var rawTextfield: String? {
+        didSet { rawTextfieldSubject.send(rawTextfield) }
+    }
+    
+    // MARK: - Private Properties
+    
+    private let nickname: PassthroughSubject<Result<NamedNearAddress, [NamedNearAddress.ParseError]>, Never> = .init()
+    private let rawTextfieldSubject: PassthroughSubject<String?, Never> = .init()
+    private let keychain = HereKeychain(keychainId: "identity")
+    
+    private let remoteService: NicknameRemoteRepository = RealNicknameRemoteRepository()
+    private let userSessionRepository: UserSessionRepository
+    private let signInResponder: SignInResponder
+    
+    private let errorSubject: PassthroughSubject<ErrorMessage, Never> = .init()
+    private let actionSubject: PassthroughSubject<NicknameAction, Never> = .init()
+    
+    private let seed: BIP39
+    private let subscriptions: CancelBag = .init()
+    
+    private var uniqueID: String {
+        get async {
+            if let id = try? await keychain.get(for: "id") {
+                return id
+            } else {
+                let id = UUID().uuidString
+                try? await keychain.set(id, for: "id")
+                return id
+            }
+        }
+    }
+    
+    public init(
+        seed: BIP39,
+        userSessionRepository: UserSessionRepository,
+        signInResponder: SignInResponder
+    ) {
+        self.seed = seed
+        self.userSessionRepository = userSessionRepository
+        self.signInResponder = signInResponder
+        bind()
+    }
+    
+    public func continuePressed() {
+        let actions = continueActions()
+        actions.forEach { actionSubject.send($0) }
+    }
+    
+    public func skipPressed() {
+        let actions = skipActions()
+        actions.forEach { actionSubject.send($0) }
+    }
+    
+    private func bind() {
+        rawTextfieldSubject
+            .replaceNil(with: "")
+            .map { NearAddress.named(address: $0) }
+            .subscribe(nickname)
+            .store(in: subscriptions)
+        
+        let publisher = collectActions()
+        
+        
+        publisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] in
+                self?.perform($0)
+            }
+            .store(in: subscriptions)
+    }
+    
+    private func collectActions() -> AnyPublisher<NicknameAction, Never> {
+        let textfieldActions = bindToTextfield()
+        let imperativeActions = actionSubject.eraseToAnyPublisher()
+        return Publishers.Merge(textfieldActions, imperativeActions).eraseToAnyPublisher()
+    }
+    
+    private func bindToTextfield() -> AnyPublisher<NicknameAction, Never> {
+        
+        let reset: AnyPublisher<NicknameAction, Never> = rawTextfieldSubject
+            .map { _ in NicknameAction.changeContinue(false) }
+            .eraseToAnyPublisher()
+        
+        let isCorrect: AnyPublisher<NicknameAction, Never> = nickname
+            .dropFirst()
+            .map {
+                switch $0 {
+                case .success: return .changeSuggestion(.empty)
+                case .failure: return .changeSuggestion(.wrongNickname)
+                }
+            }
+            .eraseToAnyPublisher()
+        
+        let onSuccess: (Bool) -> [NicknameAction] = { available in
+            if available {
+                return [.changeContinue(true)]
+            } else {
+                return [
+                    .changeSuggestion(.allocatedNickname),
+                    .changeContinue(false)
+                ]
+            }
+        }
+        
+        let isAvailable: AnyPublisher<NicknameAction, Never> = nickname
+            .debounce(for: .seconds(0.5), scheduler: RunLoop.main)
+            .compactMap({ result in
+                switch result {
+                case .failure: return nil
+                case let .success(namedAddress): return namedAddress
+                }
+            })
+            .map { NicknameAction.checkAccountIdExist($0, onSuccess: onSuccess) }
+            .eraseToAnyPublisher()
+        
+        return Publishers.MergeMany([reset, isAvailable, isCorrect]).eraseToAnyPublisher()
+    }
+    
+    private func skipActions() -> [NicknameAction] {
+        return [.signUp(seed)]
+    }
+    
+    private func continueActions() -> [NicknameAction] {
+        let nicknameParseResult = NearAddress.named(address: rawTextfield ?? "")
+        switch nicknameParseResult {
+        case let .success(named):
+            return [
+                .showLoader(true),
+                .allocateNickname(
+                    named,
+                    onSuccess: [.showLoader(false), .signUp(seed, checkNickname: true)]
+                )
+            ]
+        case .failure:
+            return [.changeSuggestion(.empty), .changeContinue(false)]
+        }
+    }
+    
+    private func perform(_ action: NicknameAction) {
+            switch action {
+            case let .changeContinue(isActive):
+                updateContinueButtonState(isActive: isActive)
+            case let .changeSuggestion(text):
+                updateSuggestionText(new: text.description)
+            case let .showError(error):
+                handleError(error)
+            case let .checkAccountIdExist(nickname, onSuccess, onFailure):
+                Task {
+                    switch await checkAccountIdExist(nickname: nickname) {
+                    case let .success(isExist): perform(onSuccess(!isExist))
+                    case let .failure(error): perform(onFailure(error))
+                    }
+                }
+            case let .allocateNickname(nickname, onSuccess, onFailure):
+                Task {
+                    switch await allocateNickname(nick: nickname) {
+                    case .success: perform(onSuccess)
+                    case let .failure(error): perform(onFailure(error))
+                    }
+                }
+            case let .signUp(seed, checkNickname, onFailure):
+                Task {
+                    switch await signUp(seed: seed, checkNickname: checkNickname) {
+                    case .success: break
+                    case let .failure(error): perform(onFailure(error))
+                    }
+                }
+            case let .showLoader(show): showLoader = show
+            }
+    }
+    
+    private func perform(_ actions: [NicknameAction]) {
+        actions.forEach(perform)
+    }
+    
+    private func updateContinueButtonState(isActive: Bool) {
+        isContinueActive = isActive
+    }
+    
+    private func updateSuggestionText(new text: String) {
+        suggestionText = text
+    }
+    
+    private func handleError(_ error: Error) {
+        switch error {
+        case let customStringConvertible as CustomStringConvertible:
+            errorSubject.send(ErrorMessage(
+                title: "Something went wrong",
+                message: "\(customStringConvertible)"
+            ))
+        default:
+            errorSubject.send(ErrorMessage(
+                title: "Something went wrong",
+                message: error.localizedDescription
+            ))
+        }
+    }
+    
+    private func checkAccountIdExist(nickname: NamedNearAddress) async -> Result<Bool, Error> {
+        return await remoteService.checkAccountIdExistance(nickname: nickname)
+    }
+    
+    private func signUp(seed: BIP39, checkNickname: Bool) async -> Result<(), Error> {
+        do {
+            let session = try await userSessionRepository.signUp(mnemonic: seed.phrase, isNew: !checkNickname)
+            signInResponder.signedIn(to: session)
+            return .success(())
+        } catch {
+            return .failure(error)
+        }
+    }
+    
+    private func allocateNickname(nick: NamedNearAddress) async -> Result<(), Error> {
+        do {
+            let deviceId = await uniqueID
+            let publicKey = try createKeyPair().getPublicKey()
+            let signForRequest = generateSignForRequest(
+                publicKey: publicKey,
+                namedNearAddress: nick,
+                deviceId: deviceId
+            )
+            return await remoteService.allocateNickname(
+                nickname: nick,
+                publicKey: publicKey.toString(),
+                sign: signForRequest.compactMap { String(format: "%02x", $0) }.joined(),
+                deviceId: deviceId
+            )
+        } catch {
+            return .failure(error)
+        }
+    }
+    
+    private func createKeyPair() throws -> KeyPair {
+        let bip32 = try BIP32(seed: seed.seed.data, coinType: .near)
+        let extendedPrivateKey = bip32.derived(paths: DerivationNode.nearPath)
+        return try KeyPairEd25519.fromSeed(seed: extendedPrivateKey.privateKey)
+    }
+    
+    fileprivate var nearPrivateKey: String {
+        switch AppInfo.shared.nearNetwork {
+        case "default", "mainnet": return "..."
+        case "testnet": return "..."
+        default: return ""
+        }
+    }
+    
+    private func generateSignForRequest(
+        publicKey: PublicKey,
+        namedNearAddress: NamedNearAddress,
+        deviceId: String
+    ) -> SHA256.Digest {
+        let publicKey = publicKey.toString()
+        let nickname = namedNearAddress.address
+        let data = Data((nearPrivateKey + publicKey + nickname + deviceId).utf8)
+        return SHA256.hash(data: data)
+    }
+}
+
+'''
+'''--- Sources/Nickname/NicknamegiftView.swift ---
+import NearIOSWalletUIKit
+import UIKit
+import Combine
+
+final class NicknameGiftView: NiblessView {
+    
+    enum Button {
+        case skip
+        case `continue`
+    }
+    
+    public var buttonPublisher: AnyPublisher<Button, Never> {
+        buttonSubject.eraseToAnyPublisher()
+    }
+    
+    public var textfieldPublisher: AnyPublisher<String?, Never> {
+        textField.textPublisher
+    }
+    
+    public var continueButton: UIButton {
+        buttonStack.arrangedSubviews[1] as! UIButton
+    }
+    
+    private var loader: OverlayLoader = {
+        let view = OverlayLoader(frame: .zero)
+        view.translatesAutoresizingMaskIntoConstraints = false
+        return view
+    }()
+    
+    
+    private var alreadyMoved: Bool = false
+    private let buttonSubject: PassthroughSubject<Button, Never> = .init()
+    
+    private var bottomConstraint: NSLayoutConstraint! = nil
+    
+    private var bgView: UIView = {
+        let view = NiblessView(frame: .zero)
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.backgroundColor = NearIOSWalletUIKitAsset.Color.blackPrimary.color
+        view.layer.cornerRadius = 16
+        return view
+    }()
+    
+    private var nicknameLabel: UILabel = {
+        let label = UILabel(frame: .zero)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.text = "Nickname"
+        label.textColor = NearIOSWalletUIKitAsset.Color.blackPrimary.color
+        label.font = NearIOSWalletUIKitFontFamily.CabinetGrotesk.black.font(size: 32)
+        return label
+    }()
+    
+    private var freeLabel: UILabel = {
+        let label = UILabel(frame: .zero)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.text = "FREE"
+        label.textColor = NearIOSWalletUIKitAsset.Color.green.color
+        label.font = NearIOSWalletUIKitFontFamily.CabinetGrotesk.black.font(size: 32)
+        
+        return label
+    }()
+    
+    private var overlayLine: UIView = {
+        let view = UIView(frame: .zero)
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.backgroundColor = NearIOSWalletUIKitAsset.Color.blackPrimary.color
+        return view
+    }()
+    
+    private var priceLabel: UILabel = {
+        let label = UILabel(frame: .zero)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.textColor = NearIOSWalletUIKitAsset.Color.blackDisabled.color
+        label.text = "0.1 NEAR"
+        label.font = NearIOSWalletUIKitFontFamily.CabinetGrotesk.extrabold.font(size: 16)
+        return label
+    }()
+    
+    private var descriptionStack: UIStackView = {
+        let label = UILabel(frame: .zero)
+        let image = NearIOSWalletUIKitAsset.Media.warningOrange.image.withRenderingMode(.alwaysTemplate)
+        let imageView = UIImageView(image: image)
+        imageView.tintColor = NearIOSWalletUIKitAsset.Color.green.color
+        imageView.contentMode = .center
+        imageView.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        
+        let stack = UIStackView(arrangedSubviews: [imageView, label])
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.spacing = 8
+        
+        
+        label.text = "FREE nickname is a gift from HERE Wallet team"
+        label.font = NearIOSWalletUIKitFontFamily.Manrope.bold.font(size: 14)
+        label.textColor = NearIOSWalletUIKitAsset.Color.blackPrimary.color
+        return stack
+    }()
+    
+    
+    private(set) lazy var textField: UITextField = {
+        let inset = UIEdgeInsets(top: 8, left: 16, bottom: 8, right: 8)
+        let textfiled: UITextField = InsetedUITextfield(inset: inset)
+        textfiled.translatesAutoresizingMaskIntoConstraints = false
+        textfiled.placeholder = "Nickname"
+        textfiled.font = NearIOSWalletUIKitFontFamily.Manrope.medium.font(size: 16)
+        textfiled.textColor = NearIOSWalletUIKitAsset.Color.blackPrimary.color
+        
+        textfiled.backgroundColor = NearIOSWalletUIKitAsset.Color.elevation1.color
+        
+        textfiled.layer.cornerRadius = 16
+        textfiled.layer.borderWidth = 1
+        textfiled.layer.borderColor = NearIOSWalletUIKitAsset.Color.blackPrimary.color.cgColor
+        
+        textfiled.keyboardType = .asciiCapable
+        textfiled.autocorrectionType = .no
+        textfiled.autocapitalizationType = .none
+        
+        return textfiled
+    }()
+    
+    private var errorLabel: UILabel = {
+        let label = UILabel(frame: .zero)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = NearIOSWalletUIKitFontFamily.Manrope.medium.font(size: 14)
+        label.textColor = NearIOSWalletUIKitAsset.Color.red.color
+        return label
+    }()
+    
+    
+    private lazy var buttonStack : UIStackView = {
+        let views = [createButton(type: .skip), createButton(type: .continue)]
+        let stack = UIStackView(arrangedSubviews: views)
+        stack.spacing = 8
+        stack.distribution = .fillEqually
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        return stack
+    }()
+    
+    public func updateErrorLabel(_ text: String) {
+        UIView.transition(
+            with: errorLabel,
+            duration: 0.25,
+            options: [.transitionFlipFromTop]
+        ) { [weak self] in
+            self?.errorLabel.text = text
+        }
+    }
+    
+    public func showLoader(_ isShown: Bool) {
+        UIView.animate(withDuration: 0.1) {
+            self.loader.alpha = isShown ? 1 : 0
+        }
+    }
+    
+    override func didMoveToWindow() {
+        guard !alreadyMoved else { return }
+        backgroundColor = NearIOSWalletUIKitAsset.Color.elevation0.color
+        addSubview(nicknameLabel)
+        addSubview(freeLabel)
+        addSubview(priceLabel)
+        addSubview(overlayLine)
+        addSubview(descriptionStack)
+        addSubview(bgView)
+        addSubview(textField)
+        addSubview(buttonStack)
+        addSubview(errorLabel)
+        addSubview(loader)
+        
+        NSLayoutConstraint.activate([
+            topAnchor.constraint(equalTo: safeAreaLayoutGuide.topAnchor),
+            bottomAnchor.constraint(equalTo: safeAreaLayoutGuide.bottomAnchor),
+            leadingAnchor.constraint(equalTo: safeAreaLayoutGuide.leadingAnchor),
+            trailingAnchor.constraint(equalTo: safeAreaLayoutGuide.trailingAnchor)
+        ])
+        
+        NSLayoutConstraint.activate(
+            [
+                nicknameLabel.topAnchor.constraint(
+                    equalTo: safeAreaLayoutGuide.topAnchor,
+                    constant: 24
+                ),
+                nicknameLabel.leadingAnchor.constraint(
+                    equalTo: leadingAnchor,
+                    constant: 16
+                ),
+                nicknameLabel.heightAnchor.constraint(equalToConstant: 40)
+            ]
+        )
+        
+        NSLayoutConstraint.activate(
+            [
+                freeLabel.topAnchor.constraint(
+                    equalTo: safeAreaLayoutGuide.topAnchor,
+                    constant: 24
+                ),
+                freeLabel.trailingAnchor.constraint(
+                    equalTo: trailingAnchor,
+                    constant: -16
+                ),
+                freeLabel.heightAnchor.constraint(equalToConstant: 40)
+            ]
+        )
+        
+        NSLayoutConstraint.activate(
+            [
+                priceLabel.topAnchor.constraint(
+                    equalTo: safeAreaLayoutGuide.topAnchor,
+                    constant: 38
+                ),
+                priceLabel.trailingAnchor.constraint(
+                    equalTo: freeLabel.leadingAnchor,
+                    constant: -8
+                ),
+                priceLabel.heightAnchor.constraint(equalToConstant: 20)
+            ]
+        )
+        
+        NSLayoutConstraint.activate(
+            [
+                overlayLine.centerXAnchor.constraint(equalTo: priceLabel.centerXAnchor),
+                overlayLine.centerYAnchor.constraint(equalTo: priceLabel.centerYAnchor),
+                overlayLine.widthAnchor.constraint(
+                    equalTo: priceLabel.widthAnchor,
+                    constant: 6
+                ),
+                overlayLine.heightAnchor.constraint(equalToConstant: 1)
+            ]
+        )
+        
+        NSLayoutConstraint.activate(
+            [
+                descriptionStack.topAnchor.constraint(
+                    equalTo: nicknameLabel.bottomAnchor,
+                    constant: 8
+                ),
+                descriptionStack.leadingAnchor.constraint(
+                    equalTo: leadingAnchor,
+                    constant: 16
+                ),
+                descriptionStack.trailingAnchor.constraint(
+                    equalTo: trailingAnchor,
+                    constant: -16
+                )
+            ]
+        )
+        
+        NSLayoutConstraint.activate(
+            [
+                textField.topAnchor.constraint(
+                    equalTo: descriptionStack.bottomAnchor,
+                    constant: 43
+                ),
+                textField.leadingAnchor.constraint(
+                    equalTo: leadingAnchor,
+                    constant: 16
+                ),
+                textField.trailingAnchor.constraint(
+                    equalTo: trailingAnchor,
+                    constant: -16
+                ),
+                textField.heightAnchor.constraint(equalToConstant: 56),
+                errorLabel.topAnchor.constraint(equalTo: textField.bottomAnchor, constant: 12),
+                errorLabel.leadingAnchor.constraint(equalTo: textField.leadingAnchor)
+            ]
+        )
+        
+        bottomConstraint = buttonStack.bottomAnchor.constraint(
+            equalTo: bottomAnchor,
+            constant: -24
+        )
+        
+        NSLayoutConstraint.activate(
+            [
+                bottomConstraint,
+                buttonStack.leadingAnchor.constraint(
+                    equalTo: leadingAnchor,
+                    constant: 16
+                ),
+                buttonStack.trailingAnchor.constraint(
+                    equalTo: trailingAnchor,
+                    constant: -16
+                ),
+                buttonStack.heightAnchor.constraint(equalToConstant: 56)
+            ]
+        )
+        
+        NSLayoutConstraint.activate(
+            [
+                bgView.topAnchor.constraint(equalTo: textField.topAnchor),
+                bgView.bottomAnchor.constraint(equalTo: textField.bottomAnchor),
+                bgView.leadingAnchor.constraint(equalTo: textField.leadingAnchor),
+                bgView.trailingAnchor.constraint(equalTo: textField.trailingAnchor)
+            ]
+        )
+        NSLayoutConstraint.activate(
+            [
+                loader.centerXAnchor.constraint(equalTo: centerXAnchor),
+                loader.centerYAnchor.constraint(equalTo: centerYAnchor)
+            ]
+        )
+        
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(keyboardNotification(_:)),
+            name: UIResponder.keyboardWillShowNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(keyboardNotification(_:)),
+            name: UIResponder.keyboardWillHideNotification,
+            object: nil
+        )
+        alreadyMoved = true
+    }
+    
+    @objc
+    private func keyboardNotification(
+        _ notification: NSNotification
+    ) {
+        animateWithKeyboard(notification: notification) { [weak self] keyboardFrame in
+            switch notification.name {
+            case UIResponder.keyboardWillHideNotification:
+                self?.bottomConstraint.constant = -24
+                self?.bgView.transform = .identity
+            case UIResponder.keyboardWillShowNotification:
+                self?.bottomConstraint.constant = -keyboardFrame.height - 24
+                self?.bgView.transform = .init(translationX: 4, y: 4)
+            default: break
+            }
+        }
+    }
+    
+    private func createButton(type: Button) -> UIButton {
+        
+        let black = NearIOSWalletUIKitAsset.Color.blackPrimary.color
+        let blackDisabled = NearIOSWalletUIKitAsset.Color.blackDisabled.color
+        let blackSecondary = NearIOSWalletUIKitAsset.Color.blackSecondary.color
+        
+        let button: UIButton
+        
+        let action = UIAction { [weak self] _ in
+            self?.buttonSubject.send(type)
+            self?.textField.resignFirstResponder()
+        }
+        
+        switch type {
+        case .skip:
+            button = PressedWalletButton(buttonType: .bordered(black, 2), action: action)
+            button.setTitle("skip", for: .normal)
+        case .continue:
+            button = PressedWalletButton(
+                buttonType: .filled((black, blackDisabled), (.white, blackSecondary)) ,
+                action: action
+            )
+            button.setTitle("continue", for: .normal)
+            button.isEnabled = false
+        }
+        
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.layer.cornerCurve = .circular
+        button.layer.cornerRadius = 24
+        button.titleLabel?.font = NearIOSWalletUIKitFontFamily.Manrope.bold.font(size: 16)
+        return button
+    }
+}
+
+'''
+'''--- Sources/Nickname/PressedWalletButton.swift ---
+import Foundation
+import NearIOSWalletUIKit
+import UIKit
+
+open class PressedWalletButton: PressedUIButton {
+    
+    enum ButtonType {
+        case filled(_ buttonColor: (UIColor, UIColor), _ titleColor: (UIColor, UIColor))
+        case bordered(_ borderColor: UIColor, _ borderWidth: CGFloat)
+    }
+    
+    enum SimpleButtonType {
+        case simpleFilled(_ buttonColor: UIColor, _ titleColor: UIColor)
+        case simpleBordered(_ borderColor: UIColor, _ borderWidth: CGFloat)
+    }
+    
+    var buttonConfig: ButtonType
+    
+    override open var isEnabled: Bool {
+        didSet {
+            switch buttonConfig {
+            case let .filled(buttonColor, titleColor):
+                let animator = UIViewPropertyAnimator(duration: 0.1, curve: .easeIn)
+                
+                animator.addAnimations { [weak self] in
+                    switch self?.isEnabled {
+                    case true:
+                        self?.backgroundColor = buttonColor.0
+                        self?.setTitleColor(titleColor.0, for: .normal)
+                    case false:
+                        self?.backgroundColor = buttonColor.1
+                        self?.setTitleColor(titleColor.1, for: .disabled)
+                    default: break
+                    }
+                }
+                
+                animator.startAnimation()
+            case .bordered: break
+            }
+        }
+    }
+    
+    convenience init(
+        buttonType: SimpleButtonType,
+        action: UIAction? = nil
+    ) {
+        switch buttonType {
+        case .simpleFilled(let buttonColor, let titleColor):
+            let buttonType = ButtonType.filled(
+                (buttonColor, buttonColor),
+                (titleColor, titleColor)
+            )
+            self.init(buttonType: buttonType, action: action)
+        case .simpleBordered(let borderColor, let borderWidth):
+            let buttonType = ButtonType.bordered(borderColor, borderWidth)
+            self.init(buttonType: buttonType, action: action)
+        }
+    }
+    
+    init(
+        buttonType: ButtonType,
+        action: UIAction? = nil
+    ) {
+        buttonConfig = buttonType
+        let animatePair = PressedWalletButton.commonInit()
+        super.init(touchBegan: animatePair.0, touchEnd: animatePair.1)
+        if let action = action {
+            self.addAction(action, for: .touchUpInside)
+        }
+        
+        switch buttonType {
+        case let .filled(buttonColor, titleColor):
+            backgroundColor = buttonColor.0
+            setTitleColor(titleColor.0, for: .normal)
+        case let .bordered(borderColor, borderWidth):
+            layer.borderColor = borderColor.cgColor
+            layer.borderWidth = borderWidth
+            setTitleColor(NearIOSWalletUIKitAsset.Color.blackPrimary.color, for: .normal)
+        }
+    }
+    
+    private static func commonInit() -> (
+        @MainActor (UIButton) async -> Void,
+        @MainActor (UIButton) async -> Void
+    ) {
+        let animator = UIViewPropertyAnimator(duration: 0.1, curve: .easeIn)
+        
+        let animateIn: @MainActor (UIButton) async -> Void  = { @MainActor button in
+            animator.addAnimations {
+                button.transform = .init(scaleX: 0.93, y: 0.93)
+            }
+            animator.startAnimation()
+            _ = await animator.addCompletion()
+        }
+        
+        let animateOut: @MainActor (UIButton) async -> Void  = { @MainActor button in
+            animator.addAnimations {
+                button.transform = .identity
+            }
+            animator.startAnimation()
+            _ = await animator.addCompletion()
+        }
+        
+        return (animateIn, animateOut)
+    }
+}
+
+'''
+'''--- Sources/SignedViewController.swift ---
+
+import Foundation
+import NearIOSWalletUIKit
+import SwiftUI
+
+struct HereButton: ButtonStyle {
+    let color: Color
+    init(color: Color = Color(NearIOSWalletUIKitAsset.Color.yellow.color)) {
+        self.color = color
+    }
+
+    func makeBody(configuration: Configuration) -> some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 16, style: .circular)
+                .fill(Color(NearIOSWalletUIKitAsset.Color.blackPrimary.color))
+                .offset(.init(width: 6, height: 6))
+
+            configuration.label
+                .foregroundColor(Color(NearIOSWalletUIKitAsset.Color.blackPrimary.color))
+                .font(Font(NearIOSWalletUIKitFontFamily.Manrope.bold.font(size: 18)))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(.horizontal, 16)
+                .background(color)
+                .cornerRadius(16)
+                .overlay(RoundedRectangle(cornerRadius: 16, style: .circular)
+                    .stroke(Color(NearIOSWalletUIKitAsset.Color.blackPrimary.color), lineWidth: 1)
+                )
+                .offset(configuration.isPressed ? .init(width: 6, height: 6) : .zero)
+                .animation(.easeOut(duration: 0.2), value: configuration.isPressed)
+        }
+        .frame(height: 46)
+    }
+}
+
+struct HereMainButton: ButtonStyle {
+    let color: Color
+    init(color: Color = Color(NearIOSWalletUIKitAsset.Color.blackPrimary.color)) {
+        self.color = color
+    }
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundColor(Color.white)
+            .font(Font(NearIOSWalletUIKitFontFamily.Manrope.bold.font(size: 18)))
+            .frame(maxWidth: .infinity)
+            .frame(height: 80)
+            .padding(.horizontal, 16)
+            .background(color)
+            .cornerRadius(32)
+            .scaleEffect(configuration.isPressed ? 0.95: 1)
+            .animation(.easeOut(duration: 0.2), value: configuration.isPressed)
+    }
+}
+
+struct InstantWallet: View {
+    @ObservedObject
+    var userSession: UserSession
+    
+    @State private var showExport = false
+    
+    var totalBalance: String {
+        let usdFormatter = NumberFormatter()
+        usdFormatter.numberStyle = .currency
+        usdFormatter.currencySymbol = "$"
+        
+        let amount = userSession.nearToken?.fiatAmount ?? 0
+        return usdFormatter.string(from: NSDecimalNumber(decimal: amount)) ?? ""
+    }
+    
+    var tokens: [FtOverviewToken] {
+        userSession.tokens.filter { $0.value > 0 || $0.symbol == "NEAR" }
+    }
+
+    var body: some View {
+        ZStack(alignment: .top) {
+            Color(NearIOSWalletUIKitAsset.Color.elevation0.color)
+            
+            ScrollView {
+                VStack {
+                    HStack(alignment: .center, spacing: 8) {
+                        Text(userSession.userProfile.account.address)
+                            .foregroundColor(Color(NearIOSWalletUIKitAsset.Color.blackPrimary.color))
+                            .font(Font(NearIOSWalletUIKitFontFamily.Manrope.bold.font(size: 18)))
+                            .truncationMode(.middle)
+                            .lineLimit(1)
+                        
+                        Button(action: {
+                            UIPasteboard.general.string = userSession.userProfile.account.address
+                        }) {
+                            Image(uiImage: NearIOSWalletUIKitAsset.Media.copy.image)
+                        }
+                    }
+                    .frame(height: 50)
+                    .frame(maxWidth: .infinity)
+                    .padding(.horizontal, 16)
+                    .background(Color(NearIOSWalletUIKitAsset.Color.elevation1.color))
+                    .cornerRadius(16)
+                    .overlay(RoundedRectangle(cornerRadius: 20)
+                        .stroke(Color(NearIOSWalletUIKitAsset.Color.blackPrimary.color), lineWidth: 1)
+                    )
+                    
+                    VStack(alignment: .leading, spacing: 24) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Total value")
+                                .foregroundColor(Color(NearIOSWalletUIKitAsset.Color.blackSecondary.color))
+                                .font(Font(NearIOSWalletUIKitFontFamily.Manrope.medium.font(size: 14)))
+                            
+                            Text(totalBalance)
+                                .foregroundColor(Color(NearIOSWalletUIKitAsset.Color.blackPrimary.color))
+                                .font(Font(NearIOSWalletUIKitFontFamily.CabinetGrotesk.black.font(size: 40)))
+                        }
+                        
+                        VStack(alignment: .center, spacing: 16) {
+                            HStack(alignment: .center, spacing: 16) {
+                                Button(action: { showExport.toggle() }) {
+                                    Text("+ Add money")
+                                }
+                                .buttonStyle(HereButton())
+                                
+                                Button(action: { showExport.toggle() }) {
+                                    Text("↓ Withdraw")
+                                }
+                                .buttonStyle(HereButton())
+                            }
+                            
+                            Button(action: { showExport.toggle() }) {
+                                Text("Pay & Transfer")
+                            }
+                            .buttonStyle(HereButton(color: Color(NearIOSWalletUIKitAsset.Color.orange.color)))
+                        }
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(16)
+                    .padding(.bottom, 8)
+                    .background(Color(NearIOSWalletUIKitAsset.Color.elevation1.color))
+                    .cornerRadius(16)
+                    .overlay(RoundedRectangle(cornerRadius: 16)
+                        .stroke(Color(NearIOSWalletUIKitAsset.Color.blackPrimary.color), lineWidth: 1)
+                    )
+                    
+                    
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(tokens, id: \.tokenId) { token in
+                            HStack(alignment: .center) {
+                                if let url = URL(string: token.icon) {
+                                    if #available(iOS 15.0, *) {
+                                        AsyncImage(url: url) { phase in
+                                            switch phase {
+                                            case .empty:
+                                                ProgressView()
+                                            case .success(let image):
+                                                image.resizable().transition(.scale(scale: 0.1, anchor: .center))
+                                            case .failure:
+                                                Image(systemName: "wifi.slash")
+                                            @unknown default:
+                                                EmptyView()
+                                            }
+                                        }
+                                        .frame(width: 40, height: 40)
+                                    } else {
+                                        RoundedRectangle(cornerRadius: 12)
+                                            .fill(Color(NearIOSWalletUIKitAsset.Color.blackDisabled.color))
+                                            .frame(width: 40, height: 40)
+                                    }
+                                }
+                                
+                                VStack(alignment: .leading) {
+                                    Text(token.name)
+                                        .foregroundColor(Color(NearIOSWalletUIKitAsset.Color.blackPrimary.color))
+                                        .font(Font(NearIOSWalletUIKitFontFamily.Manrope.bold.font(size: 16)))
+                                    
+                                    Text("\(token.amount.rounded(scale: 2, roundingMode: .bankers).description) \(token.symbol)")
+                                        .foregroundColor(Color(NearIOSWalletUIKitAsset.Color.blackSecondary.color))
+                                        .font(Font(NearIOSWalletUIKitFontFamily.Manrope.medium.font(size: 14)))
+                                }
+                                
+                                Spacer()
+               
+                            }
+                            .frame(height: 73)
+                            .frame(maxWidth: .infinity)
+                            .padding(.horizontal, 12)
+                            .background(Color(NearIOSWalletUIKitAsset.Color.elevation1.color))
+                            .cornerRadius(16)
+                            .overlay(RoundedRectangle(cornerRadius: 16)
+                                .stroke(Color(NearIOSWalletUIKitAsset.Color.blackPrimary.color), lineWidth: 1)
+                            )
+                        }
+                    }
+                    .padding(.top, 16)
+                }
+                .padding(16)
+            }
+        }
+        .navigationBarHidden(true)
+        .sheet(isPresented: $showExport, content: {
+            ZStack {
+                Color(NearIOSWalletUIKitAsset.Color.elevation0.color)
+                    .edgesIgnoringSafeArea(.all)
+                ExportWalletView(mnemonic: userSession.getMnemonic())
+            }
+        })
+    }
+}
+
+struct ExportWalletView: View {
+    let mnemonic: [String]
+    
+    var body: some View {
+        ScrollView {
+            Text("Export instant wallet")
+                .foregroundColor(Color(NearIOSWalletUIKitAsset.Color.blackPrimary.color))
+                .font(Font(NearIOSWalletUIKitFontFamily.CabinetGrotesk.black.font(size: 32)))
+                .padding(16)
+                .padding(.top, 16)
+            
+            Text("""
+            Write down or copy the following words in
+            order and keep them somewhere safe.
+            You will need them to enter the account
+            after downloading the app.
+            """)
+            .foregroundColor(Color(NearIOSWalletUIKitAsset.Color.blackSecondary.color))
+            .font(Font(NearIOSWalletUIKitFontFamily.Manrope.medium.font(size: 16)))
+            .multilineTextAlignment(.center)
+            .padding(.bottom, 16)
+
+            VStack {
+                ForEach(mnemonic.chunked(into: 3), id: \.self) { chunk in
+                    HStack {
+                        ForEach(chunk, id: \.self) { word in
+                            Text(word)
+                                .foregroundColor(Color(NearIOSWalletUIKitAsset.Color.blackPrimary.color))
+                                .font(Font(NearIOSWalletUIKitFontFamily.Manrope.bold.font(size: 16)))
+                                .frame(height: 40)
+                                .frame(maxWidth: .infinity)
+                                .padding(.horizontal, 12)
+                                .background(Color(NearIOSWalletUIKitAsset.Color.elevation1.color))
+                                .cornerRadius(12)
+                                .overlay(RoundedRectangle(cornerRadius: 12)
+                                    .stroke(Color(NearIOSWalletUIKitAsset.Color.blackPrimary.color), lineWidth: 1)
+                                )
+                        }
+                    }
+                }
+            }
+            .padding(4)
+            
+            Button(action: {
+                UIPasteboard.general.string = mnemonic.joined(separator: " ")
+            }) {
+                Text("Copy mnemonic phrase")
+            }
+            .buttonStyle(HereMainButton())
+            .padding(.top, 32)
+        }
+        .padding(16)
+    }
+}
+
+extension Array {
+    func chunked(into size: Int) -> [[Element]] {
+        return stride(from: 0, to: count, by: size).map {
+            Array(self[$0 ..< Swift.min($0 + size, count)])
+        }
+    }
+}
+
+'''

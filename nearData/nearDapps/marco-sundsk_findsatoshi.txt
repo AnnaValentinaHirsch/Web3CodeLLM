@@ -1,0 +1,1376 @@
+*GitHub Repository "marco-sundsk/findsatoshi"*
+
+'''--- README.md ---
+# findsatoshi
+'''
+'''--- contracts/nft/Cargo.toml ---
+[package]
+name = "nft"
+version = "0.1.0"
+authors = ["FS Inc <hello@findsatoshi.com>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "3.0.1"
+uint = { version = "0.8.3", default-features = false }
+
+[profile.release]
+codegen-units=1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+
+'''
+'''--- contracts/nft/README.md ---
+# TBD
+
+```shell
+export OWNERID=findsatoshi-owner.testnet
+export NFTID=findsatoshi-nft.testnet
+```
+
+### mint token
+
+```shell
+near call $NFTID nft_mint '{"token_id": "testtoken01", 
+    "metadata": {"title": "熊猫-T80S", 
+        "description": "nft-description", 
+        "media": null, 
+        "media_hash": null, 
+        "copies": "500", 
+        "issued_at": "2021-04-01T14:00:01Z", 
+        "expires_at": null, 
+        "starts_at": "2021-04-01T14:00:01Z", 
+        "updated_at": "2021-04-01T14:00:01Z", 
+        "extra": "{\"id\": \"miner001\", \"type\": \"熊猫-T80S\", \"Thash\": 110, \"W\": 3250}", 
+        "reference": null,
+        "reference_hash": null}}' --account_id=$OWNERID --amount=1
+     
+```
+
+### build and deploy
+
+```shell
+source build.sh
+
+near deploy $NFTID res/nft.wasm --account_id=$NFTID
+
+near call $NFTID new '{"owner_id": "findsatoshi-owner.testnet"}' --account_id=$NFTID
+
+near view $NFTID nft_metadata
+```
+'''
+'''--- contracts/nft/build.sh ---
+#!/bin/bash
+set -e
+cd "`dirname $0`"
+RUSTFLAGS='-C link-arg=-s' cargo build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/nft.wasm ./res/
+
+'''
+'''--- contracts/nft/src/custom.rs ---
+use crate::*;
+
+#[near_bindgen]
+impl Contract {
+
+    pub fn batch_transfer_miners(&mut self, receiver_id: ValidAccountId, token_ids: Vec<TokenId>,) {
+        let sender_id = env::predecessor_account_id();
+        for token_id in token_ids.iter() {
+            let (_, _) = self.internal_transfer(
+                &sender_id, receiver_id.as_ref(), &token_id, None, None,
+            );
+        }
+    }
+
+    pub fn batch_transfer_powers(&mut self, receiver_id: ValidAccountId, power_card: TokenMetadataId, amount: u32) {
+        let sender_id = env::predecessor_account_id();
+        // check sender has enough cards to transfer
+        let mut power_map = self.powers_per_owner.get(&sender_id)
+            .expect("Sender has insurficient card to transfer.");
+
+        let num_sender_has = power_map.get(&power_card)
+            .expect("Sender has insurficient card to transfer.");
+        
+        if num_sender_has < amount {
+            env::panic("Sender has insurficient card to transfer.".as_bytes());
+        }
+        
+        // change sender's count
+        let remain = num_sender_has - amount;
+        if remain > 0 {
+            power_map.insert(&power_card, &remain);
+            self.powers_per_owner.insert(&sender_id, &power_map);
+        } else {
+            power_map.remove(&power_card);
+            if power_map.keys_as_vector().len() > 0 {
+                self.powers_per_owner.insert(&sender_id, &power_map);
+            } else {
+                self.powers_per_owner.remove(&sender_id);
+            }
+        }
+        // change receiver's count
+        let mut recv_power_map = self.powers_per_owner.get(receiver_id.as_ref())
+            .unwrap_or(UnorderedMap::new(unique_prefix(receiver_id.as_ref())));
+        let num_recv_has = recv_power_map.get(&power_card).unwrap_or(0);
+        recv_power_map.insert(&power_card, &(num_recv_has + amount));
+        self.powers_per_owner.insert(receiver_id.as_ref(), &recv_power_map);
+        
+    }
+
+    pub fn consume_powers_by_tokens(&mut self, power_card: TokenMetadataId, token_ids: Vec<TokenId>
+    ) {
+        env::log(
+            format!(
+                "This function is underconstruction. {}, {}", token_ids.len(), power_card
+            ).as_bytes());
+
+    }
+
+    pub fn consume_powers_by_tokenmetadata(&mut self, 
+        power_card: TokenMetadataId, 
+        tokenmetadata_id: TokenMetadataId
+    ) {
+        env::log(
+            format!(
+                "This function is underconstruction. {}, {}", tokenmetadata_id, power_card
+            ).as_bytes());
+
+    }
+
+    //**********************
+    //**** VIEW FUNCTIONS **
+    //**********************
+
+    /// list all miner types created in this contract
+    pub fn list_miner_types(&self, from_index: u64, limit: u64
+    ) ->HashMap<TokenMetadataId, TokenMetadata> {
+        let keys = self.token_metadata_by_id.keys_as_vector();
+
+        (from_index..std::cmp::min(from_index + limit, keys.len())).map(
+            |index| (
+                keys.get(index).unwrap(), 
+                self.token_metadata_by_id.get(&keys.get(index).unwrap()).unwrap())
+        ).collect::<HashMap<_,_>>()
+    }
+
+    /// list all miner types of the user's miners
+    pub fn list_miner_types_by_owner(&self, owner_id: ValidAccountId, 
+        from_index: u64, limit: u64
+    ) ->HashMap<TokenMetadataId, TokenMetadata> {
+
+        let own_tokens = self.miners_per_owner.get(
+            owner_id.as_ref()).unwrap_or(UnorderedMap::new(unique_prefix(owner_id.as_ref())));
+            
+        let keys = own_tokens.keys_as_vector();
+
+        (from_index..std::cmp::min(from_index + limit, keys.len())).map(
+            |index| (
+                keys.get(index).unwrap(), 
+                self.token_metadata_by_id.get(&keys.get(index).unwrap()).unwrap())
+        ).collect::<HashMap<_,_>>()
+    }
+
+    /// list all miners belongs to the miner type of the user 
+    pub fn list_miners_by_owner_and_type(&self, owner_id: ValidAccountId, type_id: TokenMetadataId,
+        from_index: u64, limit: u64
+    ) ->HashMap<TokenId, Token> {
+        let all_tokens = self.miners_per_owner.get(owner_id.as_ref())
+            .unwrap_or(UnorderedMap::new(unique_prefix(owner_id.as_ref())));
+        
+        let tokens_of_this_type = all_tokens.get(&type_id)
+            .unwrap_or(UnorderedSet::new(unique_prefix(&String::from("no-matter"))));
+        
+        let tokenids = tokens_of_this_type.to_vec();
+
+        (from_index..std::cmp::min(from_index + limit, tokenids.len() as u64)).map(
+            |index| (
+                (*tokenids.get(index as usize).unwrap()).clone(), 
+                self.miners_by_id.get(tokenids.get(index as usize).unwrap()).unwrap())
+        ).collect::<HashMap<_,_>>()
+    }
+
+    pub fn list_miners_by_onwer(&self, owner_id: ValidAccountId, 
+        from_index: u64, limit: u64
+    ) ->HashMap<TokenId, Token> {
+        let all_tokens = self.miners_per_owner.get(owner_id.as_ref())
+            .unwrap_or(UnorderedMap::new(unique_prefix(owner_id.as_ref())));
+        
+        let types = all_tokens.keys_as_vector();
+
+        let mut tokenids = Vec::<TokenId>::new();
+
+        for type_index in 0..types.len() {
+            let tokens_of_this_type = all_tokens.get(&types.get(type_index).unwrap()).unwrap();
+            tokenids.extend(tokens_of_this_type.iter());
+        }
+
+        let retids = tokenids;
+
+        (from_index..std::cmp::min(from_index + limit, retids.len() as u64)).map(
+            |index| (
+                (*retids.get(index as usize).unwrap()).clone(), 
+                self.miners_by_id.get(retids.get(index as usize).unwrap()).unwrap())
+        ).collect::<HashMap<_,_>>()
+    }
+
+}
+
+'''
+'''--- contracts/nft/src/internal.rs ---
+use crate::*;
+
+const YOCTO_MULTIPLIER: f32 = 0.000000000000000000000001;
+
+/// Price per 1 byte of storage from mainnet config after `1.18.0` release and protocol version `42`.
+/// It's 10 times lower than the genesis price.
+pub(crate) const STORAGE_PRICE_PER_BYTE: Balance = 10_000_000_000_000_000_000;
+
+pub(crate) fn unique_prefix(account_id: &AccountId) -> Vec<u8> {
+    let mut prefix = Vec::with_capacity(33);
+    prefix.push(b'x');
+    prefix.extend(env::sha256(account_id.as_bytes()));
+    prefix
+}
+
+pub(crate) fn unique_prefix_for_owner_token(account_id: &AccountId, metadata_id: &MinerMetadataId) -> Vec<u8> {
+    let mut prefix = Vec::with_capacity(65);
+    prefix.push(b'y');
+    prefix.extend(env::sha256(account_id.as_bytes()));
+    prefix.extend(env::sha256(metadata_id.as_bytes()));
+    prefix
+}
+
+pub(crate) fn unique_power_prefix(account_id: &AccountId) -> Vec<u8> {
+    let mut prefix = Vec::with_capacity(33);
+    prefix.push(b'z');
+    prefix.extend(env::sha256(account_id.as_bytes()));
+    prefix
+}
+
+pub(crate) fn assert_one_yocto() {
+    assert_eq!(
+        env::attached_deposit(),
+        1,
+        "Requires attached deposit of exactly 1 yoctoⓃ ({} Ⓝ )",
+        YOCTO_MULTIPLIER
+    )
+}
+
+pub(crate) fn assert_self() {
+    assert_eq!(
+        env::predecessor_account_id(),
+        env::current_account_id(),
+        "Method is private"
+    );
+}
+
+pub(crate) fn deposit_refund(storage_used: u64) {
+    let required_cost = STORAGE_PRICE_PER_BYTE * Balance::from(storage_used);
+    let attached_deposit = env::attached_deposit();
+
+    assert!(
+        required_cost <= attached_deposit,
+        "Must attach {} yoctoⓃ to cover storage ({} Ⓝ )",
+        required_cost,
+        required_cost as f32  * YOCTO_MULTIPLIER
+    );
+
+    let refund = attached_deposit - required_cost;
+    if refund > 0 {
+        Promise::new(env::predecessor_account_id()).transfer(refund);
+    }
+}
+
+pub(crate) fn bytes_for_approved_account_id(account_id: &AccountId) -> u64 {
+    // The extra 4 bytes are coming from Borsh serialization to store the length of the string.
+    account_id.len() as u64 + 4
+}
+
+pub(crate) fn refund_approved_account_ids(
+    account_id: AccountId,
+    approved_account_ids: &HashSet<AccountId>,
+) -> Promise {
+    let storage_released: u64 = approved_account_ids
+        .iter()
+        .map(bytes_for_approved_account_id)
+        .sum();
+    Promise::new(account_id).transfer(Balance::from(storage_released) * STORAGE_PRICE_PER_BYTE)
+}
+
+impl Contract {
+
+    pub(crate) fn assert_owner(&self) {
+        assert_eq!(
+            &env::predecessor_account_id(),
+            &self.owner_id,
+            "Owner's method"
+        );
+    }
+
+    pub(crate) fn internal_add_token_to_owner(
+        &mut self,
+        account_id: &AccountId,
+        token_id: &TokenId,
+    ) {
+        let token = self.miners_by_id.get(token_id).expect("Internal Error:");
+
+        let mut miner_metadata_map = self
+            .miners_per_owner
+            .get(account_id)
+            .unwrap_or(UnorderedMap::new(unique_prefix(account_id)));
+
+        let mut tokens_set = miner_metadata_map
+            .get(&token.miner_metadata_id)
+            .unwrap_or_else(|| UnorderedSet::new(unique_prefix_for_owner_token(account_id, &token.miner_metadata_id)));
+        
+        tokens_set.insert(token_id);
+        miner_metadata_map.insert(account_id, &tokens_set);
+        self.miners_per_owner.insert(account_id, &miner_metadata_map);
+    }
+
+    pub(crate) fn internal_remove_token_from_owner(
+        &mut self,
+        account_id: &AccountId,
+        token_id: &TokenId,
+    ) {
+        let token = self.miners_by_id.get(token_id).expect("Internal Error:");
+
+        let mut miner_metadata_map = self
+            .miners_per_owner
+            .get(account_id)
+            .expect("Token should be owned by the sender");
+        let mut tokens_set = miner_metadata_map
+            .get(&token.miner_metadata_id)
+            .expect("Token should be owned by the sender");
+        tokens_set.remove(token_id);
+        if tokens_set.is_empty() {
+            miner_metadata_map.remove(&token.miner_metadata_id);
+        } else {
+            miner_metadata_map.insert(&token.miner_metadata_id, &tokens_set);
+        }
+        if miner_metadata_map.is_empty() {
+            self.miners_per_owner.remove(account_id);
+        } else {
+            self.miners_per_owner.insert(account_id, &miner_metadata_map);
+        }
+    }
+
+    pub(crate) fn internal_transfer(
+        &mut self,
+        sender_id: &AccountId,
+        receiver_id: &AccountId,
+        token_id: &TokenId,
+        enforce_owner_id: Option<&ValidAccountId>,
+        memo: Option<String>,
+    ) -> (AccountId, HashSet<AccountId>) {
+        let Token {
+            sn,
+            owner_id,
+            metadata_id,
+            miner_metadata_id,
+            operator,
+            switch,
+            status,
+            power_left,
+            power_deadline,
+            approved_account_ids,
+        } = self.miners_by_id.get(token_id).expect("Token not found");
+        if sender_id != &owner_id && !approved_account_ids.contains(sender_id) {
+            env::panic(b"Unauthorized");
+        }
+
+        if let Some(enforce_owner_id) = enforce_owner_id {
+            assert_eq!(
+                &owner_id,
+                enforce_owner_id.as_ref(),
+                "The token owner is different from enforced"
+            );
+        }
+
+        assert_ne!(
+            &owner_id, receiver_id,
+            "The token owner and the receiver should be different"
+        );
+
+        env::log(
+            format!(
+                "Transfer {} from @{} to @{}",
+                token_id, &owner_id, receiver_id
+            )
+            .as_bytes(),
+        );
+
+        self.internal_remove_token_from_owner(&owner_id, token_id);
+        self.internal_add_token_to_owner(receiver_id, token_id);
+
+        let token = Token {
+            sn,
+            owner_id: receiver_id.clone(),
+            metadata_id,
+            miner_metadata_id,
+            operator,
+            switch,
+            status,
+            power_left,
+            power_deadline,
+            approved_account_ids: Default::default(),
+        };
+        self.miners_by_id.insert(token_id, &token);
+
+        if let Some(memo) = memo {
+            env::log(format!("Memo: {}", memo).as_bytes());
+        }
+
+        (owner_id, approved_account_ids)
+    }
+}
+
+'''
+'''--- contracts/nft/src/lib.rs ---
+use std::collections::{HashSet, HashMap};
+
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::{LookupMap, UnorderedMap, UnorderedSet};
+use near_sdk::json_types::{ValidAccountId, Base64VecU8, U64};
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{env, near_bindgen, AccountId, Balance, PanicOnDefault, Promise, BlockHeight};
+
+use crate::internal::*;
+pub use crate::mint::*;
+pub use crate::nft_core::*;
+pub use crate::custom::*;
+pub use crate::mining::*;
+pub use crate::mining_internal::*;
+use crate::nft_metadata::{TokenMetadata, MinerMetadata};
+
+mod internal;
+mod mint;
+mod nft_core;
+mod nft_metadata;
+mod custom;
+mod mining;
+mod mining_internal;
+
+#[global_allocator]
+static ALLOC: near_sdk::wee_alloc::WeeAlloc<'_> = near_sdk::wee_alloc::WeeAlloc::INIT;
+
+pub type TokenId = String;
+pub type TokenSeqNum = String;
+pub type TokenMetadataId = String;
+pub type MinerMetadataId = String;
+
+/// 0 - normal, 1 - malfunction
+pub const ST_NORMAL: u8 = 0;
+pub const ST_MALFUNCTION: u8 = 1;
+pub type TokenStatus = u8;
+/// 0 - poweroff, 1 - poweron
+pub const PW_OFF: u8 = 0;
+pub const PW_ON: u8 = 1;
+pub type PowerSwitch = u8;
+
+/// the miner machine, 
+/// metadata_id is its batch-type,
+/// sn is its serialnum in this batch,
+/// power_left is the remaining power, participate in mining would consume this one.
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Token {
+    pub sn: TokenSeqNum,
+    pub owner_id: AccountId,
+    pub metadata_id: TokenMetadataId,
+    pub miner_metadata_id: MinerMetadataId,
+    
+    pub operator: AccountId,  // miningpoolId or owner_id itself.
+    pub status: TokenStatus,
+    pub switch: PowerSwitch,
+    
+    pub power_left: u32,
+    pub power_deadline: MiningEpoch,
+    // used for compatible with standards
+    pub approved_account_ids: HashSet<AccountId>,
+}
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Contract {
+    /// owner of this contract
+    pub owner_id: AccountId,
+
+    //*********************
+    //  NFT PARTS
+    //*********************
+    /// TokenMetadataId is designated by owner when mint
+    /// Token includes miners and e-powers
+    pub token_metadata_by_id: UnorderedMap<TokenMetadataId, TokenMetadata>,
+
+    /// only miners have this metadata
+    pub miner_metadata_by_id: UnorderedMap<MinerMetadataId, MinerMetadata>,
+
+    /// each miner is a token,
+    /// TokenId is formed as TokenMetadataId + "#" + TokenSeqNum
+    pub miners_by_id: UnorderedMap<TokenId, Token>,
+
+    /// user -> MinerMetadataId -> UnorderedSet<TokenId>
+    pub miners_per_owner: LookupMap<AccountId, UnorderedMap<MinerMetadataId, UnorderedSet<TokenId>>>,
+    
+    /// user -> TokenMetadataId -> copys
+    /// unlike miners, the copies of one power-nft is identical, we only record copy amount.
+    pub powers_per_owner: LookupMap<AccountId, UnorderedMap<TokenMetadataId, u32>>,
+
+    // pub metadata: NFTMetadata
+
+    // *****************************************
+    //        MINING PARTS
+    // *****************************************
+    
+    /// each epoch, we distribute epoch_award to some miner or pool
+    pub current_mining_epoch: MiningEpoch,
+    pub epoch_award: Balance,
+    
+    /// we can only settle epoch after interval blocks from previous epoch
+    pub min_interval_of_epoch: BlockHeight,
+    pub current_epoch_start_at: BlockHeight,
+
+    /// The total thash that participate in settlement.
+    /// And we choose winner from entities according to their Thash.
+    /// current_total_thash = Sum(mining_entities.Thash)
+    pub current_total_thash: Thash,    
+    pub mining_entities: UnorderedMap<AccountId, Thash>,
+
+    /// e-power consuming when participate in settlement
+    pub power_events: LookupMap<MiningEpoch, UnorderedSet<TokenId>>,
+
+    /// mining pool supports
+    pub mining_pools: UnorderedMap<AccountId, MiningPool>,
+
+}
+
+#[near_bindgen]
+impl Contract {
+
+    #[init]
+    pub fn new(owner_id: ValidAccountId) -> Self {
+        assert!(!env::state_exists(), "Already initialized");
+        Self {
+            miners_per_owner: LookupMap::new(b"a".to_vec()),
+            powers_per_owner: LookupMap::new(b"b".to_vec()),
+
+            miners_by_id: UnorderedMap::new(b"c".to_vec()),
+            token_metadata_by_id: UnorderedMap::new(b"d".to_vec()),
+            miner_metadata_by_id: UnorderedMap::new(b"e".to_vec()),
+            
+            owner_id: owner_id.into(),
+            
+            current_mining_epoch: 0,
+            current_epoch_start_at: env::block_index(),
+            current_total_thash: 0,
+            epoch_award: 2500000000,
+            min_interval_of_epoch: 3600,
+            mining_pools: UnorderedMap::new(b"f".to_vec()),
+            mining_entities: UnorderedMap::new(b"g".to_vec()),
+            power_events: LookupMap::new(b"h".to_vec())
+        }
+    }
+}
+
+'''
+'''--- contracts/nft/src/mining.rs ---
+use crate::*;
+
+pub type MiningEpoch = u32;
+/// 1Ehash = 10**6 Thash, so u32 is enough to indicate all mining compute power
+pub type Thash = u32;
+/// 0 - normal, 1 - maintaining
+pub type PoolStatus = u8;
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct MiningPool {
+    pub owner_id: AccountId,
+    pub name: String,
+    pub status: PoolStatus,
+    pub switch: PowerSwitch,
+    pub total_thash: Thash,
+    pub miners: UnorderedSet<TokenId>,
+}
+
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct HumanReadableMiningPool {
+    pub owner_id: AccountId,
+    pub name: String,
+    pub status: PoolStatus,
+    pub switch: PowerSwitch,
+    pub total_thash: Thash,
+    pub miners: Vec<TokenId>,
+}
+
+#[near_bindgen]
+impl Contract {
+
+    pub fn settle_mining_epoch(&mut self) {
+
+        self.assert_owner();
+
+        if env::block_index() < self.current_epoch_start_at + self.min_interval_of_epoch {
+            env::panic("not long from last settlement.".as_bytes())
+        }
+        self.current_epoch_start_at = env::block_index();
+
+        let value = self.make_random_value();
+
+        let block_producer = self.find_block_producer(value);
+
+        env::log(
+            format!(
+                "Send vBTC to {} in epoch {}.", block_producer.clone(), self.current_mining_epoch
+            ).as_bytes());
+
+        self.current_mining_epoch += 1;
+        self.settle_power_for_individuals();
+        self.settle_power_for_pools();
+        self.settle_random_failures();
+    }
+
+    pub fn batch_poweron_miners(&mut self, token_ids: Vec<TokenId>,) {
+        let owner_id = env::predecessor_account_id();
+        for token_id in token_ids.iter() {
+            let mut miner = self.miners_by_id.get(token_id).expect("Miner doesn't exist");
+            if miner.owner_id != owner_id || miner.owner_id != miner.operator {
+                env::panic("No control of this miner.".as_bytes())
+            }
+            let metadata = self.miner_metadata_by_id.get(&miner.miner_metadata_id)
+                .expect("Internal Error: no miner_metadata of this miner");
+            if miner.status == ST_NORMAL && miner.switch != PW_ON {
+                miner.switch = PW_ON;
+                // update total thash
+                self.internal_increase_thash(&miner.owner_id, &metadata);
+                // consume power
+                let (used, mining_epoch) = self.get_power_consume(miner.power_left, &metadata);
+                if used == 0 {
+                    env::panic("Not enough power to use.".as_bytes())
+                }
+                miner.power_left -= used;
+                // udapte power events
+                self.internal_add_to_power_event(&token_id, &mining_epoch);
+                // udpate miner itself
+                self.miners_by_id.insert(&token_id, &miner);
+            }
+        }
+    }
+
+    pub fn batch_poweroff_miners(&mut self, token_ids: Vec<TokenId>,) {
+        let owner_id = env::predecessor_account_id();
+        for token_id in token_ids.iter() {
+            let mut miner = self.miners_by_id.get(token_id).expect("Miner doesn't exist");
+            if miner.owner_id != owner_id || miner.owner_id != miner.operator {
+                env::panic("No control of this miner.".as_bytes())
+            }
+            let metadata = self.miner_metadata_by_id.get(&miner.miner_metadata_id)
+                .expect("Internal Error: no miner_metadata of this miner");
+            if miner.status == ST_NORMAL && miner.switch != PW_OFF {
+                miner.switch = PW_OFF;
+                // update total thash
+                self.internal_reduce_thash(&miner.owner_id, &metadata);
+                // update power events
+                self.internal_remove_from_power_event(&token_id, &miner.power_deadline);
+                // refund power
+                miner.power_left += self.get_power_refund(miner.power_deadline - self.current_mining_epoch, &metadata);
+                // udpate miner itself
+                self.miners_by_id.insert(&token_id, &miner);
+            }
+        }
+    }
+
+    pub fn batch_add_miners_to_pool(&mut self, token_ids: Vec<TokenId>, mining_pool: AccountId) {
+        env::log(
+            format!(
+                "This function is underconstruction. {}, {}", token_ids.len(), mining_pool
+            ).as_bytes());
+    }
+
+    pub fn batch_retrieve_miners_from_pool(&mut self, token_ids: Vec<TokenId>, mining_pool: AccountId) {
+        env::log(
+            format!(
+                "This function is underconstruction. {}, {}", token_ids.len(), mining_pool
+            ).as_bytes());
+
+    }
+
+}
+'''
+'''--- contracts/nft/src/mining_internal.rs ---
+use crate::*;
+
+use uint::construct_uint;
+
+construct_uint! {
+    /// 256-bit unsigned integer.
+    pub struct U256(4);
+}
+
+impl Contract {
+
+    pub(crate) fn make_random_value(&self) -> Thash {
+
+        let randomness = env::random_seed();
+        let ptr: *const u8 = randomness.as_ptr();
+        let ptr: *const u128 = ptr as *const u128;
+        let big_rand: u128 = unsafe { *ptr };
+
+        let value = U256::from(self.current_total_thash) * U256::from(big_rand) 
+            / (U256::from(u128::max_value()) + U256::from(1));
+        
+        env::log(format!("Random number is {} in epoch {}.", value.as_u128(), self.current_mining_epoch).as_bytes());
+
+        value.as_u128() as Thash
+    }
+
+    pub(crate) fn find_block_producer(&self, value: Thash) -> AccountId {
+        let keys = self.mining_entities.keys_as_vector();
+        let mut border: Thash = 0;
+        let mut ret = self.owner_id.clone();
+        for index in 0..keys.len() {
+            let entity = keys.get(index).unwrap();
+            let thash = self.mining_entities.get(&entity).unwrap();
+            border += thash;
+            if border > value {
+                ret = entity;
+                break;
+            }
+        }
+        env::log(format!("{} produced rbtc block in {}.", ret, self.current_mining_epoch).as_bytes());
+        ret
+    }
+
+    pub(crate) fn get_power_consume(&self, power_left: u32, metadata: &MinerMetadata) -> (u32, MiningEpoch) {
+        let hours = power_left / metadata.w;
+        (hours * metadata.w, self.current_mining_epoch + hours)
+    }
+
+    pub(crate) fn get_power_refund(&self, epoch_diff: u32, metadata: &MinerMetadata) -> u32 {
+        let hours = epoch_diff;
+        hours * metadata.w
+    }
+
+    pub(crate) fn internal_increase_thash(&mut self, owner_id: &AccountId, metadata: &MinerMetadata) {
+        self.current_total_thash += metadata.thash;
+        let owner_thash = self.mining_entities.get(owner_id).unwrap_or(0);
+        self.mining_entities.insert(owner_id, &(owner_thash + metadata.thash));
+    }
+
+    pub(crate) fn internal_reduce_thash(&mut self, owner_id: &AccountId, metadata: &MinerMetadata) {
+        // update total thash
+        self.current_total_thash -= metadata.thash;
+        let owner_thash = self.mining_entities.get(owner_id).expect("Internal Error: no this mining entity");
+        let thash_leftover = owner_thash - metadata.thash;
+        if thash_leftover > 0 {
+            self.mining_entities.insert(owner_id, &thash_leftover);
+        } else {
+            self.mining_entities.remove(owner_id);
+        }
+    }
+
+    pub(crate) fn internal_add_to_power_event(&mut self, token_id: &TokenId, deadline: &MiningEpoch) {
+        let mut miners_set = self.power_events.get(deadline)
+            .unwrap_or(UnorderedSet::new(format!("w{}", deadline).as_bytes().to_vec()));
+        miners_set.insert(&token_id);
+        self.power_events.insert(deadline, &miners_set);
+    }
+
+    pub(crate) fn internal_remove_from_power_event(&mut self, token_id: &TokenId, deadline: &MiningEpoch) {
+        let mut miner_set = self.power_events.get(deadline).expect("Internal Error: no this power event");
+        miner_set.remove(token_id);
+        if miner_set.len() > 0 {
+            self.power_events.insert(deadline, &miner_set);
+        } else {
+            self.power_events.remove(deadline);
+        }
+    }
+
+    /// called in the end of mining settlement each epoch,
+    /// to update power consume
+    pub(crate) fn settle_power_for_individuals(&mut self) {
+        env::log(format!("settle_power_for_individuals.").as_bytes());
+        let miners = self.power_events.get(&self.current_mining_epoch)
+            .unwrap_or(UnorderedSet::new(b"non-relevant".to_vec()));
+        for token_id in miners.iter() {
+            let mut miner = self.miners_by_id.get(&token_id).expect("Internal Error: Miner not exist.");
+            miner.switch = PW_OFF;
+            self.miners_by_id.insert(&token_id, &miner);
+
+            let miner_metadata: MinerMetadata = self.miner_metadata_by_id.get(&miner.miner_metadata_id)
+                .expect("Internal Error: No miner_metadata");
+
+            self.internal_reduce_thash(&miner.owner_id, &miner_metadata);
+        }
+        self.power_events.remove(&self.current_mining_epoch);
+    }
+    
+    pub(crate) fn settle_power_for_pools(&mut self) {
+        env::log(format!("settle_power_for_pools, under construction.").as_bytes());
+    }
+
+    pub(crate) fn settle_random_failures(&mut self) {
+        env::log(format!("settle_random_failures, under construction.").as_bytes());
+    }
+}
+'''
+'''--- contracts/nft/src/mint.rs ---
+use crate::*;
+
+const TGAS: f32 = 0.000000000001;
+
+#[near_bindgen]
+impl Contract {
+
+    /// Find relations of iterator and gas
+    pub fn see_gas(&mut self, copies: U64) -> U64 {
+        let quantity: u64 = copies.into();
+        
+        self.current_total_thash = quantity as u32 * 100;
+        let value = self.make_random_value();
+        let biggest_value = self.current_total_thash as u32 - 1;
+        env::log(
+            format!(
+                "random is {}, we take {} as max.", value, biggest_value
+            ).as_bytes());
+
+        let keys = self.miner_metadata_by_id.keys_as_vector();
+
+        let mut border: Thash = 0;
+
+        for index in 0..quantity {
+            let non_relevant1 = keys.get(0).unwrap();
+            let non_relevant2 = self.miner_metadata_by_id.get(&String::from("mid-001")).unwrap();
+            let thash = 100;
+            border += thash;
+            if border > biggest_value {
+                env::log(
+                    format!(
+                        "Found : #{} as winner.", index
+                    ).as_bytes());
+                break;
+            }
+        }
+
+        env::log(
+            format!(
+                "used gas: {}.", env::used_gas() as f32 * TGAS
+            ).as_bytes());
+        
+        (value as u64).into()
+    }
+
+    /// mint miner nft
+    pub fn create_new_miners(&mut self, token_owner: ValidAccountId, 
+        metadata_id: TokenMetadataId, metadata: TokenMetadata
+    ) {
+        
+        self.assert_owner();
+
+        let quantity: u64 = metadata.copies.unwrap_or(1.into()).into();
+
+        assert!(
+            self.token_metadata_by_id.insert(&metadata_id, &metadata).is_none(),
+            "This ID already exists"
+        );
+
+        let miner_metadata: MinerMetadata = near_sdk::serde_json::from_str(&metadata.extra.unwrap()).expect("extra msg illegal!");
+        assert!(
+            self.miner_metadata_by_id.insert(&metadata_id, &miner_metadata).is_none(),
+            "This ID already exists"
+        );
+
+        for sn_number in 0..quantity {
+            let token = Token {
+                sn: format!("{}", sn_number),
+                owner_id: token_owner.as_ref().clone(),
+                metadata_id: metadata_id.clone(),
+                miner_metadata_id: metadata_id.clone(),
+
+                operator: token_owner.as_ref().clone(),
+                status: 0,
+                switch: 0,
+
+                power_left: 0,
+                power_deadline: 0,
+                approved_account_ids: Default::default(),
+            };
+            let token_id: String = format!("{}#{}", token.metadata_id, token.sn);
+            assert!(
+                self.miners_by_id.insert(&token_id, &token).is_none(),
+                "Miner already exists"
+            );
+            self.internal_add_token_to_owner(&token.owner_id, &token_id);
+        }
+    }
+
+    /// mint power card
+    pub fn issue_power_cards(&mut self, power_owner: ValidAccountId, 
+        metadata_id: TokenMetadataId, metadata: TokenMetadata
+    ) {
+
+        self.assert_owner();
+
+        let quantity: u64 = metadata.copies.unwrap_or(1.into()).into();
+
+        assert!(
+            self.token_metadata_by_id.insert(&metadata_id, &metadata).is_none(),
+            "This ID already exists"
+        );
+
+        let mut power_map = self.powers_per_owner.get(power_owner.as_ref())
+            .unwrap_or_else(|| UnorderedMap::new(unique_power_prefix(power_owner.as_ref())));
+        power_map.insert(&metadata_id, &(quantity as u32));
+        self.powers_per_owner.insert(power_owner.as_ref(), &power_map);
+    }
+
+}
+
+'''
+'''--- contracts/nft/src/nft_core.rs ---
+use crate::*;
+use near_sdk::json_types::{ValidAccountId, U64};
+use near_sdk::{ext_contract, Gas, PromiseResult};
+
+const GAS_FOR_RESOLVE_TRANSFER: Gas = 10_000_000_000_000;
+const GAS_FOR_NFT_TRANSFER_CALL: Gas = 25_000_000_000_000 + GAS_FOR_RESOLVE_TRANSFER;
+
+const NO_DEPOSIT: Balance = 0;
+
+pub trait NonFungibleTokenCore {
+    fn nft_transfer(
+        &mut self,
+        receiver_id: ValidAccountId,
+        token_id: TokenId,
+        enforce_owner_id: Option<ValidAccountId>,
+        memo: Option<String>,
+    );
+
+    /// Returns `true` if the token was transferred from the sender's account.
+    fn nft_transfer_call(
+        &mut self,
+        receiver_id: ValidAccountId,
+        token_id: TokenId,
+        enforce_owner_id: Option<ValidAccountId>,
+        memo: Option<String>,
+        msg: String,
+    ) -> Promise;
+
+    fn nft_approve_account_id(&mut self, token_id: TokenId, account_id: ValidAccountId) -> bool;
+
+    fn nft_revoke_account_id(&mut self, token_id: TokenId, account_id: ValidAccountId) -> bool;
+
+    fn nft_revoke_all(&mut self, token_id: TokenId);
+
+    fn nft_total_supply(&self) -> U64;
+
+    fn nft_token(&self, token_id: TokenId) -> Option<Token>;
+}
+
+#[ext_contract(ext_non_fungible_token_receiver)]
+trait NonFungibleTokenReceiver {
+    /// Returns `true` if the token should be returned back to the sender.
+    /// TODO: Maybe make it inverse. E.g. true to keep it.
+    fn nft_on_transfer(
+        &mut self,
+        sender_id: AccountId,
+        previous_owner_id: AccountId,
+        token_id: TokenId,
+        msg: String,
+    ) -> Promise;
+}
+
+#[ext_contract(ext_self)]
+trait NonFungibleTokenResolver {
+    fn nft_resolve_transfer(
+        &mut self,
+        owner_id: AccountId,
+        receiver_id: AccountId,
+        approved_account_ids: HashSet<AccountId>,
+        token_id: TokenId,
+    ) -> bool;
+}
+
+trait NonFungibleTokenResolver {
+    fn nft_resolve_transfer(
+        &mut self,
+        owner_id: AccountId,
+        receiver_id: AccountId,
+        approved_account_ids: HashSet<AccountId>,
+        token_id: TokenId,
+    ) -> bool;
+}
+
+#[near_bindgen]
+impl NonFungibleTokenCore for Contract {
+    #[payable]
+    fn nft_transfer(
+        &mut self,
+        receiver_id: ValidAccountId,
+        token_id: TokenId,
+        enforce_owner_id: Option<ValidAccountId>,
+        memo: Option<String>,
+    ) {
+        assert_one_yocto();
+        let sender_id = env::predecessor_account_id();
+        let (previous_owner_id, approved_account_ids) = self.internal_transfer(
+            &sender_id,
+            receiver_id.as_ref(),
+            &token_id,
+            enforce_owner_id.as_ref(),
+            memo,
+        );
+        refund_approved_account_ids(previous_owner_id, &approved_account_ids);
+    }
+
+    #[payable]
+    fn nft_transfer_call(
+        &mut self,
+        receiver_id: ValidAccountId,
+        token_id: TokenId,
+        enforce_owner_id: Option<ValidAccountId>,
+        memo: Option<String>,
+        msg: String,
+    ) -> Promise {
+        assert_one_yocto();
+        let sender_id = env::predecessor_account_id();
+        let (owner_id, approved_account_ids) = self.internal_transfer(
+            &sender_id,
+            receiver_id.as_ref(),
+            &token_id,
+            enforce_owner_id.as_ref(),
+            memo,
+        );
+        // Initiating receiver's call and the callback
+        ext_non_fungible_token_receiver::nft_on_transfer(
+            sender_id.clone(),
+            owner_id.clone(),
+            token_id.clone(),
+            msg,
+            receiver_id.as_ref(),
+            NO_DEPOSIT,
+            env::prepaid_gas() - GAS_FOR_NFT_TRANSFER_CALL,
+        )
+        .then(ext_self::nft_resolve_transfer(
+            owner_id,
+            receiver_id.into(),
+            approved_account_ids,
+            token_id,
+            &env::current_account_id(),
+            NO_DEPOSIT,
+            GAS_FOR_RESOLVE_TRANSFER,
+        ))
+    }
+
+    #[payable]
+    fn nft_approve_account_id(&mut self, token_id: TokenId, account_id: ValidAccountId) -> bool {
+        assert_one_yocto();
+        let mut token = self.miners_by_id.get(&token_id).expect("Token not found");
+        assert_eq!(&env::predecessor_account_id(), &token.owner_id);
+        let account_id: AccountId = account_id.into();
+        let storage_used = bytes_for_approved_account_id(&account_id);
+        if token.approved_account_ids.insert(account_id) {
+            deposit_refund(storage_used);
+            self.miners_by_id.insert(&token_id, &token);
+            true
+        } else {
+            false
+        }
+    }
+
+    #[payable]
+    fn nft_revoke_account_id(&mut self, token_id: TokenId, account_id: ValidAccountId) -> bool {
+        assert_one_yocto();
+        let mut token = self.miners_by_id.get(&token_id).expect("Token not found");
+        let predecessor_account_id = env::predecessor_account_id();
+        assert_eq!(&predecessor_account_id, &token.owner_id);
+        if token.approved_account_ids.remove(account_id.as_ref()) {
+            let storage_released = bytes_for_approved_account_id(account_id.as_ref());
+            Promise::new(env::predecessor_account_id())
+                .transfer(Balance::from(storage_released) * STORAGE_PRICE_PER_BYTE);
+            self.miners_by_id.insert(&token_id, &token);
+            true
+        } else {
+            false
+        }
+    }
+
+    #[payable]
+    fn nft_revoke_all(&mut self, token_id: TokenId) {
+        assert_one_yocto();
+        let mut token = self.miners_by_id.get(&token_id).expect("Token not found");
+        let predecessor_account_id = env::predecessor_account_id();
+        assert_eq!(&predecessor_account_id, &token.owner_id);
+        if !token.approved_account_ids.is_empty() {
+            refund_approved_account_ids(predecessor_account_id, &token.approved_account_ids);
+            token.approved_account_ids.clear();
+            self.miners_by_id.insert(&token_id, &token);
+        }
+    }
+
+    fn nft_total_supply(&self) -> U64 {
+        self.miners_by_id.len().into()
+    }
+
+    fn nft_token(&self, token_id: TokenId) -> Option<Token> {
+        self.miners_by_id.get(&token_id)
+    }
+}
+
+#[near_bindgen]
+impl NonFungibleTokenResolver for Contract {
+    fn nft_resolve_transfer(
+        &mut self,
+        owner_id: AccountId,
+        receiver_id: AccountId,
+        approved_account_ids: HashSet<AccountId>,
+        token_id: TokenId,
+    ) -> bool {
+        assert_self();
+
+        // Whether receiver wants to return token back to the sender, based on `nft_on_transfer`
+        // call result.
+        if let PromiseResult::Successful(value) = env::promise_result(0) {
+            if let Ok(return_token) = near_sdk::serde_json::from_slice::<bool>(&value) {
+                if !return_token {
+                    // Token was successfully received.
+                    refund_approved_account_ids(owner_id, &approved_account_ids);
+                    return true;
+                }
+            }
+        }
+
+        let mut token = if let Some(token) = self.miners_by_id.get(&token_id) {
+            if &token.owner_id != &receiver_id {
+                // The token is not owner by the receiver anymore. Can't return it.
+                refund_approved_account_ids(owner_id, &approved_account_ids);
+                return true;
+            }
+            token
+        } else {
+            // The token was burned and doesn't exist anymore.
+            refund_approved_account_ids(owner_id, &approved_account_ids);
+            return true;
+        };
+
+        env::log(format!("Return {} from @{} to @{}", token_id, receiver_id, owner_id).as_bytes());
+
+        self.internal_remove_token_from_owner(&receiver_id, &token_id);
+        self.internal_add_token_to_owner(&owner_id, &token_id);
+        token.owner_id = owner_id;
+        refund_approved_account_ids(receiver_id, &token.approved_account_ids);
+        token.approved_account_ids = approved_account_ids;
+        self.miners_by_id.insert(&token_id, &token);
+
+        false
+    }
+}
+
+'''
+'''--- contracts/nft/src/nft_metadata.rs ---
+use crate::*;
+
+/// This structure is from NEAR-NFT-Standard 
+/// to indicate top-level infomation of NFT managed by this contract
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone)]
+#[serde(crate = "near_sdk::serde")]
+pub struct NFTMetadata {
+    spec: String, // required, essentially a version like "nft-1.0.0"
+    name: String, // required, ex. "Mosaics"
+    symbol: String, // required, ex. "MOSIAC"
+    icon: Option<String>, // Data URL
+    base_uri: Option<String>, // Centralized gateway known to have reliable access to decentralized storage assets referenced by `reference` or `media` URLs
+    reference: Option<String>, // URL to a JSON file with more info
+    reference_hash: Option<Base64VecU8>, // Base64-encoded sha256 hash of JSON from reference field. Required if `reference` is included.
+}
+
+/// This structure is from NEAR-NFT-Standard 
+/// to indicate NFT token's metadata
+/// Custom information are store in extra field with json-str 
+/// And copies is the token amount that belongs to this metadata
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone)]
+#[serde(crate = "near_sdk::serde")]
+pub struct TokenMetadata {
+    title: Option<String>, // used as Category: Miner or Power;
+    description: Option<String>, // used as Sub-category: Miner types, Power types,
+    media: Option<String>, // URL to associated media, preferably to decentralized, content-addressed storage
+    media_hash: Option<Base64VecU8>, // Base64-encoded sha256 hash of content referenced by the `media` field. Required if `media` is included.
+    pub copies: Option<U64>, // number of copies of this kind of nft.
+    issued_at: Option<String>, // ISO 8601 datetime when token was issued or minted
+    expires_at: Option<String>, // ISO 8601 datetime when token expires
+    starts_at: Option<String>, // ISO 8601 datetime when token starts being valid
+    updated_at: Option<String>, // ISO 8601 datetime when token was last updated
+    pub extra: Option<String>, // JSON-string: {"Thash": nnnn, "W": nnn} for Miner, {"class": "fire/water/nulcear", ...}
+    reference: Option<String>, // URL to an off-chain JSON file with more info.
+    reference_hash: Option<Base64VecU8>, // Base64-encoded sha256 hash of JSON from reference field. Required if `reference` is included.
+}
+
+/// custom metadata of Miner Machine, parsed from TokenMetadata::extra
+/// This is the actual Miner Type structure we used allthrough this contract
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct MinerMetadata {
+    pub producer: String,
+    pub category: String,
+    pub thash: u32,
+    pub w: u32,
+}
+
+pub trait NonFungibleTokenMetadata {
+    fn nft_metadata(&self) -> NFTMetadata;
+}
+
+#[near_bindgen]
+impl NonFungibleTokenMetadata for Contract {
+    fn nft_metadata(&self) -> NFTMetadata {
+        // self.metadata.clone()
+        NFTMetadata {
+            spec: String::from("findsatoshi-nft-1.0.0"),
+            name: String::from("FindsatoshiNft"),
+            symbol: String::from("FST"),
+            icon: Some(String::from("")),
+            base_uri: Some(String::from("")),
+            reference: None,
+            reference_hash: None,
+        }
+    }
+}
+'''
+'''--- contracts/nft/test.sh ---
+#!/bin/bash
+
+./build.sh
+cargo test
+'''
+'''--- contracts/vbtc/Cargo.toml ---
+[package]
+name = "v_btc"
+version = "0.1.0"
+authors = ["Near Inc <hello@nearprotocol.com>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# near-sdk = { git = "https://github.com/near/near-sdk-rs" }
+# near-contract-standards = { git = "https://github.com/near/near-sdk-rs" }
+near-sdk = "3.0.1"
+near-contract-standards = "3.0.1"
+
+[profile.release]
+codegen-units=1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+
+'''
+'''--- contracts/vbtc/README.md ---
+# TBD
+
+'''
+'''--- contracts/vbtc/build.sh ---
+#!/bin/bash
+set -e
+cd "`dirname $0`"
+RUSTFLAGS='-C link-arg=-s' cargo build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/v_btc.wasm ./res/
+
+'''
+'''--- contracts/vbtc/src/lib.rs ---
+/*!
+* wNear NEP-141 Token contract
+*
+* The aim of the contract is to enable the wrapping of the native NEAR token into a NEP-141 compatible token.
+* It supports methods `near_deposit` and `near_withdraw` that wraps and unwraps NEAR tokens.
+* They are effectively mint and burn underlying wNEAR tokens.
+*
+* lib.rs is the main entry point.
+* w_near.rs contains interfaces for depositing and withdrawing
+*/
+use near_contract_standards::fungible_token::metadata::{
+    FungibleTokenMetadata, FungibleTokenMetadataProvider, FT_METADATA_SPEC,
+};
+use near_contract_standards::fungible_token::FungibleToken;
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::json_types::{ValidAccountId, U128};
+use near_sdk::{env, near_bindgen, AccountId, PanicOnDefault, PromiseOrValue};
+
+mod v_btc;
+
+near_sdk::setup_alloc!();
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Contract {
+    pub ft: FungibleToken,
+
+    pub minter_id: AccountId,
+}
+
+#[near_bindgen]
+impl Contract {
+    #[init]
+    pub fn new(minter_id: ValidAccountId) -> Self {
+        assert!(!env::state_exists(), "Already initialized");
+        Self {
+            ft: FungibleToken::new(b"a".to_vec()),
+            minter_id: minter_id.into(),
+        }
+    }
+}
+
+near_contract_standards::impl_fungible_token_core!(Contract, ft);
+near_contract_standards::impl_fungible_token_storage!(Contract, ft);
+
+impl FungibleTokenMetadataProvider for Contract {
+    fn ft_metadata(&self) -> FungibleTokenMetadata {
+        FungibleTokenMetadata {
+            spec: FT_METADATA_SPEC.to_string(),
+            name: String::from("virtual BTC fungible token"),
+            symbol: String::from("vBTC"),
+            icon: None,
+            reference: None,
+            reference_hash: None,
+            decimals: 8,
+        }
+    }
+}
+
+'''
+'''--- contracts/vbtc/src/v_btc.rs ---
+use crate::*;
+use near_sdk::{env, log, Balance};
+
+#[near_bindgen]
+impl Contract {
+    /// mint vbtc.
+    /// Requirements:
+    /// * The predecessor account must be minter.
+    /// * No need to deposit near, cause minter would care about the storage fee of this contract.
+    /// * If account is not registered, will be auto registered.
+    pub fn mint(&mut self, amount: Balance, receiver_id: ValidAccountId) {
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.minter_id,
+             "Only minter can mint vBTC");
+        if !self.ft.accounts.contains_key(receiver_id.as_ref()) {
+            // Not registered, register
+            self.ft.internal_register_account(receiver_id.as_ref());
+        }
+        self.ft.internal_deposit(receiver_id.as_ref(), amount);
+        log!("Mint {} sa-vBTC to {}", amount, receiver_id);
+    }
+
+}
+
+'''

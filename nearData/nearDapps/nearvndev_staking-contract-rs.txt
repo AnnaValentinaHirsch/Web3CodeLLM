@@ -1,0 +1,923 @@
+*GitHub Repository "nearvndev/staking-contract-rs"*
+
+'''--- Cargo.toml ---
+[package]
+name = "staking-contract"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "3.1.0"
+uint = { version = "0.9.3", default-features = false }
+
+[dev-dependencies]
+near-sdk-sim = "3.1.0"
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+# Opt into extra safety checks on arithmetic operations https://stackoverflow.com/a/64136471/249801
+overflow-checks = true
+'''
+'''--- README.md ---
+# Staking FT Contract 
+
+## Roadmap
+
+- [ ] 
+
+'''
+'''--- build.sh ---
+#!/bin/bash
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo build --target wasm32-unknown-unknown --release
+mkdir -p out
+cp target/wasm32-unknown-unknown/release/*.wasm out/staking-contract.wasm
+'''
+'''--- src/account.rs ---
+use near_sdk::Timestamp;
+
+use crate::*;
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub enum UpgradableAccount {
+    Default(Account),
+    Current(Account)
+}
+
+impl From<UpgradableAccount> for Account {
+    fn from(account: UpgradableAccount) -> Self {
+        match account {
+            UpgradableAccount::Default(account) => account,
+            UpgradableAccount::Current(account) => account
+        }
+    }
+}
+
+impl From<Account> for UpgradableAccount {
+    fn from(account: Account) -> Self {
+        UpgradableAccount::Current(account)
+    }
+}
+
+#[derive(BorshDeserialize, BorshSerialize, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Account {
+    pub stake_balance: Balance,
+    pub pre_stake_balance: Balance,
+    pub pre_reward: Balance,
+    pub last_block_balance_change: BlockHeight,
+    pub unstake_balance: Balance,
+    pub unstake_start_timestamp: Timestamp,
+    pub unstake_available_epoch_height: EpochHeight
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct AccountJson {
+    pub account_id: AccountId,
+    pub stake_balance: U128,
+    pub unstake_balance: U128,
+    pub reward: U128,
+    pub can_withdraw: bool,
+    pub start_unstake_timestamp: Timestamp,
+    pub unstake_available_epoch: EpochHeight,
+    pub current_epoch: EpochHeight
+}
+'''
+'''--- src/core_impl.rs ---
+use near_sdk::Gas;
+
+use crate::*;
+
+pub const FT_TRANSFER_GAS: Gas = 10_000_000_000_000;
+pub const WITHDRAW_CALLBACK_GAS: Gas = 10_000_000_000_000;
+pub const HARVEST_CALLBACK_GAS: Gas = 10_000_000_000_000;
+
+pub trait FungibleTokenReceiver {
+    fn ft_on_transfer(&mut self, sender_id: AccountId, amount: U128, msg: String) -> PromiseOrValue<U128>;
+}
+
+#[ext_contract(ext_ft_contract)]
+pub trait FungibleTokenCore {
+    fn ft_transfer(&mut self, receiver_id: AccountId, amount: U128, memo: Option<String>);
+}
+
+#[ext_contract(ext_self)]
+pub trait ExtStakingContract {
+    fn ft_transfer_callback(&mut self, amount: U128, account_id: AccountId);
+    fn ft_withdraw_callback(&mut self, account_id: AccountId, old_account: Account);
+}
+
+#[near_bindgen]
+impl FungibleTokenReceiver for StakingContract {
+
+    fn ft_on_transfer(&mut self, sender_id: AccountId, amount: U128, msg: String) -> PromiseOrValue<U128> {
+        self.internal_deposit_and_stake(sender_id, amount.0);
+
+        // return amount not used
+        PromiseOrValue::Value(U128(0))
+    }
+}
+
+#[near_bindgen]
+impl StakingContract {
+
+    #[payable]
+    pub fn unstake(&mut self, amount: U128) {
+        assert_one_yocto();
+        let account_id: AccountId = env::predecessor_account_id();
+
+        self.internal_unstake(account_id, amount.0);
+    }
+
+    #[payable]
+    pub fn withdraw(&mut self) -> Promise {
+        assert_one_yocto();
+        let account_id: AccountId = env::predecessor_account_id();
+        let old_account: Account = self.internal_withdraw(account_id.clone());
+
+        // handle transfer withdraw
+        ext_ft_contract::ft_transfer(
+            account_id.clone(), 
+            U128(old_account.unstake_balance), 
+            Some(String::from("Staking contract withdraw")), 
+            &self.ft_contract_id, 
+            DEPOSIT_ONE_YOCTOR, 
+            FT_TRANSFER_GAS
+        ).then(
+            ext_self::ft_withdraw_callback(
+                account_id.clone(), 
+                old_account, 
+                &env::current_account_id(), 
+                NO_DEPOSIT, 
+                WITHDRAW_CALLBACK_GAS
+            )
+        )
+    }
+
+    #[payable]
+    pub fn harvest(&mut self) -> Promise {
+        assert_one_yocto();
+        let account_id: AccountId = env::predecessor_account_id();
+        let upgradable_account: UpgradableAccount = self.accounts.get(&account_id).unwrap();
+        let account: Account = Account::from(upgradable_account);
+
+        let new_reward: Balance = self.internal_calculate_account_reward(&account);
+        let current_reward: Balance = account.pre_reward + new_reward;
+        assert!(current_reward > 0, "ERR_REWARD_EQUAL_ZERO");
+
+        // Cross contract call
+        ext_ft_contract::ft_transfer(
+            account_id.clone(), 
+            U128(current_reward), 
+            Some("Staking contract harvest".to_string()), 
+            &self.ft_contract_id, 
+            DEPOSIT_ONE_YOCTOR, 
+            FT_TRANSFER_GAS
+        ).then(
+            ext_self::ft_transfer_callback(
+                U128(current_reward),
+                account_id.clone(),
+                &env::current_account_id(), 
+                NO_DEPOSIT, 
+                HARVEST_CALLBACK_GAS
+            )
+        )
+    }
+
+    #[private]
+    pub fn ft_transfer_callback(&mut self, amount: U128, account_id: AccountId) -> U128 {
+        assert_eq!(env::promise_results_count(), 1, "ERR_TOO_MANY_RESULTS");
+        match env::promise_result(0) {
+            PromiseResult::NotReady => unreachable!(),
+            PromiseResult::Successful(_value) => {
+                let upgradable_account: UpgradableAccount = self.accounts.get(&account_id).unwrap();
+                let mut account: Account = Account::from(upgradable_account);
+
+                // update account data
+                account.pre_reward = 0;
+                account.last_block_balance_change = env::block_index();
+
+                self.accounts.insert(&account_id, &UpgradableAccount::from(account));
+                self.total_paid_reward_balance += amount.0;
+
+                amount
+            },
+            PromiseResult::Failed => env::panic(b"ERR_CALL_FAILED"),
+        }
+    }
+
+    #[private]
+    pub fn ft_withdraw_callback(&mut self, account_id: AccountId, old_account: Account) -> U128 {
+        assert_eq!(env::promise_results_count(), 1, "ERR_TOO_MANY_RESULTS");
+        match env::promise_result(0) {
+            PromiseResult::NotReady => unreachable!(),
+            PromiseResult::Successful(_value) => {
+                U128(old_account.unstake_balance)
+            },
+            PromiseResult::Failed => {
+                // Handle rollback data
+                self.accounts.insert(&account_id, &UpgradableAccount::from(old_account));
+                U128(0)
+            },
+        }
+    }
+}
+'''
+'''--- src/enumeration.rs ---
+use crate::*;
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct PoolInfo {
+    pub total_stake_balance: U128,
+    pub total_reward: U128,
+    pub total_stakers: U128,
+    pub is_paused: bool
+}
+
+#[near_bindgen]
+impl StakingContract {
+    /**
+     * Get current reward by account_id
+     */
+    pub fn get_account_reward(&self, account_id: AccountId) -> Balance {
+        let upgradable_account: UpgradableAccount = self.accounts.get(&account_id).unwrap();
+        let account: Account = Account::from(upgradable_account);
+        let new_reward = self.internal_calculate_account_reward(&account);
+
+        account.pre_reward + new_reward
+    }
+
+    pub fn get_account_info(&self, account_id: AccountId) -> AccountJson {
+        let upgradable_account: UpgradableAccount = self.accounts.get(&account_id).unwrap();
+        let account: Account = Account::from(upgradable_account);
+        let new_reward = self.internal_calculate_account_reward(&account);
+
+        AccountJson { 
+            account_id: account_id, 
+            stake_balance: U128(account.stake_balance), 
+            unstake_balance: U128(account.unstake_balance), 
+            reward: U128(account.pre_reward + new_reward), 
+            can_withdraw: account.unstake_available_epoch_height <= env::epoch_height(),
+            start_unstake_timestamp: account.unstake_start_timestamp,
+            unstake_available_epoch: account.unstake_available_epoch_height,
+            current_epoch: env::epoch_height()
+        }
+    }
+
+    pub fn get_pool_info(&self) -> PoolInfo {
+        PoolInfo { 
+            total_stake_balance: U128(self.total_stake_balance), 
+            total_reward: U128(self.pre_reward + self.internal_calculate_global_reward()), 
+            total_stakers: U128(self.total_staker), 
+            is_paused: self.paused
+        }
+    }
+}
+'''
+'''--- src/internal.rs ---
+use crate::*;
+
+impl StakingContract {
+
+    /**
+     * User deposit FT token and stake
+     * Handle use transfer token to staking contract
+     * 1. validate data
+     * 2. handle stake
+     */
+    pub(crate) fn internal_deposit_and_stake(&mut self, account_id: AccountId, amount: Balance) {
+
+        let upgradable_account: Option<UpgradableAccount> = self.accounts.get(&account_id);
+        assert!(upgradable_account.is_some(), "ERR_NOT_FOUND_ACCOUNT");
+        assert!(!self.paused, "ERR_CONTRACT_PAUSED");
+        assert_eq!(self.ft_contract_id, env::predecessor_account_id(), "ERR_NOT_VALID_FT_CONTRACT");
+
+        // Check account exists
+        let upgradable_account: UpgradableAccount = self.accounts.get(&account_id).unwrap();
+        let mut account = Account::from(upgradable_account);
+
+        if account.stake_balance == 0 {
+            self.total_staker += 1;
+        }
+
+        // if exist account, update balance and update pre data
+        let new_reward: Balance = self.internal_calculate_account_reward(&account);
+
+        // update account data
+        account.pre_stake_balance = account.stake_balance;
+        account.pre_reward += new_reward;
+        account.stake_balance += amount;
+        account.last_block_balance_change = env::block_index();
+        self.accounts.insert(&account_id, &UpgradableAccount::from(account));
+
+        // Update contract data
+        let new_contract_reward: Balance = self.internal_calculate_global_reward();
+        self.total_stake_balance += amount;
+        self.pre_reward += new_contract_reward;
+        self.last_block_balance_change = env::block_index();
+
+    }
+
+    pub(crate) fn internal_unstake(&mut self, account_id: AccountId, amount: Balance) {
+        let upgradable_account: UpgradableAccount = self.accounts.get(&account_id).unwrap();
+
+        let mut account = Account::from(upgradable_account);
+
+        assert!(amount <= account.stake_balance, "ERR_AMOUNT_MUST_LESS_THAN_BALANCE");
+
+        // if exist account, update balance and update pre data
+        let new_reward: Balance = self.internal_calculate_account_reward(&account);
+
+        // update account data
+        account.pre_stake_balance = account.stake_balance;
+        account.pre_reward += new_reward;
+        account.stake_balance -= amount;
+        account.last_block_balance_change = env::block_index();
+        account.unstake_available_epoch_height = env::epoch_height() + NUM_EPOCHS_TO_UNLOCK;
+        account.unstake_balance += amount;
+        account.unstake_start_timestamp = env::block_timestamp();
+        
+        if account.stake_balance == 0 {
+            self.total_staker -= 1;
+        }
+
+        // update new account data
+        self.accounts.insert(&account_id, &UpgradableAccount::from(account));
+
+        // update contract data
+        let new_contract_reward: Balance = self.internal_calculate_global_reward();
+        self.total_stake_balance -= amount;
+        self.pre_reward += new_contract_reward;
+        self.last_block_balance_change = env::block_index();
+    }
+
+    pub(crate) fn internal_withdraw(&mut self, account_id: AccountId) -> Account {
+        let upgradable_account: UpgradableAccount = self.accounts.get(&account_id).unwrap();
+        let account: Account = Account::from(upgradable_account);
+
+        assert!(account.unstake_balance > 0, "ERR_UNSTAKE_BALANCE_IS_ZERO");
+        assert!(account.unstake_available_epoch_height <= env::epoch_height(), "ERR_DISABLE_WITHDRAW");
+
+        let new_account: Account = Account {
+            pre_reward: account.pre_reward,
+            stake_balance: account.stake_balance,
+            pre_stake_balance: account.pre_stake_balance,
+            last_block_balance_change: account.last_block_balance_change,
+            unstake_balance: 0,
+            unstake_start_timestamp: 0,
+            unstake_available_epoch_height: 0
+        };
+
+        self.accounts.insert(&account_id, &UpgradableAccount::from(new_account));
+
+        account
+    }
+
+    pub(crate) fn internal_calculate_account_reward(&self, account: &Account) -> Balance {
+        let lasted_block = if self.paused {
+            self.paused_in_block
+        } else {
+            env::block_index()
+        };
+        let diff_block = lasted_block - account.last_block_balance_change;
+        let reward: U256 = (U256::from(self.total_stake_balance) * U256::from(self.config.reward_numerator) * U256::from(diff_block)) / U256::from(self.config.reward_denumerator);
+        reward.as_u128()
+    }
+
+    pub(crate) fn internal_calculate_global_reward(&self) -> Balance {
+        let lasted_block = if self.paused {
+            self.paused_in_block
+        } else {
+            env::block_index()
+        };
+        let diff_block = lasted_block - self.last_block_balance_change;
+        let reward: U256 = (U256::from(self.total_stake_balance) * U256::from(self.config.reward_numerator) * U256::from(diff_block)) / U256::from(self.config.reward_denumerator);
+        reward.as_u128()
+    }
+
+    pub(crate) fn internal_create_account(&mut self, account: AccountId) {
+        let new_account = Account {
+            stake_balance: 0,
+            pre_stake_balance: 0,
+            pre_reward: 0,
+            last_block_balance_change: env::block_index(),
+            unstake_balance: 0,
+            unstake_available_epoch_height: 0,
+            unstake_start_timestamp: 0
+        };
+
+        let upgrade_account = UpgradableAccount::from(new_account);
+
+        self.accounts.insert(&account, &upgrade_account);
+    }
+}
+'''
+'''--- src/lib.rs ---
+use near_sdk::collections::LookupMap;
+use near_sdk::{near_bindgen, AccountId, env, PanicOnDefault, Balance, EpochHeight, BlockHeight, BorshStorageKey, Promise, PromiseResult, PromiseOrValue, ext_contract};
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::json_types::{U128};
+use uint::construct_uint;
+
+construct_uint! {
+    /// 256-bit unsigned integer.
+    pub struct U256(4);
+}
+
+use crate::account::*;
+pub use crate::enumeration::PoolInfo;
+pub use crate::account::AccountJson;
+use crate::util::*;
+
+mod account;
+mod util;
+mod internal;
+mod core_impl;
+mod enumeration;
+
+pub const NO_DEPOSIT: Balance = 0;
+pub const DEPOSIT_ONE_YOCTOR: Balance = 1;
+pub const NUM_EPOCHS_TO_UNLOCK: EpochHeight = 1;
+
+#[derive(BorshDeserialize, BorshSerialize, Deserialize, Serialize, Clone, Copy)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Config {
+    // Percent reward per 1 block
+    pub reward_numerator: u32,
+    pub reward_denumerator: u64,
+    pub total_apr: u32
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        // By default APR 15%
+        Self { reward_numerator: 715, reward_denumerator: 100000000000, total_apr: 15 }
+    }
+}
+
+#[derive(BorshDeserialize, BorshSerialize, BorshStorageKey)]
+pub enum StorageKey {
+    AccountKey
+}
+
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+#[near_bindgen]
+pub struct StakingContract {
+    pub owner_id: AccountId, // Owner of contract
+    pub ft_contract_id: AccountId,
+    pub config: Config, // Config reward and apr for contract
+    pub total_stake_balance: Balance, // Total token balance lock in contract
+    pub total_paid_reward_balance: Balance,
+    pub total_staker: Balance,
+    pub pre_reward: Balance, // Pre reward before change total balance
+    pub last_block_balance_change: BlockHeight,
+    pub accounts: LookupMap<AccountId, UpgradableAccount>, // List staking user
+    pub paused: bool, // Pause staking pool with limit reward,
+    pub paused_in_block: BlockHeight
+}
+
+#[near_bindgen]
+impl StakingContract {
+
+    #[init]
+    pub fn new_default_config(owner_id: AccountId, ft_contract_id: AccountId) -> Self {
+        Self::new(owner_id, ft_contract_id, Config::default())
+    }
+
+    #[init]
+    pub fn new(owner_id: AccountId, ft_contract_id: AccountId, config: Config) -> Self {
+        StakingContract {
+            owner_id,
+            ft_contract_id,
+            config,
+            total_stake_balance: 0,
+            total_paid_reward_balance: 0,
+            total_staker: 0,
+            pre_reward: 0,
+            last_block_balance_change: env::block_index(),
+            accounts: LookupMap::new(StorageKey::AccountKey),
+            paused: false,
+            paused_in_block: 0
+        }
+    }
+
+    pub fn get_total_pending_reward(&self) -> U128 {
+        assert_eq!(self.owner_id, env::predecessor_account_id(), "ERR_ONLY_OWNER_CONTRACT");
+        U128(self.pre_reward + self.internal_calculate_global_reward())
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    #[payable]
+    pub fn storage_deposit(&mut self, account_id: Option<AccountId>) {
+        assert_at_least_one_yocto();
+        let account = account_id.unwrap_or_else(|| env::predecessor_account_id());
+
+        let account_stake: Option<UpgradableAccount> = self.accounts.get(&account);
+        if account_stake.is_some() {
+            refund_deposit(0);
+        } else {
+            let before_storage_usage = env::storage_usage();
+            self.internal_create_account(account.clone());
+            let after_storage_usage = env::storage_usage();
+
+            refund_deposit(after_storage_usage - before_storage_usage);
+        }
+    }
+
+    // View func get storage balance, return 0 if account need deposit to interact
+    pub fn storage_balance_of(&self, account_id: AccountId) -> U128 {
+        let account: Option<UpgradableAccount> = self.accounts.get(&account_id);
+        if account.is_some() {
+            U128(1)
+        } else {
+            U128(0)
+        }
+    }
+
+    pub(crate) fn assert_owner(&self) {
+        assert_eq!(env::predecessor_account_id(), self.owner_id, "Only owner contract can be access");
+    }
+
+    #[init(ignore_state)]
+    #[private]
+    pub fn migrate() -> Self {
+        let contract: StakingContract = env::state_read().expect("ERR_READ_CONTRACT_STATE");
+        contract
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use near_sdk::json_types::ValidAccountId;
+    use near_sdk::test_utils::{VMContextBuilder, accounts};
+    use near_sdk::{testing_env, MockedBlockchain};
+
+    fn get_context(is_view: bool) -> VMContextBuilder {
+        let mut builder = VMContextBuilder::new();
+        builder.
+        current_account_id(accounts(0))
+        .signer_account_id(accounts(0))
+        .predecessor_account_id(accounts(0))
+        .is_view(is_view);
+
+        builder
+    }
+
+    #[test]
+    fn init_default_contract_test() {
+        let context = get_context(false);
+        testing_env!(context.build());
+
+        let contract: StakingContract = StakingContract::new_default_config(accounts(1).to_string(), "ft_contract".to_string());
+
+        assert_eq!(contract.owner_id, accounts(1).to_string(), "Contract owner should be equal {}", accounts(1).to_string());
+        assert_eq!(contract.ft_contract_id, "ft_contract".to_string(), "FT contract id should be init data");
+        assert_eq!(contract.config.reward_numerator, Config::default().reward_numerator, "Config must be equal default");
+        assert_eq!(contract.paused, false);
+    }
+
+    #[test]
+    fn init_contract_test() {
+        let context = get_context(false);
+        testing_env!(context.build());
+
+        let contract: StakingContract = StakingContract::new(accounts(1).to_string(), "ft_contract".to_string(), Config { 
+            reward_numerator: 1500, 
+            reward_denumerator: 10000000, 
+            total_apr: 15 
+        });
+
+        assert_eq!(contract.owner_id, accounts(1).to_string(), "Contract owner should be equal {}", accounts(1).to_string());
+        assert_eq!(contract.ft_contract_id, "ft_contract".to_string(), "FT contract id should be init data");
+        assert_eq!(contract.config.reward_numerator, 1500, "Config must be equal default");
+        assert_eq!(contract.config.reward_denumerator, 10000000);
+        assert_eq!(contract.paused, false);
+    }
+
+    #[test]
+    fn deposit_and_stake_test() {
+        let mut context = get_context(false);
+        context.block_index(0);
+        testing_env!(context.build());
+
+        let mut contract: StakingContract = StakingContract::new_default_config(accounts(1).to_string(), accounts(1).to_string());
+        contract.internal_create_account(env::predecessor_account_id());
+
+        
+        // Deposit and stake function call from FT contract
+        context.predecessor_account_id(accounts(1));
+        testing_env!(context.build());
+        contract.internal_deposit_and_stake(accounts(0).to_string(), 10_000_000_000_000);
+
+        context.block_index(10);
+        context.predecessor_account_id(accounts(0));
+        testing_env!(context.build());
+
+        // Test deposit balance and 
+        let upgradable_account = contract.accounts.get(&accounts(0).to_string()).unwrap();
+        let account: Account = Account::from(upgradable_account);
+
+        assert_eq!(account.stake_balance, 10_000_000_000_000);
+        assert_eq!(account.pre_reward, 0);
+        assert_eq!(account.pre_stake_balance, 0);
+        assert!(contract.internal_calculate_account_reward(&account) > 0);
+
+        // test contract balance
+        assert_eq!(contract.total_stake_balance, account.stake_balance);
+        assert_eq!(contract.total_staker, 1);
+        assert_eq!(contract.pre_reward, 0);
+        assert_eq!(contract.last_block_balance_change, 0);
+
+        // Test update stake balance of account
+        // Deposit and stake function call from FT contract
+        context.predecessor_account_id(accounts(1));
+        testing_env!(context.build());
+        contract.internal_deposit_and_stake(accounts(0).to_string(), 20_000_000_000_000);
+
+        context.block_index(20);
+        context.predecessor_account_id(accounts(0));
+        testing_env!(context.build());
+
+        // Test deposit balance and 
+        let upgradable_account_2 = contract.accounts.get(&accounts(0).to_string()).unwrap();
+        let account_update: Account = Account::from(upgradable_account_2);
+
+        assert_eq!(account_update.stake_balance, 30_000_000_000_000);
+        assert!(account_update.pre_reward > 0);
+        assert_eq!(account_update.pre_stake_balance, 10_000_000_000_000);
+        assert_eq!(account_update.last_block_balance_change, 10);
+        assert!(contract.internal_calculate_account_reward(&account_update) > 0);
+
+        // test contract balance
+        assert_eq!(contract.total_stake_balance, account_update.stake_balance);
+        assert_eq!(contract.total_staker, 1);
+        assert!(contract.pre_reward > 0);
+        assert_eq!(contract.last_block_balance_change, 10);
+    }
+
+    #[test]
+    fn unstake_test() {
+        let mut context = get_context(false);
+        context.block_index(0);
+        testing_env!(context.build());
+
+        let mut contract: StakingContract = StakingContract::new_default_config(accounts(1).to_string(), accounts(1).to_string());
+        contract.internal_create_account(env::predecessor_account_id());
+
+        
+        // Deposit and stake function call from FT contract
+        context.predecessor_account_id(accounts(1));
+        testing_env!(context.build());
+        contract.internal_deposit_and_stake(accounts(0).to_string(), 30_000_000_000_000);
+
+        context.block_index(10);
+        context.epoch_height(10);
+        context.predecessor_account_id(accounts(0));
+        testing_env!(context.build());
+
+        contract.internal_unstake(accounts(0).to_string(), 10_000_000_000_000);
+
+        // Test deposit balance and 
+        let upgradable_account = contract.accounts.get(&accounts(0).to_string()).unwrap();
+        let account: Account = Account::from(upgradable_account);
+
+        assert_eq!(account.stake_balance, 20_000_000_000_000);
+        assert_eq!(account.unstake_balance, 10_000_000_000_000);
+        assert_eq!(account.last_block_balance_change, 10);
+        assert_eq!(account.unstake_available_epoch_height, 11);
+    }
+
+    #[test]
+    fn withdraw_test() {
+
+    }
+}
+'''
+'''--- src/util.rs ---
+use crate::*;
+
+pub(crate) fn assert_one_yocto() {
+    assert_eq!(env::attached_deposit(), 1,
+    "Require attached deposit of exactly 1 yoctoNear");
+}
+
+pub(crate) fn assert_at_least_one_yocto() {
+    assert!(env::attached_deposit() >= 1,
+    "Require attached deposit of at least 1 yoctoNear")
+}
+
+pub(crate) fn refund_deposit(storage_used: u64) {
+    let required_cost = env::storage_byte_cost() * Balance::from(storage_used);
+    let attached_deposit = env::attached_deposit();
+
+    assert!(
+        required_cost <= attached_deposit,
+        "Must attach {} yoctoNear to cover storage", required_cost
+    );
+
+    let refund = attached_deposit - required_cost;
+
+    if refund > 1 {
+        Promise::new(env::predecessor_account_id()).transfer(refund);
+    }
+}
+'''
+'''--- tests/simulation-tests/main.rs ---
+use near_sdk::{serde_json::json, json_types::U128};
+use near_sdk_sim::{init_simulator, UserAccount, DEFAULT_GAS, STORAGE_AMOUNT, to_yocto};
+use near_sdk_sim::transaction::ExecutionStatus;
+use staking_contract::AccountJson;
+
+near_sdk_sim::lazy_static_include::lazy_static_include_bytes! {
+    FT_CONTRACT_WASM_FILE => "token-test/vbi-ft.wasm",
+    STAKING_CONTRACT_WASM_FILE => "out/staking-contract.wasm"
+}
+
+const FT_CONTRACT_ID: &str = "ft_contract";
+const FT_TOTAL_SUPPY: &str = "100000000000000000000000000000";
+const FT_STAKING_CONTRACT_BALANCE: &str = "50000000000000000000000000000";
+const STAKING_CONTRACT_ID: &str = "staking_contract";
+const ALICE_DEPOSIT_BALANCE: &str = "10000000000000000000000000000";
+
+pub fn init() -> (UserAccount, UserAccount, UserAccount, UserAccount) {
+    let root = init_simulator(None);
+
+    let alice = root.create_user("alice".to_string(), to_yocto("100"));
+
+    // Deploy and init 1M Token
+    let ft_contract = root.deploy_and_init(
+        &FT_CONTRACT_WASM_FILE,
+        FT_CONTRACT_ID.to_string(), 
+        "new_default_meta",
+        &json!({
+            "owner_id": alice.account_id(),
+            "total_supply": FT_TOTAL_SUPPY
+        }).to_string().as_bytes(),
+        STORAGE_AMOUNT,
+        DEFAULT_GAS
+    );
+
+    // Deploy and init staking contract
+    let staking_contract = root.deploy_and_init(
+        &STAKING_CONTRACT_WASM_FILE, 
+        STAKING_CONTRACT_ID.to_string(), 
+        "new_default_config", 
+        &json!({
+            "owner_id": alice.account_id(),
+            "ft_contract_id": ft_contract.account_id()
+        }).to_string().as_bytes(), 
+        STORAGE_AMOUNT, 
+        DEFAULT_GAS
+    );
+
+    // storage deposit
+    root.call(
+        ft_contract.account_id(), 
+        "storage_deposit", 
+        &json!({
+            "account_id": staking_contract.account_id()
+        }).to_string().as_bytes(), 
+        DEFAULT_GAS, 
+        to_yocto("0.01")
+    );
+
+    // Transfer 50% total supply to staking contract
+    alice.call(
+        ft_contract.account_id(), 
+        "ft_transfer", 
+        &json!({
+            "receiver_id": staking_contract.account_id(),
+            "amount": FT_STAKING_CONTRACT_BALANCE
+        }).to_string().as_bytes(), 
+        DEFAULT_GAS, 
+        1
+    );
+
+    (root, ft_contract, staking_contract, alice)
+}
+
+#[test]
+fn init_contract_test() {
+    let (root, ft_contract, staking_contract, alice) = init();
+
+    // test deploy ft_contract
+    let total_suppy: String = root.view(
+        ft_contract.account_id(), 
+        "ft_total_supply",
+        &json!({}).to_string().as_bytes()
+    ).unwrap_json();
+
+    println!("Total supply: {}", total_suppy);
+    assert_eq!(FT_TOTAL_SUPPY, total_suppy, "Total supply must equal {}", FT_TOTAL_SUPPY);
+
+    // test alice balance
+    let alice_balance: String = root.view(
+        ft_contract.account_id(), 
+        "ft_balance_of", 
+        &json!({
+            "account_id": alice.account_id()
+        }).to_string().as_bytes()
+    ).unwrap_json();
+
+    println!("Alice balance: {}", alice_balance);
+    assert_eq!(FT_STAKING_CONTRACT_BALANCE, alice_balance, "Alice balance must equal {}", FT_STAKING_CONTRACT_BALANCE);
+
+    // test staking contract balance
+    let staking_balance: String = root.view(
+        ft_contract.account_id(), 
+        "ft_balance_of", 
+        &json!({
+            "account_id": staking_contract.account_id()
+        }).to_string().as_bytes()
+    ).unwrap_json();
+
+    println!("Staking contract balance: {}", staking_balance);
+    assert_eq!(FT_STAKING_CONTRACT_BALANCE, staking_balance, "Staking contract balance must equal {}", FT_STAKING_CONTRACT_BALANCE);
+}
+
+#[test]
+fn deposit_and_stake_test() {
+    let (root, ft_contract, staking_contract, alice) = init();
+
+    // staking contract storage deposit
+    alice.call(
+        staking_contract.account_id(), 
+        "storage_deposit", 
+        &json!({}).to_string().as_bytes(),
+        DEFAULT_GAS, 
+        to_yocto("0.01")
+    );
+
+    alice.call(
+        ft_contract.account_id(), 
+        "ft_transfer_call", 
+        &json!({
+            "receiver_id": staking_contract.account_id(),
+            "amount": ALICE_DEPOSIT_BALANCE,
+            "msg": ""
+        }).to_string().as_bytes(),
+         DEFAULT_GAS, 
+        1
+    );
+
+    let account_json: AccountJson = root.view(
+        staking_contract.account_id(), 
+        "get_account_info", 
+        &json!({
+            "account_id": alice.account_id()
+        }).to_string().as_bytes()
+    ).unwrap_json();
+
+    assert_eq!(account_json.account_id, alice.account_id());
+    assert_eq!(account_json.stake_balance, U128(10000000000000000000000000000));
+    assert!(account_json.reward.0 > 0);
+    assert_eq!(account_json.unstake_balance.0, 0);
+}
+
+#[test]
+fn deposit_and_stake_error_storage_test() {
+    let (root, ft_contract, staking_contract, alice) = init();
+
+    // Deposit without storage deposit
+    let outcome = alice.call(
+        ft_contract.account_id(), 
+        "ft_transfer_call", 
+        &json!({
+            "receiver_id": staking_contract.account_id(),
+            "amount": ALICE_DEPOSIT_BALANCE,
+            "msg": ""
+        }).to_string().as_bytes(),
+         DEFAULT_GAS, 
+        1
+    );
+
+    // Have one error
+    assert_eq!(outcome.promise_errors().len(), 1);
+
+    // assert error type
+    if let ExecutionStatus::Failure(error) = &outcome.promise_errors().remove(0).unwrap().outcome().status {
+        println!("Error: {}", error.to_string());
+        assert!(error.to_string().contains("ERR_NOT_FOUND_ACCOUNT"));
+    } else {
+        unreachable!();
+    }
+
+}
+'''

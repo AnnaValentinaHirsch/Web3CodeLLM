@@ -1,0 +1,674 @@
+*GitHub Repository "myzyryzm/runner-ratchet"*
+
+'''--- Cargo.toml ---
+[package]
+name = "runner-ratchet"
+version = "0.1.0"
+authors = ["Ryan Young"]
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "4.0.0"
+
+[profile.release]
+codegen-units=1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+'''
+'''--- README.md ---
+# runner-ratchet
+
+'''
+'''--- build.sh ---
+#!/bin/bash
+set -e && RUSTFLAGS='-C link-arg=-s' cargo build --target wasm32-unknown-unknown --release && mkdir -p ./out && cp target/wasm32-unknown-unknown/release/*.wasm ./out/main.wasm
+'''
+'''--- src/account_core.rs ---
+use std::fmt::format;
+
+use crate::*;
+use crate::{internal::*, this_contract::CallbacksExt};
+use near_sdk::{ext_contract, log, Gas, PromiseResult};
+
+const GAS_FOR_RESOLVE_TRANSFER: Gas = Gas(10_000_000_000_000);
+const GAS_FOR_NFT_ON_TRANSFER: Gas = Gas(25_000_000_000_000);
+const NFT_CONTRACT: String = "nft.ratchet.testnet".to_string();
+
+pub trait AccountCore {
+    fn update_account(&mut self, owner_id: AccountId, progress: u64) -> Option<JsonAccount>;
+
+    fn account(&self, token_id: TokenId) -> Option<JsonAccount>;
+}
+
+#[near_bindgen]
+impl AccountCore for Contract {
+    fn update_account(&mut self, owner_id: AccountId, progress: u64) -> Option<JsonAccount> {
+        assert_eq!(
+            env::predecessor_account_id(),
+            env::current_account_id(),
+            "Only the contract account can update data."
+        );
+
+        if let Some(mut metadata) = self.account_metadata_by_id.get(&owner_id) {
+            metadata.progress = progress;
+            self.account_metadata_by_id.insert(&owner_id, &metadata);
+            Some(JsonAccount { owner_id, metadata })
+        } else {
+            let msg = format!("Account with id {} does not exist", owner_id);
+            env::panic_str(&msg);
+        }
+        None
+    }
+
+    /// get the information for a ratchet id
+    fn account(&self, owner_id: AccountId) -> Option<JsonAccount> {
+        if let Some(metadata) = self.account_metadata_by_id.get(&owner_id) {
+            Some(JsonAccount { owner_id, metadata })
+        } else {
+            // if there wasnt a token id in the tokens_by_id collection we return None
+            None
+        }
+    }
+}
+
+'''
+'''--- src/account_enumeration.rs ---
+use crate::*;
+
+#[near_bindgen]
+impl Contract {
+    // get number of ratchets
+    pub fn account_total_supply(&self) -> U128 {
+        U128(self.account_metadata_by_id.len() as u128)
+    }
+
+    //Query for ratchets on the contract regardless of the owner using pagination
+    pub fn accounts(&self, from_index: Option<U128>, limit: Option<u64>) -> Vec<JsonAccount> {
+        let start = u128::from(from_index.unwrap_or(U128(0)));
+
+        self.account_metadata_by_id
+            .keys()
+            .skip(start as usize)
+            .take(limit.unwrap_or(50) as usize)
+            .map(|owner_id| self.account(owner_id.clone()).unwrap())
+            .collect()
+    }
+}
+
+'''
+'''--- src/account_mint.rs ---
+use crate::*;
+use near_sdk::Gas;
+
+pub const ACCOUNT_MINT_COST: u128 = 0.1; // cost to create a account for this game
+
+#[near_bindgen]
+impl Contract {
+    /// This method is for creating the account that will keep track of the user's general progress
+    #[payable]
+    pub fn mint_account(&mut self, account_id: AccountId) {
+        assert!(
+            self.account_metadata_by_id.contains_key(&account_id) == false,
+            "Account with id {} already exists",
+            account_id
+        );
+
+        let attached = env::attached_deposit();
+        let total_cost = ACCOUNT_MINT_COST * YOCTO_NEAR;
+
+        assert_eq!(
+            attached, total_cost,
+            "Must attach {} Near to create character",
+            base_cost
+        );
+        let metadata = AccountMetadata { progress: 0 };
+        self.account_metadata_by_id.insert(&account_id, &metadata);
+    }
+}
+
+'''
+'''--- src/external.rs ---
+use crate::*;
+use near_sdk::ext_contract;
+
+/// Callbacks for this contract
+#[ext_contract(this_contract)]
+trait Callbacks {
+    fn add_to_ratchet_nft_callback(&mut self, owner_id: AccountId, token_id: TokenId) -> bool;
+
+    fn on_resolve_mint_callback(&mut self, owner_id: AccountId, token_id: TokenId) -> bool;
+}
+
+/// Functions that will be run on nft ratchet contract
+#[ext_contract(nft_ratchet)]
+trait NFTRatchet {
+    fn add_to_nft(&mut self, token_id: TokenId, game_token_id: TokenId);
+
+    fn nft_mint_from_game(&mut self, contract_id: String, ratchet_id: TokenId, owner_id: AccountId);
+}
+
+'''
+'''--- src/internal.rs ---
+use crate::*;
+use near_sdk::CryptoHash;
+
+//used to generate a unique prefix in our storage collections (this is to avoid data collisions)
+pub(crate) fn hash_account_id(account_id: &AccountId) -> CryptoHash {
+    //get the default hash
+    let mut hash = CryptoHash::default();
+    //we hash the account ID and return it
+    hash.copy_from_slice(&env::sha256(account_id.as_bytes()));
+    hash
+}
+
+//refund the initial deposit based on the amount of storage that was used up
+pub(crate) fn refund_deposit(storage_used: u64) {
+    //get how much it would cost to store the information
+    let required_cost = env::storage_byte_cost() * Balance::from(storage_used);
+    //get the attached deposit
+    let attached_deposit = env::attached_deposit();
+
+    //make sure that the attached deposit is greater than or equal to the required cost
+    assert!(
+        required_cost <= attached_deposit,
+        "Must attach {} yoctoNEAR to cover storage",
+        required_cost,
+    );
+
+    //get the refund amount from the attached deposit - required cost
+    let refund = attached_deposit - required_cost;
+
+    //if the refund is greater than 1 yocto NEAR, we refund the predecessor that amount
+    if refund > 1 {
+        Promise::new(env::predecessor_account_id()).transfer(refund);
+    }
+}
+
+pub(crate) fn assert_one_yocto() {
+    assert_eq!(
+        env::attached_deposit(),
+        1,
+        "Requires attached deposit of exactly 1 yoctoNear"
+    )
+}
+
+'''
+'''--- src/lib.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::{LazyOption, LookupMap, UnorderedMap, UnorderedSet};
+use near_sdk::json_types::{Base64VecU8, U128};
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{
+    env, near_bindgen, AccountId, Balance, CryptoHash, PanicOnDefault, Promise, PromiseOrValue,
+};
+
+pub use crate::account_core::*;
+pub use crate::account_enumeration::*;
+pub use crate::account_mint::*;
+pub use crate::external::*;
+pub use crate::internal::*;
+pub use crate::metadata::*;
+pub use crate::ratchet_core::*;
+pub use crate::ratchet_enumeration::*;
+pub use crate::ratchet_mint::*;
+
+mod account_core;
+mod account_enumeration;
+mod account_mint;
+mod external;
+mod internal;
+mod metadata;
+mod ratchet_core;
+mod ratchet_enumeration;
+mod ratchet_mint;
+
+// Define the contract structure
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Contract {
+    // contract owner
+    pub owner_id: AccountId,
+    // keeps track of the metadata for the contract
+    pub metadata: LazyOption<ContractMetadata>,
+
+    // keeps track of the metadata (e.g. the game progress) for each account
+    pub account_metadata_by_id: UnorderedMap<AccountId, AccountMetadata>,
+
+    // keeps track of all the ratchet tokens per id
+    pub ratchet_per_owner: LookupMap<AccountId, TokenId>,
+    // keeps track of the token struct for a give tokenId
+    pub ratchets_by_id: LookupMap<TokenId, Ratchet>,
+    // keeps track of the ratchet metadata for a given token ID
+    pub ratchet_metadata_by_id: UnorderedMap<TokenId, RatchetMetadata>,
+}
+
+/// Helper structure for keys of the persistent collections.
+#[derive(BorshSerialize)]
+pub enum StorageKey {
+    NFTContractMetadata,
+    AccountMetadataById,
+    RatchetPerOwner,
+    RatchetsById,
+    RatchetMetadataById,
+}
+
+// Implement the contract structure
+#[near_bindgen]
+impl Contract {
+    /*
+        initialization function (can only be called once).
+        this initializes the contract with default metadata so the
+        user doesn't have to manually type metadata.
+    */
+    #[init]
+    pub fn new_default_meta(owner_id: AccountId) -> Self {
+        let this = Self {
+            owner_id,
+            metadata: ContractMetadata {
+                spec: "runner-1.0.0".to_string(),
+                name: " Ratchet Runner Contract".to_string(),
+                symbol: "runner".to_string(),
+            },
+            account_metadata_by_id: LookupMap::new(
+                StorageKey::AccountMetadataById.try_to_vec().unwrap(),
+            ),
+            ratchet_per_owner: LookupMap::new(StorageKey::RatchetPerOwner.try_to_vec().unwrap()),
+            ratchets_by_id: LookupMap::new(StorageKey::RatchetsById.try_to_vec().unwrap()),
+            ratchet_metadata_by_id: UnorderedMap::new(
+                StorageKey::RatchetMetadataById.try_to_vec().unwrap(),
+            ),
+        };
+        this
+    }
+
+    /*
+        initialization function (can only be called once).
+        this initializes the contract with metadata that was passed in and
+        the owner_id.
+    */
+    #[init]
+    pub fn new(owner_id: AccountId, metadata: ContractMetadata) -> Self {
+        let this = Self {
+            owner_id,
+            metadata: LazyOption::new(
+                StorageKey::NFTContractMetadata.try_to_vec().unwrap(),
+                Some(&metadata),
+            ),
+            account_metadata_by_id: LookupMap::new(
+                StorageKey::AccountMetadataById.try_to_vec().unwrap(),
+            ),
+            ratchet_per_owner: LookupMap::new(StorageKey::RatchetPerOwner.try_to_vec().unwrap()),
+            ratchets_by_id: LookupMap::new(StorageKey::RatchetsById.try_to_vec().unwrap()),
+            ratchet_metadata_by_id: UnorderedMap::new(
+                StorageKey::RatchetMetadataById.try_to_vec().unwrap(),
+            ),
+        };
+        this
+    }
+}
+
+'''
+'''--- src/metadata.rs ---
+use crate::*;
+pub type TokenId = String;
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone)]
+#[serde(crate = "near_sdk::serde")]
+pub struct ContractMetadata {
+    // required, essentially a version like "nft-1.0.0"
+    pub spec: String,
+    pub name: String,
+    pub symbol: String,
+}
+
+pub trait NonFungibleTokenMetadata {
+    //view call for returning the contract metadata
+    fn nft_metadata(&self) -> ContractMetadata;
+}
+
+#[near_bindgen]
+impl NonFungibleTokenMetadata for Contract {
+    fn nft_metadata(&self) -> ContractMetadata {
+        self.metadata.get().unwrap()
+    }
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct AccountMetadata {
+    pub progress: u64, // game specific progress
+}
+
+//The Json data is what will be returned from view account calls.
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct JsonAccount {
+    // owner of the account
+    pub owner_id: AccountId,
+    // account metadata
+    pub metadata: AccountMetadata,
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Ratchet {
+    // owner of token
+    pub owner_id: AccountId,
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct RatchetMetadata {
+    pub nft_token_id: TokenId, // id of ratchet on nft contract
+    pub experience: u64,       // game specific experience
+}
+
+//The Json token is what will be returned from view calls.
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct JsonRatchet {
+    // token id
+    pub token_id: TokenId,
+    // owner of the token
+    pub owner_id: AccountId,
+    // token metadata
+    pub metadata: RatchetMetadata,
+}
+
+'''
+'''--- src/ratchet_core.rs ---
+use std::fmt::format;
+
+use crate::*;
+use crate::{internal::*, this_contract::CallbacksExt};
+use near_sdk::{ext_contract, log, Gas, PromiseResult};
+
+const GAS_FOR_RESOLVE_TRANSFER: Gas = Gas(10_000_000_000_000);
+const GAS_FOR_NFT_ON_TRANSFER: Gas = Gas(25_000_000_000_000);
+const NFT_CONTRACT: String = "nft.ratchet.testnet".to_string();
+
+pub trait RatchetCore {
+    fn update_ratchet(
+        &mut self,
+        owner_id: AccountId,
+        token_id: TokenId,
+        experience: u64,
+    ) -> Option<JsonRatchet>;
+
+    fn ratchet(&self, token_id: TokenId) -> Option<JsonRatchet>;
+}
+
+#[near_bindgen]
+impl RatchetCore for Contract {
+    fn update_ratchet(
+        &mut self,
+        owner_id: AccountId,
+        token_id: TokenId,
+        experience: u64,
+    ) -> Option<JsonRatchet> {
+        assert_eq!(
+            env::predecessor_account_id(),
+            env::current_account_id(),
+            "Only the contract account can update data."
+        );
+
+        if let Some(ratchet) = self.ratchets_by_id.get(&token_id) {
+            assert_eq!(
+                ratchet.owner_id, owner_id,
+                "{} is not the owner of ratchet with id of {}",
+                owner_id, token_id
+            );
+            if let Some(mut metadata) = self.ratchet_metadata_by_id.get(&token_id) {
+                metadata.experience = experience;
+                self.ratchet_metadata_by_id.insert(&token_id, &metadata);
+                Some(JsonRatchet {
+                    token_id,
+                    owner_id: ratchet.owner_id,
+                    metadata,
+                })
+            } else {
+                let msg = format!("Ratchet metadat with id {} does not exist", token_id);
+                env::panic_str(&msg);
+            }
+        } else {
+            let msg = format!("Ratchet with id {} does not exist", token_id);
+            env::panic_str(&msg);
+        }
+        None
+    }
+
+    /// get the information for a ratchet id
+    fn ratchet(&self, token_id: TokenId) -> Option<JsonRatchet> {
+        if let Some(ratchet) = self.ratchets_by_id.get(&token_id) {
+            // we'll get the metadata for that token
+            let metadata = self.ratchet_metadata_by_id.get(&token_id).unwrap();
+            Some(JsonRatchet {
+                token_id,
+                owner_id: ratchet.owner_id,
+                metadata,
+            })
+        } else {
+            // if there wasnt a token id in the tokens_by_id collection we return None
+            None
+        }
+    }
+}
+
+#[near_bindgen]
+impl CallbacksExt for Contract {
+    /// this runs after calling the mint function on the ratchet nft contract
+    pub fn on_resolve_mint_callback(
+        &mut self,
+        owner_id: AccountId,
+        token_id: TokenId,
+        #[callback_result] call_result: Result<(), PromiseError>,
+    ) -> bool {
+        if call_result.is_err() {
+            env::log_str("Unable to create nft, rolling back...");
+            let total_cost = (RUNNER_MINT_COST + NFT_MINT_COST) * YOCTO_NEAR;
+            Promise::new(owner_id).transfer(total_cost);
+            return false;
+        }
+
+        let token = Ratchet { owner_id: owner_id };
+
+        if self.ratchets_by_id.contains_key(&token_id) {
+            Promise::new(owner_id).transfer(RUNNER_MINT_COST * YOCTO_NEAR);
+            env::panic_str("Ratchet with id already exists on runner contract");
+        }
+
+        if self.ratchet_per_owner.contains_key(&owner_id) {
+            Promise::new(owner_id).transfer(RUNNER_MINT_COST * YOCTO_NEAR);
+            env::panic_str("Owner already has a ratchet runner");
+        }
+
+        self.ratchets_by_id.insert(&token_id, &token);
+        self.ratchet_per_owner.insert(&owner_id, &token_id);
+
+        let metadata = RatchetMetadata {
+            nft_token_id: token_id,
+            experience: 0,
+        };
+
+        self.ratchet_metadata_by_id.insert(&token_id, &metadata);
+
+        true
+    }
+
+    /// this runs after attempting to add the ratchet runner data (i.e. the runner id to the nft map)
+    pub fn add_to_ratchet_nft_callback(
+        &mut self,
+        owner_id: AccountId,
+        token_id: TokenId,
+        #[callback_result] call_result: Result<(), PromiseError>,
+    ) -> bool {
+        if call_result.is_err() {
+            env::log_str("Unable to add to nft contract, rolling back...");
+            // todo: need to check to make sure the token still exists (if somehow it was removed then these could fail)
+            // remove token from owner
+            self.ratchet_per_owner.remove(&owner_id);
+            // remove token
+            self.ratchets_by_id.remove(&token_id);
+            // remove token metadata
+            self.ratchet_metadata_by_id.remove(&token_id);
+            // transfer funds back to user
+            Promise::new(owner_id).transfer(YOCTO_NEAR * RUNNER_MINT_COST);
+            return false;
+        }
+        true
+    }
+}
+
+'''
+'''--- src/ratchet_enumeration.rs ---
+use crate::*;
+
+#[near_bindgen]
+impl Contract {
+    // get number of ratchets
+    pub fn ratchet_total_supply(&self) -> U128 {
+        U128(self.ratchet_metadata_by_id.len() as u128)
+    }
+
+    //Query for ratchets on the contract regardless of the owner using pagination
+    pub fn ratchets(&self, from_index: Option<U128>, limit: Option<u64>) -> Vec<JsonRatchet> {
+        let start = u128::from(from_index.unwrap_or(U128(0)));
+
+        self.ratchet_metadata_by_id
+            .keys()
+            .skip(start as usize)
+            .take(limit.unwrap_or(50) as usize)
+            .map(|token_id| self.ratchet(token_id.clone()).unwrap())
+            .collect()
+    }
+
+    // get ratchet belonging to owner
+    pub fn ratchets_for_owner(&self, account_id: AccountId) -> Option<JsonRatchet> {
+        if let Some(ratchet_id) = self.ratchet_per_owner.get(&account_id) {
+            let metadata = self.ratchet_metadata_by_id.get(&ratchet_id).unwrap();
+            Some(JsonRatchet {
+                token_id,
+                owner_id: ratchet.owner_id,
+                metadata,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+'''
+'''--- src/ratchet_mint.rs ---
+use crate::*;
+use near_sdk::Gas;
+
+pub const YOCTO_NEAR: u128 = 1_000_000_000_000_000_000_000_000;
+pub const RUNNER_MINT_COST: u128 = 0; // cost to create a character on this game
+pub const NFT_MINT_COST: u128 = 1; // cost to create the NFT version of character
+
+const GAS_FOR_CREATE_NFT: Gas = Gas(50_000_000_000_000);
+const GAS_FOR_RESOLVE_CREATE: Gas = Gas(50_000_000_000_000);
+
+#[near_bindgen]
+impl Contract {
+    // This method is for creating the ratchet nft character and then for creating the character on the game
+    #[payable]
+    pub fn full_mint_ratchet(&mut self, token_id: TokenId, receiver_id: AccountId) {
+        assert!(
+            self.ratchets_by_id.contains_key(&token_id) == false,
+            "Ratchet with id {} already exists",
+            token_id
+        );
+
+        assert!(
+            self.ratchet_per_owner.contains_key(&receiver_id) == false,
+            "Account {} already has a character",
+            receiver_id
+        );
+
+        let attached = env::attached_deposit();
+        let base_cost = RUNNER_MINT_COST + NFT_MINT_COST;
+        let total_cost = base_cost * YOCTO_NEAR;
+
+        assert_eq!(
+            attached, total_cost,
+            "Must attach {} Near to create character",
+            base_cost
+        );
+
+        let promise = nft_ratchet::ext("nft.ratchet.testnet".parse().unwrap())
+            .with_static_gas(GAS_FOR_CREATE_NFT)
+            .with_attached_deposit(NFT_MINT_COST * YOCTO_NEAR)
+            .nft_mint_from_game(env::current_account_id(), token_id, receiver_id);
+
+        return promise.then(
+            Self::ext(env::current_account_id())
+                .with_static_gas(GAS_FOR_RESOLVE_CREATE)
+                .on_resolve_mint_callback(receiver_id, token_id),
+        );
+    }
+
+    // this is for creating the ratchet character to be used on the actual game; right now it costs money to add the character to the game but that is still up in the air
+    #[payable]
+    pub fn mint_ratchet(
+        &mut self,
+        token_id: TokenId,
+        nft_token_id: TokenId,
+        receiver_id: AccountId,
+        nft_contract: Option<String>,
+    ) {
+        let attached_deposit = env::attached_deposit();
+        let required_cost = YOCTO_NEAR * RUNNER_MINT_COST;
+
+        // assert_one_yocto();
+
+        assert!(
+            required_cost == attached_deposit,
+            "Must attach {} NEAR to purchase",
+            RUNNER_MINT_COST,
+        );
+
+        let token = Ratchet {
+            owner_id: receiver_id,
+        };
+
+        // insert the token ID and token strct and make sure that the token doesn't exist
+        assert!(
+            self.ratchets_by_id.insert(&token_id, &token).is_none(),
+            "Token already exists"
+        );
+
+        assert!(
+            self.ratchet_per_owner
+                .insert(&owner_id, &token_id)
+                .is_none(),
+            "{} already has a ratchet character",
+            owner_id
+        );
+
+        let metadata = RatchetMetadata {
+            nft_token_id: nft_token_id,
+            experience: 0,
+        };
+
+        self.ratchet_metadata_by_id.insert(&token_id, &metadata);
+
+        let tar_contract = nft_contract.unwrap_or("nft.ratchet.testnet".parse().unwrap());
+
+        let promise = nft_ratchet::ext(tar_contract)
+            .with_static_gas(GAS_FOR_CREATE_NFT)
+            .add_to_nft(nft_token_id.clone(), token_id.clone());
+        return promise.then(
+            Self::ext(env::current_account_id())
+                .with_static_gas(GAS_FOR_RESOLVE_CREATE)
+                .add_to_ratchet_nft_callback(token.owner_id, token_id),
+        );
+    }
+}
+
+'''

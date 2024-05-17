@@ -1,0 +1,2768 @@
+*GitHub Repository "evgenykuzyakov/berryclub-testnet"*
+
+'''--- README.md ---
+# NEAR Place
+
+Draw with pixels. Your pixels earn you more pixels, so better artists get more pixels to draw.
+
+'''
+'''--- contract-rs/pixel-board/Cargo.toml ---
+[package]
+name = "near-place"
+version = "0.2.0"
+authors = ["Near Inc <hello@nearprotocol.com>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "2.0.0"
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "s"
+lto = true
+debug = false
+panic = "abort"
+# Opt into extra safety checks on arithmetic operations https://stackoverflow.com/a/64136471/249801
+overflow-checks = true
+
+[workspace]
+members = []
+
+'''
+'''--- contract-rs/pixel-board/README.md ---
+# NEAR Place
+
+Smart contract to keep track of the board.
+
+## Building
+
+```bash
+./build.sh
+```
+
+## Testing
+
+To test run:
+
+```bash
+cargo test --package near-place -- --nocapture
+```
+
+'''
+'''--- contract-rs/pixel-board/build.sh ---
+#!/bin/bash
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/near_place.wasm ./res/
+
+'''
+'''--- contract-rs/pixel-board/src/account.rs ---
+use crate::*;
+
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::json_types::{ValidAccountId, U128};
+use near_sdk::{env, near_bindgen, AccountId};
+
+pub const PIXEL_COST: Balance = 1_000_000_000_000_000_000;
+pub const ONE_NEAR: Balance = 1_000_000_000_000_000_000_000_000;
+pub const PIXEL_TOKEN_PRICE: Balance = ONE_NEAR / PIXEL_COST / 250;
+pub const MIN_AMOUNT_FOR_DISCOUNT: Balance = 5 * ONE_NEAR;
+pub const PIXEL_TOKEN_PRICE_WITH_DISCOUNT: Balance = PIXEL_TOKEN_PRICE * 5 / 6;
+pub const DEFAULT_AVOCADO_BALANCE: Balance = 25 * PIXEL_COST;
+pub const DEFAULT_BANANA_BALANCE: Balance = 0;
+/// Current reward is 1 pixel per day per pixel.
+pub const REWARD_PER_PIXEL_PER_NANOSEC: Balance = PIXEL_COST / (24 * 60 * 60 * 1_000_000_000);
+
+pub type AccountIndex = u32;
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct AccountVersionAvocado {
+    pub account_id: AccountId,
+    pub account_index: AccountIndex,
+    pub balance: u128,
+    pub num_pixels: u32,
+    pub claim_timestamp: u64,
+}
+
+impl From<AccountVersionAvocado> for Account {
+    fn from(account: AccountVersionAvocado) -> Self {
+        Self {
+            account_id: account.account_id,
+            account_index: account.account_index,
+            balances: vec![account.balance, 0],
+            num_pixels: account.num_pixels,
+            claim_timestamp: account.claim_timestamp,
+            farming_preference: Berry::Avocado,
+        }
+    }
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub enum UpgradableAccount {
+    BananaAccount(Account),
+}
+
+impl From<UpgradableAccount> for Account {
+    fn from(account: UpgradableAccount) -> Self {
+        match account {
+            UpgradableAccount::BananaAccount(account) => account,
+        }
+    }
+}
+
+impl From<Account> for UpgradableAccount {
+    fn from(account: Account) -> Self {
+        UpgradableAccount::BananaAccount(account)
+    }
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Account {
+    pub account_id: AccountId,
+    pub account_index: AccountIndex,
+    pub balances: Vec<Balance>,
+    pub num_pixels: u32,
+    pub claim_timestamp: u64,
+    pub farming_preference: Berry,
+}
+
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct HumanAccount {
+    pub account_id: AccountId,
+    pub account_index: AccountIndex,
+    pub avocado_balance: U128,
+    pub banana_balance: U128,
+    pub num_pixels: u32,
+    pub farming_preference: Berry,
+}
+
+impl From<Account> for HumanAccount {
+    fn from(account: Account) -> Self {
+        Self {
+            account_id: account.account_id,
+            account_index: account.account_index,
+            avocado_balance: account.balances[Berry::Avocado as usize].into(),
+            banana_balance: account.balances[Berry::Banana as usize].into(),
+            num_pixels: account.num_pixels,
+            farming_preference: account.farming_preference,
+        }
+    }
+}
+
+impl Account {
+    pub fn new(account_id: AccountId, account_index: AccountIndex) -> Self {
+        Self {
+            account_id,
+            account_index,
+            balances: vec![DEFAULT_AVOCADO_BALANCE, DEFAULT_BANANA_BALANCE],
+            num_pixels: 0,
+            claim_timestamp: env::block_timestamp(),
+            farming_preference: Berry::Avocado,
+        }
+    }
+
+    /// Buying avocados
+    pub fn buy_tokens(&mut self, near_amount: Balance) -> Balance {
+        let amount = if near_amount >= MIN_AMOUNT_FOR_DISCOUNT {
+            near_amount / PIXEL_TOKEN_PRICE_WITH_DISCOUNT
+        } else {
+            near_amount / PIXEL_TOKEN_PRICE
+        };
+        env::log(
+            format!(
+                "Purchased {}.{:03} Avocado tokens for {}.{:03} NEAR",
+                amount / PIXEL_COST,
+                (amount - amount / PIXEL_COST * PIXEL_COST) / (PIXEL_COST / 1000),
+                near_amount / ONE_NEAR,
+                (near_amount - near_amount / ONE_NEAR * ONE_NEAR) / (ONE_NEAR / 1000),
+            )
+            .as_bytes(),
+        );
+        self.balances[Berry::Avocado as usize] += amount;
+        amount
+    }
+
+    pub fn touch(&mut self) -> (Berry, Balance) {
+        let block_timestamp = env::block_timestamp();
+        let time_diff = block_timestamp - self.claim_timestamp;
+        let farm_bonus = if self.farming_preference == Berry::Avocado {
+            1
+        } else {
+            0
+        };
+        let farmed = Balance::from(self.num_pixels + farm_bonus)
+            * Balance::from(time_diff)
+            * REWARD_PER_PIXEL_PER_NANOSEC;
+        self.claim_timestamp = block_timestamp;
+        self.balances[self.farming_preference as usize] += farmed;
+        (self.farming_preference, farmed)
+    }
+
+    pub fn charge(&mut self, berry: Berry, num_pixels: u32) -> Balance {
+        let cost = Balance::from(num_pixels) * PIXEL_COST;
+        assert!(
+            self.balances[berry as usize] >= cost,
+            "Not enough balance to draw pixels"
+        );
+        self.balances[berry as usize] -= cost;
+        cost
+    }
+}
+
+impl Place {
+    pub fn get_internal_account_by_id(&self, account_id: &AccountId) -> Option<Account> {
+        self.account_indices
+            .get(&account_id)
+            .and_then(|account_index| self.get_internal_account_by_index(account_index))
+    }
+
+    pub fn get_mut_account(&mut self, account_id: AccountId) -> Account {
+        let mut account = self
+            .get_internal_account_by_id(&account_id)
+            .unwrap_or_else(|| Account::new(account_id, self.num_accounts));
+        self.touch(&mut account);
+        account
+    }
+
+    pub fn get_internal_account_by_index(&self, account_index: AccountIndex) -> Option<Account> {
+        self.accounts
+            .get(&account_index)
+            .map(|account| account.into())
+            .or_else(|| {
+                self.legacy_accounts
+                    .get(u64::from(account_index))
+                    .map(|legacy_account| legacy_account.into())
+            })
+    }
+
+    pub fn touch(&mut self, account: &mut Account) {
+        let (berry, farmed) = account.touch();
+        if farmed > 0 {
+            self.farmed_balances[berry as usize] += farmed;
+        }
+    }
+
+    pub fn save_account(&mut self, account: Account) {
+        let account_index = account.account_index;
+        if account_index >= self.num_accounts {
+            self.account_indices
+                .insert(&account.account_id, &account_index);
+            self.accounts.insert(&account_index, &account.into());
+            self.num_accounts += 1;
+        } else if self
+            .accounts
+            .insert(&account_index, &account.into())
+            .is_none()
+        {
+            // Need to delete the old value using a hack. This will make the vector inconsistent
+            let mut raw_key = [b'a'; 1 + core::mem::size_of::<u64>()];
+            raw_key[1..].copy_from_slice(&(u64::from(account_index).to_le_bytes()[..]));
+            env::storage_remove(&raw_key);
+        }
+    }
+}
+
+#[near_bindgen]
+impl Place {
+    pub fn get_pixel_cost(&self) -> U128 {
+        PIXEL_COST.into()
+    }
+
+    pub fn get_account_by_index(&self, account_index: AccountIndex) -> Option<HumanAccount> {
+        self.get_internal_account_by_index(account_index)
+            .map(|mut account| {
+                account.touch();
+                account.into()
+            })
+    }
+
+    pub fn get_account(&self, account_id: ValidAccountId) -> Option<HumanAccount> {
+        self.get_internal_account_by_id(account_id.as_ref())
+            .map(|mut account| {
+                account.touch();
+                account.into()
+            })
+    }
+
+    pub fn get_account_balance(&self, account_id: ValidAccountId) -> U128 {
+        self.get_internal_account_by_id(account_id.as_ref())
+            .map(|mut account| {
+                account.touch();
+                account.balances[Berry::Avocado as usize]
+            })
+            .unwrap_or(DEFAULT_AVOCADO_BALANCE)
+            .into()
+    }
+
+    pub fn get_account_num_pixels(&self, account_id: ValidAccountId) -> u32 {
+        self.get_internal_account_by_id(account_id.as_ref())
+            .map(|account| account.num_pixels)
+            .unwrap_or(0)
+    }
+
+    pub fn get_account_id_by_index(&self, account_index: AccountIndex) -> Option<AccountId> {
+        self.get_internal_account_by_index(account_index)
+            .map(|account| account.account_id)
+    }
+}
+
+'''
+'''--- contract-rs/pixel-board/src/board.rs ---
+use crate::*;
+
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::Vector;
+use near_sdk::json_types::Base64VecU8;
+use near_sdk::near_bindgen;
+use near_sdk::serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+pub const BOARD_WIDTH: u32 = 50;
+pub const BOARD_HEIGHT: u32 = 50;
+pub const TOTAL_NUM_PIXELS: u32 = BOARD_WIDTH * BOARD_HEIGHT;
+
+#[derive(BorshDeserialize, BorshSerialize, Copy, Clone)]
+pub struct Pixel {
+    pub color: u32,
+    pub owner_id: AccountIndex,
+}
+
+impl Default for Pixel {
+    fn default() -> Self {
+        Self {
+            color: 0xffffff,
+            owner_id: 0,
+        }
+    }
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct PixelLine(pub Vec<Pixel>);
+
+impl Default for PixelLine {
+    fn default() -> Self {
+        Self(vec![Pixel::default(); BOARD_WIDTH as usize])
+    }
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct PixelBoard {
+    pub lines: Vector<PixelLine>,
+    pub line_versions: Vec<u32>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct SetPixelRequest {
+    pub x: u32,
+    pub y: u32,
+    pub color: u32,
+}
+
+impl SetPixelRequest {
+    pub fn assert_valid(&self) {
+        assert!(self.x < BOARD_WIDTH, "X is out of bounds");
+        assert!(self.y < BOARD_HEIGHT, "Y is out of bounds");
+        assert!(self.color <= 0xffffff, "Color is out of bounds");
+    }
+}
+
+impl PixelBoard {
+    pub fn new() -> Self {
+        let mut board = Self {
+            lines: Vector::new(b"p".to_vec()),
+            line_versions: vec![0; BOARD_HEIGHT as usize],
+        };
+        let default_line = PixelLine::default();
+        for _ in 0..BOARD_HEIGHT {
+            board.lines.push(&default_line);
+        }
+        board
+    }
+
+    pub fn get_line(&self, index: u32) -> PixelLine {
+        self.lines.get(u64::from(index)).unwrap()
+    }
+
+    /// Returns the list of the old owner IDs for the replaced pixels
+    pub fn set_pixels(
+        &mut self,
+        new_owner_id: u32,
+        pixels: &[SetPixelRequest],
+    ) -> HashMap<AccountIndex, u32> {
+        let mut lines = HashMap::new();
+        let mut old_owners = HashMap::new();
+        for request in pixels {
+            request.assert_valid();
+            let line = lines
+                .entry(request.y)
+                .or_insert_with(|| self.lines.get(u64::from(request.y)).unwrap());
+            let old_owner = line.0[request.x as usize].owner_id;
+            line.0[request.x as usize] = Pixel {
+                owner_id: new_owner_id,
+                color: request.color,
+            };
+            *old_owners.entry(old_owner).or_default() += 1;
+        }
+        for (i, line) in lines {
+            self.save_line(i, &line);
+        }
+        old_owners
+    }
+
+    fn save_line(&mut self, index: u32, line: &PixelLine) {
+        self.lines.replace(u64::from(index), line);
+        self.line_versions[index as usize] += 1;
+    }
+}
+
+#[near_bindgen]
+impl Place {
+    pub fn get_lines(&self, lines: Vec<u32>) -> Vec<Base64VecU8> {
+        lines
+            .into_iter()
+            .map(|i| {
+                let line = self.board.get_line(i);
+                line.try_to_vec().unwrap().into()
+            })
+            .collect()
+    }
+
+    pub fn get_line_versions(&self) -> Vec<u32> {
+        self.board.line_versions.clone()
+    }
+}
+
+'''
+'''--- contract-rs/pixel-board/src/fungible_token_core.rs ---
+use crate::*;
+use near_sdk::json_types::ValidAccountId;
+use near_sdk::{ext_contract, Gas, PromiseResult};
+
+const GAS_FOR_RESOLVE_TRANSFER: Gas = 5_000_000_000_000;
+const GAS_FOR_FT_TRANSFER_CALL: Gas = 25_000_000_000_000 + GAS_FOR_RESOLVE_TRANSFER;
+
+const NO_DEPOSIT: Balance = 0;
+
+pub trait FungibleTokenCore {
+    /// Transfers positive `amount` of tokens from the `env::predecessor_account_id` to `receiver_id`.
+    /// Both accounts must be registered with the contract for transfer to succeed. (See [NEP-145](https://github.com/near/NEPs/discussions/145))
+    /// This method must to be able to accept attached deposits, and must not panic on attached deposit.
+    /// Exactly 1 yoctoNEAR must be attached.
+    /// See [the Security section](https://github.com/near/NEPs/issues/141#user-content-security) of the standard.
+    ///
+    /// Arguments:
+    /// - `receiver_id` - the account ID of the receiver.
+    /// - `amount` - the amount of tokens to transfer. Must be a positive number in decimal string representation.
+    /// - `memo` - an optional string field in a free form to associate a memo with this transfer.
+    fn ft_transfer(&mut self, receiver_id: ValidAccountId, amount: U128, memo: Option<String>);
+
+    /// Transfers positive `amount` of tokens from the `env::predecessor_account_id` to `receiver_id` account. Then
+    /// calls `ft_on_transfer` method on `receiver_id` contract and attaches a callback to resolve this transfer.
+    /// `ft_on_transfer` method must return the amount of tokens unused by the receiver contract, the remaining tokens
+    /// must be refunded to the `predecessor_account_id` at the resolve transfer callback.
+    ///
+    /// Token contract must pass all the remaining unused gas to the `ft_on_transfer` call.
+    ///
+    /// Malicious or invalid behavior by the receiver's contract:
+    /// - If the receiver contract promise fails or returns invalid value, the full transfer amount must be refunded.
+    /// - If the receiver contract overspent the tokens, and the `receiver_id` balance is lower than the required refund
+    /// amount, the remaining balance must be refunded. See [the Security section](https://github.com/near/NEPs/issues/141#user-content-security) of the standard.
+    ///
+    /// Both accounts must be registered with the contract for transfer to succeed. (See #145)
+    /// This method must to be able to accept attached deposits, and must not panic on attached deposit. Exactly 1 yoctoNEAR must be attached. See [the Security
+    /// section](https://github.com/near/NEPs/issues/141#user-content-security) of the standard.
+    ///
+    /// Arguments:
+    /// - `receiver_id` - the account ID of the receiver contract. This contract will be called.
+    /// - `amount` - the amount of tokens to transfer. Must be a positive number in a decimal string representation.
+    /// - `msg` - a string message that will be passed to `ft_on_transfer` contract call.
+    /// - `memo` - an optional string field in a free form to associate a memo with this transfer.
+    ///
+    /// Returns a promise which will result in the amount of tokens withdrawn from sender's account.
+    fn ft_transfer_call(
+        &mut self,
+        receiver_id: ValidAccountId,
+        amount: U128,
+        msg: String,
+        memo: Option<String>,
+    ) -> Promise;
+
+    /// Returns the total supply of the token in a decimal string representation.
+    fn ft_total_supply(&self) -> U128;
+
+    /// Returns the balance of the account. If the account doesn't exist must returns `"0"`.
+    fn ft_balance_of(&self, account_id: ValidAccountId) -> U128;
+}
+
+#[ext_contract(ext_fungible_token_receiver)]
+trait FungibleTokenReceiver {
+    /// Called by fungible token contract after `ft_transfer_call` was initiated by
+    /// `sender_id` of the given `amount` with the transfer message given in `msg` field.
+    /// The `amount` of tokens were already transferred to this contract account and ready to be used.
+    ///
+    /// The method must return the amount of tokens that are *not* used/accepted by this contract from the transferred
+    /// amount. Examples:
+    /// - The transferred amount was `500`, the contract completely takes it and must return `0`.
+    /// - The transferred amount was `500`, but this transfer call only needs `450` for the action passed in the `msg`
+    ///   field, then the method must return `50`.
+    /// - The transferred amount was `500`, but the action in `msg` field has expired and the transfer must be
+    ///   cancelled. The method must return `500` or panic.
+    ///
+    /// Arguments:
+    /// - `sender_id` - the account ID that initiated the transfer.
+    /// - `amount` - the amount of tokens that were transferred to this account in a decimal string representation.
+    /// - `msg` - a string message that was passed with this transfer call.
+    ///
+    /// Returns the amount of unused tokens that should be returned to sender, in a decimal string representation.
+    fn ft_on_transfer(&mut self, sender_id: AccountId, amount: U128, msg: String) -> Promise;
+}
+
+#[ext_contract(ext_self)]
+trait FungibleTokenResolver {
+    fn ft_resolve_transfer(
+        &mut self,
+        sender_id: AccountId,
+        receiver_id: AccountId,
+        amount: U128,
+    ) -> U128;
+}
+
+trait FungibleTokenResolver {
+    fn ft_resolve_transfer(
+        &mut self,
+        sender_id: AccountId,
+        receiver_id: AccountId,
+        amount: U128,
+    ) -> U128;
+}
+
+#[near_bindgen]
+impl FungibleTokenCore for Place {
+    #[payable]
+    fn ft_transfer(&mut self, receiver_id: ValidAccountId, amount: U128, memo: Option<String>) {
+        assert_one_yocto();
+        let sender_id = env::predecessor_account_id();
+        let amount = amount.into();
+        self.internal_transfer(&sender_id, receiver_id.as_ref(), amount, memo);
+    }
+
+    #[payable]
+    fn ft_transfer_call(
+        &mut self,
+        receiver_id: ValidAccountId,
+        amount: U128,
+        msg: String,
+        memo: Option<String>,
+    ) -> Promise {
+        assert_one_yocto();
+        let sender_id = env::predecessor_account_id();
+        let amount = amount.into();
+        self.internal_transfer(&sender_id, receiver_id.as_ref(), amount, memo);
+        // Initiating receiver's call and the callback
+        ext_fungible_token_receiver::ft_on_transfer(
+            sender_id.clone(),
+            amount.into(),
+            msg,
+            receiver_id.as_ref(),
+            NO_DEPOSIT,
+            env::prepaid_gas() - GAS_FOR_FT_TRANSFER_CALL,
+        )
+        .then(ext_self::ft_resolve_transfer(
+            sender_id,
+            receiver_id.into(),
+            amount.into(),
+            &env::current_account_id(),
+            NO_DEPOSIT,
+            GAS_FOR_RESOLVE_TRANSFER,
+        ))
+    }
+
+    fn ft_total_supply(&self) -> U128 {
+        self.farmed_balances[Berry::Banana as usize].into()
+    }
+
+    fn ft_balance_of(&self, account_id: ValidAccountId) -> U128 {
+        self.get_internal_account_by_id(account_id.as_ref())
+            .map(|mut account| {
+                account.touch();
+                account.balances[Berry::Banana as usize]
+            })
+            .unwrap_or(0)
+            .into()
+    }
+}
+
+#[near_bindgen]
+impl FungibleTokenResolver for Place {
+    fn ft_resolve_transfer(
+        &mut self,
+        sender_id: AccountId,
+        receiver_id: AccountId,
+        amount: U128,
+    ) -> U128 {
+        assert_self();
+        let amount: Balance = amount.into();
+
+        // Get the unused amount from the `ft_on_transfer` call result.
+        let unused_amount = match env::promise_result(0) {
+            PromiseResult::NotReady => unreachable!(),
+            PromiseResult::Successful(value) => {
+                if let Ok(unused_amount) = near_sdk::serde_json::from_slice::<U128>(&value) {
+                    std::cmp::min(amount, unused_amount.0)
+                } else {
+                    amount
+                }
+            }
+            PromiseResult::Failed => amount,
+        };
+
+        if unused_amount > 0 {
+            let mut receiver = self.get_mut_account(receiver_id.clone());
+            let receiver_balance = receiver.balances[Berry::Banana as usize];
+            if receiver_balance > 0 {
+                let refund_amount = std::cmp::min(receiver_balance, unused_amount);
+                receiver.balances[Berry::Banana as usize] -= refund_amount;
+                self.save_account(receiver);
+
+                let mut sender = self.get_mut_account(sender_id.clone());
+                sender.balances[Berry::Banana as usize] += refund_amount;
+                self.save_account(sender);
+
+                env::log(
+                    format!(
+                        "Refund {} from {} to {}",
+                        refund_amount, receiver_id, sender_id
+                    )
+                    .as_bytes(),
+                );
+                return (amount - refund_amount).into();
+            }
+        }
+        amount.into()
+    }
+}
+
+'''
+'''--- contract-rs/pixel-board/src/fungible_token_metadata.rs ---
+use super::*;
+use near_sdk::serde::Serialize;
+
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct FungibleTokenMetadata {
+    version: String,
+    name: String,
+    symbol: String,
+    url: String,
+    decimals: u8,
+}
+
+pub trait FungibleTokenMetadataProvider {
+    fn ft_metadata() -> FungibleTokenMetadata;
+}
+
+#[near_bindgen]
+impl FungibleTokenMetadataProvider for Place {
+    fn ft_metadata() -> FungibleTokenMetadata {
+        FungibleTokenMetadata {
+            version: String::from("0.1.0"),
+            name: String::from("Banana"),
+            symbol: String::from("BANANA"),
+            url: String::from("https://github.com/evgenykuzyakov/berryclub"),
+            decimals: 18,
+        }
+    }
+}
+
+'''
+'''--- contract-rs/pixel-board/src/internal.rs ---
+use crate::*;
+
+pub(crate) fn assert_one_yocto() {
+    assert_eq!(
+        env::attached_deposit(),
+        1,
+        "Requires attached deposit of exactly 1 yoctoNEAR"
+    )
+}
+
+pub(crate) fn assert_self() {
+    assert_eq!(
+        env::predecessor_account_id(),
+        env::current_account_id(),
+        "Method is private"
+    );
+}
+
+impl Place {
+    pub(crate) fn internal_deposit(&mut self, account_id: &AccountId, amount: Balance) {
+        let mut account = self.get_mut_account(account_id.clone());
+        let balance = account.balances[Berry::Banana as usize];
+
+        if let Some(new_balance) = balance.checked_add(amount) {
+            account.balances[Berry::Banana as usize] = new_balance;
+            self.save_account(account);
+        } else {
+            env::panic(b"Balance overflow");
+        }
+    }
+
+    pub(crate) fn internal_withdraw(&mut self, account_id: &AccountId, amount: Balance) {
+        let mut account = self.get_mut_account(account_id.clone());
+        let balance = account.balances[Berry::Banana as usize];
+
+        if let Some(new_balance) = balance.checked_sub(amount) {
+            account.balances[Berry::Banana as usize] = new_balance;
+            self.save_account(account);
+        } else {
+            env::panic(b"The account doesn't have enough balance");
+        }
+    }
+
+    pub(crate) fn internal_transfer(
+        &mut self,
+        sender_id: &AccountId,
+        receiver_id: &AccountId,
+        amount: Balance,
+        memo: Option<String>,
+    ) {
+        assert_ne!(
+            sender_id, receiver_id,
+            "Sender and receiver should be different"
+        );
+        assert!(amount > 0, "The amount should be a positive number");
+        self.internal_withdraw(sender_id, amount);
+        self.internal_deposit(receiver_id, amount);
+        env::log(format!("Transfer {} from {} to {}", amount, sender_id, receiver_id).as_bytes());
+        if let Some(memo) = memo {
+            env::log(format!("Memo: {}", memo).as_bytes());
+        }
+    }
+}
+
+'''
+'''--- contract-rs/pixel-board/src/lib.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::{LookupMap, Vector};
+use near_sdk::json_types::{ValidAccountId, U128, U64};
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{env, near_bindgen, AccountId, Balance, Promise};
+
+/// Price per 1 byte of storage from mainnet genesis config.
+const STORAGE_PRICE_PER_BYTE: Balance = 100_000_000_000_000_000_000;
+
+const SAFETY_BAR: Balance = 50_000000_000000_000000_000000;
+
+const FARM_START_TIME: u64 = 1606019138008904777;
+const REWARD_PERIOD: u64 = 60 * 1_000_000_000;
+const PORTION_OF_REWARDS: Balance = 24 * 60;
+
+const FARM_CONTRACT_ID_PREFIX: &str = "farm";
+
+pub mod account;
+pub use crate::account::*;
+
+pub mod board;
+pub use crate::board::*;
+
+mod fungible_token_core;
+mod fungible_token_metadata;
+mod internal;
+pub mod token;
+
+pub use crate::fungible_token_core::*;
+pub use crate::fungible_token_metadata::*;
+use crate::internal::*;
+
+pub use crate::token::*;
+
+#[global_allocator]
+static ALLOC: near_sdk::wee_alloc::WeeAlloc<'_> = near_sdk::wee_alloc::WeeAlloc::INIT;
+
+#[derive(BorshDeserialize, BorshSerialize, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub enum Berry {
+    Avocado,
+    Banana,
+}
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Place {
+    pub account_indices: LookupMap<AccountId, u32>,
+    pub board: board::PixelBoard,
+    pub legacy_accounts: Vector<AccountVersionAvocado>,
+    pub last_reward_timestamp: u64,
+    pub num_accounts: u32,
+    pub accounts: LookupMap<u32, UpgradableAccount>,
+    pub bought_balances: Vec<Balance>,
+    pub burned_balances: Vec<Balance>,
+    pub farmed_balances: Vec<Balance>,
+
+    // NEP#122 Token parts
+    /// Vaults that currently exist for the transactions in flight.
+    pub vaults: LookupMap<VaultId, Vault>,
+    /// The next vault ID to use.
+    pub next_vault_id: VaultId,
+}
+
+impl Default for Place {
+    fn default() -> Self {
+        panic!("Fun token should be initialized before usage")
+    }
+}
+
+#[near_bindgen]
+impl Place {
+    #[init]
+    pub fn new() -> Self {
+        assert!(!env::state_exists(), "Already initialized");
+        let mut place = Self {
+            account_indices: LookupMap::new(b"i".to_vec()),
+            board: PixelBoard::new(),
+            legacy_accounts: Vector::new(b"a".to_vec()),
+            num_accounts: 0,
+            accounts: LookupMap::new(b"u".to_vec()),
+            last_reward_timestamp: env::block_timestamp(),
+            bought_balances: vec![0, 0],
+            burned_balances: vec![0, 0],
+            farmed_balances: vec![0, 0],
+            vaults: LookupMap::new(b"v".to_vec()),
+            next_vault_id: VaultId(0),
+        };
+
+        let mut account = Account::new(env::current_account_id(), 0);
+        account.num_pixels = TOTAL_NUM_PIXELS;
+        place.save_account(account);
+
+        place
+    }
+
+    pub fn register_account(&mut self) {
+        let account = self.get_mut_account(env::predecessor_account_id());
+        self.save_account(account);
+    }
+
+    pub fn account_exists(&self, account_id: ValidAccountId) -> bool {
+        self.account_indices.contains_key(account_id.as_ref())
+    }
+
+    #[payable]
+    pub fn buy_tokens(&mut self) {
+        let mut account = self.get_mut_account(env::predecessor_account_id());
+        let minted_amount = account.buy_tokens(env::attached_deposit());
+        self.save_account(account);
+        self.bought_balances[Berry::Avocado as usize] += minted_amount;
+    }
+
+    pub fn select_farming_preference(&mut self, berry: Berry) {
+        let mut account = self.get_mut_account(env::predecessor_account_id());
+        account.farming_preference = berry;
+        self.save_account(account);
+    }
+
+    pub fn draw(&mut self, pixels: Vec<SetPixelRequest>) {
+        if pixels.is_empty() {
+            return;
+        }
+        let mut account = self.get_mut_account(env::predecessor_account_id());
+        let new_pixels = pixels.len() as u32;
+        let cost = account.charge(Berry::Avocado, new_pixels);
+        self.burned_balances[Berry::Avocado as usize] += cost;
+
+        let mut old_owners = self.board.set_pixels(account.account_index, &pixels);
+        let replaced_pixels = old_owners.remove(&account.account_index).unwrap_or(0);
+        account.num_pixels += new_pixels - replaced_pixels;
+        self.save_account(account);
+
+        for (account_index, num_pixels) in old_owners {
+            let mut account = self.get_internal_account_by_index(account_index).unwrap();
+            self.touch(&mut account);
+            account.num_pixels -= num_pixels;
+            self.save_account(account);
+        }
+
+        self.maybe_send_reward();
+    }
+
+    pub fn get_num_accounts(&self) -> u32 {
+        self.num_accounts
+    }
+
+    pub fn get_last_reward_timestamp(&self) -> U64 {
+        self.last_reward_timestamp.into()
+    }
+
+    pub fn get_next_reward_timestamp(&self) -> U64 {
+        core::cmp::max(FARM_START_TIME, self.last_reward_timestamp + REWARD_PERIOD).into()
+    }
+
+    pub fn get_expected_reward(&self) -> U128 {
+        let account_balance = env::account_balance();
+        let storage_usage = env::storage_usage();
+        let locked_for_storage = Balance::from(storage_usage) * STORAGE_PRICE_PER_BYTE + SAFETY_BAR;
+        if account_balance <= locked_for_storage {
+            return 0.into();
+        }
+        let liquid_balance = account_balance - locked_for_storage;
+        let reward = liquid_balance / PORTION_OF_REWARDS;
+        reward.into()
+    }
+}
+
+impl Place {
+    fn maybe_send_reward(&mut self) {
+        let current_time = env::block_timestamp();
+        let next_reward_timestamp: u64 = self.get_next_reward_timestamp().into();
+        if next_reward_timestamp > current_time {
+            return;
+        }
+        self.last_reward_timestamp = current_time;
+        let reward: Balance = self.get_expected_reward().into();
+        env::log(format!("Distributed reward of {}", reward).as_bytes());
+        Promise::new(format!(
+            "{}.{}",
+            FARM_CONTRACT_ID_PREFIX,
+            env::current_account_id()
+        ))
+        .function_call(
+            b"take_my_near".to_vec(),
+            b"{}".to_vec(),
+            reward,
+            GAS_BASE_COMPUTE,
+        );
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use near_sdk::{testing_env, MockedBlockchain, VMContext};
+
+    pub fn get_context(block_timestamp: u64, is_view: bool) -> VMContext {
+        VMContext {
+            current_account_id: "place.meta".to_string(),
+            signer_account_id: "place.meta".to_string(),
+            signer_account_pk: vec![0, 1, 2],
+            predecessor_account_id: "place.meta".to_string(),
+            input: vec![],
+            block_index: 1,
+            block_timestamp,
+            epoch_height: 1,
+            account_balance: 10u128.pow(26),
+            account_locked_balance: 0,
+            storage_usage: 10u64.pow(6),
+            attached_deposit: 0,
+            prepaid_gas: 300 * 10u64.pow(12),
+            random_seed: vec![0, 1, 2],
+            is_view,
+            output_data_receivers: vec![],
+        }
+    }
+
+    #[test]
+    fn test_new() {
+        let mut context = get_context(3_600_000_000_000, false);
+        testing_env!(context.clone());
+        let contract = Place::new();
+
+        context.is_view = true;
+        testing_env!(context.clone());
+        assert_eq!(contract.get_pixel_cost().0, PIXEL_COST);
+        assert_eq!(
+            contract.get_line_versions(),
+            vec![0u32; BOARD_HEIGHT as usize]
+        );
+    }
+}
+
+'''
+'''--- contract-rs/pixel-board/src/token.rs ---
+use crate::*;
+
+use near_sdk::json_types::ValidAccountId;
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{ext_contract, Balance, Gas, Promise};
+
+/// Don't need deposits for function calls.
+const NO_DEPOSIT: Balance = 0;
+
+/// NOTE: These fees are going to change with the update.
+/// Basic compute.
+pub(crate) const GAS_BASE_COMPUTE: Gas = 5_000_000_000_000;
+/// Fee for function call promise.
+const GAS_FOR_PROMISE: Gas = 5_000_000_000_000;
+/// Fee for the `.then` call.
+const GAS_FOR_DATA_DEPENDENCY: Gas = 10_000_000_000_000;
+
+/// Gas attached to the receiver for `on_receive_with_safe` call.
+/// NOTE: The minimum logic is to do some very basic compute and schedule a withdrawal from safe
+/// that it returns from the promise.
+const MIN_GAS_FOR_RECEIVER: Gas = GAS_FOR_PROMISE + GAS_BASE_COMPUTE;
+/// Gas attached to the callback to resolve safe. It only needs to do basic compute.
+/// NOTE: It doesn't account for storage refunds.
+const GAS_FOR_CALLBACK: Gas = GAS_BASE_COMPUTE;
+/// The amount of gas required to complete the execution of `transfer_with_safe`.
+/// We need to create 2 promises with a dependencies and with some basic compute to write to the
+/// state.
+/// NOTE: It doesn't account for storage refunds.
+const GAS_FOR_REMAINING_COMPUTE: Gas =
+    2 * GAS_FOR_PROMISE + GAS_FOR_DATA_DEPENDENCY + GAS_BASE_COMPUTE;
+
+/// Safe identifier.
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Copy)]
+#[serde(crate = "near_sdk::serde")]
+pub struct VaultId(pub u64);
+
+impl VaultId {
+    pub fn next(&self) -> Self {
+        Self(self.0 + 1)
+    }
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Vault {
+    /// The `ShortAccountHash` of the receiver ID.
+    /// This information is only needed to validate safe ownership during withdrawal.
+    pub receiver_id: AccountId,
+    /// The remaining amount of tokens in the safe.
+    pub balance: Balance,
+}
+
+#[ext_contract(ext_token_receiver)]
+trait ExtTokenReceiver {
+    fn on_receive_with_vault(
+        &mut self,
+        sender_id: AccountId,
+        amount: U128,
+        vault_id: VaultId,
+        payload: String,
+    );
+}
+
+#[ext_contract(ext_self)]
+trait ExtSelf {
+    fn resolve_vault(&mut self, vault_id: VaultId, sender_id: AccountId);
+}
+
+/// NEP 122
+trait VaultFungibleToken {
+    /// Simple transfers
+    /// Gas requirement: 5 TGas or 5000000000000 Gas
+    /// Should be called by the balance owner.
+    /// Requires that the sender and the receiver accounts be registered.
+    ///
+    /// Actions:
+    /// - Transfers `amount` of tokens from `predecessor_id` to `receiver_id`.
+    fn transfer_raw(&mut self, receiver_id: ValidAccountId, amount: U128);
+
+    /// Transfer to a contract with payload
+    /// Gas requirement: 40+ TGas or 40000000000000 Gas.
+    /// Consumes: 30 TGas and the remaining gas is passed to the `receiver_id` (at least 10 TGas)
+    /// Should be called by the balance owner.
+    /// Returns a promise, that will result in the unspent balance from the transfer `amount`.
+    ///
+    /// Actions:
+    /// - Withdraws `amount` from the `predecessor_id` account.
+    /// - Creates a new local safe with a new unique `safe_id` with the following content:
+    ///     `{sender_id: predecessor_id, amount: amount, receiver_id: receiver_id}`
+    /// - Saves this safe to the storage.
+    /// - Calls on `receiver_id` method `on_token_receive(sender_id: predecessor_id, amount, safe_id, payload)`/
+    /// - Attaches a self callback to this promise `resolve_safe(safe_id, sender_id)`
+    fn transfer_with_vault(
+        &mut self,
+        receiver_id: ValidAccountId,
+        amount: U128,
+        payload: String,
+    ) -> Promise;
+    fn withdraw_from_vault(&mut self, vault_id: VaultId, receiver_id: ValidAccountId, amount: U128);
+    fn resolve_vault(&mut self, vault_id: VaultId, sender_id: AccountId) -> U128;
+
+    fn get_total_supply(&self) -> U128;
+    fn get_balance(&self, account_id: ValidAccountId) -> U128;
+}
+
+#[near_bindgen]
+impl VaultFungibleToken for Place {
+    #[payable]
+    fn transfer_raw(&mut self, receiver_id: ValidAccountId, amount: U128) {
+        assert_paid();
+        let amount = amount.into();
+        self.withdraw_from_sender(receiver_id.as_ref(), amount);
+        self.deposit_to_account(receiver_id.as_ref(), amount);
+    }
+
+    #[payable]
+    fn transfer_with_vault(
+        &mut self,
+        receiver_id: ValidAccountId,
+        amount: U128,
+        payload: String,
+    ) -> Promise {
+        assert_paid();
+        let gas_to_receiver =
+            env::prepaid_gas().saturating_sub(GAS_FOR_REMAINING_COMPUTE + GAS_FOR_CALLBACK);
+
+        if gas_to_receiver < MIN_GAS_FOR_RECEIVER {
+            env::panic(b"Not enough gas attached. Attach at least 40 TGas");
+        }
+
+        let amount = amount.into();
+        let sender_id = self.withdraw_from_sender(receiver_id.as_ref(), amount);
+
+        // Creating a new vault
+        let vault_id = self.next_vault_id;
+        self.next_vault_id = vault_id.next();
+        let vault = Vault {
+            receiver_id: receiver_id.as_ref().clone(),
+            balance: amount,
+        };
+        self.vaults.insert(&vault_id, &vault);
+
+        // Calling the receiver
+        ext_token_receiver::on_receive_with_vault(
+            sender_id.clone(),
+            amount.into(),
+            vault_id,
+            payload,
+            receiver_id.as_ref(),
+            NO_DEPOSIT,
+            gas_to_receiver,
+        )
+        .then(ext_self::resolve_vault(
+            vault_id,
+            sender_id,
+            &env::current_account_id(),
+            NO_DEPOSIT,
+            GAS_FOR_CALLBACK,
+        ))
+    }
+
+    fn withdraw_from_vault(
+        &mut self,
+        vault_id: VaultId,
+        receiver_id: ValidAccountId,
+        amount: U128,
+    ) {
+        let mut vault = self.vaults.get(&vault_id).expect("Vault doesn't exist");
+        let vault_receiver_id = env::predecessor_account_id();
+        if &vault_receiver_id != &vault.receiver_id {
+            env::panic(b"The vault is not owned by the predecessor");
+        }
+        let amount = amount.into();
+        if vault.balance < amount {
+            env::panic(b"Not enough balance in the vault");
+        }
+        vault.balance -= amount;
+        self.vaults.insert(&vault_id, &vault);
+
+        self.deposit_to_account(receiver_id.as_ref(), amount);
+    }
+
+    fn resolve_vault(&mut self, vault_id: VaultId, sender_id: AccountId) -> U128 {
+        assert_self();
+
+        let vault = self.vaults.remove(&vault_id).expect("Vault doesn't exist");
+
+        if vault.balance > 0 {
+            self.deposit_to_account(&sender_id, vault.balance);
+        }
+
+        vault.balance.into()
+    }
+
+    fn get_total_supply(&self) -> U128 {
+        self.farmed_balances[Berry::Banana as usize].into()
+    }
+
+    fn get_balance(&self, account_id: ValidAccountId) -> U128 {
+        self.get_internal_account_by_id(account_id.as_ref())
+            .map(|mut account| {
+                account.touch();
+                account.balances[Berry::Banana as usize]
+            })
+            .unwrap_or(0)
+            .into()
+    }
+}
+
+impl Place {
+    /// Withdraws `amount` from the `predecessor_id` while comparing it to the `receiver_id`.
+    /// Return `predecessor_id` and hash of the predecessor
+    fn withdraw_from_sender(&mut self, receiver_id: &AccountId, amount: Balance) -> AccountId {
+        if amount == 0 {
+            env::panic(b"Transfer amount should be positive");
+        }
+        let sender_id = env::predecessor_account_id();
+        if &sender_id == receiver_id {
+            env::panic(b"The receiver should be different from the sender");
+        }
+
+        // Retrieving the account from the state.
+        let mut account = self.get_mut_account(sender_id.clone());
+
+        // Checking and updating the balance
+        if account.balances[Berry::Banana as usize] < amount {
+            env::panic(b"Not enough banana balance");
+        }
+        account.balances[Berry::Banana as usize] -= amount;
+
+        // Saving the account back to the state.
+        self.save_account(account);
+
+        sender_id
+    }
+
+    /// Deposits `amount` to the `account_id`
+    fn deposit_to_account(&mut self, account_id: &AccountId, amount: Balance) {
+        if amount == 0 {
+            return;
+        }
+        // Retrieving the account from the state.
+        let mut account = self
+            .get_internal_account_by_id(&account_id)
+            .expect("Receiver account doesn't exist");
+        self.touch(&mut account);
+
+        account.balances[Berry::Banana as usize] += amount;
+        // Saving the account back to the state.
+        self.save_account(account);
+    }
+}
+
+fn assert_paid() {
+    assert!(
+        env::attached_deposit() > 0,
+        "Requires a deposit of at least 1 yoctoNEAR to prevent function access key calls"
+    );
+}
+
+'''
+'''--- frontend/README.md ---
+This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
+
+## Available Scripts
+
+In the project directory, you can run:
+
+### `yarn start`
+
+Runs the app in the development mode.<br />
+Open [http://localhost:3000](http://localhost:3000) to view it in the browser.
+
+The page will reload if you make edits.<br />
+You will also see any lint errors in the console.
+
+### `yarn test`
+
+Launches the test runner in the interactive watch mode.<br />
+See the section about [running tests](https://facebook.github.io/create-react-app/docs/running-tests) for more information.
+
+### `yarn build`
+
+Builds the app for production to the `build` folder.<br />
+It correctly bundles React in production mode and optimizes the build for the best performance.
+
+The build is minified and the filenames include the hashes.<br />
+Your app is ready to be deployed!
+
+See the section about [deployment](https://facebook.github.io/create-react-app/docs/deployment) for more information.
+
+### `yarn eject`
+
+**Note: this is a one-way operation. Once you `eject`, you can’t go back!**
+
+If you aren’t satisfied with the build tool and configuration choices, you can `eject` at any time. This command will remove the single build dependency from your project.
+
+Instead, it will copy all the configuration files and the transitive dependencies (webpack, Babel, ESLint, etc) right into your project so you have full control over them. All of the commands except `eject` will still work, but they will point to the copied scripts so you can tweak them. At this point you’re on your own.
+
+You don’t have to ever use `eject`. The curated feature set is suitable for small and middle deployments, and you shouldn’t feel obligated to use this feature. However we understand that this tool wouldn’t be useful if you couldn’t customize it when you are ready for it.
+
+## Learn More
+
+You can learn more in the [Create React App documentation](https://facebook.github.io/create-react-app/docs/getting-started).
+
+To learn React, check out the [React documentation](https://reactjs.org/).
+
+### Code Splitting
+
+This section has moved here: https://facebook.github.io/create-react-app/docs/code-splitting
+
+### Analyzing the Bundle Size
+
+This section has moved here: https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size
+
+### Making a Progressive Web App
+
+This section has moved here: https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app
+
+### Advanced Configuration
+
+This section has moved here: https://facebook.github.io/create-react-app/docs/advanced-configuration
+
+### Deployment
+
+This section has moved here: https://facebook.github.io/create-react-app/docs/deployment
+
+### `yarn build` fails to minify
+
+This section has moved here: https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify
+
+'''
+'''--- frontend/package.json ---
+{
+  "name": "frontend",
+  "version": "0.2.0",
+  "homepage": "https://berryclub.io",
+  "private": true,
+  "dependencies": {
+    "@testing-library/jest-dom": "^4.2.4",
+    "@testing-library/react": "^9.3.2",
+    "@testing-library/user-event": "^7.1.2",
+    "bn.js": "^5.1.1",
+    "near-api-js": "^0.32.0",
+    "node-sass": "^4.0.0",
+    "react": "^16.13.1",
+    "react-bootstrap": "^1.0.0",
+    "react-color": "^2.18.1",
+    "react-dom": "^16.13.1",
+    "react-files": "^2.4.8",
+    "react-scripts": "3.4.0",
+    "react-switch": "^5.0.1"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test",
+    "eject": "react-scripts eject",
+    "deploy": "yarn build && gh-pages -d build"
+  },
+  "eslintConfig": {
+    "extends": "react-app"
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  },
+  "devDependencies": {
+    "gh-pages": "^2.2.0"
+  }
+}
+
+'''
+'''--- frontend/public/index.html ---
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="%PUBLIC_URL%/favicon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#000000" />
+    <meta
+      name="description"
+      content="[TEST] Berry Club - eat 🥑 - draw pixels - farm 🍌 - talk through 🥝"
+    />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta property="og:image" content="https://test.berryclub.io/moon_test.png"/>
+    <meta property="og:url" content="https://test.berryclub.io/" />
+    <meta property="og:title" content="[TEST] Berry Club" />
+    <meta property="og:description" content="Eat 🥑 - draw pixels - farm 🍌 - talk through 🥝" />
+    <link rel="apple-touch-icon" href="%PUBLIC_URL%/favicon.png" />
+    <!--
+      manifest.json provides metadata used when your web app is installed on a
+      user's mobile device or desktop. See https://developers.google.com/web/fundamentals/web-app-manifest/
+    -->
+    <link rel="manifest" href="%PUBLIC_URL%/manifest.json" />
+    <!--
+      Notice the use of %PUBLIC_URL% in the tags above.
+      It will be replaced with the URL of the `public` folder during the build.
+      Only files inside the `public` folder can be referenced from the HTML.
+
+      Unlike "/favicon.ico" or "favicon.ico", "%PUBLIC_URL%/favicon.ico" will
+      work correctly both with client-side routing and a non-root public URL.
+      Learn how to configure a non-root public URL by running `npm run build`.
+    -->
+    <title>[TEST] Berry Club 🍌</title>
+  </head>
+  <body>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="root"></div>
+    <!--
+      This HTML file is a template.
+      If you open it directly in the browser, you will see an empty page.
+
+      You can add webfonts, meta tags, or analytics to this file.
+      The build step will place the bundled scripts into the <body> tag.
+
+      To begin the development, run `npm start` or `yarn start`.
+      To create a production bundle, use `npm run build` or `yarn build`.
+    -->
+  </body>
+</html>
+
+'''
+'''--- frontend/public/manifest.json ---
+{
+  "short_name": "[TEST] Berry Club",
+  "name": "[TEST] Berry Club - eat berry - draw pixel",
+  "icons": [
+    {
+      "src": "favicon.png",
+      "sizes": "256x256",
+      "type": "image/png"
+    }
+  ],
+  "start_url": ".",
+  "display": "standalone",
+  "theme_color": "#000000",
+  "background_color": "#ffffff"
+}
+
+'''
+'''--- frontend/public/robots.txt ---
+# https://www.robotstxt.org/robotstxt.html
+User-agent: *
+Disallow:
+
+'''
+'''--- frontend/src/App.js ---
+import "./App.scss";
+import "./gh-fork-ribbon.css";
+import React from 'react';
+import BN from 'bn.js';
+import * as nearAPI from 'near-api-js'
+import { AlphaPicker, HuePicker, GithubPicker } from 'react-color'
+import Switch from "react-switch"
+import {Weapons} from "./Weapons";
+
+const PixelPrice = new BN("10000000000000000000000");
+const IsMainnet = window.location.hostname === "berryclub.io";
+const TestNearConfig = {
+  networkId: 'testnet',
+  nodeUrl: 'https://rpc.testnet.near.org',
+  contractName: 'berryclub.testnet',
+  walletUrl: 'https://wallet.testnet.near.org',
+};
+const MainNearConfig = {
+  networkId: 'mainnet',
+  nodeUrl: 'https://rpc.mainnet.near.org',
+  contractName: 'berryclub.ek.near',
+  walletUrl: 'https://wallet.near.org',
+};
+const NearConfig = IsMainnet ? MainNearConfig : TestNearConfig;
+
+const Avocado = <span role="img" aria-label="avocado" className="berry">🥑</span>;
+const Banana = <span role="img" aria-label="banana" className="berry">🍌</span>;
+// const Cucumber = <span role="img" aria-label="cucumber" className="berry">🥒</span>;
+
+const Berry = {
+  Avocado: 'Avocado',
+  Banana: 'Banana',
+};
+
+const BoardHeight = 50;
+const BoardWidth = 50;
+const NumLinesPerFetch = 10;
+const ExpectedLineLength = 4 + 8 * BoardWidth;
+const CellWidth = 12;
+const CellHeight = 12;
+const MaxNumColors = 31;
+const BatchOfPixels = 100;
+// 500 ms
+const BatchTimeout = 500;
+const RefreshBoardTimeout = 1000;
+const MaxWorkTime = 10 * 60 * 1000;
+
+const intToColor = (c) => `#${c.toString(16).padStart(6, '0')}`;
+const intToColorWithAlpha = (c, a) => `#${c.toString(16).padStart(6, '0')}${Math.round(255 * a).toString(16).padStart(2, '0')}`;
+
+const rgbaToInt = (cr, cg, cb, ca, bgColor) => {
+  const bb = (bgColor & 255);
+  const bg = ((bgColor >> 8) & 255);
+  const br = ((bgColor >> 16) & 255);
+
+  const r = Math.round(cr * ca + br * (1 - ca));
+  const g = Math.round(cg * ca + bg * (1 - ca));
+  const b = Math.round(cb * ca + bb * (1 - ca));
+  return (r << 16) + (g << 8) + b;
+}
+
+const imgColorToInt = (c, bgColor) => {
+  const cr = (c & 255);
+  const cg = ((c >> 8) & 255);
+  const cb = ((c >> 16) & 255);
+  const ca = ((c >> 24) & 255) / 255;
+  return rgbaToInt(cr, cg, cb, ca, bgColor);
+}
+
+  const int2hsv = (cInt) => {
+  cInt = intToColor(cInt).substr(1)
+  const r = parseInt(cInt.substr(0, 2), 16) / 255
+  const g = parseInt(cInt.substr(2, 2), 16) / 255
+  const b = parseInt(cInt.substr(4, 2), 16) / 255
+  let v=Math.max(r,g,b), c=v-Math.min(r,g,b);
+  let h= c && ((v===r) ? (g-b)/c : ((v===g) ? 2+(b-r)/c : 4+(r-g)/c));
+  return [60*(h<0?h+6:h), v&&c/v, v];
+}
+const transparentColor = (c, a) => `rgba(${(c >> 16) / 1}, ${((c >> 8) & 0xff) / 1}, ${(c & 0xff) / 1}, ${a})`
+const generateGamma = (hue) => {
+  const gammaColors = [];
+  for (let i = 0; i < MaxNumColors; ++i) {
+    gammaColors.push(`hsl(${hue}, 100%, ${100 * i / (MaxNumColors - 1)}%)`);
+  }
+  return gammaColors;
+};
+const decodeLine = (line) => {
+  let buf = Buffer.from(line, 'base64');
+  if (buf.length !== ExpectedLineLength) {
+    throw new Error("Unexpected encoded line length");
+  }
+  let pixels = []
+  for (let i = 4; i < buf.length; i += 8) {
+    let color = buf.readUInt32LE(i);
+    let ownerIndex = buf.readUInt32LE(i + 4);
+    pixels.push({
+      color,
+      ownerIndex,
+    })
+  }
+  return pixels;
+};
+
+const WeaponsCheat = "idkfa";
+
+class App extends React.Component {
+  constructor(props) {
+    super(props);
+
+    const colors = ["#000000", "#666666", "#aaaaaa", "#FFFFFF", "#F44E3B", "#D33115", "#9F0500", "#FE9200", "#E27300", "#C45100", "#FCDC00", "#FCC400", "#FB9E00", "#DBDF00", "#B0BC00", "#808900", "#A4DD00", "#68BC00", "#194D33", "#68CCCA", "#16A5A5", "#0C797D", "#73D8FF", "#009CE0", "#0062B1", "#AEA1FF", "#7B64FF", "#653294", "#FDA1FF", "#FA28FF", "#AB149E"].map((c) => c.toLowerCase());
+    // const currentColor = parseInt(colors[Math.floor(Math.random() * colors.length)].substring(1), 16);
+    const currentColor = parseInt(colors[0].substring(1), 16);
+    const defaultAlpha = 0.25;
+
+    this.state = {
+      connected: false,
+      signedIn: false,
+      accountId: null,
+      pendingPixels: 0,
+      boardLoaded: false,
+      selectedCell: null,
+      alpha: defaultAlpha,
+      currentColor,
+      pickerColor: intToColorWithAlpha(currentColor, defaultAlpha),
+      colors,
+      gammaColors: generateGamma(0),
+      pickingColor: false,
+      owners: [],
+      accounts: {},
+      highlightedAccountIndex: -1,
+      selectedOwnerIndex: false,
+      farmingBanana: false,
+      weaponsOn: false,
+      weaponsCodePosition: 0,
+    };
+
+    this._buttonDown = false;
+    this._oldCounts = {};
+    this._numFailedTxs = 0;
+    this._balanceRefreshTimer = null;
+    this.canvasRef = React.createRef();
+    this._context = false;
+    this._lines = false;
+    this._queue = [];
+    this._pendingPixels = [];
+    this._refreshBoardTimer = null;
+    this._sendQueueTimer = null;
+    this._stopRefreshTime = new Date().getTime() + MaxWorkTime;
+    this._accounts = {};
+
+    this._initNear().then(() => {
+      this.setState({
+        connected: true,
+        signedIn: !!this._accountId,
+        accountId: this._accountId,
+        ircAccountId: this._accountId.replace('.', '_')
+      });
+    });
+  }
+
+  componentDidMount() {
+    const canvas = this.canvasRef.current;
+    this._context = canvas.getContext('2d');
+
+    const click = async () => {
+      if (this.state.rendering) {
+        await this.drawImg(this.state.selectedCell);
+      } else if (this.state.pickingColor) {
+        this.pickColor(this.state.selectedCell);
+      } else {
+        this.saveColor();
+        await this.drawPixel(this.state.selectedCell);
+      }
+    };
+
+    const mouseMove = (e) => {
+      let x, y;
+      if ('touches' in e) {
+        if (e.touches.length > 1) {
+          return true;
+        } else {
+          const rect = e.target.getBoundingClientRect();
+          x = e.targetTouches[0].clientX - rect.left;
+          y = e.targetTouches[0].clientY - rect.top;
+        }
+      } else {
+        x = e.offsetX;
+        y = e.offsetY;
+      }
+      x = Math.trunc(x / e.target.clientWidth * BoardWidth);
+      y = Math.trunc(y / e.target.clientHeight * BoardWidth);
+      let cell = null;
+      if (x >= 0 && x < BoardWidth && y >= 0 && y < BoardHeight) {
+        cell = {x, y};
+      }
+      if (JSON.stringify(cell) !== JSON.stringify(this.state.selectedCell)) {
+        this.setState({
+          selectedCell: cell,
+          selectedOwnerIndex: this._lines && cell && this._lines[cell.y] && this._lines[cell.y][cell.x].ownerIndex
+        }, async () => {
+          this.renderCanvas()
+          if (this.state.selectedCell !== null && this._buttonDown) {
+            await click();
+          }
+        })
+      }
+      e.preventDefault();
+      return false;
+    };
+
+    canvas.addEventListener('mousemove', mouseMove);
+    canvas.addEventListener('touchmove', mouseMove);
+
+    const mouseDown = async (e) => {
+      this._buttonDown = true;
+      if (this.state.selectedCell !== null) {
+        await click();
+      }
+    };
+
+    canvas.addEventListener('mousedown', mouseDown);
+    canvas.addEventListener('touchstart', mouseDown);
+
+    const unselectCell = () => {
+      this.setState({
+        selectedCell: null,
+      }, () => this.renderCanvas());
+    }
+
+    const mouseUp = async (e) => {
+      this._buttonDown = false;
+      if ('touches' in e) {
+        unselectCell();
+      }
+    }
+
+    canvas.addEventListener('mouseup', mouseUp);
+    canvas.addEventListener('touchend', mouseUp);
+
+    canvas.addEventListener('mouseleave', unselectCell);
+
+    canvas.addEventListener('mouseenter', (e) => {
+      if (this._buttonDown) {
+        if (!('touches' in e) && !(e.buttons & 1)) {
+          this._buttonDown = false;
+        }
+      }
+    });
+
+    document.addEventListener('keydown', (e) => {
+      e.altKey && this.enablePickColor()
+    })
+
+    document.addEventListener('keyup', (e) => {
+      if (this.state.weaponsCodePosition < WeaponsCheat.length) {
+        if (e.key.toLowerCase() === WeaponsCheat[this.state.weaponsCodePosition]) {
+          this.setState({
+            weaponsCodePosition: this.state.weaponsCodePosition + 1,
+            weaponsOn: this.state.weaponsCodePosition + 1 === WeaponsCheat.length,
+          });
+        } else {
+          this.setState({
+            weaponsCodePosition: 0,
+          });
+        }
+      }
+      !e.altKey && this.disablePickColor();
+    })
+  }
+
+  enablePickColor() {
+    this.setState({
+      pickingColor: true,
+    }, () => {
+      this.renderCanvas()
+    });
+  }
+
+  disablePickColor() {
+    this.setState({
+      pickingColor: false,
+    }, () => {
+      this.renderCanvas()
+    });
+  }
+
+  pickColor(cell) {
+    if (!this.state.signedIn || !this._lines || !this._lines[cell.y]) {
+      return;
+    }
+    const color = this._lines[cell.y][cell.x].color;
+
+    this.setState({
+      currentColor: color,
+      alpha: 1,
+      pickerColor: intToColorWithAlpha(color, 1),
+      gammaColors: generateGamma(int2hsv(color)[0]),
+      pickingColor: false,
+    }, () => {
+      this.renderCanvas()
+    });
+  }
+
+  async _sendQueue() {
+    const pixels = this._queue.slice(0, BatchOfPixels);
+    this._queue = this._queue.slice(BatchOfPixels);
+    this._pendingPixels = pixels;
+
+    try {
+      await this._contract.draw({
+        pixels
+      }, new BN("75000000000000"));
+      this._numFailedTxs = 0;
+    } catch (error) {
+      console.log("Failed to send a transaction", error);
+      this._numFailedTxs += 1;
+      if (this._numFailedTxs < 3) {
+        this._queue = this._queue.concat(this._pendingPixels);
+        this._pendingPixels = [];
+      } else {
+        this._pendingPixels = [];
+        this._queue = [];
+      }
+    }
+    try {
+      await Promise.all([this.refreshBoard(true), this.refreshAccountStats()]);
+    } catch (e) {
+      // ignore
+    }
+    this._pendingPixels.forEach((p) => {
+      if (this._pending[p.y][p.x] === p.color) {
+        this._pending[p.y][p.x] = -1;
+      }
+    });
+    this._pendingPixels = [];
+  }
+
+  async _pingQueue(ready) {
+    if (this._sendQueueTimer) {
+      clearTimeout(this._sendQueueTimer);
+      this._sendQueueTimer = null;
+    }
+
+    if (this._pendingPixels.length === 0 && (this._queue.length >= BatchOfPixels || ready)) {
+      await this._sendQueue();
+    }
+    if (this._queue.length > 0) {
+      this._sendQueueTimer = setTimeout(async () => {
+        await this._pingQueue(true);
+      }, BatchTimeout);
+    }
+
+  }
+
+  async drawImg(cell) {
+    if (!this.state.signedIn || !this._lines || !this._lines[cell.y]) {
+      return;
+    }
+    const balance = this.state.account ? this.state.account.avocadoBalance : 0;
+
+    if (balance - this.state.pendingPixels < this.state.avocadoNeeded) {
+      return;
+    }
+
+    const img = this.imageData;
+    const w = img.width;
+    const h = img.height;
+    const x = cell.x - Math.trunc(w / 2);
+    const y = cell.y - Math.trunc(h / 2);
+    const d = new Uint32Array(this.imageData.data.buffer);
+    for (let i = 0; i < h; ++i) {
+      for (let j = 0; j < w; ++j) {
+        const imgColor = d[i * w + j];
+        if (imgColor && y + i >= 0 && y + i < BoardHeight && x + j >= 0 && x + j < BoardWidth) {
+          const bgColor = this._lines[y + i] ? this._lines[y + i][x + j].color : 0;
+          const color = imgColorToInt(imgColor, bgColor);
+          if (color !== bgColor) {
+            this._queue.push({
+              x: x + j,
+              y: y + i,
+              color,
+            });
+          }
+        }
+      }
+    }
+    this.setState({
+      rendering: false,
+    })
+
+    this._stopRefreshTime = new Date().getTime() + MaxWorkTime;
+    await this._pingQueue(false);
+  }
+
+  async drawPixel(cell) {
+    if (!this.state.signedIn || !this._lines || !this._lines[cell.y]) {
+      return;
+    }
+    const balance = this.state.account ? this.state.account.avocadoBalance : 0;
+    if (balance - this.state.pendingPixels < 1) {
+      return;
+    }
+
+    const bgColor = this._lines[cell.y] ? this._lines[cell.y][cell.x].color : 0;
+    const cb = (this.state.currentColor & 255);
+    const cg = ((this.state.currentColor >> 8) & 255);
+    const cr = ((this.state.currentColor >> 16) & 255);
+    const color = rgbaToInt(cr, cg, cb, this.state.alpha, bgColor);
+
+    if (this._pending[cell.y][cell.x] !== color && this._lines[cell.y][cell.x].color !== color) {
+      this._pending[cell.y][cell.x] = color;
+    } else {
+      return;
+    }
+
+    this._queue.push({
+      x: cell.x,
+      y: cell.y,
+      color,
+    });
+
+    this._stopRefreshTime = new Date().getTime() + MaxWorkTime;
+    await this._pingQueue(false);
+  }
+
+  parseAccount(account, accountId) {
+    if (!account) {
+      account = {
+        accountId,
+        accountIndex: -1,
+        avocadoBalance: 25.0,
+        bananaBalance: 0.0,
+        numPixels: 0,
+        farmingPreference: Berry.Avocado,
+      }
+    } else {
+      account = {
+        accountId: account.account_id,
+        accountIndex: account.account_index,
+        avocadoBalance: parseFloat(account.avocado_balance) / this._pixelCost,
+        bananaBalance: parseFloat(account.banana_balance) / this._pixelCost,
+        numPixels: account.num_pixels,
+        farmingPreference: account.farming_preference,
+      }
+    }
+    account.startTime = new Date().getTime();
+    account.avocadoPixels = (account.farmingPreference === Berry.Avocado) ? (account.numPixels + 1) : 0;
+    account.bananaPixels = (account.farmingPreference === Berry.Banana) ? (account.numPixels) : 0;
+    account.avocadoRewardPerMs = account.avocadoPixels / (24 * 60 * 60 * 1000);
+    account.bananaRewardPerMs = account.bananaPixels / (24 * 60 * 60 * 1000);
+    return account;
+  }
+
+  async getAccount(accountId) {
+    return this.parseAccount(
+      await this._contract.get_account({account_id: accountId}),
+      accountId
+    );
+  }
+
+  async getAccountByIndex(accountIndex) {
+    return this.parseAccount(
+      await this._contract.get_account_by_index({account_index: accountIndex}),
+      "unknown",
+    );
+  }
+
+  async refreshAccountStats() {
+    let account = await this.getAccount(this._accountId);
+    if (this._balanceRefreshTimer) {
+      clearInterval(this._balanceRefreshTimer);
+      this._balanceRefreshTimer = null;
+    }
+
+    this.setState({
+      pendingPixels: this._pendingPixels.length + this._queue.length,
+      farmingBanana: account.farmingPreference === Berry.Banana,
+      account,
+    });
+
+    this._balanceRefreshTimer = setInterval(() => {
+      const t = new Date().getTime() - account.startTime;
+      this.setState({
+        account: Object.assign({}, account, {
+          avocadoBalance: account.avocadoBalance + t * account.avocadoRewardPerMs,
+          bananaBalance: account.bananaBalance + t * account.bananaRewardPerMs,
+        }),
+        pendingPixels: this._pendingPixels.length + this._queue.length,
+      });
+    }, 100);
+  }
+
+  async _initNear() {
+    const keyStore = new nearAPI.keyStores.BrowserLocalStorageKeyStore();
+    const near = await nearAPI.connect(Object.assign({deps: {keyStore}}, NearConfig));
+    this._keyStore = keyStore;
+    this._near = near;
+
+    this._walletConnection = new nearAPI.WalletConnection(near, NearConfig.contractName);
+    this._accountId = this._walletConnection.getAccountId();
+
+    this._account = this._walletConnection.account();
+    this._contract = new nearAPI.Contract(this._account, NearConfig.contractName, {
+      viewMethods: ['get_account', 'get_account_by_index', 'get_lines', 'get_line_versions', 'get_pixel_cost', 'get_account_balance', 'get_account_num_pixels', 'get_account_id_by_index'],
+      changeMethods: ['draw', 'buy_tokens', 'select_farming_preference'],
+    });
+    this._pixelCost = parseFloat(await this._contract.get_pixel_cost());
+    if (this._accountId) {
+      await this.refreshAccountStats();
+    }
+    this._lineVersions = Array(BoardHeight).fill(-1);
+    this._lines = Array(BoardHeight).fill(false);
+    this._pending = Array(BoardHeight).fill(false);
+    this._pending.forEach((v, i, a) => a[i] = Array(BoardWidth).fill(-1));
+    await this.refreshBoard(true);
+  }
+
+  async refreshBoard(forced) {
+    if (this._refreshBoardTimer) {
+      clearTimeout(this._refreshBoardTimer);
+      this._refreshBoardTimer = null;
+    }
+    const t = new Date().getTime();
+    if (t < this._stopRefreshTime) {
+      this._refreshBoardTimer = setTimeout(async () => {
+        await this.refreshBoard(false);
+      }, RefreshBoardTimeout);
+    }
+
+    if (!forced && document.hidden) {
+      return;
+    }
+
+    let lineVersions = await this._contract.get_line_versions();
+    let needLines = [];
+    for (let i = 0; i < BoardHeight; ++i) {
+      if (lineVersions[i] !== this._lineVersions[i]) {
+        needLines.push(i);
+      }
+    }
+    let requestLines = []
+    for (let i = 0; i < needLines.length; i += NumLinesPerFetch) {
+      requestLines.push(needLines.slice(i, i + NumLinesPerFetch));
+    }
+
+    let results = await Promise.all(requestLines.map(lines => this._contract.get_lines({lines})));
+    results = results.flat();
+    requestLines = requestLines.flat();
+    for (let i = 0; i < requestLines.length; ++i) {
+      let lineIndex = requestLines[i];
+      let line = decodeLine(results[i]);
+      this._lines[lineIndex] = line;
+    }
+
+    this._lineVersions = lineVersions;
+    this._refreshOwners();
+    this.renderCanvas();
+  }
+
+  _refreshOwners() {
+    const counts = {};
+    this._lines.flat().forEach((cell) => {
+      counts[cell.ownerIndex] = (counts[cell.ownerIndex] || 0) + 1;
+    })
+    delete counts[0];
+    const sortedKeys = Object.keys(counts).sort((a, b) => counts[b] - counts[a]);
+    this.setState({
+      owners: sortedKeys.map((accountIndex) => {
+        accountIndex = parseInt(accountIndex);
+        return {
+          accountIndex,
+          numPixels: counts[accountIndex],
+        }
+      })
+    })
+    sortedKeys.forEach(async (accountIndex) => {
+      accountIndex = parseInt(accountIndex);
+      if (!(accountIndex in this._accounts) || counts[accountIndex] !== (this._oldCounts[accountIndex] || 0)) {
+        try {
+          this._accounts[accountIndex] = await this.getAccountByIndex(accountIndex);
+        } catch (err) {
+          console.log("Failed to fetch account index #", accountIndex, err)
+        }
+        this.setState({
+          accounts: Object.assign({}, this._accounts),
+        })
+      }
+    })
+    this.setState({
+      accounts: Object.assign({}, this._accounts),
+    })
+    this._oldCounts = counts;
+  }
+
+  renderCanvas() {
+    if (!this._context || !this._lines) {
+      return;
+    }
+
+    const ctx = this._context;
+
+    for (let i = 0; i < BoardHeight; ++i) {
+      const line = this._lines[i];
+      if (!line) {
+        continue;
+      }
+      for (let j = 0; j < BoardWidth; ++j) {
+        const p = line[j];
+        ctx.fillStyle = intToColor(p.color);
+        ctx.fillRect(j * CellWidth, i * CellHeight, CellWidth, CellHeight);
+        if (this.state.highlightedAccountIndex >= 0) {
+          if (p.ownerIndex !== this.state.highlightedAccountIndex) {
+            ctx.fillStyle = 'rgba(32, 32, 32, 0.8)';
+            ctx.fillRect(j * CellWidth, i * CellHeight, CellWidth / 2, CellHeight / 2);
+            ctx.fillRect((j + 0.5) * CellWidth, (i + 0.5) * CellHeight, CellWidth / 2, CellHeight / 2);
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
+            ctx.fillRect(j * CellWidth, (i + 0.5) * CellHeight, CellWidth / 2, CellHeight / 2);
+            ctx.fillRect((j + 0.5) * CellWidth, i * CellHeight, CellWidth / 2, CellHeight / 2);
+          } else {
+            ctx.beginPath();
+            ctx.strokeStyle = ctx.fillStyle = 'rgba(255, 255, 255, 0.8)';
+            ctx.lineWidth = 0.5;
+            ctx.rect(j * CellWidth + 0.5, i * CellHeight + 0.5, CellWidth - 1, CellHeight - 1);
+            ctx.stroke();
+            ctx.closePath();
+          }
+        }
+      }
+    }
+
+    this._pendingPixels.concat(this._queue).forEach((p) => {
+      ctx.fillStyle = intToColor(p.color);
+      ctx.fillRect(p.x * CellWidth, p.y * CellHeight, CellWidth, CellHeight);
+    })
+
+    if (this.state.selectedCell) {
+      const c = this.state.selectedCell;
+      if (this.state.rendering) {
+        const img = this.imageData;
+        const w = img.width;
+        const h = img.height;
+        const x = c.x - Math.trunc(w / 2);
+        const y = c.y - Math.trunc(h / 2);
+        const d = new Uint32Array(this.imageData.data.buffer);
+        for (let i = 0; i < h; ++i) {
+          for (let j = 0; j < w; ++j) {
+            const color = d[i * w + j];
+            if (color && y + i >= 0 && y + i < BoardHeight && x + j >= 0 && x + j < BoardWidth) {
+              const bgColor = this._lines[y + i] ? this._lines[y + i][x + j].color : 0;
+              ctx.fillStyle = intToColor(imgColorToInt(color, bgColor));
+              ctx.fillRect((x + j) * CellWidth, (y + i) * CellHeight, CellWidth, CellHeight);
+            }
+          }
+        }
+      } else if (this.state.pickingColor) {
+        const color = this._lines[c.y] ? this._lines[c.y][c.x].color : 0;
+        ctx.beginPath();
+        ctx.strokeStyle = ctx.fillStyle = transparentColor(color, 0.5);
+        ctx.lineWidth = CellWidth * 4;
+        ctx.arc((c.x + 0.5) * CellWidth, (c.y + 0.5) * CellHeight, CellWidth * 4, 0, 2 * Math.PI);
+        ctx.stroke();
+        ctx.closePath();
+
+        ctx.beginPath();
+        ctx.strokeStyle = ctx.fillStyle = transparentColor(color, 1);
+        ctx.lineWidth = CellWidth * 2;
+        ctx.arc((c.x + 0.5) * CellWidth, (c.y + 0.5) * CellHeight, CellWidth * 4, 0, 2 * Math.PI);
+        ctx.stroke();
+        ctx.closePath();
+      } else {
+        ctx.fillStyle = transparentColor(this.state.currentColor, 0.2);
+        ctx.fillRect(c.x * CellWidth, 0, CellWidth, c.y * CellHeight);
+        ctx.fillRect(c.x * CellWidth, (c.y + 1) * CellHeight, CellWidth, (BoardHeight - c.y - 1) * CellHeight);
+        ctx.fillRect(0, c.y * CellHeight, c.x * CellWidth, CellHeight);
+        ctx.fillRect((c.x + 1) * CellWidth, c.y * CellHeight, (BoardWidth - c.x - 1) * CellWidth, CellHeight);
+
+        ctx.beginPath();
+        ctx.lineWidth = 3;
+        ctx.fillStyle = intToColor(this.state.currentColor);
+        ctx.strokeStyle = intToColor(this.state.currentColor);
+        ctx.rect(c.x * CellWidth, c.y * CellHeight, CellWidth, CellHeight);
+        ctx.stroke();
+        ctx.closePath();
+      }
+
+    }
+
+    if (!this.state.boardLoaded) {
+      this.setState({
+        boardLoaded: true
+      })
+    }
+  }
+
+  async requestSignIn() {
+    const appTitle = '[TEST] Berry Club';
+    await this._walletConnection.requestSignIn(
+      NearConfig.contractName,
+      appTitle
+    )
+  }
+
+  async logOut() {
+    this._walletConnection.signOut();
+    this._accountId = null;
+    this.setState({
+      signedIn: !!this._accountId,
+      accountId: this._accountId,
+    })
+  }
+
+  async alphaColorChange(c) {
+    this.setState({
+      alpha: c.rgb.a,
+    }, () => {
+      this.changeColor(c, c.rgb.a)
+    });
+  }
+
+  hueColorChange(c) {
+    this.setState({
+      gammaColors: generateGamma(c.hsl.h)
+    })
+    this.changeColor(c)
+  }
+
+  saveColor() {
+    const newColor = intToColor(this.state.currentColor);
+    const index = this.state.colors.indexOf(newColor);
+    if (index >= 0) {
+      this.state.colors.splice(index, 1);
+    }
+    this.setState({
+      colors: [newColor].concat(this.state.colors).slice(0, MaxNumColors)
+    });
+  }
+
+  changeColor(c, alpha) {
+    alpha = alpha || 1.0;
+    const currentColor = c.rgb.r * 0x010000 + c.rgb.g * 0x000100 + c.rgb.b;
+    c.hex = intToColorWithAlpha(currentColor, alpha);
+    c.rgb.a = alpha;
+    c.hsl.a = alpha;
+    c.hsv.a = alpha;
+    this.setState({
+      pickerColor: c,
+      alpha,
+      currentColor,
+    }, () => {
+      this.renderCanvas();
+    })
+  }
+
+  async buyTokens(amount) {
+    const requiredBalance = PixelPrice.muln(amount);
+    await this._contract.buy_tokens({}, new BN("30000000000000"), requiredBalance);
+  }
+
+  setHover(accountIndex, v) {
+    if (v) {
+      this.setState({
+        highlightedAccountIndex: accountIndex,
+      }, () => {
+        this.renderCanvas();
+      })
+    } else if (this.state.highlightedAccountIndex === accountIndex) {
+      this.setState({
+        highlightedAccountIndex: -1,
+      }, () => {
+        this.renderCanvas();
+      })
+    }
+  }
+
+  async switchBerry(farmingBanana) {
+    this.setState({
+      farmingBanana,
+    })
+    await this._contract.select_farming_preference({
+      berry: farmingBanana ? Berry.Banana : Berry.Avocado,
+    });
+    await this.refreshAccountStats();
+  }
+
+  async renderImg(img, avocadoNeeded) {
+    this.imageData = img;
+    this.setState({
+      weaponsOn: false,
+      weaponsCodePosition: 0,
+      rendering: true,
+      pickingColor: false,
+      avocadoNeeded
+    })
+  }
+
+  render() {
+
+    const content = !this.state.connected ? (
+        <div>Connecting... <span className="spinner-grow spinner-grow-sm" role="status" aria-hidden="true"></span></div>
+    ) : (this.state.signedIn ? (
+        <div>
+          <div className="float-right">
+            <button
+              className="btn btn-outline-secondary"
+              onClick={() => this.logOut()}>Log out ({this.state.accountId})</button>
+          </div>
+          <div className="your-balance">
+            Balance: <Balance
+              account={this.state.account}
+              pendingPixels={this.state.pendingPixels}
+              detailed={true}
+          />
+          <div>
+            Farming preference:
+            <Switch
+                onChange={(e) => this.switchBerry(e)}
+                checked={this.state.farmingBanana}
+                className="react-switch"
+                height={30}
+                width={70}
+                offColor="#666"
+                onColor="#666"
+                uncheckedIcon={<div className="switch-berry avocado">{Avocado}</div>}
+                checkedIcon={<div className="switch-berry banana">{Banana}</div>}
+            />
+          </div>
+          </div>
+          <div className="buttons">
+            <button
+              className="btn btn-primary"
+              onClick={() => this.buyTokens(10)}>Buy <span className="font-weight-bold">25{Avocado}</span> for <span className="font-weight-bold">Ⓝ0.1</span></button>{' '}
+            <button
+              className="btn btn-primary"
+              onClick={() => this.buyTokens(40)}>Buy <span className="font-weight-bold">100{Avocado}</span> for <span className="font-weight-bold">Ⓝ0.4</span></button>{' '}
+            <button
+              className="btn btn-primary"
+              onClick={() => this.buyTokens(100)}>Buy <span className="font-weight-bold">250{Avocado}</span> for <span className="font-weight-bold">Ⓝ1</span></button>{' '}
+            <button
+              className="btn btn-success"
+              onClick={() => this.buyTokens(500)}>DEAL: Buy <span className="font-weight-bold">1500{Avocado}</span> for <span className="font-weight-bold">Ⓝ5</span></button>
+          </div>
+          <div className="color-picker">
+            <HuePicker color={ this.state.pickerColor } width="100%" onChange={(c) => this.hueColorChange(c)}/>
+            <AlphaPicker color={ this.state.pickerColor } width="100%" onChange={(c) => this.alphaColorChange(c)}/>
+            <div className={this.state.alpha >= 0.75 ? "display-warning" : "hidden"}>
+              <span role="img" aria-label="warning">⚠️</span>️ Please! Don't destroy art! If you just want to farm {Banana}, just draw with low opacity.
+              <span role="img" aria-label="pray">🙏</span>️
+            </div>
+            <GithubPicker className="circle-picker" colors={this.state.gammaColors} color={ this.state.pickerColor } triangle='hide' width="100%" onChangeComplete={(c) => this.changeColor(c)}/>
+            <GithubPicker className="circle-picker" colors={this.state.colors} color={ this.state.pickerColor } triangle='hide' width="100%" onChangeComplete={(c) => this.hueColorChange(c)}/>
+          </div>
+        </div>
+    ) : (
+        <div style={{marginBottom: "10px"}}>
+          <button
+              className="btn btn-primary"
+              onClick={() => this.requestSignIn()}>Log in with NEAR Wallet</button>
+        </div>
+    ));
+    const weapons = this.state.weaponsOn ? (
+      <div>
+        <Weapons
+          account={this.state.account}
+          renderIt={(img, avocadoNeeded) => this.renderImg(img, avocadoNeeded)}/>
+      </div>
+    ) : "";
+    return (
+      <div>
+        <div class="header">
+          <h2>{Avocado} [TEST] Berry Club {Banana}</h2>{' '}
+          {/*
+          <a
+            className="btn btn-outline-none"
+            href="https://farm.berryclub.io">Berry Farm {Cucumber}
+          </a>
+          <a
+            className="btn btn-outline-none"
+            href="https://bananaswap.berryclub.io">[BETA] Banana Swap {Banana}
+          </a>
+          */}
+          {content}
+        </div>
+        <div className="container">
+          <div className="row">
+            <div>
+              <div>
+                <canvas ref={this.canvasRef}
+                        width={600}
+                        height={600}
+                        className={this.state.boardLoaded ? "pixel-board" : "pixel-board c-animated-background"}>
+
+                </canvas>
+              </div>
+            </div>
+            <div className="leaderboard">
+              <div>
+                <Leaderboard
+                  owners={this.state.owners}
+                  accounts={this.state.accounts}
+                  setHover={(accountIndex, v) => this.setHover(accountIndex, v)}
+                  selectedOwnerIndex={this.state.selectedOwnerIndex}
+                  highlightedAccountIndex={this.state.highlightedAccountIndex}
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+        {weapons}
+        <a className="github-fork-ribbon right-bottom fixed" href="https://github.com/evgenykuzyakov/place" data-ribbon="Fork me on GitHub"
+           title="Fork me on GitHub">Fork me on GitHub</a>
+      </div>
+    );
+  }
+}
+
+const Balance = (props) => {
+  const account = props.account;
+  if (!account) {
+    return "";
+  }
+  const fraction = props.detailed ? 3: 1;
+  const avacadoBalance = account.avocadoBalance - (props.pendingPixels || 0);
+  const avocadoFarm = (account.avocadoPixels > 0) ? (
+    <span>
+      {'(+'}<span className="font-weight-bold">{account.avocadoPixels}</span>{Avocado}{'/day)'}
+    </span>
+  ) : "";
+  const bananaFarm = (account.bananaPixels > 0) ? (
+    <span>
+      {'(+'}<span className="font-weight-bold">{account.bananaPixels}</span>{Banana}{'/day)'}
+    </span>
+  ) : "";
+  return (
+    <span className="balances font-small">
+      <span className="font-weight-bold">{avacadoBalance.toFixed(fraction)}</span>{Avocado}{' '}
+      <span className="font-weight-bold">{account.bananaBalance.toFixed(fraction)}</span>{Banana}{' '}
+      {avocadoFarm}
+      {bananaFarm}
+      {
+        props.pendingPixels ? <span> ({props.pendingPixels} pending)</span> : ""
+      }
+    </span>
+  );
+};
+
+const Leaderboard = (props) => {
+  const owners = props.owners.map((owner) => {
+    if (owner.accountIndex in props.accounts) {
+      owner.account = props.accounts[owner.accountIndex];
+    }
+    return <Owner
+      key={owner.accountIndex}
+      {...owner}
+      isSelected={owner.accountIndex === props.selectedOwnerIndex}
+      setHover={(v) => props.setHover(owner.accountIndex, v)}
+      isHighlighted={owner.accountIndex === props.highlightedAccountIndex}
+    />
+  })
+  return (
+    <table className="table table-hover table-sm"><tbody>{owners}</tbody></table>
+  );
+};
+
+const Owner = (props) => {
+  const account = props.account;
+  return (
+    <tr onMouseEnter={() => props.setHover(true)}
+        onMouseLeave={() => props.setHover(false)}
+        className={props.isSelected ? "selected" : ""}>
+      <td>
+        {account ? <Account accountId={account.accountId} /> : "..."}
+      </td>
+      <td className="text-nowrap">
+        <small>
+          <Balance account={account} />
+        </small>
+      </td>
+    </tr>
+  )
+}
+
+const Account = (props) => {
+  const accountId = props.accountId;
+  const shortAccountId = (accountId.length > 6 + 6 + 3) ?
+    (accountId.slice(0, 6) + '...' + accountId.slice(-6)) :
+    accountId;
+  return <a className="account"
+            href={`https://wayback.berryclub.io/${accountId}`}>{shortAccountId}</a>
+}
+
+export default App;
+
+'''
+'''--- frontend/src/Weapons.js ---
+import "./Weapons.scss";
+import React from 'react';
+import Files from "react-files";
+
+const Avocado = <span role="img" aria-label="avocado" className="berry">🥑</span>;
+
+export class Weapons extends React.Component {
+  constructor(props) {
+    super(props);
+    this.canvasRef = React.createRef();
+    this.state = {
+      width: 48,
+      height: 28,
+      avocadoNeeded: 100,
+      lockedAspect: true,
+    };
+  }
+
+  componentDidMount() {
+    this.canvas = this.canvasRef.current;
+    this.ctx = this.canvas.getContext('2d');
+    this.sourceImage = new Image();
+    this.sourceImage.onload = () => {
+      this.draw();
+    }
+    this.sourceImage.src = "/bfg.png";
+  }
+
+  draw() {
+    const sourceImage = this.sourceImage;
+    const canvas = this.canvas;
+    const ctx = this.ctx;
+    const width = this.state.width;
+    const height = this.state.height;
+
+    // Create a canvas with the desired dimensions
+    canvas.width = width;
+    canvas.height = height;
+    canvas.style.width = (width * 10) + 'px';
+    canvas.style.height = (height * 10) + 'px';
+
+    // Scale and draw the source image to the canvas
+    ctx.clearRect(0, 0, width, height);
+    ctx.imageSmoothingQuality = "low";
+    ctx.drawImage(sourceImage, 0, 0, width, height);
+
+    const imageData = ctx.getImageData(0, 0, width, height);
+    this.imageData = imageData;
+    this.setState({
+      avocadoNeeded: new Uint32Array(imageData.data.buffer).reduce((sum, v) => sum + (v ? 1 : 0), 0),
+    });
+  }
+
+  async onFilesChange(f) {
+    const sourceImage = this.sourceImage;
+    let reader = new FileReader();
+
+    reader.readAsDataURL(f[0]);
+
+    sourceImage.onload = () => {
+      let width = sourceImage.naturalWidth;
+      let height = sourceImage.naturalHeight;
+      if (sourceImage.naturalWidth > 50 || sourceImage.naturalHeight > 50) {
+        const aspect = width / height;
+        width = Math.round(20 * Math.min(1, aspect));
+        height = Math.round(20 * Math.min(1, 1 / aspect));
+      }
+      this.setState({
+        width: Math.min(50, Math.max(1, width)),
+        height: Math.min(50, Math.max(1, height)),
+      });
+      this.draw();
+
+    }
+
+    reader.onload = function(event) {
+      sourceImage.src = event.target.result;
+    };
+  }
+
+  async onFilesError(e, f) {
+    console.log(e, f);
+  }
+
+  updateVal(key, value) {
+    value = Math.min(50, Math.max(1, value));
+    if (this.state.lockedAspect) {
+      const aspect = this.sourceImage.naturalWidth / this.sourceImage.naturalHeight;
+      let width, height;
+      if (key === 'width') {
+        width = value;
+        height = Math.round(width / aspect);
+      } else {
+        height = value;
+        width = Math.round(height * aspect);
+      }
+      this.setState({
+        width: Math.min(50, Math.max(1, width)),
+        height: Math.min(50, Math.max(1, height)),
+      }, () => {
+        this.draw();
+      });
+    } else {
+      this.setState({
+        [key]: value,
+      }, () => {
+        this.draw();
+      })
+    }
+  }
+
+  changeLockedAspect() {
+    this.setState({
+      lockedAspect: !this.state.lockedAspect,
+    })
+  }
+
+  render() {
+    return (
+      <div className="weapons-popup">
+        <div className="weapons-content">
+          <h2>So you need a BFG?</h2>
+          <div>
+            <Files
+              type="button"
+              className='btn'
+              onChange={(f) => this.onFilesChange(f)}
+              onError={(e, f) => this.onFilesError(e, f)}
+              multiple={false}
+              accepts={['image/*']}
+              minFileSize={1}
+              clickable
+            >
+              Click to upload an image
+            </Files>
+          </div>
+          <div>
+            <label>Width</label>
+            <input type="number" value={this.state.width}
+                   min={1}
+                   max={50}
+                   onChange={(e) => this.updateVal('width', e.target.value)} />
+            {' '}
+            <button
+              className={"btn btn-outline-secondary low-right-margin" + (this.state.lockedAspect ? " btn-pressed" : " btn-not-pressed")}
+              onClick={() => this.changeLockedAspect()}
+            >
+              <span role="img" aria-label="link" className="berry">🔗</span>
+            </button>
+            <label>Height</label>
+            <input type="number" value={this.state.height}
+                   min={1}
+                   max={50}
+                   onChange={(e) => this.updateVal('height', e.target.value)} />
+          </div>
+          <button
+            className='btn btn-success btn-large'
+            disabled={!this.props.account || this.props.account.avocadoBalance < this.state.avocadoNeeded}
+            onClick={() => this.props.renderIt(this.imageData, this.state.avocadoNeeded)}
+          >
+            Render on the board using {this.state.avocadoNeeded} {Avocado}
+          </button>
+          <div className="canvas-wrapper">
+            <canvas ref={this.canvasRef}
+                    width={480}
+                    height={280}
+                    className="draw-preview">
+            </canvas>
+          </div>
+
+        </div>
+      </div>
+    )
+  }
+}
+
+'''
+'''--- frontend/src/gh-fork-ribbon.css ---
+/*!
+ * "Fork me on GitHub" CSS ribbon v0.2.3 | MIT License
+ * https://github.com/simonwhitaker/github-fork-ribbon-css
+*/
+
+.github-fork-ribbon {
+  width: 12.1em;
+  height: 12.1em;
+  position: absolute;
+  overflow: hidden;
+  top: 0;
+  right: 0;
+  z-index: 9999;
+  pointer-events: none;
+  font-size: 13px;
+  text-decoration: none;
+  text-indent: -999999px;
+}
+
+.github-fork-ribbon.fixed {
+  position: fixed;
+}
+
+.github-fork-ribbon:hover, .github-fork-ribbon:active {
+  background-color: rgba(0, 0, 0, 0.0);
+}
+
+.github-fork-ribbon:before, .github-fork-ribbon:after {
+  /* The right and left classes determine the side we attach our banner to */
+  position: absolute;
+  display: block;
+  width: 15.38em;
+  height: 1.54em;
+
+  top: 3.23em;
+  right: -3.23em;
+
+  -webkit-box-sizing: content-box;
+  -moz-box-sizing: content-box;
+  box-sizing: content-box;
+
+  -webkit-transform: rotate(45deg);
+  -moz-transform: rotate(45deg);
+  -ms-transform: rotate(45deg);
+  -o-transform: rotate(45deg);
+  transform: rotate(45deg);
+}
+
+.github-fork-ribbon:before {
+  content: "";
+
+  /* Add a bit of padding to give some substance outside the "stitching" */
+  padding: .38em 0;
+
+  /* Set the base colour */
+  background-color: #a00;
+
+  /* Set a gradient: transparent black at the top to almost-transparent black at the bottom */
+  background-image: -webkit-gradient(linear, left top, left bottom, from(rgba(0, 0, 0, 0)), to(rgba(0, 0, 0, 0.15)));
+  background-image: -webkit-linear-gradient(top, rgba(0, 0, 0, 0), rgba(0, 0, 0, 0.15));
+  background-image: -moz-linear-gradient(top, rgba(0, 0, 0, 0), rgba(0, 0, 0, 0.15));
+  background-image: -ms-linear-gradient(top, rgba(0, 0, 0, 0), rgba(0, 0, 0, 0.15));
+  background-image: -o-linear-gradient(top, rgba(0, 0, 0, 0), rgba(0, 0, 0, 0.15));
+  background-image: linear-gradient(to bottom, rgba(0, 0, 0, 0), rgba(0, 0, 0, 0.15));
+
+  /* Add a drop shadow */
+  -webkit-box-shadow: 0 .15em .23em 0 rgba(0, 0, 0, 0.5);
+  -moz-box-shadow: 0 .15em .23em 0 rgba(0, 0, 0, 0.5);
+  box-shadow: 0 .15em .23em 0 rgba(0, 0, 0, 0.5);
+
+  pointer-events: auto;
+}
+
+.github-fork-ribbon:after {
+  /* Set the text from the data-ribbon attribute */
+  content: attr(data-ribbon);
+
+  /* Set the text properties */
+  color: #fff;
+  font: 700 1em "Helvetica Neue", Helvetica, Arial, sans-serif;
+  line-height: 1.54em;
+  text-decoration: none;
+  text-shadow: 0 -.08em rgba(0, 0, 0, 0.5);
+  text-align: center;
+  text-indent: 0;
+
+  /* Set the layout properties */
+  padding: .15em 0;
+  margin: .15em 0;
+
+  /* Add "stitching" effect */
+  border-width: .08em 0;
+  border-style: dotted;
+  border-color: #fff;
+  border-color: rgba(255, 255, 255, 0.7);
+}
+
+.github-fork-ribbon.left-top, .github-fork-ribbon.left-bottom {
+  right: auto;
+  left: 0;
+}
+
+.github-fork-ribbon.left-bottom, .github-fork-ribbon.right-bottom {
+  top: auto;
+  bottom: 0;
+}
+
+.github-fork-ribbon.left-top:before, .github-fork-ribbon.left-top:after, .github-fork-ribbon.left-bottom:before, .github-fork-ribbon.left-bottom:after {
+  right: auto;
+  left: -3.23em;
+}
+
+.github-fork-ribbon.left-bottom:before, .github-fork-ribbon.left-bottom:after, .github-fork-ribbon.right-bottom:before, .github-fork-ribbon.right-bottom:after {
+  top: auto;
+  bottom: 3.23em;
+}
+
+.github-fork-ribbon.left-top:before, .github-fork-ribbon.left-top:after, .github-fork-ribbon.right-bottom:before, .github-fork-ribbon.right-bottom:after {
+  -webkit-transform: rotate(-45deg);
+  -moz-transform: rotate(-45deg);
+  -ms-transform: rotate(-45deg);
+  -o-transform: rotate(-45deg);
+  transform: rotate(-45deg);
+}
+
+'''
+'''--- frontend/src/index.css ---
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+code {
+  font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
+    monospace;
+}
+
+'''
+'''--- frontend/src/index.js ---
+import React from 'react';
+import ReactDOM from 'react-dom';
+import './index.css';
+import App from './App';
+
+ReactDOM.render(<App />, document.getElementById('root'));
+
+'''

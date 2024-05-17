@@ -1,0 +1,905 @@
+*GitHub Repository "htafolla/open-shards-faucet"*
+
+'''--- .gitpod.yml ---
+image:
+  file: .gitpod.Dockerfile
+# Options to prebuild the image after github events and set notifications/badges
+github:
+  prebuilds:
+    # enable for the master/default branch (defaults to true)
+    master: true
+    # enable for all branches in this repo (defaults to false)
+    branches: true
+    # enable for pull requests coming from this repo (defaults to true)
+    pullRequests: true
+    # enable for pull requests coming from forks (defaults to false)
+    pullRequestsFromForks: true
+    # add a check to pull requests (defaults to true)
+    addCheck: true
+    # add a "Review in Gitpod" button as a comment to pull requests (defaults to false)
+    addComment: true
+    # add a "Review in Gitpod" button to the pull request's description (defaults to false)
+    addBadge: false
+    # add a label once the prebuild is ready to pull requests (defaults to false)
+    addLabel: false
+
+# List the start up tasks. You can start them in parallel in multiple terminals. See https://www.gitpod.io/docs/config-start-tasks/
+tasks:
+  - before: nvm use default
+
+vscode:
+  extensions:
+    - hbenl.vscode-test-explorer@2.15.0:koqDUMWDPJzELp/hdS/lWw==
+    - Swellaby.vscode-rust-test-adapter@0.11.0:Xg+YeZZQiVpVUsIkH+uiiw==
+    - bungcip.better-toml@0.3.2:3QfgGxxYtGHfJKQU7H0nEw==
+
+'''
+'''--- .travis.yml ---
+language: rust
+rust:
+  - stable
+before_install:
+  - rustup target add wasm32-unknown-unknown
+script:
+  - cd contract-rs
+  - ./build.sh
+  - cargo test --verbose --all
+'''
+'''--- README.md ---
+Proof of Work Transfer Faucet
+=============================
+
+<!-- MAGIC COMMENT: DO NOT DELETE! Everything above this line is hidden on NEAR Examples page -->
+
+Try it out: https://near-examples.github.io/token-printer/
+
+It consists of 2 parts:
+
+## Transfer Faucet contract
+
+A Faucet contract allows to transfer tokens to a desired account for doing required Proof of Work.
+This contract is based on PoW faucet example: https://github.com/near-examples/pow-faucet
+
+The transfer amount is set to 100N tokens. It's enough to deploy a 1Mb contract.
+
+Proof of Work works the following way:
+
+You need to compute a u64 salt (nonce) for a given account in such a way
+that the `sha256(account_id + ':' + salt)` has at the amount of leading zero bits as
+the required `min_difficulty`. The hash has to be unique in order to receive transfer.
+One account can request multiple transfers.
+
+## Faucet frontend
+
+Allows to enter the account ID to receive transfer. And it computes the Proof of Work required by the contract using front-end JS.
+
+https://near-examples.github.io/token-printer/
+
+## Testing
+To test run:
+```bash
+cargo test
+```
+
+'''
+'''--- contract-rs/Cargo.toml ---
+[package]
+name = "transfer-faucet"
+version = "0.1.1"
+authors = ["Near Inc <hello@nearprotocol.com>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde = { version = "*", features = ["derive"] }
+serde_json = "*"
+near-sdk = "0.9.2"
+borsh = "*"
+wee_alloc = { version = "0.4.5", default-features = false, features = [] }
+bs58 = "0.3.0"
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+
+[workspace]
+members = []
+
+'''
+'''--- contract-rs/README.md ---
+# Account faucet with Proof of Work
+
+A Faucet contract that creates and funds accounts if the caller provides basic proof of work
+to avoid sybil attacks and draining balance too fast.
+
+The new account always receives 1/1000 of the remaining balance.
+
+Proof of Work works the following way:
+
+You need to compute a u64 salt (nonce) for a given account and a given public key in such a way
+that the `sha256(account_id + ':' + public_key + ':' + salt)` has more leading zero bits than
+the required `min_difficulty`.
+
+## Testing
+To test run:
+```bash
+cargo test
+```
+
+'''
+'''--- contract-rs/build.sh ---
+#!/bin/bash
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/transfer_faucet.wasm ./res/
+
+'''
+'''--- contract-rs/src/lib.rs ---
+use borsh::{BorshDeserialize, BorshSerialize};
+use near_sdk::collections::Set;
+use near_sdk::json_types::{Base58PublicKey, U128};
+use near_sdk::{env, near_bindgen, Promise};
+
+#[global_allocator]
+static ALLOC: wee_alloc::WeeAlloc = wee_alloc::WeeAlloc::INIT;
+
+pub type AccountId = String;
+pub type Salt = u64;
+
+/// A Transfer PoW Faucet contract that allows to request token transfer towards a given account.
+/// It uses basic proof of work to avoid sybil attacks.
+/// The new account always receives selected amount of tokens.
+/// Proof of Work works the following way:
+/// You need to compute a u64 salt (nonce) for a given account in such a way
+/// that the `sha256(account_id + ':' + salt)` has more leading zero bits than
+/// the required `min_difficulty`. The hash has to be unique in order to receive transfer.
+/// One account can request multiple transfers.
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct TransferFaucet {
+    /// Transfer amount
+    pub transfer_amount: u128,
+    /// Number of leading zeros in binary representation for a hash
+    pub min_difficulty: u32,
+    /// Created accounts
+    pub existing_hashes: Set<Vec<u8>>,
+}
+
+impl Default for TransferFaucet {
+    fn default() -> Self {
+        panic!("Faucet is not initialized yet")
+    }
+}
+
+/// Returns the number of leading zero bits for a given slice of bits.
+fn num_leading_zeros(v: &[u8]) -> u32 {
+    let mut res = 0;
+    for z in v.iter().map(|b| b.leading_zeros()) {
+        res += z;
+        if z < 8 {
+            break;
+        }
+    }
+    res
+}
+
+fn assert_self() {
+    assert_eq!(
+        env::current_account_id(),
+        env::predecessor_account_id(),
+        "Can only be called by owner"
+    );
+}
+
+#[near_bindgen]
+impl TransferFaucet {
+    #[init]
+    pub fn new(transfer_amount: U128, min_difficulty: u32) -> Self {
+        assert!(env::state_read::<Self>().is_none(), "Already initialized");
+        Self {
+            transfer_amount: transfer_amount.into(),
+            min_difficulty,
+            existing_hashes: Set::new(b"h".to_vec()),
+        }
+    }
+
+    pub fn get_transfer_amount(&self) -> U128 {
+        self.transfer_amount.into()
+    }
+
+    pub fn get_min_difficulty(&self) -> u32 {
+        self.min_difficulty
+    }
+
+    pub fn get_num_transfers(&self) -> u64 {
+        self.existing_hashes.len()
+    }
+
+    pub fn request_transfer(&mut self, account_id: AccountId, salt: Salt) -> Promise {
+        // Checking proof of work
+        //     Constructing a message for checking
+        let mut message = account_id.as_bytes().to_vec();
+        message.push(b':');
+        message.extend_from_slice(&salt.to_le_bytes());
+        //     Computing hash of the message
+        let hash = env::sha256(&message);
+        //     Checking that the resulting hash has enough leading zeros.
+        assert!(
+            num_leading_zeros(&hash) >= self.min_difficulty,
+            "The proof is work is too weak"
+        );
+
+        // Checking that the given hash is not used yet and remembering it.
+//        assert!(
+//            self.existing_hashes.insert(&hash),
+//            "The given hash is already used for transfer"
+//        );
+
+        // Creating a transfer. It still can fail (e.g. account doesn't exists or the name is invalid),
+        // but this contract will get the refund back.
+        Promise::new(account_id)
+            .transfer(self.transfer_amount)
+            .into()
+    }
+
+    // Owner's methods. Can only be called by the owner
+
+    pub fn set_min_difficulty(&mut self, min_difficulty: u32) {
+        assert_self();
+        self.min_difficulty = min_difficulty;
+    }
+
+    pub fn set_transfer_amount(&mut self, transfer_amount: U128) {
+        assert_self();
+        self.transfer_amount = transfer_amount.into();
+    }
+
+    pub fn add_access_key(&mut self, public_key: Base58PublicKey) -> Promise {
+        assert_self();
+        Promise::new(env::current_account_id())
+            .add_access_key(
+                public_key.into(),
+                0,
+                env::current_account_id(),
+                b"request_transfer".to_vec(),
+            )
+            .into()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(test)]
+mod tests {
+    use near_sdk::{testing_env, MockedBlockchain, VMContext};
+    use std::convert::TryFrom;
+    use std::panic;
+
+    use super::*;
+
+    fn catch_unwind_silent<F: FnOnce() -> R + panic::UnwindSafe, R>(
+        f: F,
+    ) -> std::thread::Result<R> {
+        let prev_hook = panic::take_hook();
+        panic::set_hook(Box::new(|_| {}));
+        let result = panic::catch_unwind(f);
+        panic::set_hook(prev_hook);
+        result
+    }
+
+    fn get_context() -> VMContext {
+        VMContext {
+            current_account_id: "alice".to_string(),
+            signer_account_id: "bob".to_string(),
+            signer_account_pk: vec![0, 1, 2],
+            predecessor_account_id: "bob".to_string(),
+            input: vec![],
+            block_index: 0,
+            block_timestamp: 0,
+            account_balance: 10u128.pow(30),
+            account_locked_balance: 0,
+            storage_usage: 100,
+            attached_deposit: 0,
+            prepaid_gas: 10u64.pow(15),
+            random_seed: vec![0, 1, 2],
+            is_view: false,
+            output_data_receivers: vec![],
+            epoch_height: 0,
+        }
+    }
+
+    #[test]
+    fn test_new() {
+        let context = get_context();
+        testing_env!(context);
+        let transfer_amount = 100 * 10u128.pow(24);
+        let min_difficulty = 5;
+        let contract = TransferFaucet::new(transfer_amount.into(), min_difficulty);
+        assert_eq!(contract.get_min_difficulty(), min_difficulty);
+        assert_eq!(contract.get_transfer_amount().0, transfer_amount);
+        assert_eq!(contract.get_num_transfers(), 0);
+    }
+
+    #[test]
+    fn test_request_transfer_ok() {
+        let context = get_context();
+        testing_env!(context.clone());
+        let transfer_amount = 100 * 10u128.pow(24);
+        let min_difficulty = 5;
+        let account_id = "test.alice";
+        let mut contract = TransferFaucet::new(transfer_amount.into(), min_difficulty);
+        let mut salt: u64 = 0;
+        loop {
+            // To avoid draining all gas
+            testing_env!(context.clone());
+            let mut message = account_id.as_bytes().to_vec();
+            message.push(b':');
+            message.extend_from_slice(&salt.to_le_bytes());
+            //     Computing hash of the message
+            let hash = env::sha256(&message);
+            //     Checking that the resulting hash has enough leading zeros.
+            if num_leading_zeros(&hash) >= min_difficulty {
+                break;
+            }
+            salt += 1;
+        }
+        println!("Salt is {}", salt);
+        contract.request_transfer(account_id.to_string(), salt);
+        assert_eq!(contract.get_num_transfers(), 1);
+    }
+
+    #[test]
+    fn test_fail_default() {
+        let context = get_context();
+        testing_env!(context);
+        catch_unwind_silent(|| {
+            TransferFaucet::default();
+        })
+        .unwrap_err();
+    }
+
+    #[test]
+    fn test_fail_request_transfer_already_used() {
+        let context = get_context();
+        testing_env!(context);
+        let transfer_amount = 100 * 10u128.pow(24);
+        let min_difficulty = 5;
+        let mut contract = TransferFaucet::new(transfer_amount.into(), min_difficulty);
+        let account_id = "test.alice";
+        let salt = 58;
+        contract.request_transfer(account_id.to_string(), salt);
+        catch_unwind_silent(move || {
+            contract.request_transfer(account_id.to_string(), salt);
+        })
+        .unwrap_err();
+    }
+
+    #[test]
+    fn test_num_leading_zeros() {
+        assert_eq!(num_leading_zeros(&[0u8; 4]), 32);
+        assert_eq!(num_leading_zeros(&[255u8; 4]), 0);
+        assert_eq!(num_leading_zeros(&[254u8; 4]), 0);
+        assert_eq!(num_leading_zeros(&[]), 0);
+        assert_eq!(num_leading_zeros(&[127u8]), 1);
+        assert_eq!(num_leading_zeros(&[0u8; 32]), 256);
+        assert_eq!(num_leading_zeros(&[1u8; 4]), 7);
+        assert_eq!(num_leading_zeros(&[0u8, 0u8, 255u8 >> 3]), 19);
+        assert_eq!(num_leading_zeros(&[0u8, 0u8, 255u8 >> 3, 0u8]), 19);
+    }
+
+    #[test]
+    fn test_add_access_key() {
+        let mut context = get_context();
+        context.predecessor_account_id = "alice".to_string();
+        testing_env!(context);
+        let transfer_amount = 100 * 10u128.pow(24);
+        let min_difficulty = 5;
+        let mut contract = TransferFaucet::new(transfer_amount.into(), min_difficulty);
+        contract.add_access_key(
+            Base58PublicKey::try_from("ed25519:CFsEoaPizaj2uPP5StphygRTVugh1anqG8JpiGzpFHs")
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_bad_public_key() {
+        let mut context = get_context();
+        context.predecessor_account_id = "alice".to_string();
+        testing_env!(context);
+        let transfer_amount = 100 * 10u128.pow(24);
+        let min_difficulty = 5;
+        let mut contract = TransferFaucet::new(transfer_amount.into(), min_difficulty);
+        catch_unwind_silent(move || {
+            contract.add_access_key(
+                Base58PublicKey::try_from("ed25519:CFsEoaPTVugh1anqG8JpiGzpFHs").unwrap(),
+            );
+        })
+        .unwrap_err();
+    }
+}
+
+'''
+'''--- frontend/README.md ---
+This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
+
+## Available Scripts
+
+In the project directory, you can run:
+
+### `yarn start`
+
+Runs the app in the development mode.<br />
+Open [http://localhost:3000](http://localhost:3000) to view it in the browser.
+
+The page will reload if you make edits.<br />
+You will also see any lint errors in the console.
+
+### `yarn deploy`
+
+Deploys app to github pages.<br />
+
+### `yarn test`
+
+Launches the test runner in the interactive watch mode.<br />
+See the section about [running tests](https://facebook.github.io/create-react-app/docs/running-tests) for more information.
+
+### `yarn build`
+
+Builds the app for production to the `build` folder.<br />
+It correctly bundles React in production mode and optimizes the build for the best performance.
+
+The build is minified and the filenames include the hashes.<br />
+Your app is ready to be deployed!
+
+See the section about [deployment](https://facebook.github.io/create-react-app/docs/deployment) for more information.
+
+### `yarn eject`
+
+**Note: this is a one-way operation. Once you `eject`, you can’t go back!**
+
+If you aren’t satisfied with the build tool and configuration choices, you can `eject` at any time. This command will remove the single build dependency from your project.
+
+Instead, it will copy all the configuration files and the transitive dependencies (webpack, Babel, ESLint, etc) right into your project so you have full control over them. All of the commands except `eject` will still work, but they will point to the copied scripts so you can tweak them. At this point you’re on your own.
+
+You don’t have to ever use `eject`. The curated feature set is suitable for small and middle deployments, and you shouldn’t feel obligated to use this feature. However we understand that this tool wouldn’t be useful if you couldn’t customize it when you are ready for it.
+
+'''
+'''--- frontend/package.json ---
+{
+  "name": "frontend",
+  "version": "0.1.0",
+  "private": true,
+  "homepage": "open-shards-faucet",
+  "dependencies": {
+    "@testing-library/jest-dom": "^5.10.0",
+    "@testing-library/react": "^10.4.4",
+    "@testing-library/user-event": "^11.4.2",
+    "bn.js": "^5.1.2",
+    "near-api-js": "^0.29.0",
+    "react": "^16.13.1",
+    "react-dom": "^16.13.1",
+    "react-scripts": "^3.4.3"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test",
+    "eject": "react-scripts eject",
+    "deploy": "yarn build && gh-pages -d build"
+  },
+  "eslintConfig": {
+    "extends": "react-app"
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  },
+  "devDependencies": {
+    "gh-pages": "^2.2.0"
+  }
+}
+
+'''
+'''--- frontend/public/index.html ---
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.2.1/css/bootstrap.min.css" integrity="sha384-GJzZqFGwb1QTTN6wy59ffF1BuGJpLSa9DkKMp0DgiMDm4iYMj70gZWKYbI706tWS" crossorigin="anonymous">
+    <link rel="icon" href="%PUBLIC_URL%/favicon.ico" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#000000" />
+    <meta
+      name="description"
+      content="Token printer goes BRRR"
+    />
+    <link rel="apple-touch-icon" href="%PUBLIC_URL%/logo192.png" />
+    <!--
+      manifest.json provides metadata used when your web app is installed on a
+      user's mobile device or desktop. See https://developers.google.com/web/fundamentals/web-app-manifest/
+    -->
+    <link rel="manifest" href="%PUBLIC_URL%/manifest.json" />
+    <!--
+      Notice the use of %PUBLIC_URL% in the tags above.
+      It will be replaced with the URL of the `public` folder during the build.
+      Only files inside the `public` folder can be referenced from the HTML.
+
+      Unlike "/favicon.ico" or "favicon.ico", "%PUBLIC_URL%/favicon.ico" will
+      work correctly both with client-side routing and a non-root public URL.
+      Learn how to configure a non-root public URL by running `npm run build`.
+    -->
+    <title>Token Printer</title>
+  </head>
+  <body>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="root"></div>
+    <!--
+      This HTML file is a template.
+      If you open it directly in the browser, you will see an empty page.
+
+      You can add webfonts, meta tags, or analytics to this file.
+      The build step will place the bundled scripts into the <body> tag.
+
+      To begin the development, run `npm start` or `yarn start`.
+      To create a production bundle, use `npm run build` or `yarn build`.
+    -->
+  </body>
+</html>
+
+'''
+'''--- frontend/public/manifest.json ---
+{
+  "short_name": "React App",
+  "name": "Create React App Sample",
+  "icons": [
+    {
+      "src": "favicon.ico",
+      "sizes": "64x64 32x32 24x24 16x16",
+      "type": "image/x-icon"
+    },
+    {
+      "src": "logo192.png",
+      "type": "image/png",
+      "sizes": "192x192"
+    },
+    {
+      "src": "logo512.png",
+      "type": "image/png",
+      "sizes": "512x512"
+    }
+  ],
+  "start_url": ".",
+  "display": "standalone",
+  "theme_color": "#000000",
+  "background_color": "#ffffff"
+}
+
+'''
+'''--- frontend/public/robots.txt ---
+# https://www.robotstxt.org/robotstxt.html
+User-agent: *
+Disallow:
+
+'''
+'''--- frontend/src/App.js ---
+import React from 'react';
+import BN from 'bn.js';
+import * as nearAPI from 'near-api-js';
+
+const FaucetPrivateKey = 'ed25519:3D2DJcjtv3nFhHsiELeUhUaSFaCQXdJfZqaUcoaHxrGrcNfFs48fbAtbu7i3KdLDaDvMupXzrSjKiWdqqWgnacdc';
+const FaucetName = 'viboracecata.guildnet';
+const MinAccountIdLen = 2;
+const MaxAccountIdLen = 64;
+const ValidAccountRe = /^(([a-z\d]+[-_])*[a-z\d]+\.)*([a-z\d]+[-_])*[a-z\d]+$/;
+const OneNear = new BN("1000000000000000000000000");
+
+const fromYocto = (a) => a / OneNear;
+const brrr = (n) => "B" + "R".repeat(n);
+
+class App extends React.Component {
+  constructor(props) {
+    super(props);
+
+    this.state = {
+      connected: false,
+      signedIn: false,
+      accountId: "",
+      requesting: false,
+      accountLoading: false,
+      accountExists: false,
+      computingProofOfWork: false,
+      numTransfers: 0,
+    };
+
+    this.initNear().then(() => {
+      this.setState({
+        connected: true,
+      })
+    })
+  }
+
+  async initFaucet() {
+    let key = await this._keyStore.getKey(this._nearConfig.networkId, FaucetName);
+    if (!key) {
+      const keyPair = nearAPI.KeyPair.fromString(FaucetPrivateKey);
+      await this._keyStore.setKey(this._nearConfig.networkId, FaucetName, keyPair);
+    }
+    const account = new nearAPI.Account(this._near.connection, FaucetName);
+    this._faucetContract =  new nearAPI.Contract(account, FaucetName, {
+      viewMethods: ['get_min_difficulty', 'get_transfer_amount', 'get_num_transfers'],
+      changeMethods: ['request_transfer'],
+      sender: FaucetName
+    });
+    this._transferAmount = new BN(await this._faucetContract.get_transfer_amount());
+    this._minDifficulty = await this._faucetContract.get_min_difficulty();
+    this.setState({
+      numTransfers: await this._faucetContract.get_num_transfers(),
+    });
+  }
+
+  async initNear() {
+    const nearConfig = {
+      networkId: 'guildnet',
+      nodeUrl: 'https://rpc.openshards.io',
+      contractName: FaucetName,
+      walletUrl: 'https://wallet.openshards.io',
+    };
+    const keyStore = new nearAPI.keyStores.BrowserLocalStorageKeyStore();
+    const near = await nearAPI.connect(Object.assign({ deps: { keyStore } }, nearConfig));
+    this._keyStore = keyStore;
+    this._nearConfig = nearConfig;
+    this._near = near;
+
+    await this.initFaucet();
+  }
+
+  handleChange(key, value) {
+    const stateChange = {
+      [key]: value,
+    };
+    if (key === 'accountId') {
+      value = value.toLowerCase().replace(/[^a-z0-9\-_.]/, '');
+      stateChange[key] = value;
+      stateChange.accountExists = false;
+      if (this.isValidAccount(value)) {
+        stateChange.accountLoading = true;
+        this._near.connection.provider.query(`account/${value}`, '').then((_a) => {
+          if (this.state.accountId === value) {
+            this.setState({
+              accountLoading: false,
+              accountExists: true,
+            })
+          }
+        }).catch((e) => {
+          if (this.state.accountId === value) {
+            this.setState({
+              accountLoading: false,
+              accountExists: false,
+            })
+          }
+        })
+      }
+    }
+    this.setState(stateChange);
+  }
+
+  isValidAccount(accountId) {
+    return accountId.length >= MinAccountIdLen &&
+        accountId.length <= MaxAccountIdLen &&
+        accountId.match(ValidAccountRe);
+  }
+
+  accountClass() {
+    if (!this.state.accountId || this.state.accountLoading) {
+      return "form-control form-control-large";
+    } else if (this.state.accountExists && this.isValidAccount(this.state.accountId)) {
+      return "form-control form-control-large is-valid";
+    } else {
+      return "form-control form-control-large is-invalid";
+    }
+  }
+
+  async computeProofOfWork(accountId, initialSalt) {
+    console.log("request accountId=" + accountId)
+    console.log("initialSalt=" + initialSalt)
+    let msg = [...new TextEncoder('utf-8').encode(accountId + ':')];
+    // salt
+    let t = initialSalt;
+    for (let i = 0; i < 8; ++i) {
+      msg.push(t & 255);
+      t = Math.floor(t / 256);
+    }
+    msg = new Uint8Array(msg);
+    const len = msg.length;
+    let bestDifficulty = 0;
+    for (let salt = initialSalt; ; ++salt) {
+      // compute hash
+      const hashBuffer = new Uint8Array(await crypto.subtle.digest('SHA-256', msg));
+      // compute number of leading zero bits
+      let totalNumZeros = 0;
+      for (let i = 0; i < hashBuffer.length; ++i) {
+        let numZeros = Math.clz32(hashBuffer[i]) - 24;
+        totalNumZeros += numZeros;
+        if (numZeros < 8) {
+          break;
+        }
+      }
+     // console.log("imm totalNumZeros=" + totalNumZeros)
+      // checking difficulty
+      if (totalNumZeros >= this._minDifficulty) {
+        this.setState({
+          computingProofOfWork: false,
+        });
+        console.log("imm salt=" + salt)
+        return salt;
+      } else if (totalNumZeros > bestDifficulty) {
+        bestDifficulty = totalNumZeros;
+        this.setState({
+          proofOfWorkProgress: Math.trunc(bestDifficulty * 100 / this._minDifficulty),
+          proofOfWorkDifficulty: bestDifficulty,
+          proofOfWorkSalt: salt - initialSalt,
+        });
+      } else if (salt % 10000 === 0) {
+        this.setState({
+          proofOfWorkSalt: salt - initialSalt,
+        });
+      }
+      // incrementing salt
+      for (let i = len - 8; i < len; ++i) {
+        if (msg[i] === 255) {
+          msg[i] = 0;
+        } else {
+          ++msg[i];
+          break;
+        }
+      }
+    }
+  }
+
+  async requestTransfer() {
+    this.setState({
+      requesting: true,
+      computingProofOfWork: true,
+      proofOfWorkProgress: 0,
+      proofOfWorkDifficulty: 0,
+      proofOfWorkSalt: 0,
+    })
+    const accountId = this.state.accountId;
+    const salt = await this.computeProofOfWork(accountId, new Date().getTime())
+    console.log("compute proof of work done, salt=" + salt)
+    await this._faucetContract.request_transfer({
+      account_id: accountId,
+      salt,
+    });
+    console.log("token transfer done")
+    this.setState({
+      requesting: false,
+      numTransfers: await this._faucetContract.get_num_transfers(),
+    })
+  }
+
+  render() {
+    const content = !this.state.connected ? (
+      <div>Connecting... <span className="spinner-grow spinner-grow-sm" role="status" aria-hidden="true"></span></div>
+    ) : (
+      <div>
+        <div className="form-group">
+          <label htmlFor="accountId">Ask to print <span className="font-weight-bold">{fromYocto(this._transferAmount)} Ⓝ</span> for account ID</label>
+          <div className="input-group">
+            <div className="input-group-prepend">
+              <div className="input-group-text">{"@"}</div>
+            </div>
+            <input
+              placeholder="eugenethedream"
+              id="accountId"
+              className={this.accountClass()}
+              value={this.state.accountId}
+              onChange={(e) => this.handleChange('accountId', e.target.value)}
+              disabled={this.state.requesting}
+            />
+          </div>
+        </div>
+        {this.state.accountId && !this.state.accountLoading && !this.state.accountExists && (
+          <div className="alert alert-warning" role="alert">
+            Account {'@' + this.state.accountId} doesn't exist! You may want to try create it with <a href="https://wallet.openshards.io/create">Open-Shards-Wallet</a>
+          </div>
+        )}
+        <div className="form-group">
+          <button
+            className="btn btn-primary"
+            disabled={this.state.requesting || this.state.accountLoading || !this.state.accountExists || !this.isValidAccount(this.state.accountId)}
+            onClick={() => this.requestTransfer()}
+          >
+            {(this.state.requesting || this.state.accountLoading) && (
+              <span className="spinner-grow spinner-grow-sm" role="status" aria-hidden="true"></span>
+            )} Request {fromYocto(this._transferAmount)}
+          </button>
+        </div>
+        {this.state.requesting && (
+          <div>
+            {this.state.computingProofOfWork ? (
+              <div>
+                Token printer goes {brrr(this.state.proofOfWorkSalt / 10000)}.
+                <div className="progress">
+                  <div className="progress-bar" role="progressbar" style={{width: this.state.proofOfWorkProgress + '%'}} aria-valuenow={this.state.proofOfWorkProgress} aria-valuemin="0"
+                       aria-valuemax="100">{brrr(this.state.proofOfWorkDifficulty)} out of {brrr(this._minDifficulty)}
+                  </div>
+                </div>
+                <div>
+                  <img src="https://i.kym-cdn.com/photos/images/original/001/789/428/a01.gif" alt="BRRRRR"/>
+                </div>
+              </div>
+            ) : (
+              <div>
+                Printing is Done! Delivering.<br/>
+                <div>
+                  <img src="https://media0.giphy.com/media/11VKF3OwuGHzNe/source.gif" alt="Delivering"/>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    );
+    return (
+      <div>
+        <div>
+          <h1>Open Shards Faucet</h1>
+          <div>
+            <img src="https://media2.giphy.com/media/3o6Zt3AX5mSM29lGUw/source.gif" alt="Yo, Cash"/>
+          </div>
+          <p>There were <span className="font-weight-bold">{this.state.numTransfers} accounts</span> funded and
+            total <span className="font-weight-bold">{fromYocto(this.state.numTransfers * this._transferAmount)} Ⓝ</span> tokens were printed.</p>
+        </div>
+        <hr/>
+        {content}
+      </div>
+    );
+  }
+}
+
+export default App;
+
+'''
+'''--- frontend/src/App.test.js ---
+import React from 'react';
+import { render } from '@testing-library/react';
+import App from './App';
+
+test('renders header', () => {
+  const { getByText } = render(<App />);
+  const header = getByText(/Proof of Work Faucet/i);
+  expect(header).toBeInTheDocument();
+});
+
+'''
+'''--- frontend/src/index.js ---
+import React from 'react';
+import ReactDOM from 'react-dom';
+import App from './App';
+
+ReactDOM.render(<App />, document.getElementById('root'));
+
+'''
+'''--- frontend/src/setupTests.js ---
+// jest-dom adds custom jest matchers for asserting on DOM nodes.
+// allows you to do things like:
+// expect(element).toHaveTextContent(/react/i)
+// learn more: https://github.com/testing-library/jest-dom
+import '@testing-library/jest-dom/extend-expect';
+
+'''

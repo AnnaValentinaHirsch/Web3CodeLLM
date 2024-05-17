@@ -1,0 +1,82 @@
+Why doesn’t NEAR just replicate Ethereum Serenity design?
+DEVELOPERS
+November 7, 2018
+NEAR Protocol builds a sharded public blockchain that executes smart contracts on a WASM virtual machine. If this sounds like Ethereum 2.0 (aka Serenity), it’s because they actually are very similar. However, based on Serenity’s multi-year roadmap, we believe that with our team and focus, we can deliver significantly faster.
+
+Despite the release not being around the corner, Serenity’s specification is mostly available. As of time of this writing (November 6th, 2018), the spec for the beacon chain is complete, and the spec for the shard chains, while not published yet, is mostly finalized (in the absence of the official spec, I have a rather detailed blog post that describes the design for Ethereum 2.0 shard chains). This blog post also contains some details of the Ethereum’s beacon chain design that are not immediately obvious from the specification, that I learned from an in-depth conversation with Vitalik.
+
+NEAR differs from Serenity in several aspects. Most notably, NEAR uses different consensus algorithms and fork choice rules in both the beacon chain and the shard chains. Given the extensive experience that Ethereum researchers have, strong motivations are required to validate such decisions.
+
+In this post, I will describe the differences between the two protocols and motivations on why we use our own consensus algorithms and fork choice rules rather than those designed by the Ethereum team.
+
+The Beacon Chain
+It is highly desirable for the beacon chain not to have forks. In both Ethereum and NEAR, the beacon chains are responsible for selecting validators for shard chains and for snapshotting the state of the shard chains (the so-called cross-linking), with both processes relying on the beacon chain not having forks.
+
+BFT consensus tradeoffs
+Achieving zero forkfulness is highly challenging. The majority of modern BFT consensus algorithms do not scale beyond 1000 participants, while the permissionless blockchain networks are expected to scale to millions or possibly billions of people. Therefore, consensus on each block has to be reached by a number of participants that is significantly smaller than the total number of participants in the system. It can be done in two somewhat similar but fundamentally different ways (assuming a proof-of-stake sybil resistance mechanism exists):
+
+Make the stake for becoming a consensus participant (“validator”) so high that only on the order of 1000 participants can participate. Generally, that would be six digit numbers in the US dollars equivalent per validator. In this approach, a fork in the blockchain would result in millions or dozens of millions of dollars slashed. Even if a fork does occur, it will be a significant event, with consequences that are likely to result in a hard fork with some mitigation of the damage. For all practical reasons, such a system can be assumed to have zero forkfulness. It is arguable, however, whether such a system is decentralized. People capable of staking such sums of money within a particular blockchain ecosystem tend to know each other, meaning that the security of the system will be in the hands of a tight-knit group of people. It can result in all sorts of non-slashable misbehavior such as censoring, stalling, etc.
+Make the stake for becoming a validator low, and randomly select 1000 validators to create blocks. A new set of validators can be selected for each block, or rotated every few blocks. Assuming that the total number of malicious actors in the system is substantially less than ⅓, the probability of more than ⅓ corrupted validators appearing in a sample is very low. The problem with this approach is that the validators can be corrupted after they are selected (see this blog post with some further analysis). Corrupting a sufficient percentage of a shard is extremely hard, but not impossible. Therefore, a system that uses such an approach cannot rely on the absence of forks.
+Footnote: For example, Algorand, that claims to never have forks, uses the latter approach. When answering a direct question about bribing validators, Silvio Micali responded that Algorand assumes that less than 50% of all the validators are corruptible. It is not only an unreasonable assumption but also in my opinion invalidates some of the other Algorand declared properties.
+
+In essence, the design decision comes down to some compromise between centralization and forkfulness. An early design of Casper heavily favored centralization (see this link with a deprecated design, in particular MIN_DEPOSIT_SIZE being set to 1500 ETH). In the present designs NEAR favors forkfulness, while Ethereum’s Casper builds a consensus algorithm that scales to hundreds of thousands of validators, thus avoiding the compromise altogether. The pros and cons of both and why we do not use Casper are as follows.
+
+NEAR’s approach
+NEAR’s approach with Thresholded Proof of Stake and a flavor of TxFlow (our custom consensus) favor forkfulness.
+
+With our current constants, each block is backed by approximately 0.1% of all the stake in the system. Thus, assuming the same valuation as Ethereum’s today ($20B) and 5% of all the tokens staked for validation, the cost of corrupting 50% of one block’s validators is around ~$0.5M, which is significantly less than the cost of corrupting the entire system.
+
+Importantly, however, while for each block (produced once a minute) the probability of a fork is not negligible, the probability of reverting a large sequence of blocks is very low. Within one day, the validators (in terms of tokens staked) for each block do not intersect, so the number of tokens slashed to revert a tail of X blocks is linear in X. In particular, reverting all the blocks produced in one day would result in at least ⅓ of the total stake of all validators slashed.
+
+Ethereum’s approach
+Despite the fact that the beacon chain spec is published, the exact details of how the validation on the beacon chain is done and which subset of validators finalizes the blocks is not easy to derive from the spec. I had an in-depth conversation with Vitalik to better understand the current design.
+
+To become a validator in Ethereum, it is sufficient to stake 32ETH. The number of validators is capped at approximately 4 million, but the expected value in practice should be around 400K. Shards sample committees from those validators, but on the beacon chain, all validators attest to each block, and all validators participate in Casper (see my blog post for the overview of the shard chains in Ethereum, and an overview of proposing and attesting; from now, I assume the reader is familiar with those concepts).
+
+The attestations on the beacon chain serve multiple purposes, two that are relevant for us are:
+
+The attestations are used for the LMD (latest-message driven) fork choice rule that is used for blocks produced since the last block finalized by Casper;
+The attestations are reused for Casper finalization itself (see the Casper FFG paper).
+Unlike the previous proposals, all the ~400K validators rather than a sample participate in each Casper finalization. LMD still relies on samples of 1/64 of all the validators.
+
+Update: make sure to read Vitalik’s response here, where he provides more details and clarifications.
+
+The blocks on the beacon chain are produced every 16 seconds (increased from 8 seconds in a recent spec update), and Casper finalization happens every 100 blocks. This effectively means that every 16 seconds, 400K/64 participants create a multisignature on a block, and every ~26 minutes all 400K participants reach a byzantine consensus on a block.
+
+Both sending 400K signatures over network and aggregating them is expensive. To make it feasible, the validators are split into committees. Assuming 400K participants, each committee consists of 4096 participants (with 1024 total committees). Each committee aggregates the BLS signature internally, and propagates it up to the whole validators set, where only the resulting combined signatures from the committees are aggregated into the final BLS signature. The validation of a BLS signature is rather cheap, along with computing an aggregated public key for the 400K validators. I personally estimate the most expensive part will be validating 4K signatures within each committee, but according to Vitalik that should be doable in a couple seconds.
+
+Comparison
+While Casper FFG, in practice, indeed provides almost zero forkfulness, there are a few reasons why we chose our consensus instead of adopting Casper FFG:
+
+In Ethereum, the underlying block production mechanism relies on synchronized clocks; I will discuss problems with this reliance below when talk about shard chains;
+Casper only finalizes blocks every 26 minutes. Blocks between such finalizations can theoretically have forks — the attestations do not provide theoretical guarantees, and even with ⅔ attestations on a block and less than ⅓ of malicious actors a block could be reverted;
+Besides those reasons, NEAR aims to enable network operators to run nodes on mobile phones. To fully leverage the benefits of linear scalability that sharding provides, a blockchain network needs to have significantly more participating nodes than there are in any blockchain network existing today, and the ability to run nodes on (high end) mobile phones taps into a pool of hundreds of millions of devices. With Thresholded Proof of Stake, a participant on the beacon chain only needs to participate in a cheap consensus once per stake per day, while with Ethereum’s approach one would need to be constantly online, participating in heavy computations (validating thousands of BLS signatures every few seconds). Ethereum doesn’t target mobile devices as operating nodes, so for them, such a decision makes sense.
+
+It is also important to note that the majority of participants on Ethereum will stake significantly more than 32ETH, and will thus participate in multiple committees, which might create some bottleneck on networking (a participant that staked 32000 ETH and thus participates in ~1000 committees will have to receive around 1000 x 4096 signatures every 16 seconds).
+
+Overall, the main consideration for NEAR is the ability to run on low end devices, so we chose simpler and cheaper BFT consensus with small committees instead of running a consensus among all the validators. As a result, the beacon chain in NEAR Protocol can in theory have forks, and the rest of the system is designed to work without assuming that the beacon chain has zero forkfulness.
+
+The Shard Chains
+NEAR uses its own consensus called TxFlow for shard chains, while Ethereum 2.0 uses the proposers / attesters framework. While TxFlow provides byzantine fault-tolerant consensus under the assumption that less than ⅓ of nodes are malicious in each shard, such an assumption is completely unreasonable for a shard chain, for reasons discussed above.
+
+With that assumption removed, TxFlow and Attestations have very similar properties: blocks are produced relatively quickly, and the probability of forks is reasonably small under normal operation. The major drawback of TxFlow is that it stalls if more than ⅓ of the participants are offline. Ethereum maintains liveness with any number of validators dropping out (though the speed of block production linearly degrades with fewer participants online).
+
+On the other hand, Ethereum shard chains depend crucially on participants having synchronized clocks. The blocks are produced at a regular schedule (one every 8 seconds), and for the system to make progress, the clocks need to be synchronized with an accuracy of a few seconds. I personally do not believe that such synchronization is possible without depending on centralized time servers that become a single point of failure for the system. Also, the security analysis of possible timing attacks when there’s a dependency on a clock appears to be extremely complex.
+
+At NEAR, we have a principled position to not have any dependency on synchronized clocks, and thus cannot use the proposers/attesters framework for the shard chains.
+
+It is also worth mentioning that we are actively researching ways to adjust TxFlow in such a way that it maintains liveness when fewer than ⅔ of validators are online (naturally at an expense of higher forkfulness under such circumstances).
+
+Outro
+When designing complex sharded blockchains, many design decisions come down to choosing from multiple suboptimal solutions, such as choosing between centralization and forkfulness in the beacon chain.
+
+We are working closely with Ethereum Foundation on sharding research, and both teams are aware of the pros and cons of different approaches. In this blog post I presented our thinking behind the decisions that differ in our design from Ethereum Serenity.
+
+If you want to stay up to date with what we build at NEAR, use the following channels:
+
+Twitter — https://twitter.com/nearprotocol,
+Discord — https://discord.gg/kRY6AFp, we have open conversations on tech, governance and economics of blockchain on our discord.
+Our recently launched research forum — http://research.nearprotocol.com/
+https://upscri.be/633436/
+
+Huge thanks to Vitalik Buterin for providing detailed explanation on how the beacon chain in Ethereum Serenity works.

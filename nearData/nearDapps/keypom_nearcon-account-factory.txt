@@ -1,0 +1,2906 @@
+*GitHub Repository "keypom/nearcon-account-factory"*
+
+'''--- .eslintrc.js ---
+module.exports = {
+	parserOptions: {
+		ecmaVersion: 2020,
+        sourceType: 'module',
+        ecmaFeatures: {
+            jsx: true,
+        }
+    },
+	rules: {
+        semi: [2, 'always'],
+        indent: [2, 'tab'],
+	}
+};
+
+'''
+'''--- README.md ---
+# Keypom Accounts
+
+## 
+
+## Account Factory
+
+`create_account`: 
+- Creates sub-account with name that starts off with $NEAR equal to state's `starting_near_balance` and Fungible Tokens equal to `starting_ncon_balance`.
+
+The account has a contract deployed to it equal to `TRIAL_CONTRACT` and 
+
+'''
+'''--- __tests__/create-tix.js ---
+const path = require("path");
+const homedir = require("os").homedir();
+const { KeyPair } = require("@near-js/crypto");
+const { createHash } = require("crypto");
+const { readFileSync } = require('fs');
+const { writeFile, mkdir, readFile } = require('fs/promises');
+const { UnencryptedFileSystemKeyStore } = require("@near-js/keystores-node");
+const { Account } = require('@near-js/accounts');
+const { connect, Near } = require("@near-js/wallet-account");
+const { parseNearAmount } = require('@near-js/utils');
+
+const NETWORK_ID = 'testnet';
+
+const funderAccountId = 'benjiman.testnet';
+const mintbaseContract = "keypom.market.mintspace2.testnet";
+const nearconFactory = "keypom-factory.keypom.testnet";
+const keypomContract = "nearcon2023.keypom.testnet";
+
+const originalTicketOwner = "benjiman.testnet";
+const createDrop = false;
+const numKeys = 10;
+const numOwners = 0;
+
+const baseUrl = "https://test.near.org/nearpad.testnet/widget/Index?tab=ticket";
+const dropId = "nearcon2023";
+let basePassword = "nearcon2023-password";
+
+const main = async () => {
+    // Initiate connection to the NEAR blockchain.
+    const CREDENTIALS_DIR = '.near-credentials';
+    const credentialsPath =  path.join(homedir, CREDENTIALS_DIR);
+
+    let keyStore = new UnencryptedFileSystemKeyStore(credentialsPath);  
+
+    let nearConfig = {
+        networkId: NETWORK_ID,
+        keyStore: keyStore,
+        nodeUrl: `https://rpc.${NETWORK_ID}.near.org`,
+        walletUrl: `https://wallet.${NETWORK_ID}.near.org`,
+        helperUrl: `https://helper.${NETWORK_ID}.near.org`,
+        explorerUrl: `https://explorer.${NETWORK_ID}.near.org`,
+    };  
+
+    let near = new Near(nearConfig);
+    const funderAccount = new Account(near.connection, funderAccountId);
+    console.log('funderAccount: ', funderAccount)
+    const keypomAccount = new Account(near.connection, keypomContract);
+    const nearconAccount = new Account(near.connection, nearconFactory);
+
+    await keypomAccount.functionCall({
+        contractId: mintbaseContract,
+        methodName: 'deposit_storage',
+        args: {},
+        gas: 300000000000000,
+        attachedDeposit: parseNearAmount("10")
+    })
+
+    let sellerKeys = await createNearconDrop({
+        createDrop,
+        funderAccount,
+        keypomAccount,
+        nearconAccount,
+        originalTicketOwner,
+        numKeys,
+        numOwners,
+      });
+
+      let stringToWrite = '';
+      // Loop through each secret key
+      var i = 0;
+      for (const sk of sellerKeys.keys) {
+          stringToWrite += `${baseUrl}&secretKey=${sk}&contractId=${keypomContract}` + '\n';
+          i++;
+      }
+  
+      await writeFile(path.resolve(__dirname, 'nearcon-keys.json'), stringToWrite);
+}
+
+const createNearconDrop = async ({
+    createDrop,
+    funderAccount,
+    keypomAccount,
+    nearconAccount,
+    originalTicketOwner,
+    numKeys,
+    numOwners
+  }) => {
+    let assetData = [
+      {uses: 1, assets: [null], config: {permissions: "claim"}}, // Password protected scan into the event
+      {uses: 1, assets: [null], config: {permissions: "create_account_and_claim", account_creation_keypom_args: {drop_id_field: "drop_id"}, root_account_id: nearconAccount.accountId}},
+        // Create their trial account, deposit their fungible tokens, deploy the contract & call setup
+    ];
+
+    if (createDrop == true) {
+      await funderAccount.functionCall({
+        contractId: keypomAccount.accountId,
+        methodName: 'create_drop',
+        args: {
+          drop_id: dropId,
+          key_data: [],
+          drop_config: {
+              delete_empty_drop: false,
+              extra_allowance_per_key: parseNearAmount("0.02").toString()
+          },
+          asset_data: assetData,
+          keep_excess_deposit: true
+        },
+        gas: 300000000000000,
+        attachedDeposit: parseNearAmount("100").toString()
+    });
+    }
+    
+  let keyData = {
+    keys: [],
+    publicKeys: []
+  };
+  // Loop through from 0 -> numKeys 50 at a time
+    for (let i = 0; i < numKeys; i += 50) {
+        let {keys, publicKeys} = await addKeys({
+            funderAccount,
+            keypomAccount,
+            originalTicketOwner,
+            numKeys: Math.min(numKeys - i, 50),
+            numOwners: Math.min(numOwners - i, 50),
+            dropId
+        })
+
+        keyData.keys = keyData.keys.concat(keys);
+        keyData.publicKeys = keyData.publicKeys.concat(publicKeys);
+    }
+    return keyData;
+}
+
+const addKeys = async ({
+  funderAccount,
+  keypomAccount,
+  originalTicketOwner,
+  numKeys,
+  numOwners,
+  dropId,
+}) => {
+  let { keys, publicKeys } = await generateKeyPairs(numKeys);
+  let keyData = [];
+  
+  let idx = 0;
+  for (var pk of publicKeys) {
+    let password_by_use = generatePasswordsForKey(pk, [1], basePassword);
+    keyData.push({
+      public_key: pk,
+      password_by_use,
+      key_owner: idx < numOwners ? originalTicketOwner.accountId : null,
+    });
+    idx += 1;
+  }
+
+  await funderAccount.functionCall({
+    contractId: keypomAccount.accountId,
+    methodName: 'add_keys',
+    args: {
+      drop_id: dropId,
+      key_data: keyData,
+    },
+    gas: 300000000000000,
+    attachedDeposit: parseNearAmount("20").toString()
+  });
+
+  return { keys, publicKeys };
+};
+
+function hash(string, double = false) {
+  if (double) {
+    return createHash("sha256")
+      .update(Buffer.from(string, "hex"))
+      .digest("hex");
+  }
+
+  return createHash("sha256").update(Buffer.from(string)).digest("hex");
+}
+
+function generatePasswordsForKey(
+  pubKey,
+  usesWithPassword,
+  basePassword
+) {
+  let passwords = {};
+
+  // Loop through usesWithPassword
+  for (var use of usesWithPassword) {
+    passwords[use] = hash(hash(basePassword + pubKey + use.toString()), true);
+  }
+
+  return passwords;
+}
+
+async function generateKeyPairs(
+  numKeys
+ ) {
+  // Generate NumKeys public keys
+  let kps = [];
+  let pks = [];
+  for (let i = 0; i < numKeys; i++) {
+    let keyPair = await KeyPair.fromRandom("ed25519");
+    kps.push(keyPair);
+    pks.push(keyPair.getPublicKey().toString());
+  }
+  return {
+    keys: kps,
+    publicKeys: pks,
+  };
+}
+
+main()
+'''
+'''--- __tests__/nearcon-keys.json ---
+https://test.near.org/nearpad.testnet/widget/Index?tab=ticket&secretKey=ed25519:4vaNpEd7j4ZjdSHjuvrYJgJ9fPm8mw11Txr56WN8S8ArwAweaqAtSEGDWRHP5Ux9TMwpNjoKBz7eu829eac2CYiB&contractId=nearcon2023.keypom.testnet
+https://test.near.org/nearpad.testnet/widget/Index?tab=ticket&secretKey=ed25519:2Gr3Q8pwz7cbavqKy21wpgYwiLPnBiYBnpFsGoUxAygGYrG5HSvxUocGaNMKkj5wPKizfWA4yaBSdBiKaKrDcrVm&contractId=nearcon2023.keypom.testnet
+https://test.near.org/nearpad.testnet/widget/Index?tab=ticket&secretKey=ed25519:2bbTJhBzEBGDRWU2TeqtqFd8aP7FhrsfZpa3gcCAMNw7UkgMCAfiznc1DnJkdrnKoiJYsegZ9Em4WHCKqmb9tRP&contractId=nearcon2023.keypom.testnet
+https://test.near.org/nearpad.testnet/widget/Index?tab=ticket&secretKey=ed25519:43LXW4ejFcaMpUffuEVTUpcpzc4QLbzjsAKXFbU8knCmgxbkq9QF3YwNh8HVADQZt8s8e32FiH4W5v9bchGR9bPq&contractId=nearcon2023.keypom.testnet
+https://test.near.org/nearpad.testnet/widget/Index?tab=ticket&secretKey=ed25519:34Firjs8pwLbKgrwT31Avo9R5j2LLP3pBPPXuWRnKFybFJxmnu9zPvsypSjeYyLRD52gmAHsxfzumYJvxMiZXjfh&contractId=nearcon2023.keypom.testnet
+https://test.near.org/nearpad.testnet/widget/Index?tab=ticket&secretKey=ed25519:3M1pievnYVtEasPy6tntPXQoWRWn5CLP6ebZJkcw2ZbWNXyESMj2KiLLLimQGUA9mUAGicVBr45yacjbsWGT1h8N&contractId=nearcon2023.keypom.testnet
+https://test.near.org/nearpad.testnet/widget/Index?tab=ticket&secretKey=ed25519:5UdDUUynQ8Ke5X2LmxXEbkn4RdcyX2vrqCCUA4o2jRNVRyB3GMFCZgTZYwQDw7wEJjUJhdAQPChN5Bi5aJqchPVR&contractId=nearcon2023.keypom.testnet
+https://test.near.org/nearpad.testnet/widget/Index?tab=ticket&secretKey=ed25519:2t4Yi5qqYPUAcVNQxbwHiysasybWzfzMzERe6MAd7S7r1NJMuxkTskdwsNTysvwWmwSesmG8q9qd7sJopqqzrs8Y&contractId=nearcon2023.keypom.testnet
+https://test.near.org/nearpad.testnet/widget/Index?tab=ticket&secretKey=ed25519:2z3tbU8fDZd1MbhEZ3GzZGh6sUWtQDibFhHZJHLoJvtusqXnbJEWaoHcAV6TTEzZgsufY8tomzf2Hivpb1KJ93zg&contractId=nearcon2023.keypom.testnet
+https://test.near.org/nearpad.testnet/widget/Index?tab=ticket&secretKey=ed25519:5jyaUeDvSLMhc3CwAxTefwzpEio9hkqJ2p2mJ3Ea9n6NJmqHMzike7ZPWUq3D5efE3rG7HaH4bPH2VZcWpRQMapK&contractId=nearcon2023.keypom.testnet
+
+'''
+'''--- __tests__/nearcon/nearcon.ava.ts ---
+import anyTest, { TestFn } from "ava";
+import { NEAR, NearAccount, Worker } from "near-workspaces";
+import {
+  CONTRACT_METADATA,
+  claimAndAssertAccountCreated,
+  claimWithRequiredGas,
+  generateKeyPairs,
+  generatePasswordsForKey,
+  hash,
+} from "../utils/keypom";
+import { functionCall } from "../utils/workspaces";
+import { createNearconDrop, sellNFT } from "./utils";
+import {
+  ExtDrop,
+  ExtKeyInfo,
+  ExtNFTKey,
+  ListingJson,
+  TrialRules,
+} from "../utils/types";
+
+const test = anyTest as TestFn<{
+  worker: Worker;
+  accounts: Record<string, NearAccount>;
+}>;
+
+test.beforeEach(async (t) => {
+  console.log("Starting test");
+  // Init the worker and start a Sandbox server
+  const worker = await Worker.init();
+
+  // Prepare sandbox for tests, create accounts, deploy contracts, etc.
+  const root = worker.rootAccount;
+
+  const keypom = await root.createSubAccount("keypom");
+  await keypom.deploy(`./__tests__/ext-wasm/keypom.wasm`);
+  console.log("Deployed Keypom");
+  
+  const mintbase = await root.createSubAccount("mintbase");
+  await mintbase.deploy(`./__tests__/ext-wasm/mintbase-new.wasm`);
+  console.log("Deployed Mintbase");
+
+  const nearcon = await root.createSubAccount("nearcon");
+  await nearcon.deploy(`./out/factory.wasm`);
+  console.log("Deployed Nearcon");
+
+  // Init empty/default linkdrop contract
+  await keypom.call(keypom, "new", {
+    root_account: "test.near",
+    owner_id: keypom,
+    contract_metadata: CONTRACT_METADATA,
+  });
+  await mintbase.call(mintbase, "init", {
+    owner: mintbase,
+    mintbase_cut: 0,
+    fallback_cut: 0,
+    listing_lock_seconds: "0",
+    keypom_contract_root: keypom.accountId,
+  });
+  await nearcon.call(nearcon, "new", {
+    allowed_drop_id: "nearcon-drop",
+    keypom_contract: keypom.accountId,
+    starting_ncon_balance: NEAR.parse("1").toString(),
+    starting_near_balance: NEAR.parse("1").toString(),
+  });
+  console.log("Initialized contracts");
+
+  await keypom.call(
+    mintbase,
+    "deposit_storage",
+    {},
+    { attachedDeposit: NEAR.parse("10").toString() }
+  );
+
+  // Test users
+  const funder = await root.createSubAccount("funder");
+  const originalTicketOwner = await root.createSubAccount("og-ticket-owner");
+  const newTicketBuyer = await root.createSubAccount("new-ticket-buyer");
+
+  // Add 10k $NEAR to owner's account
+  await funder.updateAccount({
+    amount: NEAR.parse("10000 N").toString(),
+  });
+  await funder.call(
+    keypom,
+    "add_to_balance",
+    {},
+    { attachedDeposit: NEAR.parse("5000").toString() }
+  );
+
+  // Save state for test runs
+  t.context.worker = worker;
+  t.context.accounts = {
+    root,
+    keypom,
+    nearcon,
+    funder,
+    newTicketBuyer,
+    originalTicketOwner,
+    mintbase,
+  };
+});
+
+// If the environment is reused, use test.after to replace test.afterEach
+test.afterEach(async (t) => {
+  await t.context.worker.tearDown().catch((error) => {
+    console.log("Failed to tear down the worker:", error);
+  });
+});
+
+// test("Journey 3: New to NEAR Purchases & Sells on Secondary Marketplace", async (t) => {
+//   const {
+//     keypom,
+//     funder,
+//     nearcon,
+//     newTicketBuyer,
+//     originalTicketOwner,
+//     root,
+//     mintbase,
+//   } = t.context.accounts;
+//   let sellerKeys = await createNearconDrop({
+//     funder,
+//     keypom,
+//     nearcon,
+//     originalTicketOwner,
+//     numKeys: 1,
+//     numOwners: 0,
+//   });
+
+//   let nfts: Array<ExtNFTKey> = await keypom.view("nft_tokens");
+//   console.log("nfts: ", nfts);
+//   t.is(nfts.length, 1);
+//   t.is(nfts[0].owner_id, keypom.accountId);
+
+//   const buyerKeys = await generateKeyPairs(1);
+//   await sellNFT({
+//     t,
+//     keypom,
+//     mintbase,
+//     seller: keypom,
+//     buyer: newTicketBuyer,
+//     sellerKeys,
+//     buyerKeys,
+//     tokenId: `nearcon-drop:0`,
+//   });
+
+//   // Now that the key was bought, a new $NEAR drop should have been created
+//   nfts = await keypom.view("nft_tokens");
+//   console.log("nfts: ", nfts);
+//   t.is(nfts.length, 2);
+
+//   // Claim seller key and create new account
+//   let newAccountId = `benji.${root.accountId}`;
+//   await claimWithRequiredGas({
+//     keypom,
+//     root,
+//     keyPair: sellerKeys.keys[0],
+//     receiverId: newAccountId,
+//     createAccount: true,
+//     useLongAccount: false,
+//     useImplicitAccount: false,
+//     shouldPanic: false,
+//   });
+//   try {
+//     const keyInfo = await keypom.view("get_key_information", {
+//       key: sellerKeys.publicKeys[0],
+//     });
+//     t.fail();
+//   } catch (e) {
+//     t.pass();
+//   }
+
+//   await claimWithRequiredGas({
+//     keypom,
+//     root: keypom,
+//     keyPair: buyerKeys.keys[0],
+//     receiverId: "foo",
+//     password: hash("nearcon23-password" + `0` + "1"),
+//     shouldPanic: false,
+//   });
+
+//   await claimAndAssertAccountCreated({
+//     t,
+//     keypom,
+//     nearcon,
+//     keyPair: buyerKeys.keys[0],
+//   });
+
+//   nfts = await keypom.view("nft_tokens");
+//   console.log("nfts: ", nfts);
+//   t.is(nfts.length, 0);
+// });
+
+// test("Journey 2: Crypto Native Purchases & Attends Conference", async (t) => {
+//   const {
+//     keypom,
+//     funder,
+//     nearcon,
+//     newTicketBuyer,
+//     originalTicketOwner,
+//     root,
+//     mintbase,
+//   } = t.context.accounts;
+//   let { keys, publicKeys } = await createNearconDrop({
+//     funder,
+//     keypom,
+//     nearcon,
+//     originalTicketOwner,
+//     numKeys: 1,
+//     numOwners: 1,
+//   });
+
+//   let nfts: Array<ExtNFTKey> = await keypom.view("nft_tokens");
+//   console.log("nfts: ", nfts);
+//   t.is(nfts.length, 1);
+//   t.is(nfts[0].owner_id, originalTicketOwner.accountId);
+
+//   // This should panic because no password is passed in
+//   await claimWithRequiredGas({
+//     keypom,
+//     root: keypom,
+//     keyPair: keys[0],
+//     receiverId: "foo",
+//     shouldPanic: true,
+//   });
+
+//   // This should pass because the password is correct
+//   await claimWithRequiredGas({
+//     keypom,
+//     root: keypom,
+//     keyPair: keys[0],
+//     receiverId: "foo",
+//     password: hash("nearcon23-password" + `0` + "1"),
+//     shouldPanic: false,
+//   });
+
+//   let keyInfo: ExtKeyInfo = await keypom.view("get_key_information", {
+//     key: publicKeys[0],
+//   });
+//   console.log("keyInfo: ", keyInfo);
+//   t.is(keyInfo.uses_remaining, 1);
+
+//   await claimAndAssertAccountCreated({
+//     t,
+//     keypom,
+//     nearcon,
+//     keyPair: keys[0],
+//   });
+
+//   nfts = await keypom.view("nft_tokens");
+//   console.log("nfts: ", nfts);
+//   t.is(nfts.length, 0);
+// });
+
+test("Journey 1: New to NEAR Purchases & Attends Conference", async (t) => {
+  const {
+    keypom,
+    funder,
+    nearcon,
+    newTicketBuyer,
+    originalTicketOwner,
+    root,
+    mintbase,
+  } = t.context.accounts;
+  let { keys, publicKeys } = await createNearconDrop({
+    funder,
+    keypom,
+    originalTicketOwner,
+    nearcon,
+    numKeys: 1,
+    numOwners: 0,
+  });
+
+  let nfts: Array<ExtNFTKey> = await keypom.view("nft_tokens");
+  console.log("nfts: ", nfts);
+  t.is(nfts.length, 1);
+  t.is(nfts[0].owner_id, keypom.accountId);
+
+  // This should panic because no password is passed in
+  await claimWithRequiredGas({
+    keypom,
+    root: keypom,
+    keyPair: keys[0],
+    receiverId: "foo",
+    shouldPanic: true,
+  });
+
+  // This should pass because the password is correct
+  await claimWithRequiredGas({
+    keypom,
+    root: keypom,
+    keyPair: keys[0],
+    receiverId: "foo",
+    password: hash("nearcon23-password" + `0` + "1"),
+    shouldPanic: false,
+  });
+
+  let keyInfo: ExtKeyInfo = await keypom.view("get_key_information", {
+    key: publicKeys[0],
+  });
+  console.log("keyInfo: ", keyInfo);
+  t.is(keyInfo.uses_remaining, 1);
+
+  await claimAndAssertAccountCreated({
+    t,
+    keypom,
+    nearcon,
+    keyPair: keys[0],
+  });
+  nfts = await keypom.view("nft_tokens");
+  console.log("nfts: ", nfts);
+  t.is(nfts.length, 0);
+});
+
+// test("Creating Lots of Keys & Claiming", async (t) => {
+//   const {
+//     keypom,
+//     funder,
+//     nearcon,
+//     newTicketBuyer,
+//     originalTicketOwner,
+//     root,
+//     mintbase,
+//   } = t.context.accounts;
+//   let { keys, publicKeys } = await createNearconDrop({
+//     funder,
+//     keypom,
+//     nearcon,
+//     originalTicketOwner,
+//     numKeys: 75,
+//     numOwners: 25,
+//   });
+
+//   let numNfts = await keypom.view("nft_total_supply");
+//   console.log("numNfts: ", numNfts);
+//   t.is(numNfts, "75");
+
+//   let nftsOwned = await keypom.view("nft_supply_for_owner", {
+//     account_id: originalTicketOwner.accountId,
+//   });
+//   console.log("nftsOwned: ", nftsOwned);
+//   t.is(nftsOwned, "25");
+
+//   // This should panic because no password is passed in
+//   await claimWithRequiredGas({
+//     keypom,
+//     root: keypom,
+//     keyPair: keys[0],
+//     receiverId: "foo",
+//     shouldPanic: true,
+//   });
+
+//   await claimWithRequiredGas({
+//     keypom,
+//     root: keypom,
+//     keyPair: keys[0],
+//     receiverId: "foo",
+//     password: hash("nearcon23-password" + `0` + "1"),
+//   });
+
+//   await claimAndAssertAccountCreated({
+//     t,
+//     keypom,
+//     nearcon,
+//     keyPair: keys[0],
+//   });
+// });
+
+'''
+'''--- __tests__/nearcon/utils.ts ---
+import { BN } from "bn.js";
+import { KeyPair, NEAR, NearAccount } from "near-workspaces";
+import { ExtDrop, ExtKeyInfo, ListingJson } from "../utils/types";
+import { addKeys, generateKeyPairs, generatePasswordsForKey, getKeyInformation } from "../utils/keypom";
+import { functionCall } from "../utils/workspaces";
+
+export const sellNFT = async ({
+    keypom, 
+    mintbase, 
+    seller, 
+    buyer, 
+    sellerKeys, 
+    buyerKeys, 
+    t, 
+    tokenId
+}: {
+    keypom: NearAccount;
+    mintbase: NearAccount;
+    seller: NearAccount;
+    buyer: NearAccount;
+    sellerKeys: { keys: KeyPair[]; publicKeys: string[] };
+    buyerKeys: { keys: KeyPair[]; publicKeys: string[] };
+    t: any;
+    tokenId: string;
+}) => {
+    await keypom.setKey(sellerKeys.keys[0]);
+    let new_mintbase_args = JSON.stringify({
+        price: NEAR.parse('1').toString(),
+        owner_pub_key: seller == keypom ? sellerKeys.publicKeys[0] : undefined
+    })
+    let nftApproveArgs = {account_id: mintbase.accountId, msg: new_mintbase_args}
+    console.log('nftApproveArgs: ', nftApproveArgs)
+    await keypom.call(keypom, 'nft_approve', nftApproveArgs);
+    let getListingArgs = {nft_contract_id: keypom.accountId, token_id: tokenId}
+    console.log('getListingArgs: ', getListingArgs)
+    let listing: ListingJson = await mintbase.view('get_listing', getListingArgs);
+    console.log('listing: ', listing)
+    t.assert(listing.nft_token_id === tokenId);
+    t.assert(listing.price === NEAR.parse('1').toString());
+    t.assert(listing.nft_owner_id === seller.accountId);
+    t.assert(listing.nft_contract_id === keypom.accountId);
+    t.assert(listing.currency === 'near');
+
+    /// Buyer purchases the key
+    await functionCall({
+        signer: buyer,
+        receiver: mintbase,
+        methodName: "buy",
+        args: {nft_contract_id: keypom.accountId, token_id: tokenId, new_pub_key: buyerKeys.publicKeys[0]},
+        attachedDeposit: NEAR.parse('1').toString(),
+        gas: '300000000000000',
+        shouldPanic: false,
+    });
+
+    // Now that buyer bought the key, his key should have the same allowance as what seller left off with and should have all remaining uses
+    let keyInfo = await getKeyInformation(keypom, buyerKeys.publicKeys[0]);
+    console.log('keyInfo after purchase: ', keyInfo)
+    t.is(keyInfo.owner_id, buyer.accountId);
+    t.is(keyInfo.uses_remaining, 2);
+
+    try {
+        // Seller should now have a simple $NEAR drop with 0.05 $NEAR less than the 1 $NEAR purchase price
+        let dropId = sellerKeys.publicKeys[0].split('ed25519:')[1];
+        let sellerNewDrop: ExtDrop = await keypom.view('get_drop_information', {drop_id: dropId});
+        console.log('sellerNewDrop: ', sellerNewDrop)
+        if (seller == keypom) {
+            t.is(sellerNewDrop.asset_data.length, 1);
+            t.is(sellerNewDrop.asset_data[0].uses, 1);
+
+            let sellerNewKey: ExtKeyInfo = await keypom.view('get_key_information', {key: sellerKeys.publicKeys[0]});
+            console.log('sellerNewKey: ', sellerNewKey)
+            t.is(sellerNewKey.uses_remaining, 1);
+            t.is(sellerNewKey.owner_id, keypom.accountId);
+            t.is(sellerNewKey.yoctonear, NEAR.parse('0.95').toString())
+        } else {
+            t.fail();
+        }
+    } catch(e) {
+        console.log('e: ', e)
+        seller == keypom ? t.fail() : t.pass();
+    }
+}
+
+export const createNearconDrop = async ({
+    funder,
+    keypom,
+    nearcon,
+    originalTicketOwner,
+    numKeys,
+    numOwners
+  }: {
+    funder: NearAccount;
+    keypom: NearAccount;
+    nearcon: NearAccount;
+    originalTicketOwner: NearAccount;
+    numKeys: number;
+    numOwners: number;
+  }): Promise<{ keys: KeyPair[]; publicKeys: string[] }> => {
+    const dropId = "nearcon-drop";
+  let assetData = [
+      {uses: 1, assets: [null], config: {permissions: "claim"}}, // Password protected scan into the event
+      {uses: 1, assets: [null], config: {permissions: "create_account_and_claim", account_creation_keypom_args: {drop_id_field: "drop_id"}, root_account_id: nearcon.accountId}},
+    ];
+  await functionCall({
+      signer: funder,
+      receiver: keypom,
+      methodName: 'create_drop',
+      args: {
+          drop_id: dropId,
+          key_data: [],
+          drop_config: {
+              delete_empty_drop: false,
+              extra_allowance_per_key: NEAR.parse("0.02")
+          },
+          asset_data: assetData,
+          keep_excess_deposit: true
+      },
+      attachedDeposit: NEAR.parse("21").toString()
+  })
+
+  let keyData = {
+    keys: [],
+    publicKeys: []
+  };
+  // Loop through from 0 -> numKeys 50 at a time
+    for (let i = 0; i < numKeys; i += 50) {
+        let {keys, publicKeys} = await addKeys({
+            funder,
+            keypom,
+            originalTicketOwner,
+            numKeys: Math.min(numKeys - i, 50),
+            numOwners: Math.min(numOwners - i, 50),
+            dropId
+        })
+
+        keyData.keys = keyData.keys.concat(keys as never[]);
+        keyData.publicKeys = keyData.publicKeys.concat(publicKeys as never[]);
+    }
+    return keyData;
+}
+'''
+'''--- __tests__/tests.ava.ts ---
+import anyTest, { TestFn } from "ava";
+import { NEAR, NearAccount, Worker } from "near-workspaces";
+import { generateKeyPairs } from "./utils/keypom";
+import { TrialRules } from "./utils/types";
+import { parseExecutionResults } from "./utils/workspaces";
+const { readFileSync } = require("fs");
+
+const test = anyTest as TestFn<{
+  worker: Worker;
+  accounts: Record<string, NearAccount>;
+  rpcPort: string;
+}>;
+
+test.beforeEach(async (t) => {
+  console.log(t.title);
+  // Init the worker and start a Sandbox server
+  const worker = await Worker.init();
+
+  const rpcPort = (worker as any).config.rpcAddr;
+  console.log(`rpcPort: `, rpcPort);
+
+  // Prepare sandbox for tests, create accounts, deploy contracts, etc.
+  const root = worker.rootAccount;
+
+  const nearcon = await root.createSubAccount("nearcon23");
+
+  // Deploy the keypom contract.
+  await nearcon.deploy(`./out/factory.wasm`);
+
+  await nearcon.call(nearcon, "new", {
+    allowed_drop_id: "nearcon-drop",
+    keypom_contract: "keypom.test.near",
+    starting_ncon_balance: NEAR.parse("1").toString(),
+    starting_near_balance: NEAR.parse("1").toString(),
+  });
+
+  let initialBal = await nearcon.view("ft_total_supply");
+  t.is(initialBal, "0");
+
+  // Test users
+  const funder = await root.createSubAccount("funder");
+  const admin = await root.createSubAccount("admin");
+  const foodVendor = await root.createSubAccount("food_vendor");
+  const merchVendor = await root.createSubAccount("merch_vendor");
+
+  // Save state for test runs
+  t.context.worker = worker;
+  t.context.accounts = {
+    root,
+    nearcon,
+    funder,
+    admin,
+    foodVendor,
+    merchVendor,
+  };
+  t.context.rpcPort = rpcPort;
+});
+
+// If the environment is reused, use test.after to replace test.afterEach
+test.afterEach(async (t) => {
+  await t.context.worker.tearDown().catch((error) => {
+    console.log("Failed to tear down the worker:", error);
+  });
+});
+
+test("Create Duplicate Accounts", async (t) => {
+  const { root, nearcon, funder } = t.context.accounts;
+  const rpcPort = t.context.rpcPort;
+  const dropId = "nearcon-drop";
+  const keys = await generateKeyPairs(1);
+  const newAccountId = `benji.${nearcon.accountId}`;
+
+  // Loop 3 times
+  for (let i = 0; i < 3; i++) {
+    let rawVal = await nearcon.callRaw(nearcon, "create_account", {
+      new_account_id: newAccountId,
+      new_public_key: keys.publicKeys[0],
+      drop_id: dropId,
+      keypom_args: {
+        drop_id_field: "drop_id",
+      },
+    });
+
+    parseExecutionResults(
+      "create_account",
+      nearcon.accountId,
+      rawVal,
+      true,
+      false
+    );
+
+    let expectedAccountId =
+      i == 0 ? `benji.${nearcon.accountId}` : `benji-${i}.${nearcon.accountId}`;
+    let account = root.getAccount(expectedAccountId);
+    let doesExist = await account.exists();
+    t.is(doesExist, true, `Account ${expectedAccountId} does not exist`);
+
+    let keyList = await account.viewAccessKeys(expectedAccountId);
+    console.log('keyList: ', keyList)
+    t.assert(keyList.keys.length === 1);
+    t.assert(keyList.keys[0].access_key.permission === "FullAccess");
+
+    let ftBalance = await nearcon.view("ft_balance_of", {
+      account_id: expectedAccountId,
+    });
+    console.log("ftBalance: ", ftBalance);
+    t.is(ftBalance, NEAR.parse("1").toString());
+
+    let totalSupply = await nearcon.view("ft_total_supply");
+    console.log("totalSupply: ", totalSupply);
+    t.is(totalSupply, NEAR.parse((i + 1).toString()).toString());
+  }
+});
+
+test("Adding Vendor Items", async (t) => {
+  const { root, nearcon, funder, admin, merchVendor, foodVendor } =
+    t.context.accounts;
+
+  await nearcon.call(nearcon, "add_admin", { account_ids: [admin.accountId] });
+
+  let vendorMetadata = {
+    name: "Benji's Homegrown Burgers!",
+    description: "The greatest burgers in town.",
+    cover_image: "bafybeihnb36l3xvpehkwpszthta4ic6bygjkyckp5cffxvszbcltzyjcwi",
+  };
+  await admin.call(nearcon, "add_vendor", {
+    vendor_id: merchVendor,
+    vendor_metadata: vendorMetadata,
+  });
+  let metadata = await nearcon.view("get_vendor_metadata", {
+    vendor_id: merchVendor,
+  });
+  console.log("metadata: ", metadata);
+  t.deepEqual(metadata, vendorMetadata);
+
+  let items = await nearcon.view("get_items_for_vendor", {
+    vendor_id: merchVendor,
+  });
+  console.log("items before adding: ", items);
+  t.deepEqual(items, []);
+
+  await admin.call(nearcon, "add_item_to_vendor", {
+    vendor_id: merchVendor,
+    items: [
+      {
+        name: "Benji Burger",
+        image: "bafybeihnb36l3xvpehkwpszthta4ic6bygjkyckp5cffxvszbcltzyjcwi",
+        price: NEAR.parse("1").toString(),
+        in_stock: true,
+      },
+    ],
+  });
+
+  items = await nearcon.view("get_items_for_vendor", {
+    vendor_id: merchVendor,
+  });
+  console.log("items after adding: ", items);
+  t.deepEqual(items, [
+    {
+      id: "0",
+      name: "Benji Burger",
+      image: "bafybeihnb36l3xvpehkwpszthta4ic6bygjkyckp5cffxvszbcltzyjcwi",
+      price: NEAR.parse("1").toString(),
+      in_stock: true,
+    },
+  ]);
+});
+
+test("Purchase vendor items", async (t) => {
+  const { root, nearcon, funder, admin, merchVendor, foodVendor } =
+    t.context.accounts;
+  let vendorMetadata = {
+    name: "Benji's Homegrown Burgers!",
+    description: "The greatest burgers in town.",
+    cover_image: "bafybeihnb36l3xvpehkwpszthta4ic6bygjkyckp5cffxvszbcltzyjcwi",
+  };
+  await nearcon.call(nearcon, "add_vendor", {
+    vendor_id: merchVendor,
+    vendor_metadata: vendorMetadata,
+  });
+  await nearcon.call(nearcon, "add_item_to_vendor", {
+    vendor_id: merchVendor,
+    items: [
+      {
+        name: "Benji Burger",
+        image: "bafybeihnb36l3xvpehkwpszthta4ic6bygjkyckp5cffxvszbcltzyjcwi",
+        price: NEAR.parse("1").toString(),
+        in_stock: true,
+      },
+    ],
+  });
+
+  let itemInfo = await nearcon.view("get_item_information", {
+    vendor_id: merchVendor,
+    item_id: 0,
+  });
+  console.log("itemInfo: ", itemInfo);
+
+  await nearcon.call(nearcon, "ft_mint", {
+    account_id: funder.accountId,
+    amount: NEAR.parse("10").toString(),
+  });
+  let response = await funder.call(nearcon, "ft_transfer", {
+    receiver_id: merchVendor,
+    memo: JSON.stringify([0]),
+  });
+  console.log("response: ", response);
+  t.deepEqual(response, NEAR.parse("1").toString());
+
+  let buyerFtBalance = await nearcon.view("ft_balance_of", {
+    account_id: funder.accountId,
+  });
+  console.log("buyerFtBalance: ", buyerFtBalance);
+  t.is(buyerFtBalance, NEAR.parse("9").toString());
+
+  let sellerFtBalance = await nearcon.view("ft_balance_of", {
+    account_id: merchVendor.accountId,
+  });
+  console.log("sellerFtBalance: ", sellerFtBalance);
+  t.is(sellerFtBalance, NEAR.parse("1").toString());
+
+  let totalSupply = await nearcon.view("ft_total_supply");
+  console.log("totalSupply: ", totalSupply);
+  t.is(totalSupply, NEAR.parse("10").toString());
+});
+
+'''
+'''--- __tests__/utils/keypom.ts ---
+import { BN } from "bn.js";
+import { createHash } from "crypto";
+import { KeyPair, NEAR, NearAccount, PublicKey } from "near-workspaces";
+import { ExtKeyInfo, TrialRules, UserProvidedFCArgs } from "./types";
+import { functionCall } from "./workspaces";
+import { ExecutionContext } from "ava";
+
+export const DEFAULT_GAS: string = "30000000000000";
+export const LARGE_GAS: string = "300000000000000";
+export const WALLET_GAS: string = "100000000000000";
+export const DEFAULT_DEPOSIT: string = "1000000000000000000000000";
+export const GAS_PRICE = new BN("100000000");
+export const DEFAULT_TERRA_IN_NEAR: string = "3000000000000000000000";
+export const CONTRACT_METADATA = {
+  version: "1.0.0",
+  link: "https://github.com/mattlockyer/proxy/commit/71a943ea8b7f5a3b7d9e9ac2208940f074f8afba",
+};
+
+export function hash(string: string, double = false) {
+  if (double) {
+    return createHash("sha256")
+      .update(Buffer.from(string, "hex"))
+      .digest("hex");
+  }
+
+  return createHash("sha256").update(Buffer.from(string)).digest("hex");
+}
+
+export function generatePasswordsForKey(
+  pubKey: string,
+  usesWithPassword: number[],
+  basePassword: string
+) {
+  let passwords: Record<number, string> = {};
+
+  // Loop through usesWithPassword
+  for (var use of usesWithPassword) {
+    let pw = basePassword + pubKey + use.toString()
+    console.log('pw: ', pw)
+    passwords[use] = hash(hash(pw), true);
+  }
+
+  return passwords;
+}
+
+export async function getKeyInformation(
+  keypom: NearAccount,
+  publicKey: string
+): Promise<ExtKeyInfo> {
+  const keyInformation: ExtKeyInfo = await keypom.view("get_key_information", {
+    key: publicKey,
+  });
+  return keyInformation;
+}
+
+export async function generateKeyPairs(
+  numKeys: number
+): Promise<{ keys: KeyPair[]; publicKeys: string[] }> {
+  // Generate NumKeys public keys
+  let kps: KeyPair[] = [];
+  let pks: string[] = [];
+  for (let i = 0; i < numKeys; i++) {
+    let keyPair = await KeyPair.fromRandom("ed25519");
+    kps.push(keyPair);
+    pks.push(keyPair.getPublicKey().toString());
+  }
+  return {
+    keys: kps,
+    publicKeys: pks,
+  };
+}
+
+export async function claimWithRequiredGas({
+  keypom,
+  keyPair,
+  root,
+  fcArgs,
+  password,
+  receiverId,
+  createAccount = false,
+  useLongAccount = true,
+  useImplicitAccount = false,
+  shouldPanic = false,
+}: {
+  keypom: NearAccount;
+  keyPair: KeyPair;
+  root: NearAccount;
+  fcArgs?: UserProvidedFCArgs;
+  password?: string;
+  receiverId?: string;
+  createAccount?: boolean;
+  useLongAccount?: boolean;
+  useImplicitAccount?: boolean;
+  shouldPanic?: boolean;
+}) {
+  // Set key and get required gas
+  await keypom.setKey(keyPair);
+  let keyPk = keyPair.getPublicKey().toString();
+
+  const keyInfo: { required_gas: string } = await keypom.view(
+    "get_key_information",
+    { key: keyPk }
+  );
+  console.log("keyInfo: ", keyInfo);
+
+  // To allow custom receiver ID without needing to specify useLongAccount
+  if (receiverId != undefined && !createAccount) {
+    useLongAccount = false;
+  }
+
+  // customized error message to reduce chances of accidentally passing in this receiverid and throwing an error
+  let errorMsg = "Error-" + Date.now();
+
+  // actualReceiverId for non-forced-failure case
+  let actualReceiverId = useLongAccount
+    ? createAccount
+      ? `ac${Date.now().toString().repeat(4)}.${root.accountId}`
+      : useImplicitAccount
+      ? Buffer.from(PublicKey.fromString(keyPk).data).toString("hex")
+      : errorMsg
+    : receiverId;
+  if (actualReceiverId == errorMsg) {
+    throw new Error(
+      "Must specify desired usage, see claimWithRequiredGas function for more information"
+    );
+  }
+
+  if (createAccount) {
+    // Generate new keypair
+    let keyPairs = await generateKeyPairs(1);
+    let newPublicKey = keyPairs.publicKeys[0];
+
+    if (receiverId != undefined) {
+      actualReceiverId = receiverId;
+    }
+
+    console.log(
+      `create_account_and_claim with ${actualReceiverId} with ${keyInfo.required_gas} Gas`
+    );
+    let response = await functionCall({
+      signer: keypom,
+      receiver: keypom,
+      methodName: "create_account_and_claim",
+      args: {
+        new_account_id: actualReceiverId,
+        new_public_key: newPublicKey,
+        fc_args: fcArgs,
+        password,
+      },
+      gas: keyInfo.required_gas,
+      shouldPanic,
+    });
+    console.log(`Response from create_account_and_claim: ${response}`);
+    return { response, actualReceiverId };
+  }
+
+  console.log(
+    `claim with ${actualReceiverId} with ${keyInfo.required_gas} Gas`
+  );
+
+  let response = await functionCall({
+    signer: keypom,
+    receiver: keypom,
+    methodName: "claim",
+    args: {
+      account_id: actualReceiverId,
+      fc_args: fcArgs,
+      password,
+    },
+    gas: keyInfo.required_gas,
+    shouldPanic,
+  });
+  console.log(response);
+  return { response, actualReceiverId };
+}
+
+export const claimAndAssertAccountCreated = async ({
+  t,
+  keypom,
+  nearcon,
+  keyPair,
+}: {
+  t: ExecutionContext;
+  keypom: NearAccount;
+  nearcon: NearAccount;
+  keyPair: KeyPair;
+}) => {
+  let newAccountId = `benji.${nearcon.accountId}`;
+  await claimWithRequiredGas({
+    keypom,
+    root: keypom,
+    keyPair,
+    receiverId: newAccountId,
+    createAccount: true,
+    useLongAccount: false,
+    useImplicitAccount: false,
+    shouldPanic: false,
+  });
+
+  try {
+    const keyInfo = await keypom.view("get_key_information", {
+      key: keyPair.getPublicKey().toString(),
+    });
+    t.fail();
+  } catch (e) {
+    t.pass();
+  }
+
+  let account = keypom.getAccount(newAccountId);
+  let doesExist = await account.exists();
+  t.is(doesExist, true, `Account ${newAccountId} does not exist`);
+  let keyList = await account.viewAccessKeys(newAccountId);
+  console.log('keyList: ', keyList)
+  t.assert(keyList.keys.length === 1);
+  t.assert(keyList.keys[0].access_key.permission === "FullAccess");
+};
+
+export const addKeys = async ({
+  funder,
+  keypom,
+  originalTicketOwner,
+  numKeys,
+  numOwners,
+  dropId,
+}: {
+  funder: NearAccount;
+  keypom: NearAccount;
+  originalTicketOwner: NearAccount;
+  numKeys: number;
+  numOwners: number;
+  dropId: string;
+}): Promise<{ keys: KeyPair[]; publicKeys: string[] }> => {
+  let { keys, publicKeys } = await generateKeyPairs(numKeys);
+  let keyData: Array<any> = [];
+  let basePassword = "nearcon23-password";
+  let idx = 0;
+  for (var pk of publicKeys) {
+    let password_by_use = generatePasswordsForKey(idx.toString(), [1], basePassword);
+    keyData.push({
+      public_key: pk,
+      password_by_use,
+      key_owner: idx < numOwners ? originalTicketOwner.accountId : null,
+    });
+    idx += 1;
+  }
+
+  await functionCall({
+    signer: funder,
+    receiver: keypom,
+    methodName: "add_keys",
+    args: {
+      drop_id: dropId,
+      key_data: keyData,
+    },
+    attachedDeposit: NEAR.parse("20").toString(),
+  });
+
+  return { keys, publicKeys };
+};
+
+'''
+'''--- __tests__/utils/types.ts ---
+export type ExtNFTKey = {
+    owner_id: string;
+    token_id: string;
+    metadata: TokenMetadata;
+    approved_account_ids: Record<string, number>;
+    royalty: Record<string, number>;
+}
+
+export type ExtKeyInfo = {
+   required_gas: string;
+   yoctonear: string;
+   ft_list: Array<FTListData>;
+   nft_list: Array<NFTListData>;
+   drop_id: string;
+   pub_key: string;
+   token_id: string;
+   owner_id: string;
+   fc_list: Array<FCData>;
+   uses_remaining: number
+}
+
+export type FCData = {
+    methods: Array<MethodData>
+}
+
+export type NFTListData = {
+    token_id: string;
+    contract_id: string;
+}
+
+export type FTListData = {
+    amount: string;
+    contract_id: string;
+}
+
+export type ExtDrop = {
+    drop_id: string;
+    funder_id: string;
+    max_key_uses: number;
+    asset_data: Array<ExtAssetDataForUses>,
+    nft_asset_data: Array<InternalNFTData>,
+    ft_asset_data: Array<InternalFTData>,
+    drop_config?: DropConfig,
+    next_key_id: number
+}
+
+export type InternalNFTData = {
+    contract_id: string;
+    token_ids: Array<string>;
+}
+
+export type InternalFTData = {
+    contract_id: string;
+    registration_cost: string;
+    balance_avail: string
+}
+
+export type ExtAssetDataForUses = {
+    uses: number;
+    assets: Array<ExtAsset | null>;
+    config?: UseConfig
+}
+
+export type ExtAsset = ExtFTData | ExtNFTData | ExtNEARData | Array<MethodData>;
+
+export type ExtFTData = {
+    ft_contract_id: string;
+    registration_cost: string;
+    ft_amount: string
+}
+
+export type ExtNFTData = {
+    nft_contract_id: string;
+}
+
+export type ExtNEARData = {
+    yoctonear: string
+}
+
+export interface PasswordPerUse {
+    /** The password for this given use */
+    pw: string;
+    /** Which use does the password belong to? These uses are *NOT* zero-indexed so the first use corresponds to `1` not `0`. */
+    key_use: number;
+}
+
+export type MethodData = {
+    receiver_id: string,
+    method_name: string,
+    args: string,
+    attached_deposit: string,
+    attached_gas: string,
+    keypom_args?: KeypomInjectedArgs,
+    receiver_to_claimer?: boolean,
+    user_args_rule?: UserArgsRule,
+}
+
+export type UserArgsRule = "AllUser" | "FunderPreferred" | "UserPreferred"
+
+export type KeypomInjectedArgs = {
+    account_id_field: string,
+    drop_id_field: string,
+    key_id_field: string,
+    funder_id_field: string,
+}
+
+export type TimeConfig = {
+    start?: number;
+    end?: number;
+    throttle?: number;
+    interval?: number;
+}
+
+export type UseConfig = {
+    time?: TimeConfig;
+    permissions?: "claim" | "create_account_and_claim";
+    account_creation_keypom_args?: KeypomInjectedArgs;
+    root_account_id?: string;
+}
+
+export type DropConfig = {
+    metadata?: string;
+    nft_keys_config?: {
+        token_metadata?: TokenMetadata;
+        royalties?: Record<string, number>;
+    };
+    add_key_allowlist?: Array<string>;
+    delete_empty_drop?: boolean;
+    extra_allowance_per_key?: string;
+}
+
+export type NFTTokenObject = {
+    //token ID
+    token_id: string,
+    //owner of the token
+    owner_id: string,
+    //token metadata
+    metadata: TokenMetadata,
+    
+    approved_account_ids: Record<string, number>,
+    //keep track of the royalty percentages for the token in a hash map
+    royalty: Record<string, number>,
+}
+
+export type TokenMetadata = {
+    title: string | null;
+    description: string | null;
+    media: string | null;
+    media_hash: string | null;
+    copies: number | null;
+    issued_at: number | null;
+    expires_at: number | null;
+    starts_at: number | null;
+    updated_at: number | null;
+    extra: string | null;
+    reference: string | null;
+    reference_hash: string | null;
+}
+
+export interface ListingJson {
+    nft_token_id: string,
+    nft_approval_id: number,
+    nft_owner_id: string,
+    nft_contract_id: string,
+    price: string,
+    currency: string,
+    created_at: string,
+    current_offer?: OfferJson,
+}
+
+export interface OfferJson {
+    offerer_id: string,
+    amount: string,
+    referrer_id?: string,
+    referral_cut?: number
+}
+
+export interface TrialRules {
+    amounts: string, 
+    contracts: string, 
+    floor: string, 
+    funder: string, 
+    methods: string, 
+    repay: string, 
+    current_floor: string 
+}
+
+export type UserProvidedFCArgs = Array<AssetSpecificFCArgs>;
+export type AssetSpecificFCArgs = Array<string | undefined> | undefined;
+'''
+'''--- __tests__/utils/workspaces.ts ---
+import { BN } from "bn.js";
+import { formatNearAmount } from "near-api-js/lib/utils/format";
+import {
+    AccountBalance,
+    NearAccount,
+    TransactionResult
+} from "near-workspaces";
+import { LARGE_GAS } from "./keypom";
+
+export async function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export async function functionCall({
+  signer,
+  receiver,
+  methodName,
+  args,
+  attachedDeposit,
+  gas,
+  shouldLog = true,
+  shouldPanic = false,
+}: {
+  signer: NearAccount;
+  receiver: NearAccount;
+  methodName: string;
+  args: any;
+  attachedDeposit?: string;
+  gas?: string;
+  shouldLog?: boolean;
+  shouldPanic?: boolean;
+}) {
+  let rawValue = await signer.callRaw(receiver, methodName, args, {
+    gas: gas || LARGE_GAS,
+    attachedDeposit: attachedDeposit || "0",
+  });
+  parseExecutionResults(
+    methodName,
+    receiver.accountId,
+    rawValue,
+    shouldLog,
+    shouldPanic
+  );
+
+  if (rawValue.SuccessValue) {
+    return atob(rawValue.SuccessValue);
+  } else {
+    return rawValue.Failure?.error_message;
+  }
+}
+
+export function parseExecutionResults(
+  methodName: string,
+  receiverId: string,
+  transaction: TransactionResult,
+  shouldLog: boolean,
+  shouldPanic: boolean
+) {
+  console.log("");
+  let logMessages: string[] = [];
+
+  let didPanic = false;
+  let panicMessages: string[] = [];
+
+  // Loop through each receipts_outcome in the transaction's result field
+  transaction.result.receipts_outcome.forEach((receipt) => {
+    const logs = receipt.outcome.logs;
+
+    if (logs.length > 0) {
+      // Turn logs into a string
+      let logs = receipt.outcome.logs.reduce((acc, log) => {
+        return acc.concat(log).concat("\n");
+      }, "");
+
+      logs = logs.substring(0, logs.length - 1);
+      logMessages.push(logs);
+    } else if (
+      logMessages[logMessages.length - 1] != `\n` &&
+      logMessages.length > 0
+    ) {
+      logMessages.push(`\n`);
+    }
+
+    const status = receipt.outcome.status as any;
+    if (status.Failure) {
+      let failure = status.Failure.ActionError;
+      let str = `Failure for method: ${methodName} Failure: ${JSON.stringify(
+        failure
+      )}\n`;
+
+      panicMessages.push(str);
+      didPanic = true;
+    }
+  });
+
+  console.log(
+    `${methodName} -> ${receiverId}. ${logMessages.length} Logs Found. ${panicMessages.length} Panics Found.`
+  );
+
+  if (shouldLog && logMessages.length > 0) {
+    let logStr = logMessages.join("\n");
+    // Remove the last instance of `\n` from the log string
+    logStr = logStr.substring(0, logStr.length - 1);
+    console.log(logStr);
+  }
+
+  if (panicMessages.length > 0) {
+    console.log("Panics:");
+    let panicStr = panicMessages.join("\n");
+    // Remove the last instance of `\n` from the panic string
+    panicStr = panicStr.substring(0, panicStr.length - 1);
+    console.log(panicStr);
+  }
+
+  if (shouldPanic && !didPanic) {
+    throw new Error(`Expected failure for method: ${methodName}`);
+  }
+
+  if (!shouldPanic && didPanic) {
+    throw new Error("Panic found when not expected");
+  }
+}
+
+export const displayBalances = (
+  initialBalances: AccountBalance,
+  finalBalances: AccountBalance
+) => {
+  const initialBalancesNear = {
+    available: formatNearAmount(initialBalances.available.toString()),
+    staked: formatNearAmount(initialBalances.staked.toString()),
+    stateStaked: formatNearAmount(initialBalances.stateStaked.toString()),
+    total: formatNearAmount(initialBalances.total.toString()),
+  };
+
+  const finalBalancesNear = {
+    available: formatNearAmount(finalBalances.available.toString()),
+    staked: formatNearAmount(finalBalances.staked.toString()),
+    stateStaked: formatNearAmount(finalBalances.stateStaked.toString()),
+    total: formatNearAmount(finalBalances.total.toString()),
+  };
+
+  let isMoreState = false;
+  if (
+    new BN(initialBalances.stateStaked.toString()).lt(
+      new BN(finalBalances.stateStaked.toString())
+    )
+  ) {
+    let temp = initialBalances.stateStaked;
+    initialBalances.stateStaked = finalBalances.stateStaked;
+    finalBalances.stateStaked = temp;
+    isMoreState = true;
+  }
+
+  console.log(
+    `Available: ${initialBalancesNear.available.toString()} -> ${finalBalancesNear.available.toString()}`
+  );
+  console.log(
+    `Staked: ${initialBalancesNear.staked.toString()} -> ${finalBalancesNear.staked.toString()}`
+  );
+  console.log(
+    `State Staked: ${initialBalancesNear.stateStaked.toString()} -> ${finalBalancesNear.stateStaked.toString()}`
+  );
+  console.log(
+    `Total: ${initialBalancesNear.total.toString()} -> ${finalBalancesNear.total.toString()}`
+  );
+  console.log(``);
+  console.log(`NET:`);
+  console.log(
+    `Available: ${formatNearAmount(
+      new BN(finalBalances.available.toString())
+        .sub(new BN(initialBalances.available.toString()))
+        .toString()
+    )}`
+  );
+  console.log(
+    `Staked: ${formatNearAmount(
+      new BN(finalBalances.staked.toString())
+        .sub(new BN(initialBalances.staked.toString()))
+        .toString()
+    )}`
+  );
+  console.log(
+    `State Staked ${isMoreState ? "(more)" : "(less)"}: ${formatNearAmount(
+      new BN(initialBalances.stateStaked.toString())
+        .sub(new BN(finalBalances.stateStaked.toString()))
+        .toString()
+    )}`
+  );
+  console.log(
+    `Total: ${formatNearAmount(
+      new BN(finalBalances.total.toString())
+        .sub(new BN(initialBalances.total.toString()))
+        .toString()
+    )}`
+  );
+};
+
+'''
+'''--- contract/Cargo.toml ---
+[package]
+name = "nearcon-factory-contract"
+version = "0.1.0"
+authors = ["Ben Kurrek <bkurrek@uwaterloo.ca>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+near-sdk = "4.1.1"
+serde_json = "1.0.91"
+
+[profile.release]
+codegen-units = 1
+opt-level = "s"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+'''
+'''--- contract/build.sh ---
+#!/bin/bash
+set -e
+
+cargo build --target wasm32-unknown-unknown --release
+mkdir -p ../out
+cp target/wasm32-unknown-unknown/release/*.wasm ../out/factory.wasm
+
+'''
+'''--- contract/src/events/events_core.rs ---
+use std::fmt;
+
+use crate::*;
+
+/// This spec can be treated like a version of the standard.
+pub const FT_METADATA_SPEC: &str = "1.0.0";
+/// This is the name of the NFT standard we're using
+pub const FT_STANDARD_NAME: &str = "nep141";
+
+/// Enum that represents the data type of the EventLog.
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "event", content = "data")]
+#[serde(rename_all = "snake_case")]
+#[serde(crate = "near_sdk::serde")]
+#[non_exhaustive]
+pub enum EventLogVariant {
+    /// Drop creation / deletion
+    FtMint(FtMintLog),
+    FtBurn(FtBurnLog),
+    FtTransfer(FtTransferLog),
+}
+
+/// Interface to capture data about an event
+///
+/// Arguments:
+/// * `standard`: name of standard e.g. kpom1
+/// * `version`: e.g. 1.0.0
+/// * `event`: associate event data
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct EventLog {
+    pub standard: String,
+    pub version: String,
+
+    // `flatten` to not have "event": {<EventLogVariant>} in the JSON, just have the contents of {<EventLogVariant>}.
+    #[serde(flatten)]
+    pub event: EventLogVariant,
+}
+
+impl fmt::Display for EventLog {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_fmt(format_args!(
+            "EVENT_JSON:{}",
+            &serde_json::to_string(self).map_err(|_| fmt::Error)?
+        ))
+    }
+}
+'''
+'''--- contract/src/events/fts.rs ---
+use crate::*;
+
+/// An event log to capture tokens minting
+/// Arguments
+/// * `owner_id`: "account.near"
+/// * `amount`: the number of tokens to mint, wrapped in quotes and treated
+///   like a string, although the number will be stored as an unsigned integer
+///   with 128 bits.
+/// * `memo`: optional message
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct FtMintLog {
+    pub owner_id: String,
+    pub amount: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
+}
+
+/// An event log to capture tokens burning
+/// Arguments
+/// * `owner_id`: owner of tokens to burn
+/// * `amount`: the number of tokens to burn, wrapped in quotes and treated
+///   like a string, although the number will be stored as an unsigned integer
+///   with 128 bits.
+/// * `memo`: optional message
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct FtBurnLog {
+    pub owner_id: String,
+    pub amount: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
+}
+
+/// An event log to capture tokens transfer
+/// Arguments
+/// * `old_owner_id`: "owner.near"
+/// * `new_owner_id`: "receiver.near"
+/// * `amount`: the number of tokens to transfer, wrapped in quotes and treated
+///   like a string, although the number will be stored as an unsigned integer
+///   with 128 bits.
+/// * `memo`: optional message
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct FtTransferLog {
+    pub old_owner_id: String,
+    pub new_owner_id: String,
+    pub amount: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
+}
+'''
+'''--- contract/src/events/mod.rs ---
+pub mod events_core;
+pub mod fts;
+
+pub use events_core::*;
+pub use fts::*;
+'''
+'''--- contract/src/factory.rs ---
+use near_sdk::{Promise, PublicKey};
+
+use crate::*;
+
+/// Keypom Args struct to be sent to external contracts
+#[derive(Serialize, Deserialize, Debug, BorshDeserialize, BorshSerialize, Clone)]
+#[serde(crate = "near_sdk::serde")]
+pub struct KeypomArgs {
+    pub account_id_field: Option<String>,
+    pub drop_id_field: Option<String>,
+    pub key_id_field: Option<String>,
+    pub funder_id_field: Option<String>,
+}
+
+#[near_bindgen]
+impl Contract {
+    #[payable]
+    pub fn create_account(
+        &mut self,
+        new_account_id: AccountId,
+        new_public_key: PublicKey,
+        drop_id: String,
+        keypom_args: KeypomArgs,
+    ) -> Promise {
+        let initial_storage_usage = env::storage_usage();
+
+        self.assert_keypom();
+        // Ensure the incoming args are correct from Keypom
+        require!(keypom_args.drop_id_field.expect("No keypom args sent") == "drop_id".to_string());
+        if let Some(required_drop_id) = self.allowed_drop_id.clone() {
+            require!(drop_id == required_drop_id, "Invalid drop ID");
+        }
+
+        // Get the next available account ID in case the one passed in is taken
+        let account_id: AccountId = self.find_available_account_id(new_account_id);
+
+        near_sdk::log!(
+            "Creating account: {} with starting balance: {}",
+            account_id,
+            self.starting_near_balance
+        );
+        // Add the account ID to the map
+        self.account_id_by_pub_key
+            .insert(&new_public_key, &account_id);
+        let drop_set = UnorderedMap::new(StorageKeys::DropsClaimedByAccountInner {
+            account_id_hash: env::sha256_array(account_id.as_bytes()),
+        });
+        self.drops_claimed_by_account.insert(&account_id, &drop_set);
+        // Deposit the starting balance into the account and then create it
+        self.internal_deposit_mint(&account_id, self.starting_ncon_balance);
+
+        let final_storage_usage = env::storage_usage();
+        near_sdk::log!(
+            "Storage used: {}",
+            final_storage_usage - initial_storage_usage
+        );
+
+        Promise::new(account_id.clone())
+            .create_account()
+            .transfer(self.starting_near_balance)
+            .add_full_access_key(new_public_key.into())
+    }
+
+    /// In the case that multiple people choose the same username (i.e ben.nearcon.near) at the same time
+    /// Before the frontend can validate, we should simply append a number to the end of the username i.e ben1.nearcon.near & ben2.nearcon.near etc...
+    pub(crate) fn find_available_account_id(&self, new_account_id: AccountId) -> AccountId {
+        let delim = format!(".{}", env::current_account_id()).to_string();
+        let binding = new_account_id.to_string();
+        let split: Vec<&str> = binding.split(&delim).collect();
+        let prefix = split[0].to_string();
+
+        let mut account_id = new_account_id.clone();
+        let found = false;
+        let mut i = 0;
+
+        while !found {
+            let is_new_account = !self.balance_by_account.contains_key(&account_id);
+
+            if is_new_account {
+                return account_id;
+            }
+
+            i += 1;
+            account_id = format!("{}-{}.{}", prefix, i, env::current_account_id())
+                .parse()
+                .unwrap();
+        }
+
+        new_account_id
+    }
+
+    /// Update the starting balance for NEAR
+    pub fn update_starting_near_balance(&mut self, new_balance: U128) {
+        self.assert_admin();
+        self.starting_near_balance = new_balance.into();
+    }
+
+    /// Update the starting balance for NCON
+    pub fn update_starting_ncon_balance(&mut self, new_balance: U128) {
+        self.assert_admin();
+        self.starting_ncon_balance = new_balance.into();
+    }
+
+    /// Update the drop ID that is allowed to create accounts
+    pub fn update_drop_id(&mut self, new_drop_id: Option<String>) {
+        self.assert_admin();
+        self.allowed_drop_id = new_drop_id;
+    }
+
+    /// Update the drop ID that is allowed to create accounts
+    pub fn update_keypom_contract(&mut self, keypom_contract: AccountId) {
+        self.assert_admin();
+        self.keypom_contract = keypom_contract;
+    }
+
+    /// Assert that the caller is either keypom or the current account
+    pub(crate) fn assert_keypom(&self) {
+        let caller = env::predecessor_account_id();
+        if caller != env::current_account_id() {
+            require!(
+                env::predecessor_account_id() == self.keypom_contract,
+                "Only Keypom can call this method"
+            );
+        }
+    }
+}
+
+'''
+'''--- contract/src/fungible_tokens/drops.rs ---
+use std::collections::HashMap;
+
+use crate::*;
+
+#[near_bindgen]
+impl Contract {
+    /// Allows an admin to create a drop so people can scan a QR code and get the amount of tokens
+    pub fn create_drop(&mut self, drop: InternalDropData) {
+        self.assert_admin();
+        let drop_id = drop.get_id();
+        self.drop_by_id.insert(&drop_id, &drop);
+    }
+
+    /// Allows an admin to create a drop so people can scan a QR code and get the amount of tokens
+    pub fn create_drop_batch(&mut self, drops: Vec<InternalDropData>) {
+        self.assert_admin();
+        for drop in drops {
+            let drop_id = drop.get_id();
+            self.drop_by_id.insert(&drop_id, &drop);
+        }
+    }
+
+    /// Allows a user to claim an existing drop (if they haven't already)
+    pub fn claim_drop(&mut self, drop_id: String, scavenger_id: Option<String>) {
+        let drop_data = self.drop_by_id.get(&drop_id).expect("Drop not found");
+
+        let receiver_id = env::predecessor_account_id();
+        let mut claimed_drops = self
+            .drops_claimed_by_account
+            .get(&receiver_id)
+            .expect("User not registered");
+
+        match drop_data {
+            InternalDropData::token(data) => {
+                self.handle_token_drop(data, &receiver_id, scavenger_id, &mut claimed_drops);
+            }
+            InternalDropData::nft(data) => {
+                self.handle_nft_drop(data, &receiver_id, scavenger_id, &mut claimed_drops);
+            }
+        }
+        self.drops_claimed_by_account
+            .insert(&receiver_id, &claimed_drops);
+    }
+
+    fn handle_token_drop(
+        &mut self,
+        data: TokenDropData,
+        receiver_id: &AccountId,
+        scavenger_id: Option<String>,
+        claimed_drops: &mut UnorderedMap<String, Vec<String>>,
+    ) {
+        match data.scavenger_ids {
+            Some(scavenger_ids) => {
+                near_sdk::log!("Scavenger IDs: {:?}", &scavenger_ids);
+                let mut claimed_scavenger_ids = claimed_drops.get(&data.id).unwrap_or(Vec::new());
+                near_sdk::log!("Claimed scavenger IDs: {:?}", &claimed_scavenger_ids);
+                near_sdk::log!("Scavenger ID: {:?}", &scavenger_id);
+
+                let scav_id = scavenger_id.expect("Scavenger ID is required");
+                require!(
+                    !claimed_scavenger_ids.contains(&scav_id),
+                    "Scavenger item already claimed"
+                );
+                claimed_scavenger_ids.push(scav_id);
+                claimed_drops.insert(&data.id, &claimed_scavenger_ids);
+                if scavenger_ids.len() == claimed_scavenger_ids.len() {
+                    // All scavenger items claimed, now claim the main reward
+                    self.internal_deposit_mint(receiver_id, data.amount.0);
+                }
+            }
+            None => {
+                // Directly claim if no scavenger IDs
+                require!(
+                    claimed_drops.get(&data.id).is_none(),
+                    "Drop already claimed"
+                );
+                claimed_drops.insert(&data.id, &vec![data.id.clone()]);
+                self.internal_deposit_mint(receiver_id, data.amount.0);
+            }
+        }
+    }
+
+    fn handle_nft_drop(
+        &mut self,
+        data: NFTDropData,
+        receiver_id: &AccountId,
+        scavenger_id: Option<String>,
+        claimed_drops: &mut UnorderedMap<String, Vec<String>>,
+    ) {
+        match data.scavenger_ids {
+            Some(scavenger_ids) => {
+                let mut claimed_scavenger_ids = claimed_drops.get(&data.id).unwrap_or(Vec::new());
+
+                let scav_id = scavenger_id.expect("Scavenger ID is required");
+                require!(
+                    !claimed_scavenger_ids.contains(&scav_id),
+                    "Scavenger item already claimed"
+                );
+                claimed_scavenger_ids.push(scav_id);
+                claimed_drops.insert(&data.id, &claimed_scavenger_ids);
+                if scavenger_ids.len() == claimed_scavenger_ids.len() {
+                    // TODO: actually mint NFT
+                }
+            }
+            None => {
+                // Directly claim if no scavenger IDs
+                require!(
+                    claimed_drops.get(&data.id).is_none(),
+                    "Drop already claimed"
+                );
+                claimed_drops.insert(&data.id, &vec![data.id.clone()]);
+                // TODO: actually mint NFT
+            }
+        }
+    }
+
+    /// Query for the total amount of tokens currently circulating.
+    pub fn get_drop_information(&self, drop_id: String) -> Option<InternalDropData> {
+        self.drop_by_id.get(&drop_id)
+    }
+
+    pub fn claims_for_account(&self, account_id: AccountId, drop_id: String) -> Vec<String> {
+        self.drops_claimed_by_account
+            .get(&account_id)
+            .expect("Account not registered")
+            .get(&drop_id)
+            .unwrap_or(Vec::new())
+    }
+
+    pub fn get_scavengers_for_account(
+        &self,
+        account_id: AccountId,
+    ) -> HashMap<String, Vec<String>> {
+        let mut result = HashMap::new();
+
+        if let Some(claimed_drops) = self.drops_claimed_by_account.get(&account_id) {
+            for (drop_id, claimed) in claimed_drops.iter() {
+                if let Some(drop_data) = self.drop_by_id.get(&drop_id) {
+                    if let Some(scavenger_ids) = drop_data.get_scavenger_ids() {
+                        result.insert(drop_id, claimed);
+                    }
+                }
+            }
+        } else {
+            panic!("Account not registered");
+        }
+
+        result
+    }
+
+    pub fn get_nfts_for_account(&self, account_id: AccountId) -> Vec<NFTWithOwnership> {
+        let mut result_nfts = Vec::new();
+        let claimed_drops = self.drops_claimed_by_account.get(&account_id);
+
+        for (_, drop_data) in self.drop_by_id.iter() {
+            if let InternalDropData::nft(nft_data) = drop_data {
+                near_sdk::log!("Found NFT: {:?}", &nft_data);
+                let scavenger_ids_len = nft_data.scavenger_ids.as_ref().map_or(0, Vec::len);
+                near_sdk::log!("Scavenger IDs length: {:?}", &scavenger_ids_len);
+                let claimed_len = claimed_drops
+                    .as_ref()
+                    .and_then(|drops| drops.get(&nft_data.id))
+                    .map_or(0, |claimed_ids| claimed_ids.len());
+                near_sdk::log!("Claimed length: {:?}", &claimed_len);
+
+                let is_owned = if scavenger_ids_len == 0 {
+                    claimed_len > 0
+                } else {
+                    claimed_len == scavenger_ids_len
+                };
+                result_nfts.push(NFTWithOwnership {
+                    nft: nft_data.clone(),
+                    is_owned,
+                });
+            }
+        }
+        result_nfts
+    }
+}
+
+'''
+'''--- contract/src/fungible_tokens/ft_core.rs ---
+use crate::*;
+
+#[near_bindgen]
+impl Contract {
+    /// Allows an admin to mint an amount of tokens to a desired account ID.
+    /// Useful for dropping tokens to users for things like attending talks
+    pub fn ft_mint(&mut self, account_id: AccountId, amount: U128) {
+        self.assert_admin();
+        self.internal_deposit_mint(&account_id, amount.0);
+    }
+
+    /// Allows a user to specify a list of items for a specific vendor to purchase.
+    /// This will transfer their tokens to the vendor (assuming they have enough).
+    /// Alternatively, if no memo is specified, the user can simply transfer tokens to another account.
+    /// The receiving account *must* either be a valid vendor or a sub-account of this contract.
+    #[handle_result]
+    pub fn ft_transfer(&mut self, receiver_id: AccountId, memo: Option<String>, amount: Option<U128>) -> Result<U128, String> {
+        let amount_to_transfer = if let Some(memo) = memo {
+            let item_ids: Vec<u64> = serde_json::from_str(&memo).expect("Failed to parse memo");
+            let vendor_data = self.data_by_vendor.get(&receiver_id).expect("No vendor found");
+    
+            // Tally the total price across all the items being purchased
+            let mut total_price = 0;
+            for id in item_ids.iter() {
+                let item = vendor_data.item_by_id.get(id).expect("No item found");
+                total_price += item.price.0;
+            }
+
+            total_price
+        } else {
+            // Tested: https://play.rust-lang.org/?version=stable&mode=debug&edition=2021&gist=54a4a26cf62b44a178286431fe10e7f4
+            require!(receiver_id.to_string().ends_with(env::current_account_id().as_str()), "Invalid receiver ID");
+            amount.expect("No amount specified").0
+        };
+
+        // Transfer the tokens to the vendor
+        let sender_id = env::predecessor_account_id();
+        self.internal_transfer(&sender_id, &receiver_id, amount_to_transfer);
+
+        Ok(U128(amount_to_transfer))
+    }
+
+    /// Query for the total amount of tokens currently circulating.
+    pub fn ft_total_supply(&self) -> U128 {
+        // Return the total supply casted to a U128
+        self.total_supply.into()
+    }
+
+    /// Query for the balance of tokens for a specific account.
+    pub fn ft_balance_of(&self, account_id: AccountId) -> U128 {
+        // Return the balance of the account casted to a U128
+        self.balance_by_account.get(&account_id).unwrap_or(0).into()
+    }
+}
+'''
+'''--- contract/src/fungible_tokens/internal.rs ---
+use crate::*;
+use near_sdk::require;
+
+impl Contract {
+    /// Internal method for depositing some amount of FTs into an account and updating the total supply.
+    pub(crate) fn internal_deposit_mint(&mut self, account_id: &AccountId, amount: Balance) {
+        // Get the current balance of the account. If they're not registered, panic.
+        let balance = self.balance_by_account.get(account_id).unwrap_or(0);
+        
+        // Add the amount to the balance and insert the new balance into the accounts map
+        if let Some(new_balance) = balance.checked_add(amount) {
+            self.balance_by_account.insert(account_id, &new_balance);
+        } else {
+            env::panic_str("Balance overflow");
+        }
+
+        // Increment the total supply and log a mint event
+        self.total_supply += amount;
+        env::log_str(&EventLog {
+            standard: FT_STANDARD_NAME.to_string(),
+            version: FT_METADATA_SPEC.to_string(),
+            event: EventLogVariant::FtMint(FtMintLog {
+                owner_id: account_id.to_string(),
+                amount: amount.to_string(),
+                memo: None,
+            })
+        }.to_string());
+    }
+
+    /// Internal method for depositing some amount of FTs into an account. 
+    pub(crate) fn internal_deposit(&mut self, account_id: &AccountId, amount: Balance) {
+        // Get the current balance of the account.
+        let balance = self.balance_by_account.get(&account_id).unwrap_or(0);
+        
+        // Add the amount to the balance and insert the new balance into the accounts map
+        if let Some(new_balance) = balance.checked_add(amount) {
+            self.balance_by_account.insert(account_id, &new_balance);
+        } else {
+            env::panic_str("Balance overflow");
+        }
+    }
+
+    /// Internal method for withdrawing some amount of FTs from an account. 
+    pub(crate) fn internal_withdraw(&mut self, account_id: &AccountId, amount: Balance) {
+        // Get the current balance of the account.
+        let balance = self.balance_by_account.get(&account_id).unwrap_or(0);
+        
+        // Decrease the amount from the balance and insert the new balance into the accounts map
+        if let Some(new_balance) = balance.checked_sub(amount) {
+            self.balance_by_account.insert(account_id, &new_balance);
+        } else {
+            env::panic_str("The account doesn't have enough balance");
+        }
+    }
+
+    /// Internal method for performing a transfer of FTs from one account to another.
+    pub(crate) fn internal_transfer(
+        &mut self,
+        sender_id: &AccountId,
+        receiver_id: &AccountId,
+        amount: Balance
+    ) {
+        // Ensure the sender can't transfer to themselves
+        require!(sender_id != receiver_id, "Sender and receiver should be different");
+        // Ensure the sender can't transfer 0 tokens
+        require!(amount > 0, "The amount should be a positive number");
+        
+        // Withdraw from the sender and deposit into the receiver
+        self.internal_withdraw(sender_id, amount);
+        self.internal_deposit(receiver_id, amount);
+        
+        // Emit a Transfer event
+        env::log_str(&EventLog {
+            standard: FT_STANDARD_NAME.to_string(),
+            version: FT_METADATA_SPEC.to_string(),
+            event: EventLogVariant::FtTransfer(FtTransferLog {
+                old_owner_id: sender_id.to_string(),
+                new_owner_id: receiver_id.to_string(),
+                amount: amount.to_string(),
+                memo: None,
+            })
+        }.to_string());
+    }
+}
+'''
+'''--- contract/src/fungible_tokens/metadata.rs ---
+use crate::*;
+
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::json_types::Base64VecU8;
+use near_sdk::near_bindgen;
+use near_sdk::serde::{Deserialize, Serialize};
+
+/// The image URL for the default icon
+pub const DATA_IMAGE_SVG_GT_ICON: &str = "https://assets-global.website-files.com/6509ee7744afed1c907f8f97/655050623557b10a706dae04_ETHDEN_logo_full_purple-p-500.png";
+
+#[derive(BorshDeserialize, BorshSerialize, Clone, Deserialize, Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct FungibleTokenMetadata {
+    pub spec: String, // Should be ft-1.0.0 to indicate that a Fungible Token contract adheres to the current versions of this Metadata and the Fungible Token Core specs. This will allow consumers of the Fungible Token to know if they support the features of a given contract.
+    pub name: String, // The human-readable name of the token.
+    pub symbol: String, // The abbreviation, like wETH or AMPL.
+    pub icon: Option<String>, // Icon of the fungible token.
+    pub reference: Option<String>, // A link to a valid JSON file containing various keys offering supplementary details on the token
+    pub reference_hash: Option<Base64VecU8>, // The base64-encoded sha256 hash of the JSON file contained in the reference field. This is to guard against off-chain tampering.
+    pub decimals: u8, // used in frontends to show the proper significant digits of a token. This concept is explained well in this OpenZeppelin post. https://docs.openzeppelin.com/contracts/3.x/erc20#a-note-on-decimals
+}
+
+#[near_bindgen]
+impl Contract {
+    pub fn ft_metadata(&self) -> FungibleTokenMetadata {
+        self.metadata.clone()
+    }
+
+    #[private]
+    pub fn update_ft_metadata(&mut self, metadata: FungibleTokenMetadata) {
+        self.metadata = metadata;
+    }
+}
+
+'''
+'''--- contract/src/fungible_tokens/mod.rs ---
+pub mod drops;
+pub mod ft_core;
+pub mod internal;
+pub mod metadata;
+
+pub use metadata::*;
+
+'''
+'''--- contract/src/lib.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::{LookupMap, LookupSet, UnorderedMap};
+use near_sdk::json_types::U128;
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{
+    env, near_bindgen, require, AccountId, Balance, BorshStorageKey, PanicOnDefault, PublicKey,
+};
+
+mod events;
+mod factory;
+mod fungible_tokens;
+mod models;
+mod vendors;
+
+use events::*;
+use fungible_tokens::*;
+use models::*;
+
+#[near_bindgen]
+#[derive(BorshSerialize, BorshDeserialize, PanicOnDefault)]
+pub struct Contract {
+    // ------------------------ Vendor Information ------------------------ //
+    pub data_by_vendor: UnorderedMap<AccountId, VendorInformation>,
+    pub admin_accounts: LookupSet<AccountId>,
+
+    // ------------------------ Fungible Tokens ------------------------ //
+    pub balance_by_account: LookupMap<AccountId, Balance>,
+    pub total_supply: Balance,
+    pub metadata: FungibleTokenMetadata,
+    pub drop_by_id: UnorderedMap<String, InternalDropData>,
+    pub drops_claimed_by_account: LookupMap<AccountId, UnorderedMap<String, Vec<String>>>,
+
+    // ------------------------ Account Factory ------------------------ //
+    pub allowed_drop_id: Option<String>,
+    pub keypom_contract: AccountId,
+    pub starting_near_balance: Balance,
+    pub starting_ncon_balance: Balance,
+    pub account_id_by_pub_key: LookupMap<PublicKey, AccountId>,
+}
+
+#[near_bindgen]
+impl Contract {
+    /// Allows
+    pub fn recover_account(&self, key: PublicKey) -> AccountId {
+        self.account_id_by_pub_key
+            .get(&key)
+            .expect("No account found")
+    }
+
+    #[init]
+    pub fn new(
+        allowed_drop_id: Option<String>,
+        keypom_contract: AccountId,
+        starting_near_balance: U128,
+        starting_ncon_balance: U128,
+    ) -> Self {
+        Self {
+            data_by_vendor: UnorderedMap::new(StorageKeys::DataByVendor),
+            admin_accounts: LookupSet::new(StorageKeys::AdminAccounts),
+
+            balance_by_account: LookupMap::new(StorageKeys::BalanceByAccount),
+            total_supply: 0,
+            metadata: FungibleTokenMetadata {
+                spec: "ft-1.0.0".to_string(),
+                name: "NEARCon Fungible Token".to_string(),
+                symbol: "NCON".to_string(),
+                icon: Some(DATA_IMAGE_SVG_GT_ICON.to_string()),
+                reference: None,
+                reference_hash: None,
+                decimals: 24,
+            },
+            drop_by_id: UnorderedMap::new(StorageKeys::DropById),
+            drops_claimed_by_account: LookupMap::new(StorageKeys::DropsClaimedByAccount),
+
+            allowed_drop_id,
+            keypom_contract,
+            starting_near_balance: starting_near_balance.into(),
+            starting_ncon_balance: starting_ncon_balance.into(),
+            account_id_by_pub_key: LookupMap::new(StorageKeys::AccountIdByPubKey),
+        }
+    }
+
+    #[private]
+    pub fn add_admin(&mut self, account_ids: Vec<AccountId>) {
+        for account_id in account_ids {
+            self.admin_accounts.insert(&account_id);
+        }
+    }
+
+    #[private]
+    pub fn remove_admin(&mut self, account_ids: Vec<AccountId>) {
+        for account_id in account_ids {
+            self.admin_accounts.remove(&account_id);
+        }
+    }
+}
+
+'''
+'''--- contract/src/models.rs ---
+use crate::*;
+use near_sdk::CryptoHash;
+
+#[derive(BorshSerialize, BorshStorageKey)]
+pub enum StorageKeys {
+    DataByVendor,
+    AccountIdByPubKey,
+    VendorItems { vendor_id_hash: CryptoHash },
+    DropsClaimedByAccount,
+    DropsClaimedByAccountInner { account_id_hash: CryptoHash },
+    DropById,
+    AdminAccounts,
+    BalanceByAccount,
+}
+
+/// For each vendor, there's a store-front and list of items for sale
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct VendorInformation {
+    /// Info to render on the store-front
+    pub metadata: VendorMetadata,
+    /// List of items for sale
+    pub item_by_id: UnorderedMap<u64, InternalVendorItem>,
+}
+
+/// Represents an asset that is purchasable.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct InternalVendorItem {
+    pub id: String,
+    pub name: String,
+    pub image: String,
+    /// Price in $NCON
+    pub price: U128,
+    /// Is the item currently purchasable?
+    pub in_stock: bool,
+}
+
+/// Represents an asset that is purchasable.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct ExtVendorItem {
+    pub name: String,
+    pub image: String,
+    /// Price in $NCON
+    pub price: U128,
+    /// Is the item currently purchasable?
+    pub in_stock: bool,
+}
+
+/// Store-front information for a vendor
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct VendorMetadata {
+    pub name: String,
+    pub description: String,
+    /// Must be IPFS CID
+    pub cover_image: String,
+}
+
+// Outlines the different types of drops that can be created and claimed
+#[allow(non_camel_case_types)]
+#[derive(BorshSerialize, BorshDeserialize, Deserialize, Serialize, Clone)]
+#[serde(crate = "near_sdk::serde")]
+#[serde(untagged)]
+pub enum InternalDropData {
+    token(TokenDropData),
+    nft(NFTDropData),
+}
+
+impl InternalDropData {
+    pub fn get_id(&self) -> String {
+        match self {
+            InternalDropData::token(data) => data.id.clone(),
+            InternalDropData::nft(data) => data.id.clone(),
+        }
+    }
+
+    pub fn get_scavenger_ids(&self) -> Option<Vec<String>> {
+        match self {
+            InternalDropData::token(data) => data.scavenger_ids.clone(),
+            InternalDropData::nft(data) => data.scavenger_ids.clone(),
+        }
+    }
+}
+
+// Allows users to claim a set of tokens. If scavenger_ids are set, all the ids need to be claimed
+// before the user gets the `amount`
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone)]
+#[serde(crate = "near_sdk::serde")]
+pub struct TokenDropData  {
+    pub id: String,
+    pub scavenger_ids: Option<Vec<String>>,
+    pub amount: U128,
+
+    pub name: String,
+    pub image: String
+}
+
+// Allows users to claim NFTs. If scavenger_ids are set, all the ids need to be claimed
+// before the user gets the NFT
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct NFTDropData {
+    pub id: String,
+    pub scavenger_ids: Option<Vec<String>>,
+    pub name: String,
+    pub image: String,
+
+    pub contract_id: String,
+    pub method: String,
+    pub args: String,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone)]
+#[serde(crate = "near_sdk::serde")]
+pub struct NFTWithOwnership {
+    pub nft: NFTDropData,
+    pub is_owned: bool,
+}
+
+'''
+'''--- contract/src/vendors/mod.rs ---
+pub mod update_vendors;
+pub mod view_vendor_info;
+
+pub use view_vendor_info::*;
+'''
+'''--- contract/src/vendors/update_vendors.rs ---
+use crate::*;
+use near_sdk::CryptoHash;
+
+/// Used to generate a unique prefix in our storage collections (this is to avoid data collisions)
+pub(crate) fn hash_string(string: &String) -> CryptoHash {
+    env::sha256_array(string.as_bytes())
+}
+
+#[near_bindgen]
+impl Contract {
+    /// Adds a vendor to the list of vendors
+    pub fn add_vendor(&mut self, vendor_id: AccountId, vendor_metadata: VendorMetadata) {
+        self.assert_admin();
+
+        let vendor_info = VendorInformation {
+            metadata: vendor_metadata,
+            item_by_id: UnorderedMap::new(StorageKeys::VendorItems {
+                vendor_id_hash: hash_string(&vendor_id.to_string()),
+            })
+        };
+
+        require!(self.data_by_vendor.insert(&vendor_id, &vendor_info).is_none(), "Vendor already exists");
+    }
+
+    /// Adds a vendor to the list of vendors
+    pub fn update_vendor(&mut self, vendor_id: AccountId, vendor_metadata: VendorMetadata) {
+        self.assert_admin();
+
+        let mut vendor_info= self.data_by_vendor.get(&vendor_id).expect("No vendor found");
+        vendor_info.metadata = vendor_metadata;
+        self.data_by_vendor.insert(&vendor_id, &vendor_info);
+    }
+
+    /// Adds a list of items to a specific vendor's store-front
+    pub fn add_item_to_vendor(&mut self, vendor_id: AccountId, items: Vec<ExtVendorItem>) {
+        self.assert_admin_or_vendor(&vendor_id);
+        
+        let mut vendor_info = self.data_by_vendor.get(&vendor_id).expect("No vendor found");
+        let mut next_id = vendor_info.item_by_id.len() as u64;
+        for ext_item in items.iter() {
+            let internal_item = InternalVendorItem {
+                id: next_id.to_string(),
+                name: ext_item.name.clone(),
+                image: ext_item.image.clone(),
+                price: ext_item.price.clone(),
+                in_stock: ext_item.in_stock,
+            };
+
+            require!(vendor_info.item_by_id.insert(&next_id, &internal_item).is_none(), "Item already exists");
+            next_id += 1;
+        }
+
+        self.data_by_vendor.insert(&vendor_id, &vendor_info);
+    }
+
+    /// Update a specific item in a vendor's store-front
+    pub fn update_vendor_item(&mut self, vendor_id: AccountId, item_id: u64, new_item: ExtVendorItem) {
+        self.assert_admin_or_vendor(&vendor_id);
+        
+        let mut vendor_info = self.data_by_vendor.get(&vendor_id).expect("No vendor found");
+        let internal_item = InternalVendorItem {
+            id: item_id.to_string(),
+            name: new_item.name.clone(),
+            image: new_item.image.clone(),
+            price: new_item.price.clone(),
+            in_stock: new_item.in_stock,
+        };
+        require!(vendor_info.item_by_id.insert(&item_id, &internal_item).is_some(), "Item doesn't exist");
+        self.data_by_vendor.insert(&vendor_id, &vendor_info);
+    }
+
+    pub(crate) fn assert_admin(&self) {
+        if env::predecessor_account_id() != env::current_account_id() {
+            require!(self.admin_accounts.contains(&env::predecessor_account_id()), "Unauthorized");
+        }
+    }
+
+    pub(crate) fn assert_admin_or_vendor(&self, vendor_id: &AccountId) {
+        // If the caller isn't the vendor, ensure they're an admin
+        if env::predecessor_account_id() != vendor_id.clone() && env::predecessor_account_id() != env::current_account_id() {
+            self.assert_admin();
+        }
+    }
+}
+'''
+'''--- contract/src/vendors/view_vendor_info.rs ---
+use crate::*;
+
+#[near_bindgen]
+impl Contract {
+    /// Query for the metadata associated with a vendor
+    pub fn get_vendor_metadata(&self, vendor_id: AccountId) -> VendorMetadata {
+        self.data_by_vendor.get(&vendor_id).expect("No vendor found").metadata
+    }
+
+    /// Paginate through the items for a specific vendor
+    pub fn get_items_for_vendor(&self, vendor_id: AccountId, from_index: Option<U128>, limit: Option<u64>) -> Vec<InternalVendorItem> {
+        let vendor_data = self.data_by_vendor.get(&vendor_id).expect("No vendor found");
+        let start = u128::from(from_index.unwrap_or(U128(0)));
+
+        vendor_data.item_by_id.values()
+            .skip(start as usize) 
+            .take(limit.unwrap_or(50) as usize) 
+            .collect()
+    }
+
+    /// Query for the information for a specific vendor's item
+    pub fn get_item_information(&self, vendor_id: AccountId, item_id: u64) -> InternalVendorItem {
+        let vendor_data = self.data_by_vendor.get(&vendor_id).expect("No vendor found");
+        vendor_data.item_by_id.get(&item_id).expect("No item found")
+    }
+}
+'''
+'''--- package.json ---
+{
+	"name": "keypom-trial-accounts",
+	"version": "1.0.0",
+	"license": "MIT",
+	"author": "Ben Kurrek, Matt Lockyer",
+	"scripts": {
+		"build": "cd contract && ./build.sh",
+		"test": "ava __tests__/tests.ava.ts",
+		"test:nearcon": "ava __tests__/nearcon/nearcon.ava.ts",
+		"create-drop": "node scripts/create_drop.js",
+		"add-tickets": "node scripts/add_tickets.js"
+	},
+	"dependencies": {
+		"@near-js/accounts": "0.1.3",
+		"@near-js/crypto": "0.0.4",
+		"@near-js/keystores-browser": "0.0.4",
+		"@near-js/keystores-node": "0.0.4",
+		"@near-js/transactions": "0.2.0",
+		"@near-js/types": "0.0.4",
+		"@near-js/utils": "0.0.4",
+		"@near-js/wallet-account": "0.0.6",
+		"@near-wallet-selector/core": "8.0.3",
+		"@types/bn.js": "^5.1.0",
+		"@types/react": "^18.0.26",
+		"ava": "^5.2.0",
+		"near-cli": "^3.4.2",
+		"near-workspaces": "^3.3.0",
+		"react": "^18.2.0",
+		"react-dom": "18.2.0",
+		"ts-node": "^10.8.0",
+		"typedoc": "^0.23.24",
+		"typescript": "^4.8.4"
+	}
+}
+
+'''
+'''--- scripts/add_tickets.js ---
+const path = require("path");
+const homedir = require("os").homedir();
+const { KeyPair } = require("@near-js/crypto");
+const { createHash } = require("crypto");
+const { readFileSync } = require('fs');
+const { writeFile, mkdir, readFile } = require('fs/promises');
+const { UnencryptedFileSystemKeyStore } = require("@near-js/keystores-node");
+const { Account } = require('@near-js/accounts');
+const { connect, Near } = require("@near-js/wallet-account");
+const { parseNearAmount } = require('@near-js/utils');
+
+const NETWORK_ID = 'testnet';
+
+const funderAccountId = 'benjiman.testnet';
+const keypomContract = "ncon23.keypom.testnet";
+
+// 3 tickets will be added. The first two will not be owned by anyone and the last will be owned by benjiman.testnet
+const ticketOwners = [
+    null,
+    null,
+    "benjiman.testnet",
+];
+
+const ticketBaseUrl = "https://test.near.org/nearpad.testnet/widget/Index?tab=ticket";
+const dropId = "nearcon2023";
+let basePassword = "nearcon2023-password";
+
+const main = async () => {
+    // Initiate connection to the NEAR blockchain.
+    const CREDENTIALS_DIR = '.near-credentials';
+    const credentialsPath = path.join(homedir, CREDENTIALS_DIR);
+
+    let keyStore = new UnencryptedFileSystemKeyStore(credentialsPath);
+
+    let nearConfig = {
+        networkId: NETWORK_ID,
+        keyStore: keyStore,
+        nodeUrl: `https://rpc.${NETWORK_ID}.near.org`,
+        walletUrl: `https://wallet.${NETWORK_ID}.near.org`,
+        helperUrl: `https://helper.${NETWORK_ID}.near.org`,
+        explorerUrl: `https://explorer.${NETWORK_ID}.near.org`,
+    };
+
+    let near = new Near(nearConfig);
+    const funderAccount = new Account(near.connection, funderAccountId);
+    const keypomAccount = new Account(near.connection, keypomContract);
+
+    let keyData = {
+        keys: [],
+        publicKeys: []
+    };
+    // Loop through from 0 -> ticketOwners.length 50 at a time
+    for (let i = 0; i < ticketOwners.length; i += 50) {
+        // Get the ticket owners for this current iteration
+        let ticketOwnersForIteration = ticketOwners.slice(i, i + 50);
+
+        let { keys, publicKeys } = await addKeys({
+            funderAccount,
+            keypomAccount,
+            ticketOwners: ticketOwnersForIteration,
+            dropId
+        })
+
+        console.log('keys: ', keys);
+        console.log('publicKeys: ', publicKeys);
+
+        keyData.keys = keyData.keys.concat(keys);
+        keyData.publicKeys = keyData.publicKeys.concat(publicKeys);
+    }
+
+    let stringToWrite = '';
+    // Loop through each secret key
+    var i = 0;
+    for (const sk of keyData.keys) {
+        stringToWrite += `${ticketBaseUrl}&secretKey=${sk}&contractId=${keypomContract}` + '\n';
+        i++;
+    }
+
+    await writeFile(path.resolve(__dirname, 'tickets-added.json'), stringToWrite);
+}
+
+const addKeys = async ({
+    funderAccount,
+    keypomAccount,
+    ticketOwners,
+    dropId,
+}) => {
+    let keyData = [];
+    let keysToReturn = [];
+    let publicKeysToReturn = [];
+
+    for (var ticketOwner of ticketOwners) {
+        let { keys, publicKeys } = await generateKeyPairs(1);
+
+        // Concat the keys and publicKeys
+        keysToReturn = keysToReturn.concat(keys);
+        publicKeysToReturn = publicKeysToReturn.concat(publicKeys);
+
+        let password_by_use = generatePasswordsForKey(publicKeys[0], [1], basePassword);
+        keyData.push({
+            public_key: publicKeys[0],
+            password_by_use,
+            key_owner: ticketOwner,
+        });
+    }
+
+    await funderAccount.functionCall({
+        contractId: keypomAccount.accountId,
+        methodName: 'add_keys',
+        args: {
+            drop_id: dropId,
+            key_data: keyData,
+        },
+        gas: 300000000000000,
+        attachedDeposit: parseNearAmount("20").toString()
+    });
+
+    return { keys: keysToReturn, publicKeys: publicKeysToReturn };
+};
+
+function hash(string, double = false) {
+    if (double) {
+        return createHash("sha256")
+            .update(Buffer.from(string, "hex"))
+            .digest("hex");
+    }
+
+    return createHash("sha256").update(Buffer.from(string)).digest("hex");
+}
+
+function generatePasswordsForKey(
+    pubKey,
+    usesWithPassword,
+    basePassword
+) {
+    let passwords = {};
+
+    // Loop through usesWithPassword
+    for (var use of usesWithPassword) {
+        passwords[use] = hash(hash(basePassword + pubKey + use.toString()), true);
+    }
+
+    return passwords;
+}
+
+async function generateKeyPairs(
+    numKeys
+) {
+    // Generate NumKeys public keys
+    let kps = [];
+    let pks = [];
+    for (let i = 0; i < numKeys; i++) {
+        let keyPair = await KeyPair.fromRandom("ed25519");
+        kps.push(keyPair);
+        pks.push(keyPair.getPublicKey().toString());
+    }
+    return {
+        keys: kps,
+        publicKeys: pks,
+    };
+}
+
+main()
+'''
+'''--- scripts/create_drop.js ---
+const path = require("path");
+const homedir = require("os").homedir();
+const { KeyPair } = require("@near-js/crypto");
+const { createHash } = require("crypto");
+const { readFileSync } = require('fs');
+const { writeFile, mkdir, readFile } = require('fs/promises');
+const { UnencryptedFileSystemKeyStore } = require("@near-js/keystores-node");
+const { Account } = require('@near-js/accounts');
+const { connect, Near } = require("@near-js/wallet-account");
+const { parseNearAmount } = require('@near-js/utils');
+
+const NETWORK_ID = 'mainnet';
+
+const funderAccountId = 'keypom.near'; // INSERT VERIKEN'S ACCOUNT ID HERE
+const nearconFactory = "nearcon23.near";
+const keypomContract = "ncon23.keypom.near";
+const dropId = "nearcon2023";
+
+const main = async () => {
+    // Initiate connection to the NEAR blockchain.
+    const CREDENTIALS_DIR = '.near-credentials';
+    const credentialsPath =  path.join(homedir, CREDENTIALS_DIR);
+
+    let keyStore = new UnencryptedFileSystemKeyStore(credentialsPath);  
+
+    let nearConfig = {
+        networkId: NETWORK_ID,
+        keyStore: keyStore,
+        nodeUrl: `https://rpc.${NETWORK_ID}.near.org`,
+        walletUrl: `https://wallet.${NETWORK_ID}.near.org`,
+        helperUrl: `https://helper.${NETWORK_ID}.near.org`,
+        explorerUrl: `https://explorer.${NETWORK_ID}.near.org`,
+    };  
+
+    let near = new Near(nearConfig);
+    const funderAccount = new Account(near.connection, funderAccountId);
+    const keypomAccount = new Account(near.connection, keypomContract);
+
+    await createNearconDrop({
+        funderAccount,
+        keypomAccount,
+    });
+}
+
+const createNearconDrop = async ({
+    funderAccount,
+    keypomAccount
+  }) => {
+    let assetData = [
+      {uses: 1, assets: [null], config: {permissions: "claim"}},
+      {uses: 1, assets: [null], config: {permissions: "create_account_and_claim", account_creation_keypom_args: {drop_id_field: "drop_id"}, root_account_id: nearconFactory}},
+    ];
+
+    await funderAccount.functionCall({
+        contractId: keypomAccount.accountId,
+        methodName: 'create_drop',
+        args: {
+          drop_id: dropId,
+          key_data: [],
+          drop_config: {
+              delete_empty_drop: false
+          },
+          drop_config: {
+            add_key_allowlist: ["2023.nearcontickets.near"]
+          },
+          asset_data: assetData,
+          keep_excess_deposit: true
+        },
+        gas: 300000000000000,
+        attachedDeposit: parseNearAmount("1").toString()
+    });
+}
+
+main()
+'''

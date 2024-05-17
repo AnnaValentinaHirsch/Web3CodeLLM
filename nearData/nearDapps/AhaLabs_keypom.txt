@@ -1,0 +1,951 @@
+*GitHub Repository "AhaLabs/keypom"*
+
+'''--- deploy/ft/configurations.js ---
+const { parseNearAmount } = require("near-api-js/lib/utils/format");
+
+const KEYPOM_CONTRACT = "v1.keypom.testnet"
+const FUNDING_ACCOUNT_ID = "benjiman.testnet";
+const NETWORK_ID = "testnet";
+const DEPOSIT_PER_USE = parseNearAmount("1");
+const NUM_KEYS = 1;
+const FT_CONTRACT_ID = "ft.keypom.testnet";
+
+const FT_DATA = {
+    // Contract ID of the fungible token
+    contract_id: FT_CONTRACT_ID,
+    // Who will be sending the FTs to the Keypom contract
+    sender_id: FUNDING_ACCOUNT_ID,
+    // How many FTs should be sent to the claimed account everytime a key is used
+    balance_per_use: parseNearAmount("1"),
+}
+
+const DROP_CONFIG = {
+    // How many claims can each key have.
+    uses_per_key: 5,
+
+    // Should the drop be automatically deleted when all the keys are used? This is defaulted to false and
+    // Must be overwritten
+    delete_on_empty: true,
+
+    // When this drop is deleted and it is the owner's *last* drop, automatically withdraw their balance.
+    auto_withdraw: true,
+
+    // Minimum block timestamp that keys can be used. If None, keys can be used immediately
+    // Measured in number of non-leap-nanoseconds since January 1, 1970 0:00:00 UTC.
+    start_timestamp: null,
+
+    // How often can a key be used
+    // Measured in number of non-leap-nanoseconds since January 1, 1970 0:00:00 UTC.
+    throttle_timestamp: null,
+
+    // If claim is called, refund the deposit to the owner's balance. If None, default to false.
+    on_claim_refund_deposit: null,
+
+    // Can the access key only call the claim method_name? Default to both method_name callable
+    claim_permission: null,
+
+    // Root account that all sub-accounts will default to. If None, default to the global drop root.
+    drop_root: null,
+}
+
+const DROP_METADATA = "";
+
+module.exports = {
+    FUNDING_ACCOUNT_ID,
+    NETWORK_ID,
+    DEPOSIT_PER_USE,
+    NUM_KEYS,
+    DROP_CONFIG,
+    DROP_METADATA,
+    KEYPOM_CONTRACT,
+    FT_DATA,
+    FT_CONTRACT_ID
+}
+'''
+'''--- deploy/ft/ft-create.js ---
+const { parseNearAmount, formatNearAmount } = require("near-api-js/lib/utils/format");
+const path = require("path");
+const homedir = require("os").homedir();
+const { writeFile, mkdir, readFile } = require('fs/promises');
+const { initiateNearConnection, getFtCosts, estimateRequiredDeposit, ATTACHED_GAS_FROM_WALLET, getRecentDropId } = require("../utils/general");
+const { FUNDING_ACCOUNT_ID, NETWORK_ID, NUM_KEYS, DROP_METADATA, DEPOSIT_PER_USE, DROP_CONFIG, KEYPOM_CONTRACT, FT_DATA, FT_CONTRACT_ID } = require("./configurations");
+const { KeyPair } = require("near-api-js");
+const { BN } = require("bn.js");
+
+async function start() {
+	// Initiate connection to the NEAR blockchain.
+	console.log("Initiating NEAR connection");
+	let near = await initiateNearConnection(NETWORK_ID);
+	const fundingAccount = await near.account(FUNDING_ACCOUNT_ID);
+
+	let requiredDeposit = await estimateRequiredDeposit(
+		near,
+		DEPOSIT_PER_USE,
+		NUM_KEYS,
+		DROP_CONFIG.uses_per_key,
+		ATTACHED_GAS_FROM_WALLET,
+		parseNearAmount("0.1"),
+		null,
+		FT_DATA
+	)
+	
+	// Keep track of an array of the keyPairs we create
+	let keyPairs = [];
+	// Keep track of the public keys to pass into the contract
+	let pubKeys = [];
+	console.log("Creating keypairs");
+	for(var i = 0; i < NUM_KEYS; i++) {
+		let keyPair = await KeyPair.fromRandom('ed25519'); 
+		keyPairs.push(keyPair);   
+		pubKeys.push(keyPair.publicKey.toString());   
+	}
+
+	try {
+		await fundingAccount.functionCall(
+			KEYPOM_CONTRACT, 
+			'add_to_balance', 
+			{},
+			"300000000000000", 
+			requiredDeposit.toString()
+		);
+	} catch(e) {
+		console.log('error adding to balance: ', e);
+	}
+
+	try {
+		await fundingAccount.functionCall(
+			KEYPOM_CONTRACT, 
+			'create_drop', 
+			{
+				public_keys: pubKeys,
+				deposit_per_use: DEPOSIT_PER_USE,
+				config: DROP_CONFIG,
+				metadata: JSON.stringify(DROP_METADATA),
+				ft_data: FT_DATA
+			}, 
+			"300000000000000"
+		);
+	} catch(e) {
+		console.log('error creating drop: ', e);
+	}
+
+	try {
+		await fundingAccount.functionCall(
+			FT_CONTRACT_ID, 
+			'storage_deposit',
+			{
+				account_id: FUNDING_ACCOUNT_ID,
+			},
+			"300000000000000",
+			parseNearAmount("0.1")
+		);
+
+		let amountToTransfer = new BN(FT_DATA.balance_per_use).mul(new BN(NUM_KEYS * DROP_CONFIG.uses_per_key)).toString();
+		console.log('amountToTransfer: ', amountToTransfer.toString());
+
+		await fundingAccount.functionCall(
+			FT_CONTRACT_ID, 
+			'ft_mint', 
+			{
+				account_id: FUNDING_ACCOUNT_ID,
+				// The max amount of tokens an account can receive PER `ft_transfer` call is 10
+				amount: amountToTransfer.toString()
+			},
+			"300000000000000"
+		);
+
+		let dropId = await getRecentDropId(fundingAccount, FUNDING_ACCOUNT_ID, KEYPOM_CONTRACT);
+		console.log('dropId: ', dropId)
+
+		await fundingAccount.functionCall(
+			FT_CONTRACT_ID, 
+			'ft_transfer_call', 
+			{
+				receiver_id: KEYPOM_CONTRACT,
+				amount: amountToTransfer.toString(),
+				msg: dropId.toString()
+			},
+			"300000000000000",
+			"1"
+		);
+	} catch(e) {
+		console.log('error sending FTs', e);
+	}
+	
+	let curPks = {};
+	for(var i = 0; i < keyPairs.length; i++) {
+		curPks[keyPairs[i].publicKey.toString()] = `https://testnet.mynearwallet.com/linkdrop/${KEYPOM_CONTRACT}/${keyPairs[i].secretKey}`;
+		console.log(`https://testnet.mynearwallet.com/linkdrop/${KEYPOM_CONTRACT}/${keyPairs[i].secretKey}`);
+	}
+
+	console.log('curPks: ', curPks)
+	await writeFile(path.resolve(__dirname, `pks.json`), JSON.stringify(curPks));
+}
+
+start();
+'''
+'''--- deploy/function-call/configurations.js ---
+const { parseNearAmount } = require("near-api-js/lib/utils/format");
+
+const KEYPOM_CONTRACT = "beta.keypom.testnet"
+const FUNDING_ACCOUNT_ID = "benjiman.testnet";
+const NETWORK_ID = "testnet";
+const DEPOSIT_PER_USE = parseNearAmount("0.003");
+const NUM_KEYS = 420;
+const NFT_CONTRACT_ID = "nft.keypom.testnet";
+
+const DROP_CONFIG = {
+    // How many claims can each key have.
+    uses_per_key: 1,
+}
+
+const DROP_METADATA = "";
+
+module.exports = {
+    FUNDING_ACCOUNT_ID,
+    NETWORK_ID,
+    DEPOSIT_PER_USE,
+    NUM_KEYS,
+    DROP_CONFIG,
+    DROP_METADATA,
+    KEYPOM_CONTRACT,
+    NFT_CONTRACT_ID,
+    NFT_METADATA
+}
+'''
+'''--- deploy/function-call/fc-create.js ---
+const { connect, KeyPair, keyStores, utils } = require("near-api-js");
+const { parseNearAmount, formatNearAmount } = require("near-api-js/lib/utils/format");
+const path = require("path");
+const homedir = require("os").homedir();
+const { writeFile, mkdir, readFile } = require('fs/promises');
+  
+let LINKDROP_PROXY_CONTRACT_ID = process.env.CONTRACT_NAME;
+let FUNDING_ACCOUNT_ID = process.env.FUNDING_ACCOUNT_ID;
+let LINKDROP_NEAR_AMOUNT = process.env.LINKDROP_NEAR_AMOUNT;
+
+let NUM_KEYS = 1;
+
+let NETWORK_ID = "testnet";
+let near;
+let keyStore;
+
+let config = {
+	uses_per_key: 1,
+}
+
+let metadata = {
+	title: "This is a title",
+	description: "This is a description"
+}
+
+/*
+Hard coding NFT contract and metadata. Change this if you want.
+*/
+//let NFT_CONTRACT_ID = "eth-toronto.keypom.testnet";
+// const METADATA = {
+// 	"title": "JS SDK Launch",
+// 	"description": "Thank you for supporting our JavaScript launch! Welcome to the NEAR ecosystem.",
+// 	"media": "https://bafybeihnb36l3xvpehkwpszthta4ic6bygjkyckp5cffxvszbcltzyjcwi.ipfs.nftstorage.link/",
+// 	"media_hash": null,
+// 	"copies": 400,
+// 	"issued_at": null,
+// 	"expires_at": null,
+// 	"starts_at": null,
+// 	"updated_at": null,
+// 	"extra": null,
+// 	"reference": null,
+// 	"reference_hash": null
+// };
+
+let fc_data = {
+	methods: [
+		[{
+			receiver_id: "dev-1664052531433-97566156431683",
+			method_name: "nft_mint",
+			args: JSON.stringify({
+				"foo": "bar",
+				"keypom_args": {
+					"account_id_field": "receiver_id",
+					"drop_id_field" : "mint_id"
+				}
+			}),
+			attached_deposit: parseNearAmount("1"),
+			account_id_field: "receiver_id",
+			drop_id_field: "mint_id"
+		}]
+	]
+}
+
+// set up near
+const initiateNear = async () => {
+	const CREDENTIALS_DIR = ".near-credentials";
+
+	const credentialsPath = (await path).join(homedir, CREDENTIALS_DIR);
+	(await path).join;
+	keyStore = new keyStores.UnencryptedFileSystemKeyStore(credentialsPath);
+
+	let nearConfig = {
+		networkId: NETWORK_ID,
+		keyStore,
+		nodeUrl: "https://rpc.testnet.near.org",
+		walletUrl: "https://wallet.testnet.near.org",
+		helperUrl: "https://helper.testnet.near.org",
+		explorerUrl: "https://explorer.testnet.near.org",
+	};
+
+	near = await connect(nearConfig);
+};
+
+async function start() {
+	//deployed linkdrop proxy contract
+	await initiateNear();
+
+	if(!LINKDROP_PROXY_CONTRACT_ID) {
+		const dev_account = await readFile(`neardev/dev-account`);
+		LINKDROP_PROXY_CONTRACT_ID = dev_account.toString();
+	}
+
+	console.log('LINKDROP_PROXY_CONTRACT_ID: ', LINKDROP_PROXY_CONTRACT_ID);
+	console.log('FUNDING_ACCOUNT_ID: ', FUNDING_ACCOUNT_ID);
+	console.log('LINKDROP_NEAR_AMOUNT: ', LINKDROP_NEAR_AMOUNT);
+
+	if(!FUNDING_ACCOUNT_ID || !LINKDROP_NEAR_AMOUNT) {
+		throw "must specify funding account and linkdrop near amount";
+	}
+
+	const contractAccount = await near.account(LINKDROP_PROXY_CONTRACT_ID);
+	const fundingAccount = await near.account(FUNDING_ACCOUNT_ID);
+
+	console.log(`initializing contract for account ${LINKDROP_PROXY_CONTRACT_ID}`);
+	try {
+		await contractAccount.functionCall(
+			LINKDROP_PROXY_CONTRACT_ID, 
+			'new', 
+			{
+				root_account: "testnet",
+				owner_id: LINKDROP_PROXY_CONTRACT_ID
+			}, 
+			"300000000000000", 
+		);
+	} catch(e) {
+		console.log('error initializing contract: ', e);
+	}
+
+	let keyPairs = [];
+	let pubKeys = [];
+
+	console.log("BATCH Creating keypairs");
+	for(var i = 0; i < NUM_KEYS; i++) {
+		console.log('i: ', i);
+		let keyPair = await KeyPair.fromRandom('ed25519'); 
+		keyPairs.push(keyPair);   
+		pubKeys.push(keyPair.publicKey.toString());   
+	}
+	console.log("Finished.");
+
+	const dropId = await fundingAccount.viewFunction(
+		LINKDROP_PROXY_CONTRACT_ID, 
+		'get_next_drop_id',
+	);
+
+	try {
+		await fundingAccount.functionCall(
+			LINKDROP_PROXY_CONTRACT_ID, 
+			'add_to_balance', 
+			{},
+			"300000000000000", 
+			parseNearAmount(
+				"50"
+				//((parseFloat(LINKDROP_NEAR_AMOUNT) + KEY_FEE + OFFSET + 1) * pubKeys.length * config.uses_per_key || 1 + DROP_FEE).toString()
+			)
+		);
+	} catch(e) {
+		console.log('error initializing contract: ', e);
+	}
+
+	try {
+		await fundingAccount.functionCall(
+			LINKDROP_PROXY_CONTRACT_ID, 
+			'create_drop', 
+			{
+				public_keys: pubKeys,
+				deposit_per_use: parseNearAmount(LINKDROP_NEAR_AMOUNT),
+				fc_data,
+				config,
+				metadata: JSON.stringify(metadata)
+			}, 
+			"300000000000000"
+		);
+	} catch(e) {
+		console.log('error initializing contract: ', e);
+	}
+
+	try {
+		let viewData = {};
+		const totalSupply = await fundingAccount.viewFunction(
+			LINKDROP_PROXY_CONTRACT_ID, 
+			'get_key_total_supply', 
+		);
+		viewData.get_key_total_supply = totalSupply; 
+		console.log('totalSupply: ', totalSupply);
+
+		const getKeys = await fundingAccount.viewFunction(
+			LINKDROP_PROXY_CONTRACT_ID, 
+			'get_keys'
+		);
+		viewData.get_keys = getKeys; 
+		console.log('getKeys: ', getKeys);
+
+		const keyInfo = await fundingAccount.viewFunction(
+			LINKDROP_PROXY_CONTRACT_ID, 
+			'get_key_information',
+			{
+				key: pubKeys[0]
+			}
+		);
+		viewData.get_key_information = keyInfo; 
+		console.log('keyInfo: ', keyInfo);
+
+		const dropInfo = await fundingAccount.viewFunction(
+			LINKDROP_PROXY_CONTRACT_ID, 
+			'get_drop_information',
+			{
+				drop_id: dropId
+			}
+		);
+		viewData.get_drop_information = dropInfo; 
+		console.log('dropInfo: ', dropInfo);
+
+		const keysForDrop = await fundingAccount.viewFunction(
+			LINKDROP_PROXY_CONTRACT_ID, 
+			'get_keys_for_drop',
+			{
+				drop_id: dropId
+			}
+		);
+		viewData.get_keys_for_drop = keysForDrop; 
+		console.log('keysForDrop: ', keysForDrop);
+
+		const dropSupplyForFunder = await fundingAccount.viewFunction(
+			LINKDROP_PROXY_CONTRACT_ID, 
+			'get_drop_supply_for_owner',
+			{
+				account_id: FUNDING_ACCOUNT_ID
+			}
+		);
+		viewData.get_drop_supply_for_owner = dropSupplyForFunder; 
+		console.log('dropSupplyForFunder: ', dropSupplyForFunder);
+
+		const dropsForFunder = await fundingAccount.viewFunction(
+			LINKDROP_PROXY_CONTRACT_ID, 
+			'get_drops_for_owner',
+			{
+				account_id: FUNDING_ACCOUNT_ID
+			}
+		);
+		viewData.get_drops_for_owner = dropsForFunder; 
+		console.log('dropsForFunder: ', dropsForFunder);
+		;
+		await writeFile(path.resolve(__dirname, `views-create.json`), JSON.stringify(viewData));
+	} catch(e) {
+		console.log('error initializing contract: ', e);
+	}
+	
+	let curPks = {};
+	for(var i = 0; i < keyPairs.length; i++) {
+		curPks[keyPairs[i].publicKey.toString()] = `https://wallet.testnet.near.org/linkdrop/${LINKDROP_PROXY_CONTRACT_ID}/${keyPairs[i].secretKey}`;
+		console.log(`https://wallet.testnet.near.org/linkdrop/${LINKDROP_PROXY_CONTRACT_ID}/${keyPairs[i].secretKey}`);
+		console.log("Pub Key: ", keyPairs[i].publicKey.toString());
+	}
+
+	await writeFile(path.resolve(__dirname, `pks.json`), JSON.stringify(curPks));
+}
+
+start();
+'''
+'''--- deploy/nft/configurations.js ---
+const { parseNearAmount } = require("near-api-js/lib/utils/format");
+
+const KEYPOM_CONTRACT = "v1.keypom.testnet"
+const FUNDING_ACCOUNT_ID = "benjiman.testnet";
+const NETWORK_ID = "testnet";
+const DEPOSIT_PER_USE = parseNearAmount("1");
+const NUM_KEYS = 2;
+const NFT_CONTRACT_ID = "nft.examples.testnet";
+
+const NFT_METADATA = {
+    title: "My Keypom NFT",
+    description: "Keypom is lit fam",
+    media: "https://bafybeiftczwrtyr3k7a2k4vutd3amkwsmaqyhrdzlhvpt33dyjivufqusq.ipfs.dweb.link/goteam-gif.gif",
+}
+
+const NFT_DATA = {
+    // NFT Contract Id that the tokens will come from
+    contract_id: NFT_CONTRACT_ID,
+    // Who will be sending the NFTs to the Keypom contract
+    sender_id: FUNDING_ACCOUNT_ID,
+}
+
+const DROP_CONFIG = {
+    // How many claims can each key have.
+    uses_per_key: 3,
+
+    // Should the drop be automatically deleted when all the keys are used? This is defaulted to false and
+    // Must be overwritten
+    delete_on_empty: true,
+
+    // When this drop is deleted and it is the owner's *last* drop, automatically withdraw their balance.
+    auto_withdraw: true,
+
+    // Minimum block timestamp that keys can be used. If None, keys can be used immediately
+    // Measured in number of non-leap-nanoseconds since January 1, 1970 0:00:00 UTC.
+    start_timestamp: null,
+
+    // How often can a key be used
+    // Measured in number of non-leap-nanoseconds since January 1, 1970 0:00:00 UTC.
+    throttle_timestamp: null,
+
+    // If claim is called, refund the deposit to the owner's balance. If None, default to false.
+    on_claim_refund_deposit: null,
+
+    // Can the access key only call the claim method_name? Default to both method_name callable
+    claim_permission: null,
+
+    // Root account that all sub-accounts will default to. If None, default to the global drop root.
+    drop_root: null,
+}
+
+const DROP_METADATA = "";
+
+module.exports = {
+    FUNDING_ACCOUNT_ID,
+    NETWORK_ID,
+    DEPOSIT_PER_USE,
+    NUM_KEYS,
+    DROP_CONFIG,
+    DROP_METADATA,
+    KEYPOM_CONTRACT,
+    NFT_DATA,
+    NFT_CONTRACT_ID,
+    NFT_METADATA
+}
+'''
+'''--- deploy/nft/nft-create.js ---
+const { parseNearAmount, formatNearAmount } = require("near-api-js/lib/utils/format");
+const path = require("path");
+const homedir = require("os").homedir();
+const { writeFile, mkdir, readFile } = require('fs/promises');
+const { initiateNearConnection, getFtCosts, estimateRequiredDeposit, ATTACHED_GAS_FROM_WALLET, getRecentDropId } = require("../utils/general");
+const { FUNDING_ACCOUNT_ID, NETWORK_ID, NUM_KEYS, DROP_METADATA, DEPOSIT_PER_USE, DROP_CONFIG, KEYPOM_CONTRACT, NFT_DATA, NFT_CONTRACT_ID, NFT_METADATA } = require("./configurations");
+const { KeyPair } = require("near-api-js");
+const { BN } = require("bn.js");
+
+async function start() {
+	// Initiate connection to the NEAR blockchain.
+	console.log("Initiating NEAR connection");
+	let near = await initiateNearConnection(NETWORK_ID);
+	const fundingAccount = await near.account(FUNDING_ACCOUNT_ID);
+
+	let requiredDeposit = await estimateRequiredDeposit({
+		near,
+		depositPerUse: DEPOSIT_PER_USE,
+		numKeys: NUM_KEYS,
+		usesPerKey: DROP_CONFIG.uses_per_key,
+		attachedGas: ATTACHED_GAS_FROM_WALLET,
+})
+	
+	// Keep track of an array of the keyPairs we create
+	let keyPairs = [];
+	// Keep track of the public keys to pass into the contract
+	let pubKeys = [];
+	console.log("Creating keypairs");
+	for(var i = 0; i < NUM_KEYS; i++) {
+		let keyPair = await KeyPair.fromRandom('ed25519'); 
+		keyPairs.push(keyPair);   
+		pubKeys.push(keyPair.publicKey.toString());   
+	}
+
+	try {
+		await fundingAccount.functionCall(
+			KEYPOM_CONTRACT, 
+			'add_to_balance', 
+			{},
+			"300000000000000", 
+			requiredDeposit.toString()
+		);
+	} catch(e) {
+		console.log('error adding to balance: ', e);
+	}
+
+	try {
+		await fundingAccount.functionCall(
+			KEYPOM_CONTRACT, 
+			'create_drop', 
+			{
+				public_keys: pubKeys,
+				deposit_per_use: DEPOSIT_PER_USE,
+				config: DROP_CONFIG,
+				metadata: JSON.stringify(DROP_METADATA),
+				nft_data: NFT_DATA
+			}, 
+			"300000000000000"
+		);
+	} catch(e) {
+		console.log('error creating drop: ', e);
+	}
+
+	try {
+		let dropId = await getRecentDropId(fundingAccount, FUNDING_ACCOUNT_ID, KEYPOM_CONTRACT);
+		console.log('dropId: ', dropId)
+
+		let amountToTransfer = NUM_KEYS * DROP_CONFIG.uses_per_key;
+		for(var i = 0; i < amountToTransfer; i++) {
+			let tokenId = `keypom-${dropId}-${i}-${FUNDING_ACCOUNT_ID}-${Date.now()}`;
+			await fundingAccount.functionCall(
+				NFT_CONTRACT_ID, 
+				'nft_mint', 
+				{
+					receiver_id: FUNDING_ACCOUNT_ID,
+					metadata: NFT_METADATA,
+					token_id: tokenId,
+				},
+				"300000000000000",
+				parseNearAmount("0.1")
+			);
+
+			await fundingAccount.functionCall(
+				NFT_CONTRACT_ID, 
+				'nft_transfer_call', 
+				{
+					receiver_id: KEYPOM_CONTRACT,
+					token_id: tokenId,
+					msg: dropId.toString()
+				},
+				"300000000000000",
+				"1"
+			);
+		}
+	} catch(e) {
+		console.log('error sending FTs', e);
+	}
+	
+	let curPks = {};
+	for(var i = 0; i < keyPairs.length; i++) {
+		curPks[keyPairs[i].publicKey.toString()] = `https://testnet.mynearwallet.com/linkdrop/${KEYPOM_CONTRACT}/${keyPairs[i].secretKey}`;
+		console.log(`https://testnet.mynearwallet.com/linkdrop/${KEYPOM_CONTRACT}/${keyPairs[i].secretKey}`);
+	}
+
+	console.log('curPks: ', curPks)
+	await writeFile(path.resolve(__dirname, `pks.json`), JSON.stringify(curPks));
+}
+
+start();
+'''
+'''--- deploy/simple/configurations.js ---
+const { parseNearAmount } = require("near-api-js/lib/utils/format");
+
+const KEYPOM_CONTRACT = "v1.keypom.testnet"
+const FUNDING_ACCOUNT_ID = "benjiman.testnet";
+const NETWORK_ID = "testnet";
+const DEPOSIT_PER_USE = parseNearAmount("10");
+const NUM_KEYS = 10;
+
+const DROP_CONFIG = {
+    // How many claims can each key have.
+    uses_per_key: 1,
+
+    // Should the drop be automatically deleted when all the keys are used? This is defaulted to false and
+    // Must be overwritten
+    delete_on_empty: true,
+
+    // When this drop is deleted and it is the owner's *last* drop, automatically withdraw their balance.
+    auto_withdraw: true,
+
+    // Minimum block timestamp that keys can be used. If None, keys can be used immediately
+    // Measured in number of non-leap-nanoseconds since January 1, 1970 0:00:00 UTC.
+    start_timestamp: null,
+
+    // How often can a key be used
+    // Measured in number of non-leap-nanoseconds since January 1, 1970 0:00:00 UTC.
+    throttle_timestamp: null,
+
+    // If claim is called, refund the deposit to the owner's balance. If None, default to false.
+    on_claim_refund_deposit: null,
+
+    // Can the access key only call the claim method_name? Default to both method_name callable
+    claim_permission: null,
+
+    // Root account that all sub-accounts will default to. If None, default to the global drop root.
+    drop_root: null,
+}
+
+const DROP_METADATA = "";
+
+module.exports = {
+    FUNDING_ACCOUNT_ID,
+    NETWORK_ID,
+    DEPOSIT_PER_USE,
+    NUM_KEYS,
+    DROP_CONFIG,
+    DROP_METADATA,
+    KEYPOM_CONTRACT
+}
+'''
+'''--- deploy/simple/simple-create.js ---
+const { parseNearAmount, formatNearAmount } = require("near-api-js/lib/utils/format");
+const path = require("path");
+const homedir = require("os").homedir();
+const { writeFile, mkdir, readFile } = require('fs/promises');
+const { initiateNearConnection, getFtCosts, estimateRequiredDeposit, ATTACHED_GAS_FROM_WALLET } = require("../utils/general");
+const { FUNDING_ACCOUNT_ID, NETWORK_ID, NUM_KEYS, DROP_METADATA, DEPOSIT_PER_USE, DROP_CONFIG, KEYPOM_CONTRACT } = require("./configurations");
+const { KeyPair } = require("near-api-js");
+
+async function start() {
+	// Initiate connection to the NEAR blockchain.
+	console.log("Initiating NEAR connection");
+	let near = await initiateNearConnection(NETWORK_ID);
+	const fundingAccount = await near.account(FUNDING_ACCOUNT_ID);
+
+	let requiredDeposit = await estimateRequiredDeposit(
+		near,
+		DEPOSIT_PER_USE,
+		NUM_KEYS,
+		DROP_CONFIG.uses_per_key,
+		ATTACHED_GAS_FROM_WALLET,
+	)
+	
+	// Keep track of an array of the keyPairs we create
+	let keyPairs = [];
+	// Keep track of the public keys to pass into the contract
+	let pubKeys = [];
+	console.log("Creating keypairs");
+	for(var i = 0; i < NUM_KEYS; i++) {
+		let keyPair = await KeyPair.fromRandom('ed25519'); 
+		keyPairs.push(keyPair);   
+		pubKeys.push(keyPair.publicKey.toString());   
+	}
+
+	try {
+		await fundingAccount.functionCall(
+			KEYPOM_CONTRACT, 
+			'add_to_balance', 
+			{},
+			"300000000000000", 
+			requiredDeposit.toString()
+		);
+	} catch(e) {
+		console.log('error adding to balance: ', e);
+	}
+
+	try {
+		await fundingAccount.functionCall(
+			KEYPOM_CONTRACT, 
+			'create_drop', 
+			{
+				public_keys: pubKeys,
+				deposit_per_use: DEPOSIT_PER_USE,
+				config: DROP_CONFIG,
+				metadata: JSON.stringify(DROP_METADATA)
+			}, 
+			"300000000000000"
+		);
+	} catch(e) {
+		console.log('error creating drop: ', e);
+	}
+	
+	let curPks = {};
+	for(var i = 0; i < keyPairs.length; i++) {
+		curPks[keyPairs[i].publicKey.toString()] = `https://testnet.mynearwallet.com/linkdrop/${KEYPOM_CONTRACT}/${keyPairs[i].secretKey}`;
+		console.log(`https://testnet.mynearwallet.com/linkdrop/${KEYPOM_CONTRACT}/${keyPairs[i].secretKey}`);
+	}
+
+	console.log('curPks: ', curPks)
+	await writeFile(path.resolve(__dirname, `pks.json`), JSON.stringify(curPks));
+}
+
+start();
+'''
+'''--- deploy/utils/general.js ---
+const { BN } = require("bn.js");
+const { parseNearAmount, formatNearAmount } = require("near-api-js/lib/utils/format");
+const { connect, KeyPair, keyStores, utils } = require("near-api-js");
+const path = require("path");
+const homedir = require("os").homedir();
+
+/// How much Gas each each cross contract call with cost to be converted to a receipt
+const GAS_PER_CCC = 5000000000000; // 5 TGas
+const RECEIPT_GAS_COST = 2500000000000; // 2.5 TGas
+const YOCTO_PER_GAS = 100000000; // 100 million
+const ATTACHED_GAS_FROM_WALLET = 100000000000000; // 100 TGas
+
+/// How much yoctoNEAR it costs to store 1 access key
+const ACCESS_KEY_STORAGE = new BN("1000000000000000000000");
+
+// Initiate the connection to the NEAR blockchain.
+const initiateNearConnection = async (network) => {
+	const CREDENTIALS_DIR = ".near-credentials";
+
+	const credentialsPath = (await path).join(homedir, CREDENTIALS_DIR);
+	(await path).join;
+	let keyStore = new keyStores.UnencryptedFileSystemKeyStore(credentialsPath);
+
+	let nearConfig = {
+		networkId: network,
+		keyStore,
+		nodeUrl: `https://rpc.${network}.near.org`,
+		walletUrl: `https://wallet.${network}.near.org`,
+		helperUrl: `https://helper.${network}.near.org`,
+		explorerUrl: `https://explorer.${network}.near.org`,
+	};
+
+	near = await connect(nearConfig);
+	return near;
+};
+
+// Initiate the connection to the NEAR blockchain.
+const estimateRequiredDeposit = async (
+    near,
+    depositPerUse,
+    numKeys,
+    usesPerKey,
+    attachedGas,
+    storage = parseNearAmount("0.01"),
+    fcData = null,
+    ftData = null,
+) => {
+    let totalRequiredStorage = new BN(parseNearAmount("0.2"));
+    console.log('totalRequiredStorage: ', totalRequiredStorage.toString())
+
+    let actualAllowance = estimatePessimisticAllowance(attachedGas);
+    console.log('actualAllowance: ', actualAllowance.toString())
+
+    let totalAllowance = actualAllowance.mul(new BN(numKeys));
+    console.log('totalAllowance: ', totalAllowance.toString())
+
+    let totalAccessKeyStorage = ACCESS_KEY_STORAGE.mul(new BN(numKeys));
+    console.log('totalAccessKeyStorage: ', totalAccessKeyStorage.toString())
+
+    let {numNoneFcs, depositRequiredForFcDrops} = getNoneFcsAndDepositRequired(fcData, usesPerKey);
+    let totalDeposits = new BN(depositPerUse).mul(new BN(usesPerKey - numNoneFcs)).mul(new BN(numKeys));
+    console.log('totalDeposits: ', totalDeposits.toString())
+
+    let totalDepositsForFc = depositRequiredForFcDrops.mul(new BN(numKeys));
+    console.log('totalDepositsForFc: ', totalDepositsForFc.toString())
+
+    let requiredDeposit = totalRequiredStorage
+        .add(totalAllowance)
+        .add(totalAccessKeyStorage)
+        .add(totalDeposits)
+        .add(totalDepositsForFc);
+    
+    console.log('requiredDeposit B4 FT costs: ', requiredDeposit.toString())
+    
+    if (ftData != null) {
+        let extraFtCosts = await getFtCosts(near, numKeys, usesPerKey, ftData.contract_id);
+        requiredDeposit = requiredDeposit.add(new BN(extraFtCosts));
+
+        console.log('requiredDeposit AFTER FT costs: ', requiredDeposit.toString())
+    }
+
+    return requiredDeposit.toString();
+};
+
+// Estimate the amount of allowance required for a given attached gas.
+const estimatePessimisticAllowance = (attachedGas) => {
+    // Get the number of CCCs you can make with the attached GAS
+    let numCCCs = Math.floor(attachedGas / GAS_PER_CCC);
+    console.log('numCCCs: ', numCCCs)
+    // Get the constant used to pessimistically calculate the required allowance
+    let powOutcome = Math.pow(1.03, numCCCs);
+    console.log('powOutcome: ', powOutcome)
+
+    let requiredGas = (attachedGas + RECEIPT_GAS_COST) * powOutcome + RECEIPT_GAS_COST;
+    console.log('requiredGas: ', requiredGas)
+    let requiredAllowance = new BN(requiredGas).mul(new BN(YOCTO_PER_GAS));
+    console.log('requiredAllowance: ', requiredAllowance.toString())
+    return requiredAllowance;
+};
+
+// Estimate the amount of allowance required for a given attached gas.
+const getNoneFcsAndDepositRequired = (fcData, usesPerKey) => {
+    let depositRequiredForFcDrops = new BN(0);
+    let numNoneFcs = 0;
+    if (fcData == null) {
+        return {numNoneFcs, depositRequiredForFcDrops};
+    }
+
+    let numMethodData = fcData.methods.length;
+
+    // If there's one method data specified and more than 1 claim per key, that data is to be used
+    // For all the claims. In this case, we need to tally all the deposits for each method in all method data.
+    if (usesPerKey > 1 && numMethodData == 1) {
+        let methodData = fcData.methods[0];
+
+        // Keep track of the total attached deposit across all methods in the method data
+        let attachedDeposit = new BN(0);
+        for (let i = 0; i < methodData.length; i++) {
+            attachedDeposit = attachedDeposit.add(new BN(methodData[i].attachedDeposit));
+        }
+
+        depositRequiredForFcDrops = depositRequiredForFcDrops.add(attachedDeposit).mul(usesPerKey);
+
+        return {
+            numNoneFcs,
+            depositRequiredForFcDrops,
+        }
+    }
+    // In the case where either there's 1 claim per key or the number of FCs is not 1,
+    // We can simply loop through and manually get this data
+    for (let i = 0; i < numMethodData; i++) {
+        let methodData = fcData.methods[i];
+        let isNoneFc = methodData == null;
+        numNoneFcs += isNoneFc;
+
+        if (!isNoneFc) {
+            // Keep track of the total attached deposit across all methods in the method data
+            let attachedDeposit = new BN(0);
+            for (let j = 0; j < methodData.length; j++) {
+                attachedDeposit = attachedDeposit.add(new BN(methodData[j].attachedDeposit));
+            }
+
+            depositRequiredForFcDrops = depositRequiredForFcDrops.add(attachedDeposit);
+        }
+    }
+
+    return {
+        numNoneFcs,
+        depositRequiredForFcDrops,
+    } 
+};
+
+// Estimate the amount of allowance required for a given attached gas.
+const getFtCosts = async (near, numKeys, usesPerKey, ftContract) => {
+    const viewAccount = await near.account("foo");
+    const storageBalanceBounds = await viewAccount.viewFunction(ftContract, "storage_balance_bounds", {}); 
+    console.log('storageBalanceBounds: ', storageBalanceBounds)
+    let costs = new BN(storageBalanceBounds.min).mul(new BN(numKeys)).mul(new BN(usesPerKey)).add(new BN(storageBalanceBounds.min));
+    console.log('costs: ', costs.toString());
+    return costs.toString();
+};
+
+// Estimate the amount of allowance required for a given attached gas.
+const getRecentDropId = async (fundingAccountObject, accountId, keypomContract) => {
+    let dropSupplyForOwner = await fundingAccountObject.viewFunction(keypomContract, 'get_drop_supply_for_owner', {account_id: accountId});
+	console.log('dropSupplyForOwner: ', dropSupplyForOwner)
+	let dropsForOwner = await fundingAccountObject.viewFunction(keypomContract, 'get_drops_for_owner', { account_id: accountId, from_index: (dropSupplyForOwner - 1).toString() });
+	console.log('dropsForOwner: ', dropsForOwner)
+
+    return dropsForOwner[dropsForOwner.length - 1].drop_id;
+};
+
+module.exports = {
+    initiateNearConnection,
+    estimateRequiredDeposit,
+    estimatePessimisticAllowance,
+    getNoneFcsAndDepositRequired,
+    getFtCosts,
+    getRecentDropId,
+    ATTACHED_GAS_FROM_WALLET
+};
+'''

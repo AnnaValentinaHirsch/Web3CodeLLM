@@ -1,0 +1,2927 @@
+*GitHub Repository "NEAR-Balkans/pool-together"*
+
+'''--- README.md ---
+# pool-together
+'''
+'''--- build_all.sh ---
+#!/bin/bash
+set -e
+
+cd ./defi-borrow
+./build.sh
+
+cd ../draw
+./build.sh
+
+cd ../pool
+./build.sh
+'''
+'''--- common/Cargo.toml ---
+[package]
+name = "common"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+borsh = "0.9.3"
+serde = { version = "1", features = ["derive"] }
+uint = { version = "0.9.0", default-features = false }
+'''
+'''--- common/src/lib.rs ---
+pub mod generic_ring_buffer{
+
+    use borsh::{BorshDeserialize, BorshSerialize};
+    pub trait RingBuffer<T : Copy>{
+        fn next_index(&self) -> usize;
+        fn add(&mut self, element: &T);
+        fn get(&self, idx: usize) -> T;
+    }
+
+    #[derive(BorshSerialize, BorshDeserialize)]
+    pub struct GenericRingBuffer<T, const CAPACITY: usize>{
+        pub arr: [T; CAPACITY],
+        current_index: usize,
+    }
+
+    impl<T: Default + Copy, const CAPACITY: usize> Default for GenericRingBuffer<T, CAPACITY>{
+        fn default() -> Self {
+            assert_ne!(CAPACITY, 0, "capacity cannot be lower than 1");
+    
+            let arr = [T::default(); CAPACITY];
+    
+            return Self { arr: arr, current_index: 0 };
+        }
+    }
+    
+    impl<T: Default + Copy, const CAPACITY: usize> GenericRingBuffer<T, CAPACITY>{
+        pub fn new() -> Self{
+            Self::default()
+        }
+    }
+
+    impl<T: Copy, const CAPACITY: usize> RingBuffer<T> for GenericRingBuffer<T, CAPACITY>{
+        fn next_index(&self) -> usize{
+            return (self.current_index + 1) % self.arr.len();
+        }
+
+        fn add(&mut self, element: &T){
+            let next_idx = self.next_index();
+            
+            self.arr[self.current_index] = *element;
+            self.current_index = next_idx;
+        }
+
+        fn get(&self, idx: usize) -> T{
+            self.arr[idx]
+        }
+    }
+}
+
+pub mod types;
+
+#[cfg(test)]
+mod tests {
+    use crate::generic_ring_buffer::{GenericRingBuffer, RingBuffer};
+
+    #[test]
+    fn test_default_elements_in_buffer() {
+        let result = 2 + 2;
+        assert_eq!(result, 4);
+        let x = GenericRingBuffer::<u32, 5>::new();
+        for el in 0..x.arr.len(){
+            assert_eq!(x.arr[el], u32::default());
+        }
+    }
+
+    #[test]
+    fn test_ring_buffer() {
+        let mut buffer = GenericRingBuffer::<u32, 3>::new();
+        let mut current_element = 1;
+        buffer.add(&current_element);
+        current_element = 2;
+        buffer.add(&current_element);
+        current_element = 3;
+        buffer.add(&current_element);
+        current_element = 4;
+        buffer.add(&current_element);
+        
+        assert!(buffer.get(0) == 4);
+        current_element = 5;
+        buffer.add(&current_element);
+        assert!(buffer.get(1) == 5);
+    }
+}
+
+'''
+'''--- common/src/types.rs ---
+use borsh::{BorshDeserialize, BorshSerialize};
+use serde::{Serialize, Deserialize};
+use uint::construct_uint;
+
+pub type DrawId = u128;
+pub type NumPicks = u128;
+
+construct_uint!{
+    /// 256-bit unsigned integer
+    #[derive(Serialize, Deserialize, BorshDeserialize, BorshSerialize)]
+    pub struct U256(4);
+}
+
+pub type WinningNumber = U256;
+'''
+'''--- defi-borrow/Cargo.toml ---
+[package]
+name = "defi-borrow"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+near-sdk = "=4.0.0-pre.9"
+near-contract-standards = "=4.0.0-pre.9"
+'''
+'''--- defi-borrow/build.sh ---
+#!/bin/bash
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo +stable build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/defi_borrow.wasm ../res/defi.wasm
+
+'''
+'''--- defi-borrow/src/events.rs ---
+pub mod events{
+    use near_sdk::json_types::U128;
+    use near_sdk::{AccountId, Balance, log};
+    use near_sdk::serde::{Serialize};
+    use near_sdk::serde_json::json;
+
+    #[derive(Serialize)]
+    #[serde(crate = "near_sdk::serde")]
+    struct Event<'a> {
+        pub account_id: &'a AccountId,
+        pub amount: U128,
+        pub token_id: &'a AccountId,
+    }
+
+    fn log_event<T: Serialize>(event: &str, data: T) {
+        let event = json!({
+            "standard": "defi-borrow",
+            "version": "1.0.0",
+            "event": event,
+            "data": [data]
+        });
+
+        log!("EVENT_JSON:{}", event.to_string());
+    }
+
+    pub fn withdraw_success(account_id: &AccountId, amount: Balance, token_id: &AccountId){
+        log_event(
+            "withdraw_success", 
+            Event {
+                account_id: &account_id,
+                amount: U128(amount),
+                token_id: &token_id,
+            }
+        );
+    }
+
+    pub fn withdraw_failed(account_id: &AccountId, amount: Balance, token_id: &AccountId){
+        log_event(
+            "withdraw_failed", 
+            Event {
+                account_id: &account_id,
+                amount: U128(amount),
+                token_id: &token_id,
+            }
+        );
+    }
+}
+
+'''
+'''--- defi-borrow/src/lib.rs ---
+use near_contract_standards::fungible_token::receiver::FungibleTokenReceiver;
+
+use near_sdk::collections::{ UnorderedMap};
+use near_sdk::json_types::{U128};
+use near_sdk::serde::{Serialize, Deserialize};
+use near_sdk::{self, near_bindgen, ext_contract, log, env, AccountId, Balance, PromiseResult, Gas, Promise};
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use std::vec::Vec;
+
+pub const ON_FUNDING_GAS: Gas = near_sdk::Gas(10_000_000_000_000);
+
+pub const GAS_FOR_FT_TRANSFER: Gas = near_sdk::Gas(50_000_000_000_000);
+
+mod events;
+
+pub(crate) type TokenId = AccountId;
+pub(crate) type NumShares = Balance;
+
+#[derive(Deserialize, Debug, Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct AssetAmount {
+    pub token_id: TokenId,
+    /// The amount of tokens intended to be used for the action
+    /// If 'None', then the maximum will be tried
+    pub amount: Option<U128>,
+    /// The maximum amount of tokens that can be used for the action
+    /// If 'None', then the maximum 'available' amount will be used
+    pub max_amount: Option<U128>,
+}
+
+#[derive(Deserialize, Debug, Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub enum Action{
+    Withdraw(AssetAmount)
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct TokensBalances{
+    /// first variable shows the balance, second shows the reward tally
+    pub token_id_balance: UnorderedMap<AccountId, (NumShares, Balance)>,
+    pub tally_below_zero: bool,
+}
+
+impl Default for TokensBalances {
+    fn default() -> Self {
+        Self { 
+            token_id_balance: UnorderedMap::new(b"tib".to_vec()),
+            tally_below_zero: false 
+        }
+    }
+}
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Contract {
+    pub accounts: UnorderedMap<AccountId, TokensBalances>,
+} 
+
+impl Default for Contract{
+    fn default() -> Self {
+        Self {
+            accounts:UnorderedMap::new(b"a"),
+        }
+    }
+}
+
+#[ext_contract(ext_fungible_token)]
+pub trait ExtFt {
+    fn ft_transfer(&mut self, receiver_id: AccountId, amount: String, memo: Option<String>);
+    fn ft_transfer_call(
+        receiver_id: AccountId,
+        amount: String,
+        memo: Option<String>,
+        msg: String,
+    ) -> Promise;
+}
+
+#[ext_contract(ext_self)]
+pub trait ExtSelf{
+    fn on_after_ft_transfer(&mut self, account_id: AccountId, token_id: AccountId, amount: U128) -> bool;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct TokenAmountsView{
+    token: TokenId,
+    shares: U128,
+    rewards: U128
+}
+
+#[near_bindgen]
+impl Contract{
+    #[init]
+    pub fn new() -> Self{
+        assert!(!env::state_exists(), "Already initialized");
+
+        Contract::default()
+    }
+
+    pub fn show_reward(&self, account_id: AccountId) -> Vec<TokenAmountsView>{
+        let acc: TokensBalances = self
+            .accounts
+            .get(&account_id)
+            .unwrap_or_default();
+        
+        return acc.token_id_balance.iter().map(|(token_id, (share, reward))|{
+            TokenAmountsView { token: token_id, shares: U128(share), rewards: U128(reward) }
+        }).collect::<Vec<TokenAmountsView>>();
+    }
+
+    pub fn account_farm_claim_all(&self){}
+
+    #[payable]
+    pub fn execute(&mut self, actions: Vec<Action>){
+        let caller = env::predecessor_account_id();
+        assert!(env::attached_deposit() >= 1, "1 yocto for ft transfer is needed");
+
+        let acc_amounts = self.accounts.get(&caller).unwrap_or_default();
+        
+        for action in actions{
+            match action{
+                Action::Withdraw(asset_amount) => {
+                    let token_amount = acc_amounts.token_id_balance.get(&asset_amount.token_id).unwrap_or_default();
+
+                    if asset_amount.amount.unwrap().0 > token_amount.1{
+                        panic!("Trying to send amount that is not available");
+                    }
+
+                    ext_fungible_token::ft_transfer(caller.clone(), asset_amount.amount.unwrap().0.to_string(), None, asset_amount.token_id, 1, GAS_FOR_FT_TRANSFER);
+                }
+            }   
+        }       
+    }
+ 
+ 
+    #[private]
+    pub fn on_after_ft_transfer(&mut self, account_id: AccountId, token_id: AccountId, amount: U128) -> bool {
+        let promise_result = env::promise_result(0);
+        let transfer_success = match promise_result {
+            PromiseResult::Successful(_) => true,
+            _ => false
+        };
+
+        if transfer_success{
+            events::events::withdraw_success(&account_id, amount.0, &token_id);
+
+            let mut acc_amount = self.accounts.get(&account_id).unwrap_or_default();
+            let mut amounts = acc_amount.token_id_balance.get(&token_id).unwrap_or_default();
+            amounts.1 += amount.0;
+            acc_amount.token_id_balance.insert(&token_id, &amounts);
+            self.accounts.insert(&account_id, &acc_amount);
+
+        }else {
+            events::events::withdraw_failed(&account_id, amount.0, &token_id);
+        }
+
+        return transfer_success;
+    }
+ 
+    /*
+    pub fn get_reward(&mut self) -> Promise {
+        let caller = env::predecessor_account_id();
+
+        ext_ft::ft_transfer()
+
+        let acc_amounts = self.accounts.get(&caller).unwrap_or_default();
+        for x in acc_amounts.token_id_balance.to_vec().iter(){
+            
+        }
+
+        
+        if amount > 0 {
+            ext_ft::ft_transfer_call(
+                caller.clone(),
+                amount.to_string(),
+                None,
+                "reward".to_string(),
+
+            ).
+
+            ext_ft::ft_transfer_call(
+                self.lender.clone(),
+                format!(
+                    "{}",
+                    self.collateral.1 - self.shares.collateral_to_liquidate as u128
+                ),
+                None,
+                "liquidation".to_string(),
+                self.collateral.0.clone(),
+                SECURITY_DEPOSIT,
+                gas::TRANSFER_GAS,
+            )
+            .then(ext_self::on_user_transfer(
+                self.state.clone(),
+                env::current_account_id(),
+                NO_DEPOSIT,
+                gas::CALLBACK_GAS,
+            ))
+
+    }*/
+}
+
+#[near_bindgen]
+impl FungibleTokenReceiver for Contract{
+    fn ft_on_transfer(
+        &mut self,
+        sender_id: AccountId,
+        amount: near_sdk::json_types::U128,
+        msg: String,
+    ) -> near_sdk::PromiseOrValue<near_sdk::json_types::U128> {
+        let acc_id: AccountId = if msg.is_empty() {
+            sender_id.clone()
+        }else{
+            AccountId::new_unchecked(msg.clone())
+        };
+
+        let token_id = env::predecessor_account_id();
+        log!("Predecesor {} Signer {} Sender {} amount {} acc_id {}", env::predecessor_account_id(), env::signer_account_id(), &sender_id, amount.0, acc_id);
+        let mut account_tokens: TokensBalances = self.accounts.get(&acc_id).unwrap_or_default();
+        let mut token_balance: (NumShares, Balance) = account_tokens.token_id_balance.get(&token_id).unwrap_or_default();
+        if msg.is_empty(){
+            token_balance.0 += amount.0;
+        }else{
+            token_balance.1 += amount.0;
+        }
+        account_tokens.token_id_balance.insert(&token_id, &token_balance);
+        self.accounts.insert(&acc_id, &account_tokens);
+
+        return near_sdk::PromiseOrValue::Value(U128(0));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use near_sdk::{json_types::U128, AccountId};
+    use near_contract_standards::fungible_token::receiver::FungibleTokenReceiver;
+
+    use crate::Contract;
+
+    #[test]
+    fn it_works() {
+        let x = vec![1,2,3];
+        let mut contract = Contract::default();
+        let res = contract.ft_on_transfer(AccountId::new_unchecked("test.near".to_string()), U128(10), "".to_string());
+        let shares = contract.show_reward(AccountId::new_unchecked("test.near".to_string())).first().unwrap().shares;
+        assert_eq!(shares.0, 10);
+        contract.ft_on_transfer(AccountId::new_unchecked("test.near".to_string()), U128(5), "test.near".to_string());
+        let reward = contract.show_reward(AccountId::new_unchecked("test.near".to_string())).first().unwrap().rewards;
+        assert_eq!(reward.0, 5);
+    }
+}
+
+'''
+'''--- draw/Cargo.toml ---
+[package]
+name = "draw"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+uint = { version = "0.9.0", default-features = false }
+near-sdk = "=4.0.0-pre.9"
+near-contract-standards = "=4.0.0-pre.9"
+common = {path = "../common" }
+
+[dev-dependencies]
+near-sdk = "=4.0.0-pre.9"
+rand = "0.8.5"
+'''
+'''--- draw/build.sh ---
+#!/bin/bash
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo +stable build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/draw.wasm ../res/draw.wasm
+
+'''
+'''--- draw/src/interfaces/mod.rs ---
+pub mod draw {
+    use common::types::WinningNumber;
+    use common::types::DrawId;
+    use near_sdk::{borsh::{self, BorshDeserialize, BorshSerialize}, serde::{Serialize, Deserialize}};
+
+    #[derive(Clone, Debug, Copy, Default)]
+    #[derive(BorshDeserialize, BorshSerialize)]
+    #[derive(Serialize, Deserialize)]
+    #[serde(crate = "near_sdk::serde")]
+    pub struct Draw {
+        pub winning_random_number: WinningNumber,
+        pub draw_id: DrawId,
+        pub started_at: u64,
+        pub completed_at: u64,
+    }
+
+    pub trait DrawCreator{
+        fn can_start_draw(&self) -> bool;
+        fn can_complete_draw(&self) -> bool;
+        fn start_draw(&mut self);
+        fn complete_draw(&mut self);
+    }
+
+    pub trait DrawBuffer{
+        fn get_draw(&self, draw_id: DrawId) -> Draw;
+    }
+
+    pub trait DrawRegister{
+        fn get_draws(&self, from_index: usize, limit: usize) -> Vec<Draw>;
+    }
+}
+'''
+'''--- draw/src/lib.rs ---
+use common::generic_ring_buffer::{GenericRingBuffer, RingBuffer};
+use common::types::{DrawId, U256};
+use near_sdk::{env, near_bindgen, EpochHeight, PanicOnDefault};
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use interfaces::draw::{DrawCreator, Draw, DrawBuffer, DrawRegister};
+
+mod interfaces;
+
+const DRAW_DURATION_IN_EPOCHS: u64 = 5;
+const DRAW_BUFFER_CAPACITY:usize = 3;
+
+#[cfg(test)]
+mod test_utils;
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Contract{
+    pub draw_buffer: GenericRingBuffer<Draw, DRAW_BUFFER_CAPACITY>,
+    pub last_epoch_started: EpochHeight,
+    pub is_started: bool,
+    pub temp_draw: Draw,
+}
+
+fn as_u256(arr: &[u8; 32]) -> U256{
+    let mut result:U256 = U256::zero();
+    let mut shift:u16 = 0;
+
+    for idx in 0..arr.len(){
+        result += U256::from(arr[idx]) << shift;
+        shift += 8;
+    }
+
+    return result;
+}
+
+fn random_u256() -> U256{
+    let random_seed = env::random_seed(); // len 32
+    println!("Random seed is {:?}", random_seed.to_vec());
+    // using first 16 bytes (doesn't affect randomness)
+    return as_u256(random_seed.as_slice().try_into().expect("random seed of incorrect length"));
+}
+
+#[near_bindgen]
+impl Contract{
+    #[init]
+    pub fn new() -> Self{
+        Self { 
+            draw_buffer: GenericRingBuffer::<Draw, DRAW_BUFFER_CAPACITY>::default(), 
+            last_epoch_started: 0, 
+            is_started: false, 
+            temp_draw: Draw::default(),
+        }
+    }
+
+    
+}
+
+#[near_bindgen]
+impl DrawRegister for Contract{
+    fn get_draws(&self, from_index: usize, limit: usize) -> Vec<Draw>{
+        return self.draw_buffer.arr
+            .iter()
+            .cloned()
+            .skip(from_index)
+            .take(limit)
+            .collect::<Vec<Draw>>();
+    }
+}
+
+#[near_bindgen]
+impl DrawBuffer for Contract{
+    fn get_draw(&self, id: DrawId) -> Draw{
+        return self
+            .draw_buffer
+            .arr
+            .into_iter()
+            .find(|&el| el.draw_id == id).unwrap_or_default();
+    }
+}
+
+#[near_bindgen]
+impl DrawCreator for Contract{
+    fn can_start_draw(&self) -> bool{
+        return !self.is_started;
+    }
+
+    fn can_complete_draw(&self) -> bool {
+        return self.is_started && env::epoch_height() >= self.last_epoch_started + DRAW_DURATION_IN_EPOCHS;
+    }
+
+    fn start_draw(&mut self) {
+        if !self.can_start_draw(){
+            return;
+        }
+
+        self.is_started = true;
+        self.last_epoch_started = env::epoch_height();
+        self.temp_draw.started_at = env::block_timestamp_ms();
+        self.temp_draw.draw_id = self.temp_draw.draw_id + 1;
+    }
+
+    fn complete_draw(&mut self) {
+        if !self.can_complete_draw() {
+            return;
+        }
+
+        self.is_started = false;
+        self.last_epoch_started = 0;
+        self.temp_draw.winning_random_number = random_u256();
+        self.temp_draw.completed_at = env::block_timestamp_ms();
+
+        self.draw_buffer.add(&self.temp_draw);
+    }
+}
+
+#[cfg(test)]
+pub mod tests {
+    use crate::interfaces::draw::{Draw};
+    use common::{generic_ring_buffer::{GenericRingBuffer, RingBuffer}};
+
+    use rand::Rng;
+    use super::*;
+    use crate::test_utils::tests::*;
+
+    fn generate_random_seed() -> [u8; 32]{
+        return rand::thread_rng().gen::<[u8; 32]>();
+    }
+
+    fn test_arr(arr: &[u8; 32]){
+        for idx in 0..arr.len(){
+            println!("{} {}", idx, arr[idx]);
+        }
+    }
+
+    #[test]
+    fn test_conversion(){
+        let seed = generate_random_seed();
+        let _res256 = as_u256(seed.as_slice().try_into().expect("msg"));
+    }
+
+    #[test]
+    fn test_ring_buffer() {
+        let mut buffer = GenericRingBuffer::<Draw, 3>::new();
+        let mut current_draw = Draw::default();
+        
+        current_draw.winning_random_number = U256::from(1);
+        buffer.add(&current_draw);
+        current_draw.winning_random_number = U256::from(2);
+        buffer.add(&current_draw);
+        current_draw.winning_random_number = U256::from(3);
+        buffer.add(&current_draw);
+        current_draw.winning_random_number = U256::from(4);
+        buffer.add(&current_draw);
+        
+        assert!(buffer.get(0).winning_random_number == U256::from(4));
+        current_draw.winning_random_number = U256::from(5);
+        buffer.add(&current_draw);
+        assert!(buffer.get(1).winning_random_number == U256::from(5));
+    }
+
+    #[test]
+    fn test_if_can_start_draw(){
+        let mut emulator = Emulator::new();
+        
+        assert_eq!(emulator.contract.can_start_draw(), true);
+        assert_eq!(emulator.contract.can_complete_draw(), false);
+
+        emulator.contract.start_draw();
+        emulator.skip_epochs(1, generate_random_seed());
+        assert_eq!(emulator.contract.can_start_draw(), false);
+        assert_eq!(emulator.contract.can_complete_draw(), false);
+
+        emulator.skip_epochs(4, generate_random_seed());
+        assert_eq!(emulator.contract.can_start_draw(), false);
+        assert_eq!(emulator.contract.can_complete_draw(), true);
+
+        emulator.contract.complete_draw();
+        let mut current_draw_id = emulator.contract.temp_draw.draw_id;
+
+        for _ in 0..4{
+            assert_eq!(emulator.contract.can_start_draw(), true);
+            emulator.contract.start_draw();
+            emulator.skip_epochs(5, generate_random_seed());
+            assert_eq!(emulator.contract.can_complete_draw(), true);
+            emulator.contract.complete_draw();
+            assert_eq!(emulator.contract.temp_draw.draw_id, current_draw_id + 1);
+            current_draw_id+=1;
+        }
+    }
+}
+
+'''
+'''--- draw/src/test_utils.rs ---
+use near_sdk::AccountId;
+use near_sdk::Balance;
+
+pub fn staking() -> AccountId {
+    "staking".parse().unwrap()
+}
+
+pub fn alice() -> AccountId {
+    "alice".parse().unwrap()
+}
+pub fn bob() -> AccountId {
+    "bob".parse().unwrap()
+}
+pub fn owner() -> AccountId {
+    "owner".parse().unwrap()
+}
+pub fn charlie() -> AccountId {
+    "charlie".parse().unwrap()
+}
+
+pub fn a() -> AccountId {
+    "aa".parse().unwrap()
+}
+pub fn b() -> AccountId {
+    "bb".parse().unwrap()
+}
+pub fn c() -> AccountId {
+    "cc".parse().unwrap()
+}
+pub fn d() -> AccountId {
+    "dd".parse().unwrap()
+}
+pub fn e() -> AccountId {
+    "ee".parse().unwrap()
+}
+
+pub fn ntoy(near_amount: Balance) -> Balance {
+    near_amount * 10u128.pow(24)
+}
+
+/// Rounds to nearest
+pub fn yton(yocto_amount: Balance) -> Balance {
+    (yocto_amount + (5 * 10u128.pow(23))) / 10u128.pow(24)
+}
+
+/// Checks that two amount are within epsilon
+pub fn almost_equal(left: Balance, right: Balance, epsilon: Balance) -> bool {
+    println!("{} ~= {}", left, right);
+    if left > right {
+        (left - right) < epsilon
+    } else {
+        (right - left) < epsilon
+    }
+}
+
+#[macro_export]
+macro_rules! assert_eq_in_near {
+    ($a:expr, $b:expr) => {
+        assert_eq!(yton($a), yton($b))
+    };
+    ($a:expr, $b:expr, $c:expr) => {
+        assert_eq!(yton($a), yton($b), $c)
+    };
+}
+
+#[cfg(test)]
+pub mod tests {
+    use near_sdk::test_utils::VMContextBuilder;
+    use near_sdk::{testing_env, VMContext};
+
+    use crate::*;
+
+    use super::*;
+
+    pub const ONE_EPOCH_TS: u64 = 12 * 60 * 60 * 1_000_000_000;
+
+    pub struct Emulator {
+        pub contract: Contract,
+        pub epoch_height: EpochHeight,
+        pub block_index: u64,
+        pub block_timestamp: u64,
+        pub context: VMContext,
+    }
+
+    impl Emulator {
+        pub fn new(
+        ) -> Self {
+            let context = VMContextBuilder::new()
+                .current_account_id(owner())
+                .account_balance(ntoy(10))
+                .build();
+            testing_env!(context.clone());
+            let contract = Contract::new();
+            Emulator {
+                contract,
+                epoch_height: 0,
+                block_timestamp: 0,
+                block_index: 0,
+                context,
+            }
+        }
+
+        pub fn update_context(&mut self, random_seed: [u8; 32]) {
+            self.context = VMContextBuilder::new()
+                .current_account_id(staking())
+                .epoch_height(self.epoch_height)
+                .block_index(self.block_index)
+                .block_timestamp(self.block_timestamp)
+                .random_seed(random_seed)
+                .build();
+            testing_env!(self.context.clone());
+            println!(
+                "Epoch: {}",
+                self.epoch_height
+            );
+        }
+
+        pub fn skip_epochs(&mut self, num: EpochHeight, random_seed: [u8; 32]) {
+            self.epoch_height += num;
+            self.block_index += num * 12 * 60 * 60;
+            self.block_timestamp += num * ONE_EPOCH_TS;
+            self.update_context(random_seed);
+        }
+
+    }
+}
+
+'''
+'''--- pool/Cargo.toml ---
+[package]
+name = "pool-together"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "=4.0.0-pre.9"
+near-contract-standards = "=4.0.0-pre.9"
+common = {path = "../common" }
+
+[dev-dependencies]
+near-sdk = "=4.0.0-pre.9"
+workspaces = "0.6.0"
+tokio = "^1"
+anyhow = "^1.0"
+'''
+'''--- pool/build.sh ---
+#!/bin/bash
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo +stable build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/pool_together.wasm ../res/pool.wasm
+
+'''
+'''--- pool/neardev/dev-account.env ---
+CONTRACT_NAME=dev-1666004455964-23768313401083
+'''
+'''--- pool/src/burrow.rs ---
+use crate::{*, utils::gas::{GAS_FOR_AFTER_FT_TRANSFER, GAS_FOR_FT_TRANSFER}};
+use near_sdk::{AccountId, Balance, json_types::{U128}, PromiseError, Promise};
+use crate::interfaces::defi::IYieldSource;
+use near_sdk::serde::{Deserialize};
+use crate::utils::gas;
+use near_sdk::ext_contract;
+
+// Callback
+#[ext_contract(this_contract)]
+pub trait ExtSelf {
+    fn on_get_account_from_burrow(&mut self, #[callback_result] call_result: Result<AccountDetailedView, PromiseError>);
+}
+
+#[derive(Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct AccountDetailedView{
+    pub account_id: AccountId,
+    /// A list of assets that are supplied by the account (but not used a collateral).
+    pub supplied: Vec<AssetView>,
+}
+
+#[derive(Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct AssetView {
+    pub token_id: AccountId,
+    //#[serde(with = "u128_dec_format")]
+    pub balance: U128,
+    /// The number of shares this account holds in the corresponding asset pool
+    pub shares: U128,
+}
+
+pub (crate) struct BurrowYieldSource{
+    pub(crate) address: AccountId,
+}
+
+#[near_bindgen]
+impl Contract{
+    #[private]
+    pub fn on_get_reward_from_defi(&self, #[callback_result] call_result: Result<Vec<TokenAmountsView>, PromiseError>)-> Balance{
+        return 10;
+    }
+
+    #[private]
+    pub fn on_after_rewards_claim_from_defi(&mut self, account_id: AccountId, amount: Balance, #[callback_result] result: Result<(), PromiseError>){
+        if result.is_err(){
+            log!("Error when claiming rewards from defi");
+            return;
+        }
+
+        // Send to user account
+        ext_fungible_token::ft_transfer(account_id, U128(amount), None, self.deposited_token_id.clone(), 1, GAS_FOR_FT_TRANSFER);
+    }
+}
+
+impl IYieldSource for BurrowYieldSource{
+    fn get_reward(&self, account_id: &AccountId) -> Promise {
+
+        ext_defi::show_reward(account_id.clone(), self.address.clone(), 0, gas::GAS_FOR_FT_TRANSFER)
+         .then(crate::this_contract::on_get_reward_from_defi(env::current_account_id(), 0, gas::GET_BALANCE_FROM_DEFI))
+    }
+
+    fn transfer(&self, token_id: &AccountId, amount: Balance) {
+        log!("Transfer to {} {}", self.address, token_id.clone());
+        log!("burrow transfer prepaid:{} used: {}", env::prepaid_gas().0, env::used_gas().0);
+
+        ext_fungible_token::ft_transfer_call(self.address.clone(), amount.into(), None, "".to_string(), token_id.clone(), 1, gas::GAS_FOR_TRANSFER_TO_DEFI);
+    }
+
+    fn claim(&self, account_id: &AccountId, token_id: &AccountId, amount: Balance) {
+        let asset_amount = AssetAmount{ token_id: token_id.clone(), amount: Some(U128(amount)), max_amount: None};
+        let action = Action::Withdraw(
+            asset_amount
+        );
+
+        ext_defi::execute(vec![action], self.address.clone(), 1, gas::MAX_GAS)
+        .then(crate::this_contract::on_after_rewards_claim_from_defi(account_id.clone(), amount, token_id.clone(), 1, gas::GAS_FOR_FT_TRANSFER));
+    }
+    
+}
+'''
+'''--- pool/src/external.rs ---
+use near_sdk::Promise;
+
+use crate::*;
+
+// Callback
+#[ext_contract(this_contract)]
+pub trait ExtSelf {
+    fn on_get_draw_and_add_prize_distribution(&mut self, prize_awards: Balance, #[callback_result] call_result: Result<Draw, PromiseError>);
+    fn on_get_draw_calculate_picks(&mut self, account_id: AccountId, #[callback_result] call_result: Result<Draw, PromiseError>) -> NumPicks;
+    fn on_get_reward_from_defi(&self, #[callback_result] call_result: Result<Vec<TokenAmountsView>, PromiseError>)-> Balance;
+    fn on_after_rewards_claim_from_defi(&mut self, account_id: AccountId, amount: Balance, #[callback_result] result: Result<(), PromiseError>);
+}
+
+#[ext_contract(ext_draw)]
+pub trait ExtDraw {
+    fn get_draw(&self, id: DrawId) -> Draw;
+}
+
+#[ext_contract(ext_defi)]
+pub trait ExtDeFi {
+    fn show_reward(&self, account_id: AccountId) -> Vec<TokenAmountsView>;
+    fn execute(&self, actions: Vec<Action>);
+}
+
+#[ext_contract(ext_fungible_token)]
+pub trait FungibleTokenContract {
+    fn ft_transfer(&mut self, receiver_id: AccountId, amount: U128, memo: Option<String>);
+
+    fn ft_transfer_call(
+        &mut self,
+        receiver_id: AccountId,
+        amount: U128,
+        memo: Option<String>,
+        msg: String,
+    ) -> PromiseOrValue<U128>;
+
+    /// Returns the total supply of the token in a decimal string representation.
+    fn ft_total_supply(&self) -> U128;
+
+    /// Returns the balance of the account. If the account doesn't exist, `"0"` must be returned.
+    fn ft_balance_of(&self, account_id: AccountId) -> U128;
+}
+'''
+'''--- pool/src/ft_token.rs ---
+use crate::*;
+use near_sdk::ext_contract;
+
+#[near_bindgen]
+impl Contract{
+    pub (crate) fn mint_tokens(&mut self, account_id: AccountId, balance: Balance){       
+        self.token.internal_register_account(&account_id);
+        self.token.internal_deposit(&account_id, balance);
+        
+        near_contract_standards::fungible_token::events::FtMint {
+            owner_id: &account_id,
+            amount: &U128(balance),
+            memo: Some("Tokens supply is minted"),
+        }
+        .emit();
+
+        let current_time = env::block_timestamp_ms();
+        self.tickets.increase_balance(&account_id, balance, current_time);
+        self.tickets.increase_total_supply(balance, current_time);
+    }
+
+    pub (crate) fn burn_tokens(&mut self, account_id: AccountId, balance: Balance){
+        self.token.internal_transfer(&account_id, &AccountId::new_unchecked(ZERO_ADDRESS.to_string()), balance, Option::None);
+        let current_time = env::block_timestamp_ms();
+
+        self.tickets.decrease_balance(&account_id, balance, current_time);
+        self.tickets.decrease_total_supply(balance, current_time);
+    }
+
+    pub (crate) fn on_tokens_burned(&mut self, account_id: AccountId, amount: Balance) {
+        log!("Account @{} burned {}", account_id, amount);
+    }
+
+    pub (crate) fn on_account_closed(&mut self, account_id: AccountId, balance: Balance) {
+        log!("Closed @{} with {}", account_id, balance);
+    }
+
+}
+
+'''
+'''--- pool/src/interfaces/mod.rs ---
+pub mod pool {
+
+    use near_sdk::{AccountId, Balance};
+
+    use super::defi::IYieldSource;
+    pub trait IPool{
+        fn assert_correct_token_is_send_to_contract(&self, token: &AccountId);
+        fn get_lottery_asset(&self) -> AccountId;
+        fn send_to_dex(&self);
+        fn get_yield_source(&self) -> Box<dyn IYieldSource>;
+    }
+
+    pub trait ITwab{
+        fn increase_balance(&mut self, account: &AccountId, amount: Balance, current_time: u64);
+        fn decrease_balance(&mut self, account: &AccountId, amount: Balance, current_time: u64);
+        fn increase_total_supply(&mut self, amount: Balance, current_time: u64);
+        fn decrease_total_supply(&mut self, amount: Balance, current_time: u64);
+
+        fn average_balance_between_timestamps(
+            &self, 
+            account: &AccountId, 
+            start_time: u64, 
+            end_time: u64
+        ) -> Balance;
+
+        fn average_total_supply_between_timestamps(
+            &self, 
+            start_time: u64, 
+            end_time: u64
+        ) -> Balance;
+    }
+
+}
+
+pub mod defi {
+    use near_sdk::{Balance, borsh::{self, BorshDeserialize, BorshSerialize}, AccountId, PromiseOrValue, Promise};
+
+    use crate::Contract;
+
+    #[derive(BorshDeserialize, BorshSerialize)]
+    pub enum YieldSource{
+        Burrow { address: AccountId },
+        Metapool { address: AccountId }
+    }
+
+    pub trait IYieldSource{
+        fn get_reward(&self, account_id: &AccountId) -> Promise;
+        fn transfer(&self, token_id: &AccountId, amount: Balance);
+        fn claim(&self, account_id: &AccountId, token_id:&AccountId, amount: Balance);
+    }
+}
+
+pub mod prize_distribution{
+    const MAX_TIERS:usize = 16;
+    use common::types::{NumPicks, DrawId, WinningNumber};
+    use near_sdk::Balance;
+    use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+    use near_sdk::json_types::U128;
+    use near_sdk::serde::{Serialize, Deserialize};
+
+    #[derive(BorshDeserialize, BorshSerialize, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(crate = "near_sdk::serde")]
+    pub struct PrizeDistribution{
+        pub number_of_picks: u64,
+        pub draw_id: u128,
+        pub cardinality: u8,
+        pub bit_range_size: u8,
+        pub tiers: [u32; MAX_TIERS],
+        pub prize: u128,
+        pub max_picks: u128,
+        pub start_time: u64,
+        pub end_time: u64,
+        #[serde(skip_serializing)]
+        pub winning_number: WinningNumber,
+    }
+    pub trait PrizeDistributionActor{
+        fn get_prize_distribution(&self, draw_id: u128) -> PrizeDistribution;
+        fn add_prize_distribution(&mut self, draw_id: u128, prize_awards: Balance);
+        fn claim(&mut self, draw_id: U128, pick: U128) -> u128;
+    }
+}
+
+pub mod picker{
+    use common::types::{DrawId, NumPicks};
+    use near_sdk::{PromiseOrValue};
+    pub trait Picker{
+        fn get_picks(&self, draw_id: DrawId) -> PromiseOrValue<NumPicks> ;
+    }
+}
+'''
+'''--- pool/src/lib.rs ---
+use burrow::BurrowYieldSource;
+use near_contract_standards::fungible_token::metadata::{
+    FungibleTokenMetadata, FungibleTokenMetadataProvider, FT_METADATA_SPEC,
+};
+use near_contract_standards::fungible_token::FungibleToken;
+use near_contract_standards::fungible_token::receiver::FungibleTokenReceiver;
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::LazyOption;
+use near_sdk::json_types::U128;
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{env, log, near_bindgen, AccountId, Balance, PanicOnDefault, PromiseOrValue, assert_one_yocto, ext_contract, PromiseError};
+use interfaces::pool::{IPool, ITwab};
+use interfaces::defi::IYieldSource;
+use picks::AccountsPicks;
+use twab::AccountsDepositHistory;
+use prize::PrizeBuffer;
+use common::types::{DrawId, NumPicks, WinningNumber};
+use interfaces::defi::YieldSource;
+use utils::gas;
+
+const ZERO_ADDRESS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+pub mod external;
+pub use crate::external::*;
+
+mod ft_token;
+mod interfaces;
+mod twab;
+mod prize;
+mod picks;
+mod utils;
+mod test_utils;
+mod burrow;
+
+const PROTOCOL_FT_SYMBOL: &str = "PTTICK";
+const PROTOCOL_FT_NAME: &str = "Pool Together Ticket";
+const TOTAL_SUPPLY: u128 = 1_000;
+
+#[derive(Deserialize, Debug, Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct AssetAmount {
+    pub token_id: AccountId,
+    /// The amount of tokens intended to be used for the action
+    /// If 'None', then the maximum will be tried
+    pub amount: Option<U128>,
+    /// The maximum amount of tokens that can be used for the action
+    /// If 'None', then the maximum 'available' amount will be used
+    pub max_amount: Option<U128>,
+}
+
+#[derive(Deserialize, Debug, Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub enum Action{
+    Withdraw(AssetAmount)
+}
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Contract {
+    token: FungibleToken,
+    metadata: LazyOption<FungibleTokenMetadata>,
+    // the token that is going to be used
+    deposited_token_id: AccountId,
+    tickets: AccountsDepositHistory,
+    prizes: PrizeBuffer,
+    draw_contract: AccountId,
+    acc_picks: AccountsPicks,
+    yield_source: YieldSource,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct TokenAmountsView{
+    token: near_sdk::AccountId,
+    shares: U128,
+    rewards: U128
+}
+
+const DATA_IMAGE_SVG_NEAR_ICON: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 288 288'%3E%3Cg id='l' data-name='l'%3E%3Cpath d='M187.58,79.81l-30.1,44.69a3.2,3.2,0,0,0,4.75,4.2L191.86,103a1.2,1.2,0,0,1,2,.91v80.46a1.2,1.2,0,0,1-2.12.77L102.18,77.93A15.35,15.35,0,0,0,90.47,72.5H87.34A15.34,15.34,0,0,0,72,87.84V201.16A15.34,15.34,0,0,0,87.34,216.5h0a15.35,15.35,0,0,0,13.08-7.31l30.1-44.69a3.2,3.2,0,0,0-4.75-4.2L96.14,186a1.2,1.2,0,0,1-2-.91V104.61a1.2,1.2,0,0,1,2.12-.77l89.55,107.23a15.35,15.35,0,0,0,11.71,5.43h3.13A15.34,15.34,0,0,0,216,201.16V87.84A15.34,15.34,0,0,0,200.66,72.5h0A15.35,15.35,0,0,0,187.58,79.81Z'/%3E%3C/g%3E%3C/svg%3E";
+
+#[derive(Deserialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Draw {
+    pub draw_id: DrawId,
+    pub winning_random_number: WinningNumber,
+    pub started_at: u64,
+    pub completed_at: u64,
+}
+
+impl IPool for Contract{
+    fn assert_correct_token_is_send_to_contract(&self, token: &AccountId) {
+        assert_eq!(token, &self.get_lottery_asset());
+    }
+
+    fn get_lottery_asset(&self) -> AccountId {
+        self.deposited_token_id.clone()
+    }
+
+    fn send_to_dex(&self) {
+        todo!()
+    }
+
+    fn get_yield_source(&self) -> Box<dyn IYieldSource> {
+        return match &self.yield_source{
+            YieldSource::Burrow { address } =>
+                Box::new(BurrowYieldSource{address: address.clone()}),
+            YieldSource::Metapool { address } =>
+                panic!("Not implemented for Metapool"),
+            _ => panic!("No default option"),
+        };
+    }
+}
+
+#[near_bindgen]
+impl Contract {
+    /// Initializes the contract with the given total supply owned by the given `owner_id` with
+    /// default metadata (for example purposes only).
+    #[init]
+    pub fn new_default_meta(owner_id: AccountId, token_for_deposit: AccountId, draw_contract: AccountId, burrow_address: AccountId) -> Self {
+        Self::new(
+            owner_id,
+            token_for_deposit,
+            FungibleTokenMetadata {
+                spec: FT_METADATA_SPEC.to_string(),
+                name: PROTOCOL_FT_NAME.to_string(),
+                symbol: PROTOCOL_FT_SYMBOL.to_string(),
+                icon: Some(DATA_IMAGE_SVG_NEAR_ICON.to_string()),
+                reference: None,
+                reference_hash: None,
+                decimals: 3,
+            },
+            draw_contract,
+            burrow_address,
+        )
+    }
+
+    /// Initializes the contract with the given total supply owned by the given `owner_id` with
+    /// the given fungible token metadata.
+    /// Dont provide initial supply
+    /// The contract should not have initial supply at the beginning
+    /// With every deposit of tokens to the contract, tokens will be minted
+    #[init]
+    fn new(
+        owner_id: AccountId,
+        deposited_token_id: AccountId,
+        metadata: FungibleTokenMetadata,
+        draw_contract: AccountId,
+        burrow_address: AccountId,
+    ) -> Self {
+        assert!(!env::state_exists(), "Already initialized");
+        metadata.assert_valid();
+        let mut this = Self {
+            token: FungibleToken::new(b"a".to_vec()),
+            metadata: LazyOption::new(b"m".to_vec(), Some(&metadata)),
+            deposited_token_id: deposited_token_id,
+            tickets: AccountsDepositHistory::default(),
+            prizes: PrizeBuffer::new(),
+            draw_contract: draw_contract,
+            acc_picks: AccountsPicks::default(),
+            yield_source: YieldSource::Burrow { address: burrow_address },
+        };
+
+        this.token.internal_register_account(&owner_id);
+        
+        near_contract_standards::fungible_token::events::FtMint {
+            owner_id: &owner_id,
+            amount: &U128(0),
+            memo: Some("Initial tokens supply is minted"),
+        }
+        .emit();
+
+        this
+    }
+
+    pub fn get_asset(&self) -> AccountId {
+        self.deposited_token_id.clone()
+    }
+}
+
+near_contract_standards::impl_fungible_token_core!(Contract, token, on_tokens_burned);
+near_contract_standards::impl_fungible_token_storage!(Contract, token, on_account_closed);
+
+#[near_bindgen]
+impl FungibleTokenMetadataProvider for Contract {
+    fn ft_metadata(&self) -> FungibleTokenMetadata {
+        self.metadata.get().unwrap()
+    }
+}
+
+#[near_bindgen]
+impl FungibleTokenReceiver for Contract{
+    fn ft_on_transfer(
+        &mut self,
+        sender_id: AccountId,
+        amount: U128,
+        msg: String,
+    ) -> PromiseOrValue<U128> {
+        self.assert_correct_token_is_send_to_contract(&env::predecessor_account_id());
+        self
+            .get_yield_source()
+            .transfer(&env::predecessor_account_id(), amount.0);
+
+        self.mint_tokens(sender_id, amount.0);
+
+        return PromiseOrValue::Value(U128(0));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use near_sdk::{collections::Vector, AccountId, Balance, env};
+    use crate::{twab::AccountsDepositHistory, twab::AccountBalance, interfaces::{pool::ITwab, prize_distribution::PrizeDistribution}};
+    use common::{generic_ring_buffer::GenericRingBuffer, types::U256};
+
+    fn mint(tickets: &mut AccountsDepositHistory, acc_id: &AccountId, amount: Balance, time: u64){
+        tickets.increase_balance(acc_id, amount, time);
+        tickets.increase_total_supply(amount, time);
+    }
+
+    fn burn(tickets: &mut AccountsDepositHistory, acc_id: &AccountId, amount: Balance, time: u64){
+        tickets.decrease_balance(acc_id, amount, time);
+        tickets.decrease_total_supply(amount, time);
+    }
+
+    fn mmmm() -> AccountId{
+        AccountId::new_unchecked("mmmm".to_string())
+    }
+
+    fn sec() -> AccountId{
+        AccountId::new_unchecked("sec".to_string())
+    }
+
+    fn setup() -> AccountsDepositHistory{
+        let mut result = AccountsDepositHistory::default();
+        let acc_id = mmmm();
+        let sec_id = sec();
+
+        mint(&mut result, &acc_id, 100, 0);
+        mint(&mut result, &sec_id, 30, 5);
+        mint(&mut result, &acc_id, 50, 10);
+        burn(&mut result, &acc_id, 100, 20);
+        mint(&mut result, &sec_id, 80, 26);
+        burn(&mut result, &acc_id, 20, 30);
+        mint(&mut result, &acc_id, 10, 40);
+        burn(&mut result, &sec_id, 50, 50);
+
+        return result;
+    }
+
+    #[test]
+    fn test_generic_buffer(){
+        let mut buffer = GenericRingBuffer::<PrizeDistribution, 5>::new();
+        buffer.arr[0] =  PrizeDistribution::default();
+        buffer.arr[0].tiers[1] = 20;
+        println!("xx");
+    }
+
+    #[test]
+    fn it_works() {
+        let num:u32 = 13;
+
+        let x:u8 = 1;
+        println!("{:08b}", x);
+
+        let aa = u64::from_le_bytes([0,1,0,0,0,0,0,0]);
+        
+        let one = U256::from_little_endian(&[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]);
+
+        let a = U256([1u64, 0, 0, 0]);
+        let b = U256::one();
+
+        assert_eq!(b, one);
+
+        let bytes_arr = [mmmm().as_bytes(), &num.to_le_bytes()].concat();
+        let hash = env::keccak256_array(&bytes_arr);
+        
+        let mut nums = vec![1,2,3,4];
+        let mut v:Vector<u32> = Vector::new(b"x".to_vec());
+        let a = v.pop();
+        v.push(&1);
+        v.push(&2);
+        let x = v.pop();
+        println!("{}", nums[3]);
+        let result = 2 + 2;
+        assert_eq!(result, 4);
+    }
+
+    #[test]
+    fn verify_setup(){
+        let setup = setup();
+        assert_eq!(setup.total_supply.balance, 100);
+        assert_eq!(setup.total_supply.twabs.get(0).unwrap_or_default().amount, 0);
+        assert_eq!(setup.total_supply.twabs.get(1).unwrap_or_default().amount, 500);
+        assert_eq!(setup.total_supply.twabs.get(2).unwrap_or_default().amount, 1150);
+        assert_eq!(setup.total_supply.twabs.get(3).unwrap_or_default().amount, 2950);
+        assert_eq!(setup.total_supply.twabs.get(4).unwrap_or_default().amount, 3430);
+
+        let acc_sec : AccountBalance = setup.accounts.get(&sec()).unwrap_or_default();
+        let acc_mmm : AccountBalance = setup.accounts.get(&mmmm()).unwrap_or_default();
+
+        assert_eq!(acc_mmm.balance, 40);
+        assert_eq!(acc_mmm.twabs.get(0).unwrap_or_default().amount, 0);
+        assert_eq!(acc_mmm.twabs.get(1).unwrap_or_default().amount, 1000);
+        assert_eq!(acc_mmm.twabs.get(2).unwrap_or_default().amount, 2500);
+        assert_eq!(acc_mmm.twabs.get(3).unwrap_or_default().amount, 3000);
+
+        assert_eq!(acc_sec.balance, 60);
+        assert_eq!(acc_sec.twabs.get(0).unwrap_or_default().amount, 0);
+        assert_eq!(acc_sec.twabs.get(1).unwrap_or_default().amount, 630);
+        assert_eq!(acc_sec.twabs.get(2).unwrap_or_default().amount, 3270);
+    }
+
+    #[test]
+    fn check_twabs(){
+        let setup = setup();
+        
+        // test existing timestamps
+        assert_eq!(setup.average_balance_between_timestamps(&mmmm(), 0, 20), 125);
+        // test timestamps that are in range but doesnt exist
+        assert_eq!(setup.average_balance_between_timestamps(&mmmm(), 5, 15), 125);
+        assert_eq!(setup.average_balance_between_timestamps(&mmmm(), 5, 10), 100);
+        assert_eq!(setup.average_balance_between_timestamps(&mmmm(), 3, 13), 115);
+        assert_eq!(setup.average_balance_between_timestamps(&mmmm(), 4, 28), 104);
+        // test timestamps that are not in existing range
+        assert_eq!(setup.average_balance_between_timestamps(&mmmm(), 4, 45), 75);
+
+        assert_eq!(setup.average_balance_between_timestamps(&sec(), 0, 60), 64);
+    }
+
+    #[test]
+    fn check_total_supply_twabs(){
+
+    }
+}
+
+'''
+'''--- pool/src/picks.rs ---
+use crate::interfaces::{picker::{Picker}, prize_distribution::PrizeDistributionActor};
+use near_sdk::{collections::{UnorderedMap}};
+use common::types::{DrawId, NumPicks};
+use utils::storage_keys::StorageKeys;
+use crate::*;
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct DrawPicks{
+    draws: UnorderedMap<DrawId, NumPicks>,
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct AccountsPicks{
+    accounts: UnorderedMap<AccountId, DrawPicks>
+}
+
+impl Default for AccountsPicks{
+    fn default() -> Self {
+        AccountsPicks { accounts: UnorderedMap::new(StorageKeys::AccountPicks) }
+    }
+}
+
+impl AccountsPicks{
+    fn get_draws(&self, account_id: &AccountId) -> DrawPicks{
+        return self.accounts.get(&account_id).unwrap_or_else(|| {
+            DrawPicks {
+                draws: UnorderedMap::new(
+                    StorageKeys::AccountDrawPicks { 
+                        account_hash: utils::utils::get_hash(&account_id)
+                    }
+                )
+            }
+        });
+    }
+
+    pub fn get_picks_for_draw(&self, account_id: &AccountId, draw_id: &DrawId) -> NumPicks{
+        return self.get_draws(&account_id).draws.get(&draw_id).unwrap_or_default();
+    }
+
+    pub fn add_picks_for_draw(&mut self, account_id: &AccountId, draw_id: &DrawId, picks: NumPicks){
+        let mut acc_draws_picks = self.get_draws(account_id);
+        if acc_draws_picks.draws.get(&draw_id).is_some(){
+            return;
+        }
+
+        acc_draws_picks.draws.insert(&draw_id, &picks);
+        self.accounts.insert(&account_id, &acc_draws_picks);
+    }
+}
+
+#[near_bindgen]
+impl Contract{
+    #[private]
+    pub fn on_get_draw_calculate_picks(&mut self, account_id: AccountId, #[callback_result] call_result: Result<Draw, PromiseError>) -> NumPicks{
+        if call_result.is_err() {
+            log!("{:?}", call_result.err().unwrap());
+            panic!("Cannot get draw")
+        }
+        let draw = call_result.unwrap();
+        log!("{:?}", draw);
+        
+        let acc_tickets = self.tickets.average_balance_between_timestamps(&account_id, draw.started_at, draw.completed_at);
+        let total_tickets = self.tickets.average_total_supply_between_timestamps(draw.started_at, draw.completed_at);
+        let prize_distribution = self.get_prize_distribution(draw.draw_id);
+        let acc_picks: NumPicks = (prize_distribution.number_of_picks as u128) * acc_tickets / total_tickets;
+        self.acc_picks.add_picks_for_draw(&account_id, &draw.draw_id, acc_picks);
+
+        return acc_picks;
+    }
+}
+
+#[near_bindgen]
+impl Picker for Contract{
+    fn get_picks(&self, draw_id: DrawId) -> PromiseOrValue<NumPicks> {
+        let caller = env::signer_account_id();
+        let acc_draws_picks = self.acc_picks.get_draws(&caller);
+
+        let draw_picks = acc_draws_picks.draws.get(&draw_id);
+        if draw_picks.is_some(){
+            return PromiseOrValue::Value(draw_picks.unwrap());
+        } else {
+            let draw_promise = ext_draw::get_draw(draw_id, self.draw_contract.clone(), 0, gas::GET_DRAW);
+            // ext_draw::ext(self.draw_contract.clone())
+            // .with_static_gas(gas::GET_DRAW)
+            // .get_draw(draw_id);
+
+            let picks = draw_promise.then(this_contract::on_get_draw_calculate_picks(caller, env::current_account_id(), 0, gas::GET_DRAW));
+            // draw_promise.then(
+            //     Self::ext(env::current_account_id())
+            //     .with_static_gas(gas::GET_DRAW)
+            //     .on_get_draw_calculate_picks(caller));
+
+            return PromiseOrValue::Promise(picks);
+        }
+    }
+}
+'''
+'''--- pool/src/prize.rs ---
+use crate::*;
+use near_sdk::{borsh::{self, BorshDeserialize, BorshSerialize}};
+use crate::interfaces::prize_distribution::{PrizeDistribution, PrizeDistributionActor};
+use common::{generic_ring_buffer::{GenericRingBuffer, RingBuffer}, types::{WinningNumber, U256}};
+
+const MAX_PRIZES_CAPACITY: usize = 32;
+const MIN_PICK_COST: Balance = 1;
+const BIT_RANGE_SIZE: u8 = 1;
+const TIERS: [u32; 16]= [20,30,20,10,5,5,10,0,0,0,0,0,0,0,0,0];
+const TIERS_NOMINAL:u128 = 100;
+const PRIZE_DISTRIBUTION_TIME_OFFSET: u64 = 1000 * 3600 * 24 * 7;
+
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct PrizeBuffer{
+    pub buffer: GenericRingBuffer<PrizeDistribution, MAX_PRIZES_CAPACITY>,
+}
+
+impl PrizeBuffer{
+    pub fn new() -> Self{
+        return Self { buffer: GenericRingBuffer::<PrizeDistribution, MAX_PRIZES_CAPACITY>::new() };
+    }
+}
+
+#[near_bindgen]
+impl Contract{
+    fn create_masks(&self, bit_range_size: u8, cardinality: u8) -> Vec<WinningNumber>{
+        let mut result:Vec<WinningNumber> = Vec::new();
+
+        result.push(WinningNumber::from(2).pow(bit_range_size.into()) - 1);
+
+        for _idx in 1..cardinality{
+            result.push(result.last().unwrap() << bit_range_size);
+        }
+
+        return result;
+    }
+
+    fn get_tier_match(&self, masks: &Vec<WinningNumber>, user_winning_number: &WinningNumber, winning_number: &WinningNumber) -> u8{
+        return self.get_tier_match_generic(masks, user_winning_number, winning_number);
+    }
+
+    fn get_tier_match_generic<T>(
+        &self, 
+        masks: &Vec<T>, 
+        user_winning_number: &T, 
+        winning_number: &T
+    ) -> u8 
+    where T: std::ops::BitAnd<Output = T> + PartialEq + Copy {
+        let mut matched_tiers = 0u8;
+        for el in masks.iter(){
+            if (*el & *winning_number) == (*el & *user_winning_number){
+                matched_tiers += 1;
+            }else{
+                break;
+            }
+        }
+
+        return (masks.len() as u8) - matched_tiers;
+    }
+
+    fn number_of_prizes_for_tier(&self, tier: u8, bit_range_size: u8) -> u64{
+        if tier == 0{
+            return 1;
+        }else{
+            return ( 1 << (bit_range_size * tier) ) - ( 1 << (bit_range_size * (tier - 1)) );
+        }
+    }
+
+    fn prize_tier_fraction(&self, tier_idx: u8, bit_range_size: u8, prize_tiers: &[u32]) -> u64{
+        let prize_fraction = prize_tiers[(tier_idx as usize)];
+        
+        let number_of_prizes_for_tier = self.number_of_prizes_for_tier(tier_idx, bit_range_size);
+
+        return (prize_fraction as u64) / number_of_prizes_for_tier;
+    }
+
+    #[private]
+    pub fn on_get_draw_and_add_prize_distribution(&mut self, prize_awards: Balance, #[callback_result] call_result: Result<Draw, PromiseError>) {
+        if call_result.is_err(){
+            log!("Error when getting draw");
+        }
+
+        let draw = call_result.unwrap();
+        let mut cardinality:u8 = 0;
+        let tickets_supply = self.tickets.average_total_supply_between_timestamps(draw.started_at, draw.completed_at);
+        let max_picks = tickets_supply / MIN_PICK_COST;
+        let bit_range_sized_two = 2u8.pow(BIT_RANGE_SIZE.into());
+        while u128::from(bit_range_sized_two.pow(cardinality.into())) < max_picks {
+            cardinality += 1;
+        }
+
+        let number_of_picks: u64 = bit_range_sized_two.pow(cardinality.into()).into();
+        let prize_distribution = PrizeDistribution {
+            number_of_picks: number_of_picks, 
+            draw_id: draw.draw_id,
+            cardinality: cardinality,
+            bit_range_size: BIT_RANGE_SIZE,
+            tiers: TIERS,
+            max_picks: max_picks,
+            prize: prize_awards,
+            start_time: draw.completed_at + PRIZE_DISTRIBUTION_TIME_OFFSET,
+            end_time: draw.completed_at + 2 * PRIZE_DISTRIBUTION_TIME_OFFSET,
+            winning_number: draw.winning_random_number,
+        };
+
+        self.prizes.buffer.add(&prize_distribution);
+    }
+}
+
+#[near_bindgen]
+impl PrizeDistributionActor for Contract{
+    fn get_prize_distribution(&self, draw_id: DrawId) -> PrizeDistribution {
+        for idx in 0..self.prizes.buffer.arr.len(){
+            if self.prizes.buffer.arr[idx].draw_id == draw_id{
+                return self.prizes.buffer.arr[idx];
+            }
+        }
+
+        return PrizeDistribution::default();
+    }
+
+    fn add_prize_distribution(&mut self, draw_id: DrawId, prize_awards: Balance) {
+        if self.get_prize_distribution(draw_id) != PrizeDistribution::default(){
+            return;
+        }
+        let draw_promise = ext_draw::get_draw(draw_id, self.draw_contract.clone(), 0, gas::GET_DRAW);
+        draw_promise.then(
+            this_contract::on_get_draw_and_add_prize_distribution(prize_awards, env::current_account_id(), 0, gas::GET_DRAW)
+        );
+    }
+
+    #[payable]
+    fn claim(&mut self, draw_id: U128, pick: U128) -> u128{
+        assert_one_yocto();
+        
+        let prize_distribution = self.get_prize_distribution(draw_id.0);
+        let caller = env::signer_account_id();
+        let picks_for_draw = self.acc_picks.get_picks_for_draw(&caller, &draw_id.0);
+        
+        if picks_for_draw == NumPicks::default(){
+            panic!("There are no generated picks for this draw for client");
+        }
+
+        if pick.0 >= picks_for_draw {
+            panic!("Invalid pick");
+        }
+
+        let user_winning_number = utils::utils::get_user_winning_number(&caller, pick.0);
+        let masks = self.create_masks(prize_distribution.bit_range_size, prize_distribution.cardinality);
+        // get tier match
+        let tier_match = self.get_tier_match(&masks, &user_winning_number, &prize_distribution.winning_number);
+        // get prize tier fraction
+        let prize_tier_fraction = self.prize_tier_fraction(tier_match, prize_distribution.bit_range_size, &prize_distribution.tiers);
+        let prize_to_take = u128::from(prize_tier_fraction) * prize_distribution.prize / TIERS_NOMINAL;
+
+        log!("Prize to claim is {} {}", prize_to_take, self.deposited_token_id);
+        self.get_yield_source().claim(&caller, &self.deposited_token_id, prize_to_take);
+        
+        return prize_to_take;
+    }
+}
+
+#[cfg(test)]
+mod tests{
+    use crate::*;
+    use crate::test_utils::{get_contract};
+    use common::types::U256;
+
+    use super::TIERS;
+
+    #[test]
+    fn test_masks(){
+        let contract = get_contract();
+
+        let cardinality = 8;
+        let mut masks = contract.create_masks(1, 8);
+
+        assert_eq!(masks.len(), cardinality as usize);
+        assert_eq!(masks[0], U256::from(1));
+        assert_eq!(masks[1], U256::from(2));
+        assert_eq!(masks[2], U256::from(4));
+        assert_eq!(masks[7], U256::from(128));
+
+        masks = contract.create_masks(4, cardinality);
+        assert_eq!(masks.len(), cardinality as usize);
+        assert_eq!(masks[0], U256::from(15));
+        assert_eq!(masks[1], U256::from(240));
+    }
+
+    #[test]
+    fn test_tier_match(){
+        let contract = get_contract();
+
+        let masks= contract
+            .create_masks(1, 8)
+            .iter()
+            .map(|x| x.as_u32())
+            .collect::<Vec<u32>>();
+
+        let winning_number = 153u32;
+        let mut guess_number = 25u32;
+        let tier_match = contract.get_tier_match_generic(&masks, &guess_number, &winning_number);
+        assert_eq!(tier_match, 1);
+
+        guess_number = 153;
+        let tier_match = contract.get_tier_match_generic(&masks, &guess_number, &winning_number);
+        assert_eq!(tier_match, 0);
+
+        guess_number = 152;
+        let tier_match = contract.get_tier_match_generic(&masks, &guess_number, &winning_number);
+        assert_eq!(tier_match, 8);
+
+        guess_number = 25;
+        let tier_match = contract.get_tier_match(&masks.iter().map(|x| U256::from(*x)).collect(), &U256::from(guess_number), &U256::from(winning_number));
+        assert_eq!(U256::from(tier_match), U256::one());
+
+    }
+
+    #[test]
+    fn test_number_of_prizes(){
+        let contract = get_contract();
+        let prizes_number = contract.number_of_prizes_for_tier(0, 8);
+        assert_eq!(prizes_number, 1);
+        let prizes_number = contract.number_of_prizes_for_tier(0, 10);
+        assert_eq!(prizes_number, 1);
+        let prizes_number = contract.number_of_prizes_for_tier(1, 4);
+        assert_eq!(prizes_number, 15);
+        let prizes_number = contract.number_of_prizes_for_tier(1, 1);
+        assert_eq!(prizes_number, 1);
+    }
+
+    #[test]
+    fn test_prize_tier_fraction(){
+        let contract = get_contract();
+
+        let prize_fraction = contract.prize_tier_fraction(0, 4, &TIERS);
+        assert_eq!(prize_fraction, TIERS[0] as u64);
+
+        let prize_fraction = contract.prize_tier_fraction(1, 1, &TIERS);
+        assert_eq!(prize_fraction, TIERS[1] as u64);
+
+        let prize_fraction = contract.prize_tier_fraction(1, 4, &TIERS);
+        assert_eq!(prize_fraction, 2);
+        
+        let prize_fraction = contract.prize_tier_fraction(1, 2, &TIERS);
+        assert_eq!(prize_fraction, 10);
+
+        let prize_fraction = contract.prize_tier_fraction(2, 2, &TIERS);
+        assert_eq!(prize_fraction, 1);
+    }
+}
+'''
+'''--- pool/src/test_utils.rs ---
+use near_sdk::AccountId;
+
+use crate::{Contract};
+
+pub fn mmmm() -> AccountId{
+    AccountId::new_unchecked("mmmm".to_string())
+}
+
+pub fn sec() -> AccountId{
+    AccountId::new_unchecked("sec".to_string())
+}
+
+pub fn burrow() -> AccountId{
+    AccountId::new_unchecked("burrow".to_string())
+}
+
+pub fn get_contract() -> Contract{
+    return Contract::new_default_meta(
+        mmmm(), 
+        AccountId::new_unchecked("usdc".to_string()), 
+        sec(),
+        burrow(), 
+    );
+}
+
+'''
+'''--- pool/src/twab.rs ---
+use crate::*;
+use interfaces::pool::ITwab;
+use near_sdk::collections::{UnorderedMap, Vector};
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use utils::storage_keys::StorageKeys;
+
+#[derive(Clone, Debug, Copy, Default, BorshDeserialize, BorshSerialize)]
+pub struct Twab{
+    pub amount: Balance,
+    pub timestamp: u64,
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct AccountBalance{
+    pub balance: Balance,
+    pub twabs: Vector<Twab>,
+}
+
+impl Default for AccountBalance{
+    fn default() -> Self {
+        AccountBalance { 
+            balance: Balance::default(), 
+            twabs: Vector::new(StorageKeys::AccountBalance) 
+        }
+    }
+}
+
+impl AccountBalance{
+    fn get_twab_before_or_at(&self, start_time: u64) -> Twab{
+        let mut before_idx = 0;
+        for idx in 0..self.twabs.len(){
+            let current_twab = self.twabs.get(idx).unwrap_or_default();
+
+            if current_twab.timestamp <= start_time {
+                before_idx = idx;
+            } else {
+                break;
+            }
+        }
+
+        return self.twabs.get(before_idx).unwrap_or_default();
+    }
+
+    fn calculate_twab(&self, oldest_twab: &Twab, newest_twab: &Twab, target_timestamp: u64) -> Twab{
+
+        if oldest_twab.timestamp == target_timestamp{
+            return *oldest_twab;
+        }
+
+        if newest_twab.timestamp == target_timestamp{
+            return *newest_twab;
+        }
+
+        if oldest_twab.timestamp > target_timestamp {
+            return Twab { amount: 0, timestamp: target_timestamp };
+        }
+
+        if newest_twab.timestamp < target_timestamp {
+            return Twab { 
+                amount: self.compute_twab_balance(
+                    newest_twab.amount, 
+                    self.balance, 
+                    target_timestamp, 
+                    newest_twab.timestamp
+                ),
+                timestamp: target_timestamp, 
+            }
+        }
+
+        let before_or_at = self.get_twab_before_or_at(target_timestamp);
+        let after_or_at = self.get_twab_after_or_at(target_timestamp);
+
+        if before_or_at.timestamp == target_timestamp{
+            return before_or_at;
+        } 
+
+        if after_or_at.timestamp == target_timestamp{
+            return after_or_at;
+        }
+
+        let held_balance = (after_or_at.amount - before_or_at.amount) / 
+            ((after_or_at.timestamp - before_or_at.timestamp) as u128);
+
+        let mut result = Twab::default();
+        result.timestamp = target_timestamp;
+        result.amount = self.compute_twab_balance(
+            before_or_at.amount, 
+            held_balance, 
+            target_timestamp, 
+            before_or_at.timestamp);
+
+        return result;
+    }
+
+    fn get_twab_after_or_at(&self, end_time: u64) -> Twab{
+        let mut after_idx = 0;
+        for idx in (0..self.twabs.len()).rev(){
+            let current_twab = self.twabs.get(idx).unwrap_or_default();
+
+            if current_twab.timestamp >= end_time {
+                after_idx = idx;
+            } else {
+                break;
+            }
+        }
+
+        return self.twabs.get(after_idx).unwrap_or_default();
+    }
+
+    fn generate_twab(&mut self, current_time: u64){
+        let last_element_option = self.twabs.pop();
+
+        // If there are no elements in the collection
+        // just add an element
+        if last_element_option.is_none() {
+            let twab_amount = self.compute_twab_balance(0, 0, current_time, 0);
+            self.twabs.push(&Twab{timestamp: current_time, amount: twab_amount});      
+        } else {
+            let last_element = last_element_option.unwrap();
+
+            // If this balance increase is for the same timestamp increase the balance
+            // because we are using the block_timestamp, 
+            // In real life situations it will be hard to enter this case
+            if last_element.timestamp == current_time{
+                self.twabs.push(&last_element);
+            } else {
+                let twab_amount = self.compute_twab_balance(
+                    last_element.amount, 
+                    self.balance, 
+                    current_time, 
+                    last_element.timestamp
+                );
+                self.twabs.push(&last_element);
+                self.twabs.push(&Twab{timestamp: current_time, amount: twab_amount});
+            }
+        }
+    }
+
+    fn compute_twab_balance(
+        &self, 
+        last_twab_amount: Balance, 
+        current_balance: Balance, 
+        current_time: u64, 
+        last_twab_timestamp: u64
+    ) -> Balance {
+        return last_twab_amount + current_balance * ((current_time - last_twab_timestamp) as u128);
+    }
+
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct AccountsDepositHistory{
+    pub accounts: UnorderedMap<AccountId, AccountBalance>,
+    pub total_supply: AccountBalance,
+}
+
+impl Default for AccountsDepositHistory{
+    fn default() -> Self {
+        AccountsDepositHistory { 
+            accounts: UnorderedMap::new(StorageKeys::AccountBalance),
+            total_supply: AccountBalance { 
+                balance: Balance::default(), 
+                twabs: Vector::new(StorageKeys::TotalSupplyAccountBalance) 
+            },
+        }
+    }
+}
+
+impl AccountsDepositHistory {
+    fn get_account(&self, account_id: &AccountId) -> AccountBalance{
+        return self.accounts.get(&account_id).unwrap_or_else(|| {
+            AccountBalance { 
+                balance: Balance::default(), 
+                twabs: Vector::new(
+                    StorageKeys::SubAccountBalance { 
+                        account_hash: utils::utils::get_hash(&account_id) 
+                    }) 
+            }
+        });
+    }
+}
+
+impl ITwab for AccountsDepositHistory{
+    fn increase_balance(&mut self, account: &AccountId, amount: Balance, current_time: u64) {
+        let mut acc_balance = self.get_account(&account);
+        acc_balance.generate_twab(current_time);
+
+        acc_balance.balance += amount;
+        self.accounts.insert(&account, &acc_balance);
+    }
+
+    fn decrease_balance(&mut self, account: &AccountId, amount: Balance, current_time: u64) {
+        let mut acc_balance = self.get_account(&account);
+        acc_balance.generate_twab(current_time);
+        
+        acc_balance.balance -= amount;
+        self.accounts.insert(&account, &acc_balance);
+    }
+
+    fn increase_total_supply(&mut self, amount: Balance, current_time: u64) {
+        self.total_supply.generate_twab(current_time);
+        self.total_supply.balance += amount;
+    }
+
+    fn decrease_total_supply(&mut self, amount: Balance, current_time: u64) {
+        self.total_supply.generate_twab(current_time);
+        self.total_supply.balance -= amount;
+    }
+
+    fn average_total_supply_between_timestamps(
+        &self,
+        start_time: u64,
+        end_time: u64
+    ) -> Balance{
+        assert!(start_time < end_time);
+        let oldest_twab = self.total_supply.twabs.get(0).unwrap_or_default();
+        let newest_twab = self.total_supply.twabs.get(self.total_supply.twabs.len() - 1).unwrap_or_default();
+
+        let start_twab: Twab = self.total_supply.calculate_twab(&oldest_twab, &newest_twab, start_time);
+        let end_twab: Twab = self.total_supply.calculate_twab(&oldest_twab, &newest_twab, end_time);
+            
+        return (end_twab.amount - start_twab.amount)/((end_twab.timestamp - start_twab.timestamp) as u128);
+    }
+
+    fn average_balance_between_timestamps(
+            &self, 
+            account: &AccountId, 
+            start_time: u64, 
+            end_time: u64
+        ) -> Balance {
+        assert!(start_time < end_time);
+        let account_balance = self.accounts.get(&account).unwrap_or_default();
+        let oldest_twab = account_balance.twabs.get(0).unwrap_or_default();
+        let newest_twab = account_balance.twabs.get(account_balance.twabs.len() - 1).unwrap_or_default();
+
+        let start_twab: Twab = account_balance.calculate_twab(&oldest_twab, &newest_twab, start_time);
+        let end_twab: Twab = account_balance.calculate_twab(&oldest_twab, &newest_twab, end_time);
+            
+        return (end_twab.amount - start_twab.amount)/((end_twab.timestamp - start_twab.timestamp) as u128);
+    }
+}
+'''
+'''--- pool/src/utils.rs ---
+pub mod storage_keys{
+    use near_sdk::{BorshStorageKey, CryptoHash};
+    use near_sdk::borsh::{self, BorshSerialize};
+
+    #[derive(BorshStorageKey, BorshSerialize)]
+    pub enum StorageKeys {
+        AccountsDepositHistory,
+        AccountBalance,
+        SubAccountBalance {account_hash: CryptoHash},
+        TotalSupplyAccountBalance,
+        AccountPicks,
+        AccountDrawPicks {account_hash: CryptoHash},
+    }
+}
+
+pub mod utils{
+    use common::types::{NumPicks, WinningNumber};
+    use near_sdk::{AccountId, CryptoHash};
+    use near_sdk::env::{self, keccak256_array};
+
+    pub(crate) fn get_hash(account_id: &AccountId) -> CryptoHash {
+        env::sha256_array(account_id.as_bytes())
+    }
+
+    pub(crate) fn get_user_winning_number(account_id: &AccountId, pick: NumPicks) -> WinningNumber{
+        let acc_keccak = env::keccak256_array(account_id.as_bytes());
+        return WinningNumber::from_little_endian(&concat_pick_and_hash(&acc_keccak, pick));
+    }
+
+    pub(crate) fn concat_pick_and_hash(bytes: &[u8], pick: NumPicks) -> [u8; 32]{
+        let arr=[bytes, &pick.to_be_bytes()].concat();
+        return keccak256_array(&arr);
+    } 
+}
+
+pub mod gas{
+    use near_sdk::{Gas, Balance};
+
+    pub const GET_DRAW: Gas = Gas(20_000_000_000_000);
+    pub const ONE_YOCTO: Balance = 1;
+    pub const GET_BALANCE_FROM_DEFI: Gas = Gas(20_000_000_000_000);
+    
+    pub const GAS_FOR_FT_TRANSFER: Gas = Gas(Gas::ONE_TERA.0 * 10);
+    pub const GAS_FOR_FT_TRANSFER_CALL: Gas = Gas(300_000_000_000_000);
+    pub const GAS_FOR_AFTER_FT_TRANSFER: Gas = Gas(Gas::ONE_TERA.0 * 20);
+    pub const GAS_FOR_TRANSFER_TO_DEFI:Gas = Gas(Gas::ONE_TERA.0 * 100);
+    
+    pub const MAX_GAS: Gas = Gas(300_000_000_000_000);
+}
+'''
+'''--- pool/tests/basic.rs ---
+use anyhow::Ok;
+use near_contract_standards::storage_management::StorageManagement;
+use near_sdk::{serde_json::{json, self}, json_types::U128, Balance, serde::{Serialize, Deserialize}};
+use workspaces::{Account, Contract, AccountId, Worker, network::Sandbox};
+mod utils;
+use crate::utils::to_yocto;
+
+const DEFAULT_GAS: u64 = 300_000_000_000_000;
+const DRAW_BYTES: &[u8] = include_bytes!("../../res/draw.wasm");
+const TEST_TOKEN_BYTES: &[u8] = include_bytes!("../../res/fungible_token.wasm");
+const POOL_BYTES: &[u8] = include_bytes!("../../res/pool.wasm");
+const DEFI_BYTES: &[u8] = include_bytes!("../../res/defi.wasm");
+const TOKEN_SYMBOL: &str = "USDC";
+const TOKEN_DESCRIPTION: &str = "USD Coin on the blockchain";
+const FT_TOKEN_DECIMALS: u32 = 0;
+const FT_TOKEN_TOTAL_SUPPLY: u128 = 1000;
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct TokenAmountsView{
+    token: near_sdk::AccountId,
+    shares: U128,
+    rewards: U128
+}
+
+fn to_token_amount(amount: u64) -> u128{
+    (amount as u128) * 10u128.pow(FT_TOKEN_DECIMALS)
+}
+
+async fn storage_deposit(caller: &Account, ft_contract: &AccountId) -> anyhow::Result<()>{
+    caller.call(ft_contract, "storage_deposit")
+        .args_json(json!({}))
+        .gas(DEFAULT_GAS)
+        .deposit(to_yocto("1"))
+        .transact()
+        .await?
+        .unwrap();
+    
+    return Ok(());
+}
+
+async fn ft_transfer(sender: &Account, receiver: &AccountId, amount: Balance, ft_token: &AccountId) -> anyhow::Result<()>{
+    sender.call(ft_token, "ft_transfer")
+        .args_json(json!({"receiver_id": receiver, "amount": amount.to_string()}))
+        .gas(DEFAULT_GAS)
+        .deposit(1)
+        .transact()
+        .await?
+        .into_result()?;
+
+    return Ok(());
+}
+
+async fn ft_transfer_call(sender: &Account, receiver: &AccountId, amount: Balance, ft_token: &AccountId, msg: &str) -> anyhow::Result<()>{
+    let res = sender.call(ft_token, "ft_transfer_call")
+        .args_json((receiver, amount.to_string(), String::from(""), msg))
+        .max_gas()
+        .deposit(1)
+        .transact()
+        .await?
+        .into_result()?;
+
+    println!("{:?} \n", res);
+
+    return Ok(());
+}
+
+async fn ft_balance_of(caller: &Account, contract: &AccountId) -> anyhow::Result<u128>{
+    let balance = caller.call(contract, "ft_balance_of")
+    .args_json((caller.id(),))
+    .max_gas()
+    .view()
+    .await?
+    .json::<U128>()?;
+
+    return Ok(balance.0);
+}
+
+async fn deploy_and_init_defi(owner: &Account) -> anyhow::Result<Contract>{
+    let defi_acc = create_account(owner, "defi").await?;
+    let defi_contract = defi_acc.deploy(&DEFI_BYTES).await?.unwrap();
+    
+    defi_contract
+        .call("new")
+        .gas(DEFAULT_GAS)
+        .transact()
+        .await?
+        .into_result()?;
+
+    return Ok(defi_contract);
+}
+
+async fn deploy_and_init_pool(owner: &Account, token: &AccountId, draw: &AccountId, burrow: &AccountId) -> anyhow::Result<Contract>{
+    let pool_acc = create_account(owner, "pool").await?;
+    let pool_contract = pool_acc.deploy(&POOL_BYTES).await?.unwrap();
+    
+    let res = pool_contract
+        .call("new_default_meta")
+        .args_json(json!({"owner_id": pool_acc.id(), "token_for_deposit": token, "draw_contract": draw, "burrow_address": burrow}))
+        .gas(DEFAULT_GAS)
+        .transact()
+        .await?
+        .into_result()?;
+
+    return Ok(pool_contract);
+}
+
+async fn deploy_and_init_draw(owner: &Account) -> anyhow::Result<Contract>{
+    let draw_acc = create_account(owner, "draw").await?;
+    let draw_contract = draw_acc.deploy(&DRAW_BYTES).await?.unwrap();
+
+    draw_contract
+        .call("new")
+        .gas(DEFAULT_GAS)
+        .transact()
+        .await?
+        .into_result()?;
+
+    return Ok(draw_contract);
+}
+
+async fn deploy_and_init_token(owner: &Account) -> anyhow::Result<Contract>{
+    let token_acc = create_account(owner, "token").await?;
+    let token_contract = token_acc.deploy(&TEST_TOKEN_BYTES).await?.unwrap();
+    
+    token_contract
+        .call("new")
+        .args_json(json!({
+            "owner_id": token_acc.id(), 
+            "total_supply": (FT_TOKEN_TOTAL_SUPPLY * 10u128.pow(FT_TOKEN_DECIMALS)).to_string(), 
+            "metadata": 
+                { 
+                    "spec": "ft-1.0.0", 
+                    "name": TOKEN_DESCRIPTION, 
+                    "symbol": TOKEN_SYMBOL, 
+                    "decimals": FT_TOKEN_DECIMALS 
+                }
+            }))
+        .gas(DEFAULT_GAS)
+        .transact()
+        .await?
+        .into_result()?;
+    
+    return Ok(token_contract);
+}
+
+async fn create_account(owner: &Account, acc_name: &str) -> anyhow::Result<Account>{
+    let acc = owner
+        .create_subaccount( acc_name)
+        .initial_balance(to_yocto("10"))
+        .transact()
+        .await?
+        .unwrap();
+
+    return Ok(acc);
+}
+
+async fn setup() -> anyhow::Result<(Contract, Contract, Contract, Contract, Account)>{
+    let workspaces = workspaces::sandbox().await?;
+    let root = workspaces.root_account().unwrap();
+    let ft_contract = deploy_and_init_token(&root).await?;
+    let draw_contract = deploy_and_init_draw(&root).await?;
+    let defi = deploy_and_init_defi(&root).await?;
+    let pool_contract = deploy_and_init_pool(&root, ft_contract.id(), draw_contract.id(), defi.id()).await?;
+
+    return Ok((pool_contract, draw_contract, ft_contract, defi, root));
+}
+
+#[tokio::test]
+async fn test_simple_transfer() -> anyhow::Result<()>{
+    let (pool, _, ft, defi, root) = setup().await?;
+    
+    let test1 = create_account(&root, "test1").await?;
+
+    storage_deposit(&test1, ft.id()).await?;
+
+    let balance = ft.call("ft_balance_of")
+        .args_json(json!({"account_id": ft.as_account().id()}))
+        .view()
+        .await?
+        .json::<U128>()
+        .unwrap();
+
+        println!("{}", balance.0);
+
+    ft_transfer(ft.as_account(), test1.id(), to_token_amount(10), ft.id()).await?;
+
+    // ft.call("ft_transfer")
+    //     .args_json(json!({"receiver_id": test1.id(), "amount": to_token_amount(10).to_string()}))
+    //     .gas(DEFAULT_GAS)
+    //     .deposit(1)
+    //     .transact()
+    //     .await?
+    //     .into_result()?;
+
+    let balance = ft.call("ft_balance_of")
+        .args_json(json!({"account_id": ft.as_account().id()}))
+        .view()
+        .await?
+        .json::<U128>()
+        .unwrap();
+
+    println!("{}", balance.0);
+
+    let balance = ft.call("ft_balance_of")
+        .args_json(json!({"account_id": test1.id()}))
+        .view()
+        .await?
+        .json::<U128>()
+        .unwrap();
+
+        println!("{}", balance.0);
+     
+    return Ok(());
+}
+
+#[tokio::test]
+async fn test_sending_not_authorized_token() -> anyhow::Result<()>{
+    let (pool, _, ft, defi, root) = setup().await.unwrap();
+
+    let token_acc = create_account(&root, "another-token").await.unwrap();
+    let token_contract = token_acc.deploy(&TEST_TOKEN_BYTES).await.unwrap().unwrap();
+
+    let test1 = create_account(&root, "test1").await.unwrap();
+    
+    token_contract
+        .call("new")
+        .args_json(json!({
+            "owner_id": token_acc.id(), 
+            "total_supply": (FT_TOKEN_TOTAL_SUPPLY * 10u128.pow(FT_TOKEN_DECIMALS)).to_string(), 
+            "metadata": 
+                { 
+                    "spec": "ft-1.0.0", 
+                    "name": "Another token description", 
+                    "symbol": "ANOT", 
+                    "decimals": FT_TOKEN_DECIMALS 
+                }
+            }))
+        .gas(DEFAULT_GAS)
+        .transact()
+        .await
+        .unwrap()
+        .into_result()
+        .unwrap();
+
+    storage_deposit(&test1, &token_contract.id()).await?;
+    storage_deposit(&test1, &ft.id()).await?;
+
+    storage_deposit(pool.as_account(), &token_contract.id()).await?;
+    storage_deposit(pool.as_account(), &ft.id()).await?;
+
+    ft_transfer(token_contract.as_account(), test1.id(), to_token_amount(3), token_contract.id()).await?;
+    ft_transfer_call(&test1, pool.id(), to_token_amount(2), token_contract.id(), "").await?;
+
+    let test1_balance = ft_balance_of(&test1, pool.id()).await?;
+    assert_eq!(test1_balance, 0);
+
+    return Ok(());
+}
+
+#[tokio::test]
+async fn test_sending_correct_token() -> anyhow::Result<()>{
+    let (pool, _, ft, defi, root) = setup().await.unwrap();
+
+    let test1 = create_account(&root, "test1").await.unwrap();
+
+    storage_deposit(&test1, &ft.id()).await?;
+    storage_deposit(pool.as_account(), &ft.id()).await?;
+
+    ft_transfer(ft.as_account(), test1.id(), to_token_amount(3), ft.id()).await?;
+    ft_transfer_call(&test1, pool.id(), to_token_amount(2), ft.id(), "").await?;
+
+    let test1_balance = ft_balance_of(&test1, pool.id()).await?;
+    assert_eq!(test1_balance, to_token_amount(2));
+    let pool_balance = ft_balance_of(pool.as_account(), pool.id()).await?;
+    assert_eq!(pool_balance, 0);
+
+    return Ok(());
+}
+
+#[tokio::test]
+async fn test_defi_send_token() -> anyhow::Result<()>{
+    let (_, _, ft, defi, root) = setup().await?;
+    let test1 = create_account(&root, "test1").await?;  
+
+    let token_acc = create_account(&root, "another-token").await.unwrap();
+    let token_contract = token_acc.deploy(&TEST_TOKEN_BYTES).await.unwrap().unwrap();
+
+    token_contract
+        .call("new")
+        .args_json(json!({
+            "owner_id": token_acc.id(), 
+            "total_supply": (FT_TOKEN_TOTAL_SUPPLY * 10u128.pow(FT_TOKEN_DECIMALS)).to_string(), 
+            "metadata": 
+                { 
+                    "spec": "ft-1.0.0", 
+                    "name": "Another token description", 
+                    "symbol": "ANOT", 
+                    "decimals": FT_TOKEN_DECIMALS 
+                }
+            }))
+        .gas(DEFAULT_GAS)
+        .transact()
+        .await
+        .unwrap()
+        .into_result()
+        .unwrap();
+
+    storage_deposit(&test1, ft.id()).await?;
+    storage_deposit(defi.as_account(), ft.id()).await?;
+
+    ft_transfer(ft.as_account(), test1.id(), to_token_amount(100), ft.id()).await?;
+    ft_transfer_call(&test1, defi.id(), to_token_amount(10), ft.id(), "").await?;
+    ft_transfer_call(&test1, defi.id(), to_token_amount(3), ft.id(), test1.id()).await?;
+
+    let res = test1.call(defi.id(), "show_reward")
+        .args_json((test1.id(), ))
+        .max_gas()
+        .view()
+        .await?
+        .json::<Vec<TokenAmountsView>>()?;
+
+    println!("{:?}", res);
+
+    let token_amounts = res.iter().find(|el| el.token.to_string() == ft.id().to_string()).unwrap();
+    assert_eq!(token_amounts.rewards.0, to_token_amount(3));
+    assert_eq!(token_amounts.shares.0, to_token_amount(10));
+
+    return Ok(());
+}
+
+#[tokio::test]
+async fn test_sending_correct_token_check_defi() -> anyhow::Result<()>{
+    let (pool, _, ft, defi, root) = setup().await.unwrap();
+
+    let test1 = create_account(&root, "test1").await.unwrap();
+
+    storage_deposit(&test1, &ft.id()).await?;
+    storage_deposit(pool.as_account(), &ft.id()).await?;
+    storage_deposit(defi.as_account(), ft.id()).await?;
+
+    /// Test1 users has 3 FT tokens
+    ft_transfer(ft.as_account(), test1.id(), to_token_amount(3), ft.id()).await?;
+    let test1_ft_balance = ft_balance_of(&test1, ft.id()).await?;
+    assert_eq!(test1_ft_balance, to_token_amount(3));
+
+    /// Test1 user transfer 2 FT tokens to pool contract
+    ft_transfer_call(&test1, pool.id(), to_token_amount(2), ft.id(), "").await?;
+    let test1_ft_balance = ft_balance_of(&test1, ft.id()).await?;
+    assert_eq!(test1_ft_balance, to_token_amount(1));
+    
+    // Pool contract should not have any balance in the ft contract
+    let pool_balance_of_ft = ft_balance_of(&pool.as_account(), &ft.id()).await?;
+    assert_eq!(0, pool_balance_of_ft);
+    let defi_balance_of_ft = ft_balance_of(&defi.as_account(), &ft.id()).await?;
+    assert_eq!(defi_balance_of_ft, to_token_amount(2));
+
+    let test1_tickets = ft_balance_of(&test1, pool.id()).await?;
+    assert_eq!(test1_tickets, to_token_amount(2));
+    let pool_balance = ft_balance_of(pool.as_account(), pool.id()).await?;
+    assert_eq!(pool_balance, 0);
+
+    // set rewards
+    ft_transfer_call(ft.as_account(), defi.id(), to_token_amount(5), ft.id(), pool.id()).await?;
+    let res = pool.as_account().call(defi.id(), "show_reward")
+        .args_json((pool.id(), ))
+        .max_gas()
+        .view()
+        .await?
+        .json::<Vec<TokenAmountsView>>()?;
+
+    println!("{:?}", res);
+
+    return Ok(());
+}
+'''
+'''--- pool/tests/utils.rs ---
+pub(crate) fn to_yocto(value: &str) -> u128 {
+    let vals: Vec<_> = value.split('.').collect();
+    let part1 = vals[0].parse::<u128>().unwrap() * 10u128.pow(24);
+    if vals.len() > 1 {
+        let power = vals[1].len() as u32;
+        let part2 = vals[1].parse::<u128>().unwrap() * 10u128.pow(24 - power);
+        part1 + part2
+    } else {
+        part1
+    }
+}   
+'''
+'''--- sim-tests/Cargo.toml ---
+[package]
+name = "sim-tests"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type= ["cdylib", "rlib"]
+
+[dependencies]
+uint = { version = "0.9.0", default-features = false }
+near-sdk = "=4.0.0-pre.9"
+
+[dev-dependencies]
+lazy_static = "1.4.0"
+near-sdk="=4.0.0-pre.9"
+near-sdk-sim = "=4.0.0-pre.9"
+rand = "0.8.5"
+
+'''
+'''--- sim-tests/src/lib.rs ---
+use near_sdk::{env, near_bindgen, EpochHeight, PanicOnDefault};
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+
+const DRAW_DURATION_IN_EPOCHS: u64 = 5;
+const DRAW_BUFFER_CAPACITY:usize = 3;
+
+#[cfg(test)]
+mod utils;
+
+#[cfg(test)]
+pub mod tests {
+    use near_sdk::{serde_json::json, json_types::U128};
+    use crate::utils::*;
+    
+    #[test]
+    fn draw_test(){
+        let mut env= Env::init();
+        
+        let can_start_draw = env.draw.view(env.draw.account_id(), "can_start_draw", &[]).unwrap_json::<bool>();
+        assert!(can_start_draw == true);
+        env.draw.call(env.draw.account_id(), "start_draw", &[], DEFAULT_GAS.0, 0).assert_success();
+        env.print_epoch();
+        let mut draw_time = 4;
+        while draw_time > 0{
+            env.print_epoch();
+            let can_complete_draw = env.draw.view(env.draw.account_id(), "can_complete_draw", &[]).unwrap_json::<bool>();
+            assert!(can_complete_draw == false);
+            draw_time-=1;
+            env.wait_epoch();
+        }
+
+        env.draw.call(env.draw.account_id(), "complete_draw", &[], DEFAULT_GAS.0, 0);
+        let x = env.draw.view(env.draw.account_id(), "get_draws", &json!({"from_index": 0, "limit": 10}).to_string().into_bytes()).unwrap_json_value();
+        println!("{:?}", x);
+    }
+
+    #[test]
+    fn test_claim_picks(){
+        let mut env = Env::init();
+        let mut tokens = Tokens::init(&env);
+        let mut users = Users::init(&env);
+
+        ft_storage_deposit(&users.alice, &tokens.correct_token.account_id());
+        ft_storage_deposit(&users.bob, &tokens.correct_token.account_id());
+
+        ft_storage_deposit(&env.pool, &tokens.correct_token.account_id());
+        ft_storage_deposit(&env.defi, &tokens.correct_token.account_id());
+
+        ft_transfer(&tokens.correct_token.account_id(), &tokens.correct_token, &users.alice.account_id(), to_token_amount(30));
+        ft_transfer(&tokens.correct_token.account_id(), &tokens.correct_token, &users.bob.account_id(), to_token_amount(100));
+        
+        assert_eq!(ft_balance_of(&tokens.correct_token.account_id(), &users.alice), to_token_amount(30));
+
+        // Send 10 tokens from Alice to pool contract
+        ft_transfer_call(&tokens.correct_token.account_id(), &users.alice, &env.pool.account_id(), to_token_amount(10), "");
+        // Alice should have 20 tokens left in the correct_token contract
+        assert_eq!(ft_balance_of(&tokens.correct_token.account_id(), &users.alice), to_token_amount(20));
+        // Defi contract should have 10 tokens in the correct_token contract
+        assert_eq!(ft_balance_of(&tokens.correct_token.account_id(), &env.defi), to_token_amount(10));
+        // Pool contract should have no tokens in the correct_token contract
+        assert_eq!(ft_balance_of(&tokens.correct_token.account_id(), &env.pool), 0);
+
+        env.draw.call(env.draw.account_id(), "start_draw", &[], DEFAULT_GAS.0, 0);
+        env.wait_epoch();
+        env.wait_epoch();
+        ft_transfer_call(&tokens.correct_token.account_id(), &users.bob, &env.pool.account_id(), to_token_amount(40), "");
+        let mut can_complete_draw = env.draw.view(env.draw.account_id(), "can_complete_draw", &[]).unwrap_json::<bool>();
+        while !can_complete_draw{
+            env.wait_epoch();
+        }
+        env.draw.call(env.draw.account_id(), "complete_draw", &[], DEFAULT_GAS.0, 0).assert_success();
+        ft_transfer_call(&tokens.correct_token.account_id(), &tokens.correct_token, &env.defi.account_id, to_token_amount(300), env.pool.account_id.as_str());
+        println!("{:?}", env.defi.view(env.defi.account_id(), "show_reward", &json!({"account_id": env.pool.account_id}).to_string().into_bytes()).unwrap_json_value());
+        let add_prize_distribution = env.pool.call(env.pool.account_id(), "add_prize_distribution", &json!({"draw_id": 1}).to_string().into_bytes(), MAX_GAS.0, 0);
+        println!("{:?}", add_prize_distribution);
+        add_prize_distribution.assert_success();
+
+        let prize_distr = env.pool.view(env.pool.account_id(), "get_prize_distribution", &json!({"draw_id": 1}).to_string().into_bytes()).unwrap_json_value();
+        println!("{:?}", prize_distr);
+
+        let mut picks = users.alice.call(env.pool.account_id(), "get_picks", &json!({"draw_id": 1}).to_string().into_bytes(), MAX_GAS.0, 0).unwrap_json::<u128>();
+        println!("{:?}", picks);
+
+        while picks >= 1{
+            let res = users.alice.call(env.pool.account_id(), "claim", &json!({"draw_id": U128(1), "pick": U128(picks)}).to_string().into_bytes(), MAX_GAS.0, 0);
+            println!("{:?}", res);
+            picks-=1;
+        }
+        
+
+    }
+}
+
+'''
+'''--- sim-tests/src/setup.rs ---
+
+'''
+'''--- sim-tests/src/utils.rs ---
+use crate::*;
+use near_sdk::json_types::U128;
+use near_sdk::serde_json::json;
+use near_sdk::{env, serde_json, AccountId, Balance, Gas, Timestamp};
+use near_sdk_sim::account::Account;
+use near_sdk_sim::{
+    deploy, init_simulator, to_yocto, ContractAccount, ExecutionResult, UserAccount,
+};
+use near_sdk_sim::runtime::RuntimeStandalone;
+
+const FT_WASM_BYTES: &[u8] = include_bytes!("../../res/fungible_token.wasm");
+const DEFI_WASM_BYTES: &[u8] = include_bytes!("../../res/defi.wasm");
+const DRAW_WASM_BYTES: &[u8] = include_bytes!("../../res/draw.wasm");
+const POOL_WASM_BYTES: &[u8] = include_bytes!("../../res/pool.wasm");
+
+pub fn defi_bytes() -> &'static [u8] {
+    &DEFI_WASM_BYTES
+}
+
+pub fn draw_bytes() -> &'static [u8] {
+    &DRAW_WASM_BYTES
+}
+
+pub fn ft_bytes() -> &'static [u8] {
+    &FT_WASM_BYTES
+}
+
+pub fn pool_bytes() -> &'static [u8] {
+    &POOL_WASM_BYTES
+}
+
+pub const NEAR: &str = "near";
+pub const POOL_ID: &str = "pool.near";
+pub const DEFI_ID: &str = "defi.near";
+pub const DRAW_ID: &str = "draw.near";
+pub const FT_ID: &str = "ft.near";
+pub const FALSE_FT_ID: &str = "another-ft.near";
+pub const OWNER_ID: &str = "owner.near";
+
+pub const DEFAULT_GAS: Gas = Gas(1_000_000_000_000 * 15);
+pub const MAX_GAS: Gas = Gas(1_000_000_000_000 * 300);
+
+const TOKEN_SYMBOL: &str = "USDC";
+const TOKEN_DESCRIPTION: &str = "USD Coin on the blockchain";
+const FT_TOKEN_DECIMALS: u32 = 0;
+const FT_TOKEN_TOTAL_SUPPLY: u128 = 1000;
+
+pub struct Env {
+    pub root: UserAccount,
+    pub near: UserAccount,
+    pub owner: UserAccount,
+    pub pool: UserAccount,
+    pub draw: UserAccount,
+    pub defi: UserAccount,
+}
+
+pub struct Tokens{
+    pub correct_token: UserAccount,
+    pub false_token: UserAccount,
+}
+
+pub struct Users {
+    pub alice: UserAccount,
+    pub bob: UserAccount
+}
+
+pub fn to_token_amount(amount: u64) -> u128{
+    (amount as u128) * 10u128.pow(FT_TOKEN_DECIMALS)
+}
+
+pub fn storage_deposit(
+    user: &UserAccount,
+    contract_id: &AccountId,
+    account_id: &AccountId,
+    attached_deposit: Balance,
+) {
+    user.call(
+        contract_id.clone().into(),
+        "storage_deposit",
+        &json!({ "account_id": account_id }).to_string().into_bytes(),
+        DEFAULT_GAS.0,
+        attached_deposit,
+    )
+    .assert_success();
+}
+
+pub fn ft_balance_of(
+    token: &AccountId,
+    user: &UserAccount
+) -> Balance{
+    user.view(token.clone(), "ft_balance_of", &json!({"account_id": user.account_id()}).to_string().into_bytes()).unwrap_json::<U128>().0
+}
+
+pub fn ft_storage_deposit(
+    user: &UserAccount,
+    token_account_id: &AccountId
+) {
+    storage_deposit(
+        user,
+        token_account_id,
+        &user.account_id(),
+        125 * env::STORAGE_PRICE_PER_BYTE,
+    );
+}
+
+pub fn ft_transfer_call(
+    token: &AccountId,
+    sender: &UserAccount,
+    receiver: &AccountId,
+    amount: Balance,
+    msg: &str,
+) {
+    sender.call(
+        token.clone(),
+        "ft_transfer_call",
+        &json!({
+            "receiver_id": receiver,
+            "amount": U128::from(amount),
+            "msg": msg,
+        })
+        .to_string()
+        .into_bytes(),
+        MAX_GAS.0,
+        1,
+    ).assert_success()
+}
+
+pub fn ft_transfer(
+    token: &AccountId,
+    sender: &UserAccount,
+    receiver: &AccountId,
+    amount: Balance,
+) {
+    sender.call(
+        token.clone(),
+        "ft_transfer",
+        &json!({
+            "receiver_id": receiver,
+            "amount": U128::from(amount),
+        })
+        .to_string()
+        .into_bytes(),
+        MAX_GAS.0,
+        1,
+    ).assert_success()
+}
+
+impl Users{
+    pub fn init(env: &Env) -> Self{
+        let alice = env.near.create_user(
+            AccountId::new_unchecked("alice.near".to_string()),
+            to_yocto("100")
+        );
+
+        let bob = env.near.create_user(
+            AccountId::new_unchecked("bob.near".to_string()),
+            to_yocto("100")
+        );
+
+        return Self { alice: alice, bob: bob };
+    }
+}
+
+impl Tokens{
+    pub fn init(env: &Env) -> Self{
+        let ft = env.near.deploy_and_init(
+            ft_bytes(),
+            AccountId::new_unchecked(FT_ID.to_string()),
+            "new",
+            &json!({
+                "owner_id": FT_ID, 
+                "total_supply": (FT_TOKEN_TOTAL_SUPPLY * 10u128.pow(FT_TOKEN_DECIMALS)).to_string(), 
+                "metadata": 
+                    { 
+                        "spec": "ft-1.0.0", 
+                        "name": TOKEN_DESCRIPTION, 
+                        "symbol": TOKEN_SYMBOL, 
+                        "decimals": FT_TOKEN_DECIMALS 
+                    }
+            })
+            .to_string()
+            .into_bytes(),
+            to_yocto("10"),
+            MAX_GAS.0
+        );
+
+        let another_ft = env.near.deploy_and_init(
+            ft_bytes(),
+            AccountId::new_unchecked(FALSE_FT_ID.to_string()),
+            "new",
+            &json!({
+                "owner_id": FALSE_FT_ID, 
+                "total_supply": (FT_TOKEN_TOTAL_SUPPLY * 10u128.pow(FT_TOKEN_DECIMALS)).to_string(), 
+                "metadata": 
+                    { 
+                        "spec": "ft-1.0.0", 
+                        "name": "FALSE TOKEN", 
+                        "symbol": "FTS", 
+                        "decimals": FT_TOKEN_DECIMALS 
+                    }
+            })
+            .to_string()
+            .into_bytes(),
+            to_yocto("10"),
+            MAX_GAS.0
+        );
+
+        return Self { correct_token: ft, false_token: another_ft };
+    }
+} 
+
+impl Env{
+    pub fn init() -> Self{
+        let root = init_simulator(None);
+        
+        let near = root.create_user(
+            AccountId::new_unchecked(NEAR.to_string()),
+            to_yocto("10000")
+        );
+        
+        let owner = near.create_user(
+            AccountId::new_unchecked(OWNER_ID.to_string()),
+            to_yocto("100")
+        );
+
+        let draw = near.deploy_and_init(
+            draw_bytes(),
+            AccountId::new_unchecked(DRAW_ID.to_string()),
+            "new",
+            &[],
+            to_yocto("10"),
+            MAX_GAS.0,
+        );
+
+        let defi = near.deploy(defi_bytes(), AccountId::new_unchecked(DEFI_ID.to_string()), to_yocto("10"));
+        defi.call(defi.account_id(), "new", &[], MAX_GAS.0, 0).assert_success();
+       
+        let pool = near.deploy_and_init(
+            &pool_bytes(),
+            AccountId::new_unchecked(POOL_ID.to_string()),
+            "new_default_meta",
+            &json!({
+                "owner_id": POOL_ID, 
+                "token_for_deposit": FT_ID, 
+                "draw_contract": DRAW_ID, 
+                "burrow_address": DEFI_ID
+            })
+            .to_string()
+            .into_bytes(),
+            to_yocto("10"),
+            MAX_GAS.0,
+        );
+
+        return Self{
+            root: root,
+            near: near,
+            owner: owner,
+            pool: pool,
+            draw: draw,
+            defi: defi,
+        };
+    }
+
+    pub fn wait_epoch(&mut self){
+        let epoch_height = self.root.borrow_runtime().cur_block.epoch_height;
+        while self.root.borrow_runtime().cur_block.epoch_height == epoch_height{
+            assert!(self.root.borrow_runtime_mut().produce_block().is_ok());
+        }
+    }
+
+    pub fn print_epoch(&self){
+        println!("{} {}", self.root.borrow_runtime().cur_block.epoch_height, self.root.borrow_runtime().cur_block.block_timestamp / 1_000_000);
+    }
+}
+'''

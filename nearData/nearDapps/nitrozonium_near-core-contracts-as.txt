@@ -1,0 +1,1676 @@
+*GitHub Repository "nitrozonium/near-core-contracts-as"*
+
+'''--- .gitpod.yml ---
+tasks:
+  - init: yarn
+    command: yarn dev
+ports:
+  - port: 1234
+    onOpen: open-browser
+
+'''
+'''--- README.md ---
+# NEAR core contracts transcribed into assembly script
+
+Port of [near core contracts](https://github.com/near/core-contracts) from rust to assembly script.
+
+'''
+'''--- as-pect.config.js ---
+module.exports = require("near-sdk-as/imports");
+module.exports.include.push("**/*.unit.spec.ts");
+'''
+'''--- asconfig.json ---
+
+{
+    "workspaces": [
+      "contracts/multisig",
+      "contracts/voting",
+      "contracts/staking-pool"
+    ],
+    "in-progress": [
+    ]
+  }
+'''
+'''--- babel.config.js ---
+module.exports = {
+  presets: ['@babel/preset-env', '@babel/preset-react'],
+}
+
+'''
+'''--- contracts/__tests__/as-pect.d.ts ---
+/// <reference types="@as-pect/assembly/types/as-pect" />
+'''
+'''--- contracts/__tests__/main.spec.ts ---
+import { setGreeting } from '../main';
+import { storage, Context } from "near-sdk-as";
+
+describe("Greeting ", () => {
+    it("should be set and read", () => {
+        setGreeting("hello world");
+        const greeting = storage.get<string>(Context.sender);
+    });
+});
+
+'''
+'''--- contracts/as-pect.d.ts ---
+/// <reference types="@as-pect/assembly/types/as-pect" />
+'''
+'''--- contracts/as_types.d.ts ---
+/// <reference types="near-sdk-as/assembly/as_types" />
+'''
+'''--- contracts/multisig/asconfig.json ---
+{
+  "extends": "near-sdk-as/asconfig.json"
+}
+'''
+'''--- contracts/multisig/assembly/index.ts ---
+import {
+  u128,
+  context,
+  base58,
+  ContractPromiseBatch,
+} from 'near-sdk-as';
+
+// NEAR types //
+type AccountId = string;
+type PublicKey = Uint8Array;
+
+export type RequestId = u32;
+
+class Option<T> {
+  constructor(readonly value: T) {}
+  is_some(): bool {
+    return (!this.is_none());
+  }
+  is_none(): bool {
+    if (isNullable<T>() || isReference<T>()) {
+      return changetype<usize>(this.value) == 0;
+    } else {
+      return false
+    }
+  }
+  expect(message: string = "Missing expected value"): T {
+    assert(this.is_some(), message);
+    return this.value;
+  }
+  unwrap(): T {
+    return this.expect();
+  }
+}
+
+const DEFAULT_ALLOWANCE: u128 = u128.Zero;
+const REQUEST_COOLDOWN: u64 = 900_000_000_000;
+
+// @ts-ignore
+@nearBindgen
+class FunctionCallPermission {
+  allowance: u128
+  receiver_id: AccountId
+  method_names: Array < string >
+}
+
+// NOTE :: Interfaces are only supported with getter/setter in AS -- but Getters / setters are not supported in nearBindgen
+// interface MultiSigRequestAction {
+//   actionType: ActionType
+// }
+
+class MultiSigRequestAction {
+  constructor(public readonly _type: ActionType) {}
+}
+
+// @ts-ignore
+@nearBindgen
+enum ActionType {
+  Transfer,
+  CreateAccount,
+  DeployContract,
+  AddKey,
+  DeleteKey,
+  FunctionCall,
+  SetNumConfirmations,
+  SetActiveRequestsLimit,
+}
+
+// @ts-ignore
+@nearBindgen
+class TransferAction extends MultiSigRequestAction {
+  constructor(readonly amount: u128) {
+    super(ActionType.Transfer);
+  }
+}
+
+// @ts-ignore
+@nearBindgen
+class CreateAccountAction extends MultiSigRequestAction {
+  constructor() {
+    super(ActionType.CreateAccount);
+  }
+}
+
+// @ts-ignore
+@nearBindgen
+class DeployContractAction extends MultiSigRequestAction {
+  constructor(readonly code: Uint8Array) {
+    super(ActionType.DeployContract);
+  }
+}
+
+// @ts-ignore
+@nearBindgen
+class AddKeyAction extends MultiSigRequestAction {
+  constructor(
+    readonly public_key: PublicKey,
+    readonly permission: Option < FunctionCallPermission >
+  ) {super(ActionType.AddKey);}
+}
+
+// @ts-ignore
+@nearBindgen
+class DeleteKeyAction extends MultiSigRequestAction {
+  constructor(readonly public_key: PublicKey) {super(ActionType.DeleteKey);}
+}
+
+// @ts-ignore
+@nearBindgen
+class FunctionCallAction extends MultiSigRequestAction {
+
+  constructor(
+    readonly method_name: string,
+    readonly args: Uint8Array,
+    readonly deposit: u128,
+    readonly gas: u64
+  ) {super(ActionType.FunctionCall);}
+
+}
+// @ts-ignore
+@nearBindgen
+class SetNumConfirmationsAction extends MultiSigRequestAction {
+  constructor(readonly num_confirmations: u32) {super(ActionType.SetNumConfirmations);}
+}
+@nearBindgen
+class SetActiveRequestsLimitAction extends MultiSigRequestAction {
+  constructor(readonly active_request_limit: u32) {super(ActionType.SetActiveRequestsLimit);}
+}
+@nearBindgen
+class MultiSigRequest  {
+  receiver_id: AccountId
+  actions: MultiSigRequestAction[]
+}
+
+@nearBindgen
+class MultiSigRequestWithSigner {
+  request: MultiSigRequest
+  signer_pk: PublicKey
+  added_timestamp: u64
+}
+
+/*****************************
+ * MAIN CONTRACT CLASS
+ ***************************** */
+@nearBindgen
+export class MultiSigContract {
+
+  num_confirmations: u32
+  request_nonce: RequestId
+  requests: Map < RequestId,
+  MultiSigRequestWithSigner >
+  confirmations: Map < RequestId, Set < PublicKey >>
+  num_requests_pk: Map < PublicKey, u32 >
+  // per_key
+  active_requests_limit: u32
+  constructor() {
+    this.requests = new Map < RequestId,
+    MultiSigRequestWithSigner >();
+    this.confirmations = new Map < RequestId, Set < PublicKey >>()
+    this.num_requests_pk = new Map < PublicKey, u32 >()
+  }
+
+  @mutateState()
+  add_request(request: MultiSigRequest): RequestId {
+    assert(
+      (context.contractName == context.predecessor),
+      "Predecessor account must match current account"
+    );
+    let sender_pk = base58.decode(context.senderPublicKey);
+    let num_requests = this.num_requests_pk.get(sender_pk) + 1;
+    assert(num_requests <= this.active_requests_limit, "Account has too many active requests");
+    this.num_requests_pk.set(sender_pk, num_requests);
+    let confirmations = new Set < Uint8Array > ();
+    this.confirmations.set(this.request_nonce, confirmations);
+    this.request_nonce += 1;
+    return this.request_nonce - 1;
+  }
+
+  @mutateState()
+  add_request_and_confirm(request: MultiSigRequest): RequestId {
+    let request_id = this.add_request(request);
+    this.confirm(request_id);
+    return request_id;
+  }
+
+  @mutateState()
+  delete_request(request_id: RequestId): void {
+    this.assert_valid_request(request_id);
+    let request_with_signer = this.requests.get(request_id);
+    assert((request_with_signer), "No such request");
+    assert(context.blockTimestamp > request_with_signer.added_timestamp + REQUEST_COOLDOWN, "Request cannot be deleted immediately after creation");
+  }
+
+  @mutateState()
+  execute_request(request: MultiSigRequest): ContractPromiseBatch  {
+    let receiver_id = request.receiver_id;
+    let num_actions = request.actions.length;
+    let promise = ContractPromiseBatch.create(receiver_id);    
+
+    for(let i = 0; i < num_actions; i ++ ) {
+      let action = request.actions[i];
+      switch (action._type) {
+        case ActionType.Transfer: {
+          let amount = (action as TransferAction).amount;
+          promise = promise.transfer(amount);
+        }
+        case ActionType.CreateAccount: {
+          // let thisAction = (action as CreateAccountAction)
+          promise = promise.create_account();
+        }
+        case ActionType.DeployContract: {
+          let code = (action as DeployContractAction).code;
+          promise = promise.deploy_contract(code);
+        }
+        case ActionType.AddKey: {
+          let thisAction = (action as AddKeyAction);
+          let public_key = thisAction.public_key;
+          let permission = thisAction.permission;
+          
+          this.assert_self_request(receiver_id);
+          if (permission.is_some()) {
+            promise = promise.add_access_key(
+              public_key,
+              permission.unwrap().allowance || DEFAULT_ALLOWANCE,
+              permission.unwrap().receiver_id,
+              permission.unwrap().method_names
+            )
+          } else {
+            promise = promise.add_full_access_key(public_key);
+          }
+        }
+        case ActionType.DeleteKey: {
+          let public_key = (action as DeleteKeyAction).public_key;
+          this.assert_self_request(receiver_id);
+          let pk: PublicKey = public_key;
+          let request_ids: Array<u32> = [];
+          // NOTE :: Not sure if there's a better way to do this in AssemblyScript // Does not support `for(let E of S)` syntax -T
+          for(let i = 0; i < this.requests.size; i ++ ) {
+            let r_id = this.requests.keys()[i];
+            let r = this.requests.get(r_id);
+            if (r.signer_pk == pk) {
+              request_ids.push(r_id) 
+            }
+          }
+          for(let i = 0; i < request_ids.length; i++ ) {
+            let r_id = request_ids[i];
+            this.confirmations.delete(r_id);
+            this.requests.delete(r_id);
+          }
+          this.num_requests_pk.delete(pk);
+          promise = promise.delete_key(pk);
+        }
+        case ActionType.FunctionCall: {
+          let thisAction = (action as FunctionCallAction);
+          let method_name: string = thisAction.method_name;
+          let args = thisAction.args;
+          let deposit: u128 = thisAction.deposit;
+          let gas: u64 = thisAction.gas;
+          promise = promise.function_call(method_name, args, deposit, gas);
+        }
+        case ActionType.SetNumConfirmations: {
+          let num_confirmations = (action as SetNumConfirmationsAction).num_confirmations;
+          this.assert_one_action_only(receiver_id, num_actions);
+          this.num_confirmations = num_confirmations;
+          return promise;
+        }
+        case ActionType.SetActiveRequestsLimit: {
+          let active_request_limit: u32 = (action as SetActiveRequestsLimitAction).active_request_limit;
+          this.assert_one_action_only(receiver_id, num_actions);
+          this.active_requests_limit = active_request_limit;
+          return promise;
+        }
+      }
+    }
+    return promise;
+  }
+
+  /// Confirm given request with given signing key.
+  /// If with this, there has been enough confirmation, a promise with request will be scheduled.
+  @mutateState()
+  confirm(request_id: RequestId): ContractPromiseBatch {
+    this.assert_valid_request(request_id);
+    let signer_acount_pk = base58.decode(context.senderPublicKey);
+    let confirmations = this.confirmations.get(request_id);
+    assert(!confirmations.has(signer_acount_pk), "Already confirmed this request from this key");
+    if (<u32>(confirmations.size + 1) >= this.num_confirmations) { // why not just c.size > this.n_c ? (vs +1 >=) -T
+      let request = this.remove_request(request_id);
+      /********************************
+      NOTE: If the tx execution fails for any reason, the request and confirmations are removed already, so the client has to start all over
+      ********************************/
+      return this.execute_request(request);
+    } else {
+      confirmations.add(signer_acount_pk);
+      this.confirmations.set(request_id, confirmations);
+      return new ContractPromiseBatch();
+    }
+  }
+
+  // /********************************
+  // Helper methods
+  // ********************************/
+
+  // removes request, removes confirmations and reduces num_requests_pk - used in delete, delete_key, and confirm
+  @mutateState()
+  remove_request(request_id: RequestId): MultiSigRequest {
+    // remove confirmations for this request
+    this.confirmations.delete(request_id);
+    let request_with_signer = this.requests.get(request_id);
+    assert((request_with_signer), "Failed to remove existing element");
+    // remove the original request
+    this.requests.delete(request_id);
+    // decrement num requests for original request signer
+    let original_signer_pk = request_with_signer.signer_pk;
+    let num_requests = this.num_requests_pk.get(original_signer_pk)
+    if (num_requests > 0) {
+      num_requests = num_requests - 1;
+    }
+    this.num_requests_pk.set(original_signer_pk, num_requests);
+    // return request
+    return request_with_signer.request;
+  }
+
+  private assert_valid_request(request_id: RequestId): void {
+    assert(context.contractName == context.predecessor, "Predecessor account must be current account");
+    assert(this.requests.has(request_id), "No such request: either wrong number or already confirmed");
+    assert(this.confirmations.has(request_id), "Internal error: confirmations mismatch requests");
+  }
+  private assert_self_request(receiver_id: AccountId): void {
+    assert(receiver_id == context.contractName, "This method only works when receiver_id is equal to current_account_id");
+  }
+
+  private assert_one_action_only(receiver_id: AccountId, num_actions: usize): void {
+    this.assert_self_request(receiver_id);
+    assert(num_actions == 1, "This metod should be a separate request");
+  }
+
+  /********************************
+  View methods
+  ********************************/
+
+  get_request(request_id: RequestId): MultiSigRequest {
+    assert(this.requests.has(request_id), "No such request");
+    return this.requests.get(request_id).request;
+  }
+
+  get_num_requests_pk(public_key: PublicKey): u32 {
+    return this.num_requests_pk.get(public_key);
+  }
+
+  list_request_ids(): Array<RequestId> {
+    return this.requests.keys();
+  }
+
+  get_confirmations(request_id: RequestId) : Array<PublicKey> {
+    assert(this.confirmations.has(request_id), "No such request");
+    let request_confirmations = this.confirmations.get(request_id);
+    return request_confirmations.values();
+  }
+  get_num_confirmations(): u32  {
+    return this.num_confirmations;
+  }
+  get_request_nonce(): u32 {
+    return this.request_nonce;
+  }
+}
+'''
+'''--- contracts/staking-pool-factory/asconfig.json ---
+
+{
+  "extends": "near-sdk-as/asconfig.json"
+}
+'''
+'''--- contracts/staking-pool-factory/assembly/index.ts ---
+import { env, ContractPromiseBatch, u128, context, logging } from "near-sdk-core";
+
+type AccountId = string
+type Balance = u128;
+type Gas = u64;
+type PublicKey = Uint8Array;
+type Base58PublicKey = PublicKey; // need some better way of doing this
+
+const SUBACCOUNT_SEPARATOR:string = ".";
+// const STAKING_POOL_BIN_PATH:string = "../../../build/release/staking-pool.wasm";
+
+class GasPrices {
+    private static BASE: Gas = 25_000_000_000_000;
+    static STAKING_POOL_NEW: Gas = (GasPrices.BASE * 2);
+    static CALLBACK: Gas = (GasPrices.BASE * 2);
+    static WHITELIST_STAKING_POOL: Gas = GasPrices.BASE;
+}
+
+const MIN_ATTACHED_BALANCE: Balance = u128.from(30_000_000_000_000_000_000_000_000);
+
+const NO_DEPOSIT: Balance = u128.Zero;
+
+enum PromiseResult {
+    NotReady = 0,
+    Successful = 1,
+    Failed = 2 
+  }
+
+  /// Register used internally for atomic operations. This register is safe to use by the user,
+/// since it only needs to be untouched while methods of `Environment` execute, which is guaranteed
+/// guest code is not parallel.
+const ATOMIC_OP_REGISTER: u64 = 0;
+/// Register used to record evicted values from the storage.
+const EVICTED_REGISTER: u64 = u64.MAX_VALUE - 1;
+
+class ContractBase {
+    constructor(private init: bool = true) {}
+    protected isInit(): bool {
+        return this.init;
+    }
+    protected assertInit():void {
+        assert(this.isInit(), "This contract has not been initialized")
+    }
+
+    protected assert_self(): void {
+        assert(context.predecessor == context.contractName, "This method can only be invoked by self");
+    }
+    protected is_promise_success(): bool {
+        assert( env.promise_results_count() == 1, "Contract expected a result on the callback");
+        switch(<u32>env.promise_result(0, ATOMIC_OP_REGISTER)) {
+            case PromiseResult.Successful: {
+                return true
+            }
+            default: {
+                return false
+            }
+        }
+    }
+}
+
+@nearBindgen
+export class StakingPoolFactory extends ContractBase {
+    /// Account ID of the staking pool whitelist contract.
+    staking_pool_whitelist_account_id: AccountId;
+
+    /// The account ID of the staking pools created.
+    staking_pool_account_ids: Set<AccountId>;
+
+    constructor(staking_pool_whitelist_account_id: AccountId) {
+        super();
+        this.staking_pool_whitelist_account_id = staking_pool_whitelist_account_id;
+        this.staking_pool_account_ids = new Set<AccountId>();
+    }
+    get_min_attached_balance(): Balance {
+        return MIN_ATTACHED_BALANCE;
+    }
+    get_number_of_staking_pools_created(): u64 {
+        return this.staking_pool_account_ids.size
+    }
+
+    create_staking_pool(
+        staking_pool_id: string,
+        owner_id: AccountId,
+        stake_public_key: Base58PublicKey,
+        reward_fee_fraction: RewardFeeFraction,
+    ):  ContractPromiseBatch {
+        assert(
+            context.attachedDeposit >= MIN_ATTACHED_BALANCE,
+            "Not enough attached deposit to complete staking pool creation"
+        );
+
+        assert(
+            !staking_pool_id.includes(SUBACCOUNT_SEPARATOR),
+            "The staking pool ID can't contain `.`"
+        );
+
+        let staking_pool_account_id = [staking_pool_id, context.contractName].join(SUBACCOUNT_SEPARATOR);
+
+        assert(
+            env.isValidAccountID(staking_pool_account_id),
+            "The staking pool account ID is invalid"
+        );
+
+        assert(
+            env.isValidAccountID(owner_id),
+            "The owner account ID is invalid"
+        );
+
+        reward_fee_fraction.assert_valid();
+        
+        
+        assert(
+            !this.staking_pool_account_ids.has(staking_pool_account_id),
+            "The staking pool account ID already exists"
+        );
+
+        this.staking_pool_account_ids.add(staking_pool_account_id)
+        
+        let stakingPoolBin = Uint8Array.wrap(changetype<ArrayBuffer>(includeBytes("../../../build/release/staking-pool.wasm")));
+        
+        return ContractPromiseBatch.create(staking_pool_account_id)
+            .create_account()
+            .transfer(context.attachedDeposit)
+            .deploy_contract(stakingPoolBin)
+            .function_call(
+                ExtStakingPool.NEW_METHOD,
+                ExtStakingPool.NewArgs(
+                    owner_id,
+                    stake_public_key,
+                    reward_fee_fraction,
+                ),
+                NO_DEPOSIT,
+                GasPrices.STAKING_POOL_NEW,
+            )
+            .then(context.contractName)
+            .function_call(
+                ExtSelf.ON_STAKING_POOL_CREATE_METHOD,
+                ExtSelf.OnStakingPoolCreateArgs(
+                    staking_pool_account_id,
+                    context.attachedDeposit,
+                    context.predecessor
+                ),
+                NO_DEPOSIT,
+                GasPrices.CALLBACK
+            )
+    }
+    on_staking_pool_create(
+        staking_pool_account_id: AccountId,
+        attached_deposit: u128,
+        predecessor_account_id: AccountId,
+    ) : ContractPromiseBatch {
+        this.assert_self();
+
+        let staking_pool_created = this.is_promise_success();
+
+        if (staking_pool_created) {
+            logging.log("The staking pool "+staking_pool_account_id+"was successfully created. Whitelisting...",);
+            let whitelist = new ExtWhitelist(this.staking_pool_whitelist_account_id);
+            return whitelist.add_staking_pool(staking_pool_account_id);
+        } else {
+            this.staking_pool_account_ids.delete(staking_pool_account_id);
+
+            logging.log(
+                    "The staking pool "+staking_pool_account_id+"creation has failed. Returning attached deposit of "+attached_deposit.toString()+" to " + predecessor_account_id);
+            return ContractPromiseBatch.create(predecessor_account_id).transfer(attached_deposit);
+        }
+    }
+}
+
+class RewardFeeFraction {
+    numerator: u32;
+    denominator: u32;
+    assert_valid(): void {
+        assert(this.denominator != 0, "Denominator must be a positive number");
+        assert(this.numerator <= this.denominator, "The reward fee must be less than or equal to 1");
+    }
+}
+
+class ExtContract {
+    constructor(public accountId: AccountId) {}
+    call<T>(method: string, args: T, amount: u128, gas: Gas ): ContractPromiseBatch {
+        return ContractPromiseBatch.create(this.accountId).function_call(
+            method,
+            args,
+            amount,
+            gas
+        );
+    }
+}
+
+@nearBindgen
+class SelfOnStakingPoolCreateArgs {
+    staking_pool_account_id: AccountId;
+    attached_deposit: u128;
+    predecessor_account_id: AccountId;
+}
+
+// @nearBindgen
+class ExtSelf { // extends ExtContract{
+    static readonly ON_STAKING_POOL_CREATE_METHOD: string = "on_staking_pool_create";
+    static OnStakingPoolCreateArgs(
+        staking_pool_account_id: AccountId, 
+        attached_deposit: u128, 
+        predecessor_account_id: AccountId
+    ): SelfOnStakingPoolCreateArgs {
+        return {
+            staking_pool_account_id,
+            attached_deposit,
+            predecessor_account_id
+        }
+    }
+}
+
+@nearBindgen
+class StakingPoolNewArgs {
+    owner_id: AccountId;
+    stake_public_key: Base58PublicKey;
+    reward_fee_fraction: RewardFeeFraction;
+}
+
+class ExtStakingPool {
+    static readonly NEW_METHOD:string = "new";
+    static NewArgs(owner_id: AccountId, stake_public_key: Base58PublicKey, reward_fee_fraction: RewardFeeFraction): StakingPoolNewArgs {
+        return {
+            owner_id,
+            stake_public_key,
+            reward_fee_fraction
+        }
+    }
+}
+
+@nearBindgen 
+class WhitelistAddStakingPoolArgs {
+    staking_pool_account_id: AccountId
+}
+
+class ExtWhitelist extends ExtContract {
+    static readonly ADD_STAKING_POOL_METHOD: string = "add_staking_pool";
+    static AddStakingPoolArgs(staking_pool_account_id: AccountId): WhitelistAddStakingPoolArgs {
+        return {staking_pool_account_id}
+    }
+    constructor(accountId: AccountId) {super(accountId)}
+    add_staking_pool(staking_pool_account_id: AccountId): ContractPromiseBatch {
+        return this.call(
+            ExtWhitelist.ADD_STAKING_POOL_METHOD,
+            ExtWhitelist.AddStakingPoolArgs(staking_pool_account_id),
+            u128.Zero,
+            GasPrices.WHITELIST_STAKING_POOL );
+    }
+}
+
+'''
+'''--- contracts/staking-pool/asconfig.json ---
+
+{
+    "extends": "near-sdk-as/asconfig.json"
+  }
+'''
+'''--- contracts/staking-pool/assembly/index.ts ---
+import {
+  u128,
+  context,
+  env,
+  logging,
+  ContractPromiseBatch,
+} from 'near-sdk-as';
+
+// NEAR types //
+type AccountId = string;
+type Balance = u128;
+type EpochHeight = u64;
+type PublicKey = Uint8Array;
+type Base58PublicKey = PublicKey; // need some better way of doing this
+
+enum PromiseResult {
+  NotReady = 0,
+  Successful = 1,
+  Failed = 2 
+}
+
+/// Register used internally for atomic operations. This register is safe to use by the user,
+/// since it only needs to be untouched while methods of `Environment` execute, which is guaranteed
+/// guest code is not parallel.
+const ATOMIC_OP_REGISTER: u64 = 0;
+/// Register used to record evicted values from the storage.
+const EVICTED_REGISTER: u64 = u64.MAX_VALUE - 1;
+
+class Option<T> {
+  constructor(readonly value: T) {}
+  is_some(): bool {
+    return (!this.is_none());
+  }
+  is_none(): bool {
+    if (isNullable<T>() || isReference<T>()) {
+      return changetype<usize>(this.value) == 0;
+    } else {
+      return false
+    }
+  }
+  expect(message: string = "Missing expected value"): T {
+    assert(this.is_some(), message);
+    return this.value;
+  }
+}
+// STORAGE //
+
+/// The amount of gas given to complete `vote` call.
+const VOTE_GAS: u64 = 100_000_000_000_000;
+
+/// The amount of gas given to complete internal `on_stake_action` call.
+const ON_STAKE_ACTION_GAS: u64 = 20_000_000_000_000;
+
+/// The amount of yocto NEAR the contract dedicates to guarantee that the "share" price never
+/// decreases. It's used during rounding errors for share : amount conversions.
+const STAKE_SHARE_PRICE_GUARANTEE_FUND: Balance = u128.from(1_000_000_000_000);
+
+/// There is no deposit balance attached.
+const NO_DEPOSIT: Balance = u128.Zero;
+
+/// A type to distinguish between a balance and "stake" shares for better readability.
+export type NumStakeShares = Balance;
+
+@nearBindgen
+class Account {
+  constructor(
+    public unstaked: Balance = u128.Zero,
+    public stake_shares: NumStakeShares = u128.Zero,
+    public unstaked_available_epoch_height: EpochHeight = 0,
+  ){}
+}
+
+@nearBindgen
+class HumanReadableAccount {
+  constructor(
+    public account_id: AccountId,
+    public unstaked_balance: Balance,
+    public staked_balance: Balance,
+    public can_withdraw: bool,
+  ) {}
+}
+
+/// The number of epochs required for the locked balance to become unlocked.
+/// NOTE: The actual number of epochs when the funds are unlocked is 3. But there is a corner case
+/// when the unstaking promise can arrive at the next epoch, while the inner state is already
+/// updated in the previous epoch. It will not unlock the funds for 4 epochs.
+const NUM_EPOCHS_TO_UNLOCK: EpochHeight = 4;
+
+@nearBindgen
+export class StakingContract {
+
+    /// The account ID of the owner who's running the staking validator node.
+    /// NOTE: This is different from the current account ID which is used as a validator account.
+    /// The owner of the staking pool can change staking public key and adjust reward fees.
+    public owner_id: AccountId;
+    /// The public key which is used for staking action. It's the public key of the validator node
+    /// that validates on behalf of the pool.
+    public stake_public_key: Base58PublicKey;
+    /// The last epoch height when `ping` was called.
+    public last_epoch_height: EpochHeight;
+    /// The last total balance of the account (consists of staked and unstaked balances).
+    public last_total_balance: Balance;
+    /// The total amount of shares. It should be equal to the total amount of shares across all
+    /// accounts.
+    public total_stake_shares: NumStakeShares;
+    /// The total staked balance.
+    public total_staked_balance: Balance;
+    /// The fraction of the reward that goes to the owner of the staking pool for running the
+    /// validator node.
+    public reward_fee_fraction: RewardFeeFraction;
+    /// Persistent map from an account ID to the corresponding account.
+    public accounts: Map < AccountId, Account >;
+    /// Whether the staking is paused.
+    /// When paused, the account unstakes everything (stakes 0) and doesn't restake.
+    /// It doesn't affect the staking shares or reward distribution.
+    /// Pausing is useful for node maintenance. Only the owner can pause and resume staking.
+    /// The contract is not paused by default.
+    public paused: bool;
+
+    private init: bool;
+
+  // storage key used for persisting contract data
+
+  // Initialize a new Staking Contract
+  constructor (owner_id: AccountId, stake_public_key: Base58PublicKey, reward_fee_fraction: RewardFeeFraction) {
+    reward_fee_fraction.assert_valid();
+    assert(env.isValidAccountID(owner_id), "The owner id is invalid");
+    let account_balance = context.accountBalance;
+    let total_staked_balance = u128.sub(account_balance, STAKE_SHARE_PRICE_GUARANTEE_FUND);
+    assert(context.accountLockedBalance > u128.Zero);
+    this.owner_id =  owner_id;
+    this.stake_public_key =  stake_public_key;
+    this.last_epoch_height =  env.epoch_height();
+    this.last_total_balance =  account_balance;
+    this.total_stake_shares =  total_staked_balance;
+    this.total_staked_balance =  total_staked_balance;
+    this.reward_fee_fraction =  reward_fee_fraction;
+    this.accounts =  new Map < AccountId, Account > ();
+    this.paused = false;
+
+    this.init = true;
+
+    this.internal_restake();
+  }
+
+  private assertInit(): void {
+    assert((this.init), "Contract has not been initialized; initialize with #new(owner_id: AccountId, stake_public_key: Base58PublicKey, reward_fee_fraction: RewardFeeFraction)")
+  }
+
+  // PUBLIC METHODS
+
+  @mutateState()
+  ping(): void {
+    if (this.internal_ping()) {
+      this.internal_restake();
+    }
+  }
+
+  // @payable
+  @mutateState()
+  deposit(): void {
+    let need_to_restake = this.internal_ping();
+    this.internal_deposit();
+    if (need_to_restake) {
+      this.internal_restake();
+    }
+  }
+
+  /// Deposits the attached amount into the inner account of the predecessor and stakes it.
+  // #[payable]
+  @mutateState()
+  deposit_and_stake(): void {
+    this.internal_ping();
+
+    let amount = this.internal_deposit();
+    this.internal_stake(amount);
+
+    this.internal_restake();
+  }
+
+  /// Withdraws the entire unstaked balance from the predecessor account.
+  /// It's only allowed if the `unstake` action was not performed in the four most recent epochs.
+  @mutateState()
+  withdraw_all(): void {
+    let need_to_restake = this.internal_ping();
+    let account_id = context.predecessor;
+    let account = this.internal_get_account(account_id);
+    this.internal_withdraw(account.unstaked);
+
+    if (need_to_restake) {
+      this.internal_restake();
+    }
+  }
+
+  /// Withdraws the non staked balance for given account.
+  /// It's only allowed if the `unstake` action was not performed in the four most recent epochs.
+  @mutateState()
+  withdraw(amount: Balance): void {
+    let need_to_restake = this.internal_ping();
+
+    this.internal_withdraw(amount);
+
+    if (need_to_restake) {
+      this.internal_restake();
+    }
+  }
+
+  /// Stakes all available unstaked balance from the inner account of the predecessor.
+  @mutateState()
+  stake_all(): void {
+    // Stake action always restakes
+    this.internal_ping();
+
+    let account_id = context.predecessor;
+    let account = this.internal_get_account(account_id);
+    this.internal_stake(account.unstaked);
+
+    this.internal_restake();
+  }
+
+  /// Stakes the given amount from the inner account of the predecessor.
+  /// The inner account should have enough unstaked balance.
+  @mutateState()
+  stake(amount: Balance): void {
+    // Stake action always restakes
+    this.internal_ping();
+
+    this.internal_stake(amount);
+
+    this.internal_restake();
+  }
+
+  /// Unstakes all staked balance from the inner account of the predecessor.
+  /// The new total unstaked balance will be available for withdrawal in four epochs.
+  @mutateState()
+  unstake_all(): void {
+    // Unstake action always restakes
+    this.internal_ping();
+
+    let account_id = context.predecessor;
+    let account = this.internal_get_account(account_id);
+    let amount = this.staked_amount_from_num_shares_rounded_down(account.stake_shares);
+    this.inner_unstake(amount);
+
+    this.internal_restake();
+  }
+
+  /// Unstakes the given amount from the inner account of the predecessor.
+  /// The inner account should have enough staked balance.
+  /// The new total unstaked balance will be available for withdrawal in four epochs.
+  @mutateState()
+  unstake(amount: Balance): void {
+    // Unstake action always restakes
+    this.internal_ping();
+
+    this.inner_unstake(amount);
+
+    this.internal_restake();
+  }
+
+  /****************/
+  /* View methods */
+  /****************/
+
+  /// Returns the unstaked balance of the given account.
+  get_account_unstaked_balance(account_id: AccountId): Balance {
+    return this.get_account(account_id).unstaked_balance
+  }
+
+  /// Returns the staked balance of the given account.
+  /// NOTE: This is computed from the amount of "stake" shares the given account has and the
+  /// current amount of total staked balance and total stake shares on the account.
+  get_account_staked_balance(account_id: AccountId): Balance {
+    return this.get_account(account_id).staked_balance
+  }
+
+  /// Returns the total balance of the given account (including staked and unstaked balances).
+  get_account_total_balance(account_id: AccountId): Balance {
+    let account = this.get_account(account_id);
+    return u128.add(account.unstaked_balance, account.staked_balance);
+  }
+
+  /// Returns `true` if the given account can withdraw tokens in the current epoch.
+  is_account_unstaked_balance_available(account_id: AccountId): bool {
+    return this.get_account(account_id).can_withdraw
+  }
+
+  /// Returns the total staking balance.
+  get_total_staked_balance(): Balance {
+    return this.total_staked_balance
+  }
+
+  /// Returns account ID of the staking pool owner.
+  get_owner_id(): AccountId {
+    return this.owner_id
+  }
+
+  /// Returns the current reward fee as a fraction.
+  get_reward_fee_fraction(): RewardFeeFraction {
+    return this.reward_fee_fraction
+  }
+
+  /// Returns the staking public key
+  get_staking_key(): Base58PublicKey {
+    return this.stake_public_key;
+  }
+
+  /// Returns true if the staking is paused
+  is_staking_paused(): bool {
+    return this.paused;
+  }
+
+  /// Returns human readable representation of the account for the given account ID.
+  get_account(account_id: AccountId): HumanReadableAccount {
+    let account = this.internal_get_account(account_id);
+    return new HumanReadableAccount(
+      account_id,
+      account.unstaked,
+      this.staked_amount_from_num_shares_rounded_down(account.stake_shares),
+      (account.unstaked_available_epoch_height <= context.epochHeight)
+    );
+  }
+
+  /// Returns the number of accounts that have positive balance on this staking pool.
+  get_number_of_accounts(): u64 {
+    return this.accounts.size
+  }
+
+  /// Returns the list of accounts
+  get_accounts(from_index: u64, limit: u64): Array < HumanReadableAccount > {
+    let keys = this.accounts.keys();
+    let accounts: Array < HumanReadableAccount > = [];
+    for (let i = from_index; i < min(from_index + limit, keys.length); i++) {
+      accounts.push(this.get_account(keys[<i32>i]))
+    }
+    return accounts;
+  }
+
+  /*************/
+  /* Callbacks */
+  /*************/
+
+  on_stake_action(): void {
+    assert(
+      context.contractName ==
+      context.predecessor,
+      "Can be called only as a callback"
+    );
+
+    assert(
+      env.promise_results_count() == 1,
+      "Contract expected a result on the callback"
+    );
+
+    let stake_action_succeeded = (env.promise_result(0, ATOMIC_OP_REGISTER) == PromiseResult.Successful);
+    if (!stake_action_succeeded &&context.accountLockedBalance > u128.Zero) {
+      ContractPromiseBatch.create(context.contractName).stake(u128.Zero, this.stake_public_key);
+    }
+  }
+
+  /*******************/
+  /* Owner's methods */
+  /*******************/
+
+  /// Owner's method.
+  /// Updates current public key to the new given public key.
+  @mutateState()
+  update_staking_key(stake_public_key: Base58PublicKey): void {
+    this.assert_owner();
+    // When updating the staking keythe contract has to restake.
+    let _need_to_restake = this.internal_ping();
+    this.stake_public_key = stake_public_key;
+    this.internal_restake();
+  }
+
+  /// Owner's method.
+  /// Updates current reward fee fraction to the new given fraction.
+  @mutateState()
+  update_reward_fee_fraction(reward_fee_fraction: RewardFeeFraction): void {
+    this.assert_owner();
+    reward_fee_fraction.assert_valid();
+
+    let need_to_restake = this.internal_ping();
+    this.reward_fee_fraction = reward_fee_fraction;
+    if (need_to_restake) {
+      this.internal_restake();
+    }
+  }
+
+  /// Owner's method.
+  /// Calls `vote(is_vote)` on the given voting contract account ID on behalf of the pool.
+  @mutateState()
+  vote(voting_account_id: AccountId, is_vote: bool): ContractPromiseBatch {
+    this.assert_owner();
+    assert(
+      env.isValidAccountID(voting_account_id),
+      "Invalid voting account ID"
+    );
+    
+    let ext = new ExtVoting(voting_account_id);
+    return ext.vote(is_vote);
+  }
+
+  /// Owner's method.
+  /// Pauses pool staking.
+  @mutateState()
+  pause_staking(): void {
+    this.assert_owner();
+    assert(!this.paused, "The staking is already paused");
+
+    this.internal_ping();
+    this.paused = true;
+    ContractPromiseBatch.create(context.contractName).stake(u128.Zero, this.stake_public_key);
+  }
+
+  /// Owner's method.
+  /// Resumes pool staking.
+  @mutateState()
+  resume_staking(): void {
+    this.assert_owner();
+    assert(this.paused, "The staking is not paused");
+
+    this.internal_ping();
+    this.paused = false;
+    this.internal_restake();
+  }
+
+  // INTERNAL METHODS
+  // No @mutateState provided -- should be on external methods
+
+  protected internal_restake(): void {
+    if (this.paused) {
+      return;
+    }
+
+    ContractPromiseBatch.create(context.contractName)
+      .stake(this.total_staked_balance, this.stake_public_key)
+      // NOTE :: THIS IS BROKEN
+      .function_call(
+        ExtSelf.ON_STAKE_ACTION_METHOD,
+        ExtSelf.OnStakeActionArgs(),
+        NO_DEPOSIT,
+        ON_STAKE_ACTION_GAS
+      );
+  }
+
+  protected internal_deposit(): u128 {
+    let account_id = context.predecessor;
+    let account = this.internal_get_account(account_id);
+    let amount = context.attachedDeposit;
+    account.unstaked = u128.add(amount, account.unstaked);
+    this.internal_save_account(account_id, account);
+    this.last_total_balance = u128.add(this.last_total_balance, amount);
+    logging.log(account_id + " deposited " + amount.toString() + ". New unstaked balance is " + account.unstaked.toString());
+    return amount;
+  }
+
+  protected internal_withdraw(amount: Balance): void {
+    assert(amount > u128.Zero, "Withdrawal amount should be positive");
+    let account_id = context.predecessor;
+    let account = this.internal_get_account(account_id);
+    assert(account.unstaked >= amount, "Not enough unstaked balance to withdraw");
+    assert(account.unstaked_available_epoch_height <= context.epochHeight, "The unstaked balance is not yet available due to unstaking delay");
+    account.unstaked = u128.sub(account.unstaked, amount);
+    this.internal_save_account(account_id, account);
+    logging.log(account_id + " wutgdrawubg " + amount.toString() + ". New unstaked balance is " + account.unstaked.toString());
+    ContractPromiseBatch.create(account_id).transfer(amount);
+    this.last_total_balance = u128.sub(this.last_total_balance, amount);
+  }
+
+  protected internal_stake(amount: Balance): void {
+    assert(amount > u128.Zero, "Staking amount should be positive");
+    let account_id = context.predecessor;
+    let account = this.internal_get_account(account_id);
+
+    // Calculate the number of "stake" shares that the account will receive for staking the
+    // given amount.
+    let num_shares = this.num_shares_from_staked_amount_rounded_down(amount);
+    assert(
+      num_shares > u128.Zero,
+      "The calculated number of \"stake\" shares received for staking should be positive"
+    );
+
+    // The amount of tokens the account will be charged from the unstaked balance.
+    // Rounded down to avoid overcharging the account to guarantee that the account can always
+    // unstake at least the same amount as staked.
+    let charge_amount = this.staked_amount_from_num_shares_rounded_down(num_shares);
+    assert(
+      charge_amount > u128.Zero,
+      "Invariant violation. Calculated staked amount must be positive, because \"stake\" share price should be at least 1"
+    );
+
+    assert(
+      account.unstaked >= charge_amount,
+      "Not enough unstaked balance to stake"
+    );
+    account.unstaked = u128.sub(charge_amount, account.unstaked);
+    account.stake_shares = u128.add(num_shares, account.stake_shares);
+    this.internal_save_account(account_id, account);
+
+    // The staked amount that will be added to the total to guarantee the "stake" share price
+    // never decreases. The difference between `stake_amount` and `charge_amount` is paid
+    // from the allocated STAKE_SHARE_PRICE_GUARANTEE_FUND.
+    let stake_amount = this.staked_amount_from_num_shares_rounded_up(num_shares);
+
+    this.total_staked_balance = u128.add(stake_amount, this.total_staked_balance);
+    this.total_stake_shares = u128.add(num_shares, this.total_stake_shares);
+
+    logging.log(
+      account_id + " staking " + charge_amount.toString() + ". Received " + num_shares.toString() + " new staking shares. Total " + account.unstaked.toString() + " unstaked balance and " + account.stake_shares.toString() + " staking shares"
+    );
+    logging.log(
+      "Contract total staked balance is " + this.total_staked_balance.toString() + ". Total number of shares" + this.total_stake_shares.toString()
+    );
+
+  }
+
+  protected inner_unstake(amount: u128): void {
+    assert(amount > u128.Zero, "Unstaking amount should be positive");
+
+    let account_id = context.predecessor;
+    let account = this.internal_get_account(account_id);
+
+    assert(
+      this.total_staked_balance > u128.Zero,
+      "The contract doesn't have staked balance"
+    );
+    // Calculate the number of shares required to unstake the given amount.
+    // NOTE: The number of shares the account will pay is rounded up.
+    let num_shares = this.num_shares_from_staked_amount_rounded_up(amount);
+    assert(
+      num_shares > u128.Zero,
+      "Invariant violation. The calculated number of \"stake\" shares for unstaking should be positive"
+    );
+    assert(
+      account.stake_shares >= num_shares,
+      "Not enough staked balance to unstake"
+    );
+
+    // Calculating the amount of tokens the account will receive by unstaking the corresponding
+    // number of "stake" shares, rounding up.
+    let receive_amount = this.staked_amount_from_num_shares_rounded_up(num_shares);
+    assert(
+      receive_amount > u128.Zero,
+      "Invariant violation. Calculated staked amount must be positive, because \"stake\" share price should be at least 1"
+    );
+
+    account.stake_shares = u128.sub(num_shares, account.stake_shares);
+    account.unstaked = u128.add(receive_amount, account.unstaked);
+    account.unstaked_available_epoch_height = context.epochHeight + NUM_EPOCHS_TO_UNLOCK;
+    this.internal_save_account(account_id, account);
+
+    // The amount tokens that will be unstaked from the total to guarantee the "stake" share
+    // price never decreases. The difference between `receive_amount` and `unstake_amount` is
+    // paid from the allocated STAKE_SHARE_PRICE_GUARANTEE_FUND.
+    let unstake_amount = this.staked_amount_from_num_shares_rounded_down(num_shares);
+
+    this.total_staked_balance = u128.add(this.total_staked_balance, unstake_amount);
+    this.total_stake_shares = u128.add(this.total_stake_shares, num_shares);
+
+    logging.log("@" + account_id + " unstaking " + receive_amount.toString() + ". Spent " + num_shares.toString() + " staking shares. Total " + account.unstaked.toString() + " unstaked balance and " + account.stake_shares.toString() + " staking shares");
+    logging.log("Contract total staked balance is " + this.total_staked_balance.toString() + ". Total number of shares " + this.total_stake_shares.toString());
+  }
+
+  protected assert_owner(): void {
+    assert(context.predecessor == this.owner_id, "Can only be called by owner");
+  }
+
+  /// Distributes rewards after the new epoch. It's automatically called before every action.
+  /// Returns true if the current epoch height is different from the last epoch height.
+  protected internal_ping(): bool {
+    let epoch_height = context.epochHeight;
+    if (this.last_epoch_height == epoch_height) {
+      return false;
+    }
+    this.last_epoch_height = epoch_height;
+
+    // New total amount (both locked and unlocked balances).
+    // NOTE: We need to subtract `attached_deposit` in case `ping` called from `deposit` call
+    // since the attached deposit gets included in the `account_balance`, and we have not
+    // accounted it yet.
+    let total_balance = u128.add(context.accountLockedBalance, u128.sub(context.accountBalance, context.attachedDeposit));
+
+    assert(
+      total_balance >= this.last_total_balance,
+      "The new total balance should not be less than the old total balance"
+    );
+    let total_reward = u128.sub(total_balance, this.last_total_balance);
+
+    if (total_reward > u128.Zero) {
+      // The validation fee that the contract owner takes.
+      let owners_fee = this.reward_fee_fraction.multiply(total_reward);
+
+      //istributing the remaining reward to the delegators first.
+      let remaining_reward = u128.sub(total_reward, owners_fee);
+      this.total_staked_balance = u128.add(remaining_reward, this.total_staked_balance);
+
+      // Now buying "stake" shares for the contract owner at the new share price.
+      let num_shares = this.num_shares_from_staked_amount_rounded_down(owners_fee);
+      if (num_shares > u128.Zero) {
+        // Updating owner's inner account
+        let owner_id = this.owner_id;
+        let account = this.internal_get_account(owner_id);
+        account.stake_shares = u128.add(num_shares, account.stake_shares);
+        this.internal_save_account(owner_id, account);
+        // Increasing the total amount of "stake" shares.
+        this.total_stake_shares = u128.add(num_shares, this.total_stake_shares);
+      }
+      // Increasing the total staked balance by the owners fee, no matter whether the owner
+      // received any shares or not.
+      this.total_staked_balance = u128.add(this.total_staked_balance, owners_fee);
+
+      logging.log(
+        "Epoch " + epoch_height.toString() + 
+        ": Contract received total rewards of " + total_reward.toString() + 
+        " tokens. New total staked balance is " + this.total_staked_balance.toString() + 
+        ". Total number of shares " + this.total_stake_shares.toString());
+
+      if (num_shares > u128.Zero) {
+        logging.log("Total rewards fee is " + num_shares.toString() + "stake shares");
+      }
+    }
+
+    this.last_total_balance = total_balance;
+    return true
+  }
+
+  /// Returns the number of "stake" shares rounded down corresponding to the given staked balance
+  /// amount.
+  ///
+  /// price = total_staked / total_shares
+  /// Price is fixed
+  /// (total_staked + amount) / (total_shares + num_shares) = total_staked / total_shares
+  /// (total_staked + amount) * total_shares = total_staked * (total_shares + num_shares)
+  /// amount * total_shares = total_staked * num_shares
+  /// num_shares = amount * total_shares / total_staked
+  protected num_shares_from_staked_amount_rounded_down(amount: Balance): NumStakeShares {
+    assert(
+      this.total_staked_balance > u128.Zero,
+      "The total staked balance can't be 0"
+    );
+    // u256 math not supported
+    // (U256::from(this.total_stake_shares) * U256::from(amount)
+    // / U256::from(this.total_staked_balance))
+    return u128.mul(amount, u128.div(this.total_stake_shares, this.total_staked_balance));
+  }
+
+  /// Returns the number of "stake" shares rounded up corresponding to the given staked balance
+  /// amount.
+  ///
+  /// Rounding up division of `a / b` is done using `(a + b - 1) / b`.
+  protected num_shares_from_staked_amount_rounded_up(amount: Balance): NumStakeShares {
+    assert(
+      this.total_staked_balance > u128.Zero,
+      "The total staked balance can't be 0"
+    );
+    // ((U256::from(this.total_stake_shares) * U256::from(amount)
+    //     + U256::from(this.total_staked_balance - 1))
+    //     / U256::from(this.total_staked_balance))
+    // .as_u128()
+
+    return u128.add(
+      u128.mul(this.total_stake_shares, amount),
+      u128.div(
+        u128.sub(this.total_staked_balance, u128.One),
+        this.total_staked_balance
+      )
+    );
+  }
+
+  /// Returns the staked amount rounded down corresponding to the given number of "stake" shares.
+  protected staked_amount_from_num_shares_rounded_down(num_shares: NumStakeShares): Balance {
+    assert(
+      this.total_stake_shares > u128.Zero,
+      "The total number of stake shares can't be 0"
+    );
+    // (U256::from(this.total_staked_balance) * U256::from(num_shares)
+    //     / U256::from(this.total_stake_shares))
+    // .as_u128()
+    return u128.mul(
+      num_shares,
+      u128.div(this.total_staked_balance, this.total_stake_shares)
+    )
+  }
+
+  /// Returns the staked amount rounded up corresponding to the given number of "stake" shares.
+  ///
+  /// Rounding up division of `a / b` is done using `(a + b - 1) / b`.
+  protected staked_amount_from_num_shares_rounded_up(num_shares: NumStakeShares): Balance {
+    assert(
+      this.total_stake_shares > u128.Zero,
+      "The total number of stake shares can't be 0"
+    );
+    // ((U256::from(this.total_staked_balance) * U256::from(num_shares)
+    //     + U256::from(this.total_stake_shares - 1))
+    //     / U256::from(this.total_stake_shares))
+    // .as_u128()
+    return u128.add(
+      u128.mul(this.total_staked_balance, num_shares),
+      u128.div(
+        u128.sub(this.total_stake_shares, u128.One),
+        this.total_stake_shares
+      )
+    );
+  }
+
+  /// Inner method to get the given account or a new default value account.
+  protected internal_get_account(account_id: AccountId): Account {
+    return this.accounts.get(account_id) || new Account();
+  }
+
+  /// Inner method to save the given account for a given account ID.
+  /// If the account balances are 0, the account is deleted instead to release storage.
+  protected internal_save_account(account_id: AccountId, account: Account): void {
+    if (account.unstaked > u128.Zero || account.stake_shares > u128.Zero) {
+      this.accounts.set(account_id, account);
+    } else {
+      this.accounts.delete(account_id);
+    }
+  }
+
+}
+
+@nearBindgen
+class RewardFeeFraction {
+  numerator: u32;
+  denominator: u32;
+  assert_valid(): void {
+    assert(this.denominator != 0, "Denominator must be a positive number");
+    assert(this.numerator <= this.denominator, "The reward must be less than or equal to 1");
+  }
+  multiply(value: Balance): Balance {
+    // NOTE :: multiplication and division are not yet implemented for u256 :: so currently, lacking precision
+    // u256.fromU32(this.numerator) * u256.fromU128(value) / u256.fromU32(this.denominator)
+    return u128.mul(value, u128.div(u128.fromU32(this.numerator), u128.fromU32(this.denominator)));
+  }
+}
+
+/************************z
+ * External Contracts
+ * ********************** */
+
+class ExtContract {
+  constructor(readonly ext_account_id: AccountId){}
+  
+  protected call<T>(method_name: string, args: T, amount: u128, gas: u64  ): ContractPromiseBatch {
+    return ContractPromiseBatch.create(this.ext_account_id).function_call(method_name, args, amount, gas)
+  }
+
+}
+@nearBindgen
+class VoteArgs {
+  constructor(public is_vote:bool) {  } 
+}
+class ExtVoting extends ExtContract {
+  static readonly VOTE_METHOD: string = "vote";
+  static VoteArgs(is_vote: bool): VoteArgs {
+    return {is_vote}
+  }
+
+  vote(is_vote:bool): ContractPromiseBatch {
+    return this.call(ExtVoting.VOTE_METHOD, ExtVoting.VoteArgs(is_vote), NO_DEPOSIT, VOTE_GAS);
+  }
+}
+
+@nearBindgen
+class OnStakeActionArgs {}
+
+class ExtSelf extends ExtContract {
+  /// A callback to check the result of the staking action.
+  /// In case the stake amount is less than the minimum staking threshold, the staking action
+  /// fails, and the stake amount is not changed. This might lead to inconsistent state and the
+  /// follow withdraw calls might fail. To mitigate this, the contract will issue a new unstaking
+  /// action in case of the failure of the first staking action.
+  static readonly ON_STAKE_ACTION_METHOD: string = "on_stake_action";
+  static OnStakeActionArgs(): OnStakeActionArgs {
+    return {}
+  }
+  // on_stake_action(): ContractPromiseBatch {
+  //   // return this.call(this.on_stake_action.name, new Uint8Array(0), NO_DEPOSIT, ON_STAKE_ACTION_GAS);
+  // }
+}
+
+'''
+'''--- contracts/tsconfig.json ---
+{
+    "extends": "assemblyscript/std/assembly.json",
+    "include": ["./**/*.ts"]
+  }
+'''
+'''--- contracts/voting/asconfig.json ---
+
+{
+    "extends": "near-sdk-as/asconfig.json"
+  }
+'''
+'''--- contracts/voting/assembly/index.ts ---
+
+import {
+  u128,
+  context,
+  env
+} from 'near-sdk-as';
+
+// NEAR types //
+type AccountId = string;
+type Balance = u128;
+type EpochHeight = u64;
+type WrappedTimestamp = u64;
+
+class Option<T> {
+  constructor(readonly value: T) {}
+  
+  is_some(): bool {
+    return (!this.is_none());
+  }
+  is_none(): bool {
+    if (isNullable<T>() || isReference<T>()) {
+      return changetype<usize>(this.value) == 0;
+    } else {
+      return false
+    }
+  }
+  expect(message: string = "Missing expected value"): T {
+    assert(this.is_some(), message);
+    return this.value;
+  }
+  unwrap(): T {
+    return this.expect();
+  }
+}
+
+// class None extends Option<null> {
+//   constructor() {
+//     super(null);
+//   }
+// }
+
+@nearBindgen
+export class VotingContract {
+  public votes: Map<AccountId, Balance>
+  public total_voted_stake: Balance
+  public result: Option<WrappedTimestamp>
+  public last_epoch_height: EpochHeight
+  // exported as "new"
+  constructor() {
+    this.votes = new Map<AccountId, Balance>();
+    this.total_voted_stake = u128.Zero;
+    this.result = new Option(0); // new Option(0); // 0 is interpreted as "none"
+    this.last_epoch_height = 0;
+  }
+
+  @mutateState()
+  ping(): void {
+    assert(
+      this.result.is_none(),
+      "Voting has already ended"
+    );
+    let cur_epoch_height = env.epoch_height();
+    if (cur_epoch_height != this.last_epoch_height ) {
+      this.total_voted_stake = u128.Zero;
+      let account_ids = this.votes.keys();
+      for (let i = 0; i < account_ids.length; i ++ ) {
+        let account_id = account_ids[i];
+        // NOTE :: env.validator_stake currently causes a compile time error for all values.
+        // let account_current_stake = env.validator_stake(account_id);
+        let account_current_stake = u128.One;
+        if (account_current_stake > u128.Zero) {
+          this.votes.set(account_id, account_current_stake);
+        }
+        this.check_result();
+        this.last_epoch_height = cur_epoch_height;
+      }
+    }
+  }
+
+  @mutateState()
+  check_result(): void {
+    assert(
+      this.result.is_none(),
+      "check result is called after result is already set"
+    );
+
+    let total_stake = env.validator_total_stake();
+    if (
+      // u128 math is verbose -T
+      u128.gt(
+        this.total_voted_stake,
+        u128.mul(
+          total_stake,
+          u128.div(
+            u128.from(2),
+            u128.from(3)))
+      )
+    ) {
+      this.result = new Option(env.block_timestamp());
+    }
+  }
+
+  @mutateState()
+  vote(is_vote: bool):void {
+    this.ping();
+    if (this.result.is_some()) {
+      return;
+    }
+    // NOTE :: I'm assuming that this is equivalent to env::predecessor_account_id();
+    let account_id = context.predecessor;
+    
+    let account_stake: u128;
+
+    if (is_vote) {
+      // NOTE :: env.validator_stake currently causes a compile time error for all values.
+      // let stake = env.validator_stake(account_id);
+      let stake = u128.One;
+      assert(stake > u128.Zero, account_id + "is not a validator");
+      account_stake = stake;
+    } else {
+      account_stake = u128.Zero;
+    }
+
+    let voted_stake = this.votes.get(account_id);
+    this.votes.delete(account_id);
+    assert(
+      voted_stake <= this.total_voted_stake,
+      "invariant: voted stake " + voted_stake.toString() + " is more than total voted stake " + this.total_voted_stake.toString()
+    );
+    this.total_voted_stake = u128.add(
+      this.total_voted_stake, u128.sub(
+        account_stake, voted_stake));
+    if (account_stake > u128.Zero) {
+      this.votes.set(account_id, account_stake);
+      this.check_result();
+    }
+  }
+
+  get_result(): Option<WrappedTimestamp> {
+    return this.result;
+  }
+
+  get_total_voted_stake():  StaticArray<u128> { // no tuple type available
+    return [this.total_voted_stake, env.validator_total_stake()];
+  }
+
+  get_votes(): Map<AccountId, u128> {
+    // Note :: I think this is okay to just return without processing .. need to confirm -T
+    return this.votes;
+  } 
+}
+'''
+'''--- package.json ---
+{
+  "name": "near-core-contracts-as",
+  "version": "0.0.1",
+  "description": "Core near contracts in assembly script",
+  "author": "theophoric",
+  "license": "(MIT AND Apache-2.0)",
+  "scripts": {
+    "dev": "watch -d -n 1 'clear && yarn test:unit'",
+    "asp": "asp --verbose --nologo",
+    "build": "asb",
+    "build:debug": "asb --target debug",
+    "build:multisig": "yarn build -d ./contracts/multisig",
+    "build:voting": "yarn build -d ./contracts/voting",
+    "build:staking-pool": "yarn build -d ./contracts/staking-pool",
+    "build:staking-pool-factory": "yarn build -d ./contracts/staking-pool-factory",
+    "clean": "rm -rf ./out",
+    "test": "yarn test:unit",
+    "test:all": "yarn test && yarn test:simulate:runtime",
+    "test:unit": "asp --verbose --nologo -c contracts/as-pect.config.js -f unit.spec"
+  },
+  "devDependencies": {
+    "near-sdk-as": "^2.2.0"
+  },
+  "engines": {
+    "node": ">=12.0.0"
+  }
+}
+
+'''

@@ -1,0 +1,604 @@
+*GitHub Repository "agileurbanite/api.pubdrop"*
+
+'''--- src/config/events.js ---
+export const events = {
+  'miami-mainnet': {
+    network: 'mainnet',
+    campaignId: 'miami-neardrop.near',
+  },
+  'miami-testnet': {
+    network: 'testnet',
+    campaignId: 'dev-1637570167698-74050947045323',
+  },
+  'newYork-mainnet': {
+    network: 'mainnet',
+    campaignId: 'nyc-neardrop.near',
+  },
+  'sf-mainnet': {
+    network: 'mainnet',
+    campaignId: 'sf-neardrop.near',
+  },
+  'hongbao-mainnet': {
+    network: 'mainnet',
+    campaignId: 'hongbao-neardrop.near',
+  },
+  'ethdenver-mainnet': {
+    network: 'mainnet',
+    campaignId: 'ethdenver-neardrop.near',
+  },
+  'brand-mainnet': {
+    network: 'mainnet',
+    campaignId: 'brand-neardrop.near',
+  },
+  'bermuda-mainnet': {
+    network: 'mainnet',
+    campaignId: 'bermuda-neardrop.near',
+  }
+};
+
+export const getEvent = (event) => {
+  const data = events[`${event}-${process.env.NETWORK}`];
+  if (data) return data;
+  throw new Error(`No event with such name: ${event}`);
+};
+
+'''
+'''--- src/config/near.js ---
+const testnet = {
+  networkId: 'testnet',
+  nodeUrl: 'https://rpc.testnet.near.org',
+};
+
+const mainnet = {
+  networkId: 'mainnet',
+  nodeUrl: 'https://rpc.mainnet.near.org',
+};
+
+export const getNearConfig = () => (process.env.NETWORK === 'mainnet' ? mainnet : testnet);
+
+'''
+'''--- src/config/verificationMethod.js ---
+export const isThisAnEmailCheck = (event = '') => {
+  return `${process.env['USER_VERIFICATION_METHOD_' + event.toUpperCase()]}`.toLowerCase() === "email";
+}
+
+'''
+'''--- src/helpers/getCampaignContract.js ---
+import { Account, Contract } from 'near-api-js';
+import { getEvent } from '../config/events.js';
+
+export const getCampaignContract = (near, event) => {
+  const { campaignId } = getEvent(event);
+
+  return new Contract(new Account(near.connection, campaignId), campaignId, {
+    viewMethods: ['get_metadata'],
+    changeMethods: ['add_claim_key'],
+  });
+};
+
+'''
+'''--- src/helpers/getED25519KeyPair.js ---
+import { mnemonicToSeedHex } from 'bip39-light';
+import bs58 from 'bs58';
+import { derivePath } from 'ed25519-hd-key';
+import nacl from 'tweetnacl';
+
+const toED25519 = (key) => `ed25519:${bs58.encode(Buffer.from(key))}`;
+
+export const getED25519KeyPair = (password = '') => {
+  const seed = mnemonicToSeedHex(process.env.SEED_PHRASE, password);
+  const { key } = derivePath("m/44'/397'/0'", seed);
+  const keyPair = nacl.sign.keyPair.fromSeed(key);
+
+  return {
+    publicKey: toED25519(keyPair.publicKey),
+    secretKey: toED25519(keyPair.secretKey),
+  };
+};
+
+'''
+'''--- src/helpers/getNear.js ---
+import { connect, keyStores } from 'near-api-js';
+import { KeyPair } from 'near-api-js';
+import { getED25519KeyPair } from './getED25519KeyPair.js';
+import { getNearConfig } from '../config/near.js';
+import { events } from '../config/events.js';
+
+export const getNear = async () => {
+  const { networkId, nodeUrl } = getNearConfig();
+
+  const keyStore = new keyStores.InMemoryKeyStore();
+  const keyPair = KeyPair.fromString(getED25519KeyPair().secretKey);
+
+  await Promise.all(
+    Object.values(events)
+      .filter(({ network }) => network === networkId)
+      .map(({ network, campaignId }) => keyStore.setKey(network, campaignId, keyPair)),
+  );
+
+  return connect({
+    networkId,
+    nodeUrl,
+    keyStore,
+  });
+};
+
+'''
+'''--- src/helpers/isAccessKey.js ---
+import { getEvent } from '../config/events.js';
+
+export const isAccessKey = async (near, publicKey, event) => {
+  const { campaignId } = getEvent(event);
+
+  try {
+    await near.connection.provider.query({
+      request_type: 'view_access_key',
+      finality: 'final',
+      account_id: campaignId,
+      public_key: publicKey,
+    });
+    return true;
+  } catch (e) {
+    return false;
+  }
+};
+
+'''
+'''--- src/helpers/isDelayOut.js ---
+export const isDelayOut = (date, delay = 60) => Date.now() > date.getTime() + delay * 1000; // 1 min delay
+
+'''
+'''--- src/index.js ---
+import express from 'express';
+import sendgrid from '@sendgrid/mail';
+import cors from 'cors';
+import mongoose from 'mongoose';
+import { getNear } from './helpers/getNear.js';
+import { signUp } from './services/signUp/signUp.js';
+import { confirmEmail } from './services/confirmEmail/confirmEmail.js';
+import { confirmPhoneNumber } from './services/confirmPhoneNumber/confirmPhoneNumber.js';
+import { getKeyStatus } from './services/getKeyStatus/getKeyStatus.js';
+import { getCampaignStatus } from './services/getCampaignStatus/getCampaignStatus.js';
+
+await mongoose.connect(process.env.MONGO);
+sendgrid.setApiKey(process.env.SENDGRID_API_KEY);
+const near = await getNear();
+const app = express();
+
+app.use(cors());
+app.use(express.json());
+
+app.use((req, res, next) => {
+  req.near = near;
+  next();
+});
+
+app.post('/signup', signUp);
+app.post('/confirm-email', confirmEmail);
+app.post('/confirm-phone-number', confirmPhoneNumber);
+app.get('/key-status', getKeyStatus);
+app.get('/campaign-status', getCampaignStatus);
+
+app.listen(process.env.PORT);
+
+'''
+'''--- src/mongoose/User.js ---
+import mongoose from 'mongoose';
+const { Schema, model } = mongoose;
+
+const user = new Schema({
+  phone: {
+    type: String,
+    index: true,
+    unique: true,
+    required: true,
+  },
+  event: String,
+  confirmationCode: Number,
+  isConfirmed: Boolean,
+  sentAt: { type: Date, default: Date.now },
+  confirmAttemptAt: Date,
+  publicKey: String,
+  secretKey: String,
+});
+
+export const User = model('User', user);
+
+'''
+'''--- src/services/confirmEmail/confirmEmail.js ---
+import { User } from '../../mongoose/User.js';
+import { isDelayOut } from '../../helpers/isDelayOut.js';
+import { confirmAndCreateClaimKey } from '../confirmPhoneNumber/confirmAndCreateClaimKey.js';
+import { isThisAnEmailCheck } from "../../config/verificationMethod.js";
+import { checkCampaignStatus } from "../getCampaignStatus/checkCampaignStatus.js";
+
+export const confirmEmail = async (req, res) => {
+  try {
+    // TODO validate email / code format
+    const { email, confirmationCode } = req.body;
+    const { event } = req.query;
+
+    if (!isThisAnEmailCheck(event)) {
+      return res
+        .status(400)
+        .send({ error: 'Email verification is not available for this event' });
+    }
+
+    if (!await checkCampaignStatus(event, req.near)) {
+      return res
+        .status(400)
+        .send({ error: 'The company is not active' });
+    }
+
+    const user = await User.findOne({ phone: email });
+
+    if (!user)
+      return res
+        .status(400)
+        .send({ error: 'Email has not registered in the system. Try to sign up first' });
+
+    if (user.isConfirmed)
+      return res.status(400).send({ error: 'This email has been already confirmed' });
+
+    // If it is a second (or n) attempt and user trying to validate email often than 1 min
+    if (user.confirmAttemptAt && !isDelayOut(user.confirmAttemptAt))
+      return res
+        .status(400)
+        .send({ error: 'You trying to send too many requests. Please try again in a few minutes' });
+
+    if (confirmationCode !== user.confirmationCode) {
+      user.confirmAttemptAt = Date.now();
+      await user.save();
+      return res.status(400).send({ error: 'Code does not match to this email' });
+    }
+
+    await confirmAndCreateClaimKey(req, res, user, event);
+  } catch (e) {
+    console.log(e);
+    res.status(500).send({ error: 'Your email was not confirmed. Please try again' });
+  }
+};
+
+'''
+'''--- src/services/confirmPhoneNumber/confirmAndCreateClaimKey.js ---
+import { getCampaignContract } from '../../helpers/getCampaignContract.js';
+import { getED25519KeyPair } from '../../helpers/getED25519KeyPair.js';
+
+export const confirmAndCreateClaimKey = async (req, res, user, event) => {
+  const { publicKey, secretKey } = getED25519KeyPair(user.phone);
+
+  user.isConfirmed = true;
+  user.confirmAttemptAt = Date.now();
+  user.publicKey = publicKey;
+  user.secretKey = secretKey;
+  await user.save();
+
+  const campaign = getCampaignContract(req.near, event);
+  await campaign.add_claim_key({ args: { public_key: publicKey } });
+
+  res.send({ publicKey, secretKey });
+};
+
+'''
+'''--- src/services/confirmPhoneNumber/confirmPhoneNumber.js ---
+import { User } from '../../mongoose/User.js';
+import { isDelayOut } from '../../helpers/isDelayOut.js';
+import { confirmAndCreateClaimKey } from './confirmAndCreateClaimKey.js';
+import { checkCampaignStatus } from "../getCampaignStatus/checkCampaignStatus.js";
+import { isThisAnEmailCheck } from "../../config/verificationMethod.js";
+
+export const confirmPhoneNumber = async (req, res) => {
+  try {
+    // TODO validate phone / code format
+    const { phone, confirmationCode } = req.body;
+    const { event } = req.query;
+
+    if (isThisAnEmailCheck(event)) {
+      return res
+        .status(400)
+        .send({ error: 'Sms verification is not available for this event' });
+    }
+
+    if (!await checkCampaignStatus(event, req.near)) {
+      return res
+        .status(400)
+        .send({ error: 'The company is not active' });
+    }
+
+    const user = await User.findOne({ phone });
+
+    if (!user)
+      return res
+        .status(400)
+        .send({ error: 'Phone number has not registered in the system. Try to sign up first' });
+
+    if (user.isConfirmed)
+      return res.status(400).send({ error: 'This phone number has been already confirmed' });
+
+    // If it is a second (or n) attempt and user trying to validate phone number often than 1 min
+    if (user.confirmAttemptAt && !isDelayOut(user.confirmAttemptAt))
+      return res
+        .status(400)
+        .send({ error: 'You trying to send too many requests. Please try again in a few minutes' });
+
+    if (confirmationCode !== user.confirmationCode) {
+      user.confirmAttemptAt = Date.now();
+      await user.save();
+      return res.status(400).send({ error: 'Code does not match to this SMS' });
+    }
+
+    await confirmAndCreateClaimKey(req, res, user, event);
+  } catch (e) {
+    console.log(e);
+    res.status(500).send({ error: 'Your phone number was not confirmed. Please try again' });
+  }
+};
+
+'''
+'''--- src/services/getCampaignStatus/checkCampaignStatus.js ---
+import { getCampaignContract } from '../../helpers/getCampaignContract.js';
+
+export const checkCampaignStatus = async (event, near) => {
+  const campaign = getCampaignContract(near, event);
+  const metadata = await campaign.get_metadata();
+  return metadata.active_drops > 0;
+}
+
+'''
+'''--- src/services/getCampaignStatus/getCampaignStatus.js ---
+import { checkCampaignStatus } from "./checkCampaignStatus.js";
+
+export const getCampaignStatus = async (req, res) => {
+  try {
+    const { event } = req.query;
+    res.send({ isActive: await checkCampaignStatus(event, req.near) });
+  } catch (e) {
+    console.log(e);
+    res.status(500).send({ error: 'Cannot check campaign status. Please try again' });
+  }
+};
+
+'''
+'''--- src/services/getKeyStatus/getKeyStatus.js ---
+import { isAccessKey } from '../../helpers/isAccessKey.js';
+
+/*
+  Get key status. If a contract account doesn't have a key, it means the key was used
+  (drop was claimed)
+ */
+
+export const getKeyStatus = async (req, res) => {
+  try {
+    const { publicKey, event } = req.query;
+    const isKey = await isAccessKey(req.near, publicKey, event);
+    res.send({ isActive: isKey });
+  } catch (e) {
+    console.log(e);
+    res.status(500).send({ error: 'Cannot check key status. Please try again' });
+  }
+};
+
+'''
+'''--- src/services/signUp/createUserAndSendCode.js ---
+import { User } from '../../mongoose/User.js';
+import { generateConfirmationCode } from './helpers/generateConfirmationCode.js';
+import { sendSmsWithCode } from './helpers/sendSmsWithCode.js';
+import { sendCodeToEmail } from "./helpers/sendCodeToEmail.js";
+import { isThisAnEmailCheck } from "../../config/verificationMethod.js";
+
+export const createUserAndSendCode = async (res, userId, event) => {
+  const confirmationCode = generateConfirmationCode();
+  if (isThisAnEmailCheck(event)) {
+    await sendCodeToEmail(confirmationCode, userId, event)
+  } else {
+    await sendSmsWithCode(confirmationCode, userId);
+  }
+
+  await User.create({
+    phone: userId,
+    event,
+    confirmationCode,
+    isConfirmed: false,
+    confirmAttemptAt: null,
+    publicKey: null,
+    secretKey: null,
+  });
+
+  res.send({});
+};
+
+'''
+'''--- src/services/signUp/helpers/checkReCaptcha.js ---
+import https from 'https';
+import querystring from 'querystring';
+
+const requestPromise = async (url) => {
+  const options = {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': 0
+    }
+  };
+  return new Promise((resolve, reject) => {
+    const req = https.request(url, options, res => {
+      let body = '';
+      res.on('data', chunk => { body += chunk.toString() })
+      res.on('error', reject);
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode <= 299) {
+          resolve({ statusCode: res.statusCode, headers: res.headers, body: body });
+        } else {
+          reject('Request failed. status: ' + res.statusCode + ', body: ' + body);
+        }
+      });
+    });
+    req.on('error', reject);
+    req.write("");
+    req.end();
+  });
+}
+
+export const checkReCaptcha = async (token) => {
+  console.log(`g-recaptcha-response => ${token}`);
+  const secretKey = process.env.RECAPTCHA_SECRET_KEY;
+
+  const parameters = querystring.stringify({
+    secret: secretKey,
+    response: token
+  });
+  const url = `https://www.google.com/recaptcha/api/siteverify?${parameters}`;
+  const result = await requestPromise(url);
+  console.log(`reCAPTCHA response: ${result.body}`);
+  const response = JSON.parse(result.body);
+  return response.success;
+}
+
+'''
+'''--- src/services/signUp/helpers/generateConfirmationCode.js ---
+export const generateConfirmationCode = () => {
+  const min = 1000;
+  const max = 9999;
+  return Math.floor(Math.random() * (max - min)) + min;
+};
+
+'''
+'''--- src/services/signUp/helpers/sendCodeToEmail.js ---
+import sendgrid from '@sendgrid/mail';
+
+export const sendCodeToEmail = async (code, email, event = '') => {
+  let emailTemplateId = process.env['SENDGRID_' + event.toUpperCase() + '_TEMPLATE_ID'];
+  let sender = process.env.SENDGRID_SENDER;
+
+  await sendgrid.send({
+    to: email,
+    from: sender,
+    templateId: emailTemplateId,
+    dynamicTemplateData: { code },
+  });
+};
+
+'''
+'''--- src/services/signUp/helpers/sendSmsWithCode.js ---
+import twilio from "twilio";
+
+export const sendSmsWithCode = async (code, phone) => {
+  const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+  const message = `${process.env.TWILIO_SMS_BODY_TEMPLATE}: ${code}`;
+
+  await client.messages
+    .create({
+      body: message,
+      from: process.env.TWILIO_CALLER_PHONE_NUMBER,
+      to: phone
+    })
+    .then(message => console.log(message.sid));
+};
+
+'''
+'''--- src/services/signUp/resendCode.js ---
+import { isDelayOut } from '../../helpers/isDelayOut.js';
+import { generateConfirmationCode } from './helpers/generateConfirmationCode.js';
+import { sendSmsWithCode } from './helpers/sendSmsWithCode.js';
+import { sendCodeToEmail } from "./helpers/sendCodeToEmail.js";
+import { isThisAnEmailCheck } from "../../config/verificationMethod.js";
+
+export const resendCode = async (res, user, event) => {
+  // If user tries to resend code too often / try to spam - throw an error
+  if (!isDelayOut(user.sentAt)) {
+    return res
+      .status(400)
+      .send({ error: 'You trying to send too many requests. Please try again in a few minutes' });
+  }
+
+  const confirmationCode = generateConfirmationCode();
+  if (isThisAnEmailCheck(event)) {
+    await sendCodeToEmail(confirmationCode, user.phone, event)
+  } else {
+    await sendSmsWithCode(confirmationCode, user.phone);
+  }
+
+  user.confirmationCode = confirmationCode;
+  user.sentAt = Date.now();
+  await user.save();
+
+  res.send({});
+};
+
+'''
+'''--- src/services/signUp/signUp.js ---
+import { createUserAndSendCode } from './createUserAndSendCode.js';
+import { User } from '../../mongoose/User.js';
+import { resendCode } from './resendCode.js';
+import { isAccessKey } from '../../helpers/isAccessKey.js';
+import { checkReCaptcha } from "./helpers/checkReCaptcha.js";
+import { checkCampaignStatus } from "../getCampaignStatus/checkCampaignStatus.js";
+import { isThisAnEmailCheck } from "../../config/verificationMethod.js";
+
+export const signUp = async (req, res) => {
+  try {
+    const { event } = req.query;
+    const token = req.body["g-recaptcha-response"];
+
+    if (!await checkCampaignStatus(event, req.near)) {
+      return res
+        .status(400)
+        .send({ error: 'The company is not active' });
+    }
+
+    const isReCaptchaComplete = await checkReCaptcha(token);
+    if (!isReCaptchaComplete) {
+      return res
+        .status(400)
+        .send({ error: 'Didn\'t complete the reCAPTCHA' });
+    }
+
+    let userId;
+    if (isThisAnEmailCheck(event)) {
+      let { email } = req.body;
+
+      if (!email) {
+        return res
+          .status(400)
+          .send({ error: 'Email address not specified' });
+      }
+      // TODO validate email format
+
+      userId = email;
+    } else {
+      let { phone } = req.body;
+
+      if (!phone) {
+        return res
+          .status(400)
+          .send({ error: 'Phone number not specified' });
+      }
+      // TODO validate phone format
+
+      phone = phone.replace(/[\s-()]/g, '');
+      userId = (phone.substring(0, 1) !== '+' ? '+' : '') + phone;
+    }
+    const user = await User.findOne({ phone: userId });
+
+    if (!user) return await createUserAndSendCode(res, userId, event);
+    if (!user.isConfirmed) return await resendCode(res, user, event);
+
+    const isKeyActive = await isAccessKey(req.near, user.publicKey, event);
+
+    if (isKeyActive) {
+      res.send({
+        publicKey: user.publicKey,
+        secretKey: user.secretKey,
+      });
+    } else {
+      res.status(400).send({ error: 'You have already claimed your drop' });
+    }
+  } catch (e) {
+    console.log(e);
+    res
+      .status(500)
+      .send({ error: 'Verification code was not sent. Please try again later' });
+  }
+};
+
+'''

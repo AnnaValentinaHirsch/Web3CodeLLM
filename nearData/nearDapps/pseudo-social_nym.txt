@@ -1,0 +1,1690 @@
+*GitHub Repository "pseudo-social/nym"*
+
+'''--- Cargo.toml ---
+[workspace]
+# include a member for each contract
+members = [
+  "registrar",
+  "deed",
+  "escrow"
+]
+
+#[dev-dependencies]
+#near-sdk = "3.1.0"
+#near-sdk-sim = "3.1.0"
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+# Opt into extra safety checks on arithmetic operations https://stackoverflow.com/a/64136471/249801
+overflow-checks = true
+
+'''
+'''--- README.md ---
+<div align="center">
+  <h1>
+    NYM Exchange
+  </h1>
+  <p>
+  Auctions for NEAR Protocol Accounts
+  </p>
+</div>
+
+## Building
+Run:
+```bash
+./build.sh
+```
+
+## Testing
+To test run:
+```bash
+cargo test --package registrar -- --nocapture
+```
+
+## Changelog
+
+### `0.2.0`
+
+Upgrade near_sdk to 3.1.0, fix transfer contracts to utilize fully trustless transfer logic. extended workflow.
+
+### `0.0.1`
+
+Initial setup
+'''
+'''--- build.sh ---
+#!/bin/bash
+set -e
+
+if [ -d "res" ]; then
+  echo ""
+else
+  mkdir res
+fi
+
+cd "`dirname $0`"
+
+if [ -z "$KEEP_NAMES" ]; then
+  export RUSTFLAGS='-C link-arg=-s'
+else
+  export RUSTFLAGS=''
+fi
+
+cargo build --all --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/*.wasm ./res/
+'''
+'''--- clear_all.sh ---
+#!/bin/bash
+# Uncomment the desired network
+export NEAR_ENV=testnet
+# export NEAR_ENV=mainnet
+
+export FACTORY=testnet
+# export FACTORY=near
+# export FACTORY=registrar
+
+export MASTER_ACCOUNT=nym.testnet
+export UNDERWRITER_ACCOUNT_ID=underwriter_bash.$MASTER_ACCOUNT
+export ESCROW_ACCOUNT_ID=escrow_bash.$MASTER_ACCOUNT
+export REGISTRAR_ACCOUNT_ID=registrar_bash.$MASTER_ACCOUNT
+export CRON_ACCOUNT_ID=cron.in.testnet
+export DAO_ACCOUNT_ID=dao.sputnikv2.testnet
+
+export TITLE_ACCOUNT_ID=acct00000001.testnet
+export TITLE_PK=ed25519:6Mzi9dRMSiPWYp7BgLJ2Lj6KPCcs48FwB93NgQ4LKSBo
+
+# clear and recreate all accounts
+near delete $UNDERWRITER_ACCOUNT_ID $MASTER_ACCOUNT
+near delete $ESCROW_ACCOUNT_ID $MASTER_ACCOUNT
+near delete $REGISTRAR_ACCOUNT_ID $MASTER_ACCOUNT
+near delete $TITLE_ACCOUNT_ID $MASTER_ACCOUNT
+
+echo "Clear Complete"
+'''
+'''--- create_and_deploy.sh ---
+#!/bin/bash
+# This file is used for starting a fresh set of all contracts & configs
+set -e
+
+if [ -d "res" ]; then
+  echo ""
+else
+  mkdir res
+fi
+
+cd "`dirname $0`"
+
+if [ -z "$KEEP_NAMES" ]; then
+  export RUSTFLAGS='-C link-arg=-s'
+else
+  export RUSTFLAGS=''
+fi
+
+# build the things
+cargo build --all --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/*.wasm ./res/
+
+# Uncomment the desired network
+export NEAR_ENV=testnet
+# export NEAR_ENV=mainnet
+
+export FACTORY=testnet
+# export FACTORY=near
+# export FACTORY=registrar
+
+export MASTER_ACCOUNT=nym.testnet
+export UNDERWRITER_ACCOUNT_ID=underwriter_bash.$MASTER_ACCOUNT
+export ESCROW_ACCOUNT_ID=escrow_bash.$MASTER_ACCOUNT
+export REGISTRAR_ACCOUNT_ID=registrar_bash.$MASTER_ACCOUNT
+export CRON_ACCOUNT_ID=cron.in.testnet
+export DAO_ACCOUNT_ID=dao.sputnikv2.testnet
+
+export TITLE_ACCOUNT_ID=acct00000001.testnet
+export TITLE_PK=ed25519:6Mzi9dRMSiPWYp7BgLJ2Lj6KPCcs48FwB93NgQ4LKSBo
+
+# create all accounts
+near create-account $UNDERWRITER_ACCOUNT_ID --masterAccount $MASTER_ACCOUNT
+near create-account $ESCROW_ACCOUNT_ID --masterAccount $MASTER_ACCOUNT
+near create-account $REGISTRAR_ACCOUNT_ID --masterAccount $MASTER_ACCOUNT
+
+# Deploy all the contracts to their rightful places
+near deploy --wasmFile res/escrow.wasm --initFunction new --initArgs '{"factory": "'$FACTORY'", "registrar": "'$REGISTRAR_ACCOUNT_ID'", "dao": "'$DAO_ACCOUNT_ID'"}' --accountId $ESCROW_ACCOUNT_ID
+near deploy --wasmFile res/registrar.wasm --initFunction new --initArgs '{"escrow": "'$ESCROW_ACCOUNT_ID'", "dao": "'$DAO_ACCOUNT_ID'", "cron": "'$CRON_ACCOUNT_ID'"}' --accountId $REGISTRAR_ACCOUNT_ID
+
+# Create dummy account(s)
+near call $FACTORY create_account '{"new_account_id": "'$TITLE_ACCOUNT_ID'", "new_public_key" :"'$TITLE_PK'"}' --accountId $MASTER_ACCOUNT --amount 5 --gas 300000000000000
+
+echo "Setup Complete"
+'''
+'''--- deed/Cargo.toml ---
+[package]
+name = "deed"
+version = "0.2.0"
+authors = ["Trevor <hello.tjtc.near>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "3.1.0"
+
+'''
+'''--- deed/README.md ---
+# Deed
+
+A tiny contract to manage account ownership and transfer functionality, by utilizing an escrow contract as the coordinator
+
+### Transfer Flows
+
+#### General Workflow
+
+1. Initialization
+2. change ownership only possible upon auction finalized by new owner
+
+#### Initialization
+
+This happens upon contract deploy from escrow contract. This requires the user to grant escrow full access to their account. All precautions must be taken before initialization can proceed.
+
+1. User grants access to escrow, adding full access key to the account being transfered
+2. User deploys a Deed contract, and calls the function "new" on the newly deployed Deed contract, which executes the following logic:
+  2A. Make sure the initialization is valid
+  2B. Transfer any/all balance on this account (No ability to know any sub account balances)
+  2C. Call escrow to register this account with it, optionally allow escrow to tell registrar to include this account in its registery for THIS underwriter
+  2D. Finish by assigning state, for future contract calls
+
+#### Transfer of Ownership
+
+The escrow contract will manage the movement from escrow ownership into the new access keys. This is done by allowing the escrow to make judgements about whether an account is available and ready to make a transfer. Such logic and caveats can be seen in the escrow folder.
+
+1. Check access
+2. Add new full access key, the new owner
+3. Remove original owner id
+
+### Commands & Usage
+
+Requires [near cli]()
+
+```bash
+# Init
+near deploy --wasmFile res/deed.wasm --initFunction new --initArgs '{"escrow": "escrow.testnet", "underwriter": "ACCOUNT_THAT_WILL_OWN.testnet"}' --accountId ACCOUNT_THAT_WILL_OWN.testnet --gas 300000000000000
+
+# transfer ownership (Only callable via escrow)
+near call escrow.testnet claim '{"pk": "ed25519:..."}' --accountId ACCOUNT_THAT_OWNS.testnet --gas 300000000000000
+```
+'''
+'''--- deed/src/lib.rs ---
+use near_sdk::{
+    AccountId,
+    near_bindgen,
+    ext_contract,
+    borsh::{self, BorshDeserialize, BorshSerialize},
+    json_types::{ ValidAccountId, Base58PublicKey },
+    env,
+    Promise,
+    PromiseResult,
+    PanicOnDefault,
+    log,
+};
+
+near_sdk::setup_alloc!();
+
+// TODO: Adjust these to minimums
+const DEED_STORAGE_COST: u128 = 1_700_000_000_000_000_000_000_000;
+const ESCROW_STORAGE_COST: u128 = 2_000_000_000_000_000_000_000;
+const REGISTER_GAS_FEE: u64 = 5_000_000_000_000; // 5 Tgas
+const CALLBACK_GAS_FEE: u64 = 20_000_000_000_000; // 20 Tgas
+
+#[ext_contract(ext_escrow)]
+pub trait ExtEscrow {
+    fn register(&mut self, underwriter: AccountId);
+}
+
+#[ext_contract(ext_self)]
+pub trait ExtSelf {
+    fn ownership_callback(&mut self, original_owner: AccountId);
+}
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Deed {
+    escrow: AccountId,
+    underwriter: AccountId,
+}
+
+/// Deed
+/// A deployable contract to an account that needs witness-based access transfer
+#[near_bindgen]
+impl Deed {
+    /// Upon deploy, contract initializes with only escrow account owning this account
+    /// the account is available for any other ownership transfers
+    ///
+    /// ```bash
+    /// near deploy --wasmFile res/deed.wasm --initFunction new --initArgs '{"escrow": "escrow.testnet", "underwriter": "ACCOUNT_THAT_WILL_OWN.testnet"}' --accountId ACCOUNT_THAT_WILL_OWN.testnet --gas 300000000000000
+    /// ```
+    #[init(ignore_state)]
+    #[payable]
+    pub fn new(
+        underwriter: ValidAccountId,
+        escrow: ValidAccountId,
+    ) -> Self {
+        assert_eq!(env::signer_account_id(), env::current_account_id(), "Signer must have original ownership");
+        assert_eq!(env::predecessor_account_id(), env::current_account_id(), "Signer must have original ownership");
+
+        // transfer any remaining balance to underwriter
+        // transfers ALL balance except whats needed for contract storage
+        let remaining_balance = core::cmp::max(env::account_balance() - DEED_STORAGE_COST - ESCROW_STORAGE_COST, 0);
+        log!("remaining_balance {}", &remaining_balance);
+        Promise::new(underwriter.to_string())
+            .transfer(remaining_balance);
+
+        // register with escrow contract
+        ext_escrow::register(
+            underwriter.to_string(),
+            &escrow.to_string(),
+            ESCROW_STORAGE_COST,
+            REGISTER_GAS_FEE,
+        );
+
+        Deed {
+            escrow: escrow.to_string(),
+            underwriter: underwriter.to_string(),
+        }
+    }
+
+    /// Adding access keys for escrow mediated keys
+    /// IMPORTANT: pk MUST be the pk of the claimer's signing keys, otherwise they wont be able to own it!
+    ///
+    /// ```bash
+    /// near call escrow.testnet claim '{"pk": "ed25519:Ggs1UC1z..."}' --accountId ACCOUNT_THAT_OWNS.testnet --gas 300000000000000
+    /// ```
+    pub fn change_ownership(&mut self, pk: Base58PublicKey) -> Promise {
+        assert_eq!(env::predecessor_account_id(), self.escrow.to_string(), "Unauthorized access, escrow only");
+
+        // Remove underwriter so escrow is the sole executor of the account temporarily
+        self.underwriter = AccountId::default();
+
+        // Add new access key
+        Promise::new(env::current_account_id())
+            .add_full_access_key(pk.into())
+            .then(
+                ext_self::ownership_callback(
+                    self.underwriter.clone(),
+                    &env::current_account_id(),
+                    0,
+                    CALLBACK_GAS_FEE,
+                )
+            )
+    }
+
+    /// Internal function to check that the key change was successful
+    #[private]
+    pub fn ownership_callback(&mut self, original_owner: AccountId) {
+        match env::promise_result(0) {
+            PromiseResult::Successful(_) => {
+                // NOTE: this contract could be removed now.
+                log!("Owner transfer success");
+            }
+            PromiseResult::Failed => {
+                // reset owner if unsuccessful
+                self.underwriter = original_owner;
+                log!("Owner transfer failure");
+            }
+            PromiseResult::NotReady => unreachable!(),
+        };
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use std::convert::TryFrom;
+    use near_sdk::{test_utils::{accounts, VMContextBuilder}};
+    use near_sdk::json_types::{ValidAccountId};
+    use near_sdk::MockedBlockchain;
+    use near_sdk::{testing_env};
+
+    use super::*;
+
+    fn create_blank_account_manager() -> Deed {
+        Deed::new(
+            accounts(1),
+            accounts(0),
+            Some(true)
+        )
+    }
+
+    // escrow: Acct 0
+    // signer: Acct 1
+    // transfer: Acct 2
+    fn get_context(c: ValidAccountId, s: ValidAccountId, p: ValidAccountId) -> VMContextBuilder {
+        let mut builder = VMContextBuilder::new();
+        builder
+            .current_account_id(c)
+            .signer_account_id(s)
+            .predecessor_account_id(p);
+        builder
+    }
+
+    #[test]
+    fn test_init() {
+        let context = get_context(accounts(1), accounts(1), accounts(0));
+        testing_env!(context.build());
+        let contract = create_blank_account_manager();
+        assert_eq!(contract.escrow, accounts(0).to_string());
+    }
+
+    #[test]
+    fn test_transfer_ownership() {
+        let context = get_context(accounts(1), accounts(1), accounts(0));
+        testing_env!(context.build());
+        let mut contract = create_blank_account_manager();
+
+        contract.change_ownership(Base58PublicKey::try_from("ed25519:2mXmCTrFHMYTBv2kUEKGrKwk1wdT5EfXmFL85P6Xr9dV".to_string()).unwrap());
+
+        assert_eq!(contract.escrow, accounts(0).to_string());
+    }
+}
+'''
+'''--- escrow/Cargo.toml ---
+[package]
+name = "escrow"
+version = "0.3.0"
+authors = ["Trevor <hello.tjtc.near>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "3.1.0"
+
+'''
+'''--- escrow/README.md ---
+# Escrow
+
+A tiny contract to maintain a registry of accounts in escrow. This contract will be 100% owner-free, meaning escrow contract can never be updated or rug-pulled. Escrow will deploy a new Deed contract for every account being transferred.
+
+### Transfer Flows
+
+#### General Workflow
+
+1. Create new escrow contract, only needs deploy once
+2. Deploy new Deed contract for an account
+3. Close Escrow for a Deed
+
+Optional other actions:
+
+- Revert Title: Allow owner to regain ownership via escrow
+
+#### Initialization
+
+This happens upon contract deploy of escrow contract. Main requirement is allowing the escrow contract to keep a registry of escrowed accounts.
+
+1. Registrar or DAO deploys new escrow contract, without access keys
+2. Users verify no access keys via `near keys escrow.nym.near`
+
+#### Register Title
+
+Register a new title by the following workflow (under the hood):
+1. Deploy a new Deed contract to title account (not this contract)
+2. call the register method so escrow knows to escrow the deed
+3. optionally call a registrar so it also knows the escrowed account
+
+#### Clear Escrow
+
+Proxy to deed change_ownership function
+
+### Commands & Usage
+
+Requires [near cli]()
+
+```bash
+# Init
+near deploy --wasmFile res/escrow.wasm --initFunction new --initArgs '{"factory": "testnet", "registrar": "auction.nym.testnet", "dao": "dao.sputnik.testnet"}' --accountId escrow_account.testnet
+
+# Start deed (but this is actually called at DEED deploy)
+near call _escrow_account_ register '{"underwriter": "some_other_account.testnet", "registrar": true}' --accountId youraccount_to_auction.testnet
+
+# Close deed
+near call _escrow_account_ close_escrow '{"auction_id": "some_account.testnet", "new_key": "ed25591:PK_HERE"}' --accountId youraccount.testnet
+
+# Update Settings (only via DAO)
+near call _escrow_account_ update_settings '{"dao": "dao.sputnik.testnet", "registrar": "registrar.alias.testnet"}' --accountId dao.sputnik.testnet
+
+# view if account is in escrow
+near view _escrow_account_ in_escrow '{"title": "some_account.testnet"}'
+near view _escrow_account_ get_underwriter '{"title": "some_account.testnet"}'
+
+# view the escrow settings
+near view _escrow_account_ get_settings
+
+```
+'''
+'''--- escrow/src/lib.rs ---
+use near_sdk::{
+    ext_contract,
+    near_bindgen,
+    borsh::{self, BorshDeserialize, BorshSerialize},
+    collections::{ LookupMap },
+    json_types::{ ValidAccountId, Base58PublicKey },
+    AccountId,
+    env,
+    log,
+    Promise,
+    BorshStorageKey,
+    PanicOnDefault,
+    StorageUsage,
+};
+
+near_sdk::setup_alloc!();
+
+// TODO: Finalize amounts needed!
+// Ⓝa Ⓝa Ⓝa Ⓝa Ⓝa Ⓝa Ⓝa Ⓝa - Batmannnnnnnn
+pub const ONE_NEAR: u128 = 1_000_000_000_000_000_000_000_000;
+const CLOSE_ESCROW_GAS_FEE: u64 = 50_000_000_000_000; // 50 Tgas
+
+#[derive(BorshStorageKey, BorshSerialize)]
+pub enum StorageKeys {
+    Accounts,
+    Tlas,
+}
+
+#[ext_contract(ext_deed)]
+pub trait ExtDeed {
+    fn new(underwriter: ValidAccountId, escrow: ValidAccountId, registrar: Option<ValidAccountId>) -> Self;
+    fn change_ownership(&mut self, pk: Base58PublicKey) -> Promise;
+}
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Escrow {
+    pub base_storage_usage: StorageUsage,
+
+    /// The account that can create base accounts
+    /// testnet factory: "testnet"
+    /// mainnet factory: "near"
+    /// mainnet TLA factory: "registrar"
+    pub factory: AccountId,
+
+    /// The account that handles all logic for auctions, bids & other actions
+    pub registrar: AccountId,
+
+    // keeps track of the escrowed accounts
+    tlas: LookupMap<AccountId, AccountId>,
+    accounts: LookupMap<AccountId, AccountId>,
+
+    // Optional
+    pub dao: Option<AccountId>,
+
+    // TODO: setup DAO whitelists and params for TLAs
+}
+
+/// Escrow
+/// Contract keeps track of accounts in escrow
+/// is the only account that can execute functions on escrowed account
+/// should not be owned by anyone -- NO ACCESS KEYS!
+#[near_bindgen]
+impl Escrow {
+    /// Initialize an escrow instance
+    /// NO migration logic is to be implementated, as this contract should not have any full access keys
+    ///
+    /// ```bash
+    /// near deploy --wasmFile res/escrow.wasm --initFunction new --initArgs '{"factory": "testnet", "registrar": "auction.nym.testnet", "dao": "dao.sputnik.testnet"}' --accountId escrow_account.testnet
+    /// ```
+    #[init]
+    pub fn new(
+        factory: ValidAccountId,
+        registrar: ValidAccountId,
+        dao: Option<AccountId>,
+    ) -> Self {
+        assert!(!env::state_exists(), "The contract is already initialized");
+        assert_eq!(env::current_account_id(), env::predecessor_account_id(), "Must be called by owner");
+
+        let mut this = Escrow {
+            base_storage_usage: 0,
+            factory: factory.to_string(),
+            registrar: registrar.to_string(),
+            tlas: LookupMap::new(StorageKeys::Tlas),
+            accounts: LookupMap::new(StorageKeys::Accounts),
+            dao,
+        };
+        // compute storage needs before finishing
+        this.measure_account_storage_usage();
+        this
+    }
+
+    /// Measure the storage an agent will take and need to provide
+    fn measure_account_storage_usage(&mut self) {
+        let initial_storage_usage = env::storage_usage();
+        // Create a temporary, dummy entry and measure the storage used.
+        let tmp_account_id = "z".repeat(64);
+        self.accounts.insert(&tmp_account_id, &tmp_account_id);
+        self.base_storage_usage = env::storage_usage() - initial_storage_usage;
+        // Remove the temporary entry.
+        self.accounts.remove(&tmp_account_id);
+    }
+
+    /// Responsible for bonding an account to a deed contract, where
+    /// escrow is the sole owner, and can only transfer ownership upon
+    /// close of title
+    ///
+    /// ```bash
+    /// near call _escrow_account_ register '{"underwriter": "some_other_account.testnet"}' --accountId youraccount_to_auction.testnet
+    /// ```
+    ///
+    #[payable]
+    pub fn register(&mut self, underwriter: AccountId) {
+        let acct = env::predecessor_account_id();
+        // Make sure this account isnt already in escrow
+        assert_ne!(self.accounts.contains_key(&acct), true, "Account already in escrow");
+
+        // Store the account in escrow
+        self.accounts.insert(&acct, &underwriter);
+        log!("Account {} is in escrow", &acct);
+    }
+
+    // TODO: support TLAs
+    /// The full realization of an escrow deed, where the account is
+    /// transferred to the new owner OR the old owner.
+    /// If the account was registered with registrar, then we must check the signer.
+    ///
+    /// near call _escrow_account_ close_escrow '{"title": "some_account.testnet", "new_key": "ed25591:PK_HERE"}' --accountId youraccount.testnet
+    /// ```
+    pub fn close_escrow(&mut self, title: ValidAccountId, new_key: Base58PublicKey) -> Promise {
+        let acct_id = title.clone().to_string();
+        let acct = self.accounts.get(&acct_id).expect("Account is not in escrow");
+
+        // Check that this is indeed the owner
+        if self.registrar == env::predecessor_account_id() {
+            assert_eq!(acct, env::signer_account_id(), "Account does not control deed account");
+        } else {
+            assert_eq!(acct, env::predecessor_account_id(), "Account does not control deed account");
+        }
+
+        // Remove from registry
+        self.accounts.remove(&acct_id);
+        log!("Close deed: {}", &acct_id);
+
+        // Call the deed, to transfer ownership to new public key
+        ext_deed::change_ownership(
+            new_key,
+            &acct_id,
+            0,
+            CLOSE_ESCROW_GAS_FEE,
+        )
+    }
+
+    /// Checks if an account is escrowed
+    ///
+    /// ```bash
+    /// near view _escrow_account_ in_escrow '{"title": "some_account.testnet"}'
+    /// ```
+    pub fn in_escrow(&self, title: ValidAccountId) -> bool {
+        self.accounts.get(&title.to_string()).is_some()
+    }
+
+    /// Get the owner for a specific title
+    ///
+    /// ```bash
+    /// near view _escrow_account_ get_underwriter '{"title": "some_account.testnet"}'
+    /// ```
+    pub fn get_underwriter(&self, title: ValidAccountId) -> Option<AccountId> {
+        self.accounts.get(&title.to_string())
+    }
+
+    /// Gets the escrow settings
+    ///
+    /// ```bash
+    /// near view _escrow_account_ get_settings
+    /// ```
+    pub fn get_settings(&self) -> (
+        AccountId,
+        AccountId,
+        Option<AccountId>,
+    ) {
+        (
+            self.registrar.clone(),
+            self.factory.clone(),
+            self.dao.clone(),
+        )
+    }
+
+    /// change the contract basic parameters, in case of needing to upgrade
+    /// or change to different account IDs later.
+    /// Can only be called by the DAO contract (if originally configured)
+    ///
+    /// ```bash
+    /// near call _escrow_account_ update_settings '{"dao": "dao.sputnik.testnet", "registrar": "registrar.alias.testnet"}' --accountId dao.sputnik.testnet
+    /// ```
+    pub fn update_settings(
+        &mut self,
+        dao: Option<ValidAccountId>,
+        factory: Option<ValidAccountId>,
+        registrar: Option<ValidAccountId>,
+    ) {
+        assert!(self.dao.is_some(), "No ownership, cannot change settings");
+        assert_eq!(self.dao.clone().unwrap(), env::predecessor_account_id(), "Callee must be dao contract");
+        
+        // Update each individual setting
+        if dao.is_some() { self.dao = Some(dao.unwrap().to_string()); }
+        if factory.is_some() { self.factory = factory.unwrap().to_string(); }
+        if registrar.is_some() { self.registrar = registrar.unwrap().to_string(); }
+    }
+
+    /// Returns semver of this contract.
+    pub fn version(&self) -> String {
+        env!("CARGO_PKG_VERSION").to_string()
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::json_types::{ValidAccountId};
+    use near_sdk::MockedBlockchain;
+    use near_sdk::{testing_env};
+
+    use super::*;
+
+    // factory: Acct 0
+    // registrar: Acct 1
+    // escrow (me): Acct 2
+    // dao: Acct 3
+    fn create_blank_escrow() -> Escrow {
+        Escrow::new(
+            accounts(0),
+            accounts(1),
+            Some(accounts(3).to_string())
+        )
+    }
+
+    fn get_context(c: ValidAccountId, s: ValidAccountId, p: ValidAccountId, is_view: Option<bool>) -> VMContextBuilder {
+        let mut builder = VMContextBuilder::new();
+        builder
+            .current_account_id(c)
+            .signer_account_id(s)
+            .predecessor_account_id(p)
+            .is_view(is_view.unwrap_or(false));
+        builder
+    }
+
+    #[test]
+    fn test_init() {
+        let context = get_context(accounts(3), accounts(3), accounts(3), Some(false));
+        testing_env!(context.build());
+        let contract = create_blank_escrow();
+        assert_eq!(contract.factory, accounts(0).to_string());
+        assert_eq!(contract.registrar, accounts(1).to_string());
+    }
+
+    #[test]
+    #[should_panic(expected = "Must be called by owner")]
+    fn test_init_fail() {
+        let context = get_context(accounts(3), accounts(2), accounts(2), Some(false));
+        testing_env!(context.build());
+        create_blank_escrow();
+    }
+
+    #[test]
+    fn test_register() {
+        let mut context = get_context(accounts(3), accounts(3), accounts(3), Some(false));
+        testing_env!(context.build());
+        let mut contract = create_blank_escrow();
+
+        context = get_context(accounts(3), accounts(2), accounts(2), Some(false));
+        testing_env!(context.build());
+
+        contract.register(accounts(2).to_string(), Some(true));
+    }
+
+    // #[test]
+    // #[should_panic(expected = "Account already in escrow")]
+    // fn test_register_error() {
+    //     let context = get_context(accounts(3), accounts(3), accounts(3));
+    //     testing_env!(context.build());
+    //     let mut contract = create_blank_escrow();
+
+    //     let context2 = get_context(accounts(3), accounts(2), accounts(2));
+    //     testing_env!(context2.build());
+
+    //     contract.register(accounts(2));
+    //     testing_env!(context2.build());
+    //     contract.register(accounts(2));
+    // }
+
+    #[test]
+    fn test_in_escrow() {
+        let context = get_context(accounts(3), accounts(3), accounts(3), Some(false));
+        testing_env!(context.build());
+        let mut contract = create_blank_escrow();
+
+        let context2 = get_context(accounts(3), accounts(2), accounts(2), Some(false));
+        testing_env!(context2.build());
+
+        contract.register(accounts(2).to_string(), Some(false));
+
+        let context3 = get_context(accounts(3), accounts(2), accounts(2), Some(true));
+        testing_env!(context3.build());
+        let is_registered: bool = contract.in_escrow(accounts(2));
+        assert!(is_registered, "Needs to be registered");
+    }
+
+    // #[test]
+    // fn test_register() {
+    //     let context = get_context(accounts(0), Some(usize::from(u8::from(0))));
+    //     testing_env!(context.build());
+    //     let contract = TransferOwner::new(
+    //         accounts(1),
+    //         accounts(3)
+    //     );
+
+    //     let mut builder = VMContextBuilder::new();
+    //     builder
+    //         .current_account_id(accounts(1))
+    //         .signer_account_id(accounts(1).clone())
+    //         .signer_account_pk(b"ed25519:AtysLvy7KGoE8pznUgXvSHa4vYyGvrDZFcT8jgb8PEQ6".to_vec())
+    //         .predecessor_account_id(accounts(1));
+    //     testing_env!(builder.build());
+
+    //     contract.register();
+    // }
+}
+'''
+'''--- package.json ---
+{
+  "name": "nym",
+  "version": "0.0.0",
+  "scripts": {
+    "build": "npm run build:contracts",
+    "build:contracts": "./build.sh",
+    "test": "npm run test:to",
+    "test:deed": "cd deed && cargo test --package deed -- --nocapture",
+    "test:escrow": "cd escrow && cargo test --package escrow",
+    "test:registrar": "cd registrar && cargo test --package registrar",
+    "test:to": "cd transfer_owner && cargo test --package transfer-owner"
+  },
+  "authors": ["@TrevorJTClarke", "@seedyrom"],
+  "license": "MIT",
+  "devDependencies": {},
+  "dependencies": {}
+}
+
+'''
+'''--- registrar/Cargo.toml ---
+[package]
+name = "registrar"
+version = "0.3.0"
+authors = ["Trevor <hello.tjtc.near>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "3.1.0"
+bs58 = "0.4.0"
+
+'''
+'''--- registrar/README.md ---
+# Registrar
+
+A tiny contract to manage account ownership and transfer functionality, by utilizing an escrow account as the coordinator
+
+### Transfer Flows
+
+#### General Workflow
+
+1. Deploy registrar
+2. Create an auction for account (that is in escrow)
+3. accept bids between auction blocks
+4. Optional: Reveal phase
+5. Finalize auction
+
+#### Initialization
+
+This happens upon contract deploy. Used to specify the escrow account
+
+1. 
+
+### Commands & Usage
+
+Requires [near cli]()
+
+```bash
+# Init
+near deploy --wasmFile res/registrar.wasm --initFunction new --initArgs '{}' --accountId registrar_account.testnet
+
+```
+'''
+'''--- registrar/src/lib.rs ---
+use near_sdk::{
+    near_bindgen,
+    ext_contract,
+    borsh::{self, BorshDeserialize, BorshSerialize},
+    collections::{ UnorderedMap, TreeMap},
+    json_types::{ ValidAccountId, Base58PublicKey, Base64VecU8, U128 },
+    serde_json::json,
+    serde::{Deserialize, Serialize},
+    AccountId,
+    Balance,
+    BlockHeight,
+    PanicOnDefault,
+    Promise,
+    PublicKey,
+    env,
+    log,
+    BorshStorageKey,
+    StorageUsage,
+    Gas,
+};
+use bs58;
+
+near_sdk::setup_alloc!();
+
+pub const ONE_NEAR: u128 = 1_000_000_000_000_000_000_000_000;
+// const AUCTION_STORAGE_COST: u128 = 2_000_000_000_000_000_000_000;
+// const ACCESS_KEY_ALLOWANCE: u128 = 1_000_000_000_000_000_000_000;
+const CHECK_UNDERWRITER_GAS_FEE: u64 = 5_000_000_000_000; // 5 Tgas
+const CREATE_CALLBACK_GAS_FEE: u64 = 50_000_000_000_000; // 50 Tgas
+const CLOSE_ESCROW_GAS_FEE: u64 = 50_000_000_000_000; // 50 Tgas
+const CLOSE_BLOCK_OFFSET: u64 = 600_000; // ~7 days
+const REVEAL_BLOCK_OFFSET: u64 = 260_000; // ~3 days
+
+// TODO: Cron fee & schedule setup
+
+#[derive(BorshStorageKey, BorshSerialize)]
+pub enum StorageKeys {
+    Auctions,
+    Bids,
+    Reveals,
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Task {
+    pub owner_id: AccountId,
+    pub contract_id: AccountId,
+    pub function_id: String,
+    pub cadence: String,
+    pub recurring: bool,
+    pub total_deposit: U128,
+    pub deposit: U128,
+    pub gas: Gas,
+    pub arguments: Vec<u8>,
+}
+
+/// https://cron.cat
+/// REF: https://docs.cron.cat/docs/contract-integration/
+/// REF: https://github.com/Cron-Near/contracts
+#[ext_contract(ext_croncat)]
+pub trait ExtCroncat {
+    fn get_tasks(&self, offset: Option<u64>) -> (Vec<Base64VecU8>, U128);
+    fn get_all_tasks(&self, slot: Option<U128>) -> Vec<Task>;
+    fn get_task(&self, task_hash: Base64VecU8) -> Task;
+    fn create_task(
+        &mut self,
+        contract_id: String,
+        function_id: String,
+        cadence: String,
+        recurring: Option<bool>,
+        deposit: Option<U128>,
+        gas: Option<Gas>,
+        arguments: Option<Vec<u8>>,
+    ) -> Base64VecU8;
+    fn update_task(
+        &mut self,
+        task_hash: Base64VecU8,
+        cadence: Option<String>,
+        recurring: Option<bool>,
+        deposit: Option<U128>,
+        gas: Option<Gas>,
+        arguments: Option<Vec<u8>>,
+    );
+    fn remove_task(&mut self, task_hash: Base64VecU8);
+    fn proxy_call(&mut self);
+}
+
+#[ext_contract(ext)]
+pub trait ExtRegistrar {
+    fn create_callback(
+        &mut self,
+        title: ValidAccountId,
+        signer: AccountId,
+        auction_close_block: Option<BlockHeight>,
+        is_blind: Option<bool>,
+        #[callback]
+        underwriter: Option<AccountId>,
+    );
+    fn cron_callback(
+        &self,
+        #[callback]
+        task_hash: Base64VecU8
+    );
+}
+
+#[ext_contract(ext_escrow)]
+pub trait ExtEscrow {
+    fn get_underwriter(&self, title: ValidAccountId) -> Option<AccountId>;
+    fn close_escrow(&mut self, title: AccountId, new_key: PublicKey) -> Promise;
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Debug, Serialize, Deserialize, PartialEq, PanicOnDefault)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Bid {
+    amount: Balance,
+    pk: PublicKey,
+    precommit: Option<Vec<u8>>
+}
+
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Auction {
+    pub title: AccountId,
+    pub is_blind: bool,
+    pub underwriter: Option<AccountId>,
+    pub winner_id: Option<AccountId>,
+    pub close_block: Option<BlockHeight>,
+    pub cron_hash: Option<Base64VecU8>,
+    bids: UnorderedMap<AccountId, Bid>,
+    reveals: TreeMap<Balance, AccountId>,
+}
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Registrar {
+    auctions: UnorderedMap<AccountId, Auction>,
+
+    // stats
+    total_auctions: u64,
+    total_canceled_auctions: u64,
+    total_completed_auctions: u64,
+
+    // Admin only
+    pub escrow: AccountId,
+    pub dao: Option<AccountId>,
+    pub cron: Option<AccountId>,
+    pub paused: bool,
+
+    // Base fee will cover things like covering cost of refunding bids in cancel, scheduling cron close, etc
+    pub base_fee: Balance,
+    pub base_storage_usage: StorageUsage,
+}
+
+#[near_bindgen]
+impl Registrar {
+    /// Constructor:
+    /// See notes regarding escrow contract, ownership & state separation
+    /// This method instantiates new registrar contract with baseline config
+    /// 
+    /// ```bash
+    /// near deploy --wasmFile res/registrar.wasm --initFunction new --initArgs '{"escrow": "escrow_account.testnet", "dao": "dao.sputnik.testnet", "cron": "cron.in.testnet"}' --accountId registrar_account.testnet
+    /// ```
+    #[init]
+    pub fn new(
+        escrow: ValidAccountId,
+        dao: Option<ValidAccountId>,
+        cron: Option<ValidAccountId>
+    ) -> Self {
+        // Make absolutely sure this contract doesnt get state removed easily
+        // TODO: Change to support migrations
+        assert!(!env::state_exists(), "The contract is already initialized");
+        assert_eq!(env::current_account_id(), env::predecessor_account_id(), "Must be called by owner");
+
+        let mut this = Registrar {
+            paused: false,
+            base_fee: ONE_NEAR / 100_000,
+            base_storage_usage: 0,
+            auctions: UnorderedMap::new(StorageKeys::Auctions),
+            escrow: escrow.to_string(),
+            dao: Some(dao.unwrap().to_string()),
+            cron: Some(cron.unwrap().to_string()),
+            total_auctions: 0,
+            total_canceled_auctions: 0,
+            total_completed_auctions: 0,
+        };
+        // compute storage needs before finishing
+        this.measure_account_storage_usage();
+        this
+    }
+
+    /// Measure the storage an agent will take and need to provide
+    fn measure_account_storage_usage(&mut self) {
+        let initial_storage_usage = env::storage_usage();
+        // Create a temporary, dummy entry and measure the storage used.
+        let tmp_account_id = "z".repeat(64);
+        let tmp_auction = Auction {
+            title: tmp_account_id.clone(),
+            is_blind: true,
+            underwriter: Some(tmp_account_id.clone()),
+            winner_id: Some(tmp_account_id.clone()),
+            close_block: Some(env::block_index()),
+            cron_hash: None,
+            bids: UnorderedMap::new(b"a".to_vec()),
+            reveals: TreeMap::new(b"b"),
+        };
+        self.auctions.insert(&tmp_account_id, &tmp_auction);
+        self.base_storage_usage = env::storage_usage() - initial_storage_usage;
+        // Remove the temporary entry.
+        self.auctions.remove(&tmp_account_id);
+    }
+
+    /// Create Auction
+    /// Allows an underwriter to create a new auction for an account they own.
+    /// The underwriter is the original owner or another account that takes ownership in the event
+    /// the auction closes with no winner or underwriter wants to claim the account back before auction close.
+    /// 
+    /// Defaults:
+    /// auction_close_block: 7 Days
+    /// auction reveals: 3 Days
+    ///
+    /// ```bash
+    /// near call _auction_ create '{"title": "account_to_auction.testnet", "auction_close_block": 41000000, "is_blind": true}' --accountId youraccount.testnet
+    /// ```
+    #[payable]
+    pub fn create(
+        &mut self,
+        title: ValidAccountId,
+        auction_close_block: Option<BlockHeight>,
+        is_blind: Option<bool>
+    ) {
+        // Check if there is already an auction with this same matching title
+        // AND if that auction is ongoing (ongoing = current block < closing block)
+        let previous_auction = self.auctions.get(&title.clone().to_string());
+        if previous_auction.is_some() {
+            assert!(
+                env::block_index() > previous_auction.unwrap().close_block.unwrap(),
+                "Auction is already happening"
+            );
+        }
+
+        // TODO: Check it can cover costs
+
+        // Confirm escrow has custody
+        ext_escrow::get_underwriter(
+            title.clone(),
+            &self.escrow,
+            0,
+            CHECK_UNDERWRITER_GAS_FEE
+        ).then(
+            ext::create_callback(
+                title,
+                env::signer_account_id(),
+                auction_close_block,
+                is_blind,
+                &env::current_account_id(),
+                env::attached_deposit(),
+                CREATE_CALLBACK_GAS_FEE,
+            )
+        );
+    }
+
+    /// Create Auction Callback
+    #[private]
+    #[payable]
+    pub fn create_callback(
+        &mut self,
+        title: ValidAccountId,
+        signer: AccountId,
+        auction_close_block: Option<BlockHeight>,
+        is_blind: Option<bool>,
+        #[callback]
+        underwriter: Option<AccountId>,
+    ) {
+        // Check the signer IS the underwriter
+        let owner = underwriter.expect("No underwriter found, abort");
+        assert_eq!(&signer, &owner, "Auction can only be started by owner");
+
+        let close_block = match auction_close_block {
+            Some(close_block) => {
+                if close_block > env::block_index() { close_block } else { env::block_index() + CLOSE_BLOCK_OFFSET }
+            },
+            None => env::block_index() + CLOSE_BLOCK_OFFSET,
+        };
+
+        let auction = Auction {
+            title: title.to_string(),
+            is_blind: is_blind.unwrap_or(false),
+            underwriter: Some(owner),
+            winner_id: None,
+            close_block: Some(close_block),
+            cron_hash: None,
+            bids: UnorderedMap::new(StorageKeys::Bids),
+            reveals: TreeMap::new(StorageKeys::Reveals)
+        };
+
+        self.auctions.insert(&title.to_string(), &auction);
+        self.total_auctions += 1;
+        log!("New Auction:{}", &title.to_string());
+
+        // Schedule the closing of auction with cron.cat
+        ext_croncat::create_task(
+            env::current_account_id(),
+            String::from("finalize_auction"),
+            close_block.to_string(),
+            Some(false),
+            Some(U128::from(0)),
+            Some(140_000_000_000_000), // 140 Tgas
+            Some(json!({ "id": &title.to_string() }).to_string().as_bytes().to_vec()),
+            &String::from("cron.in.testnet"),
+            ONE_NEAR / 100_000,
+            100_000_000_000_000,
+        )
+        .then(
+            ext::cron_callback(
+                &env::current_account_id(),
+                0,
+                25_000_000_000_000 // 25 Tgas
+            )
+        );
+    }
+
+    /// Get the task hash, and store in state
+    #[private]
+    pub fn cron_callback(
+        &mut self,
+        #[callback]
+        id: AccountId,
+        #[callback]
+        task_hash: Base64VecU8
+    ) {
+        log!("schedule_callback task_hash {:?}", &task_hash);
+        let mut auc = self.auctions.get(&id).expect("Auction doesnt exist");
+        auc.cron_hash = Some(task_hash);
+        self.auctions.insert(&id, &auc);
+    }
+
+    /// Bid:
+    /// Allow anyone to place a bid on an auction,
+    /// which accepts an auction id and attached_deposit balance for contribution which buys the asset
+    ///
+    /// Requires:
+    /// - user to NOT be owner
+    /// - bid amount needs to be greater than 0
+    /// - auction needs to not be closed
+    ///
+    /// Optional:
+    /// - amount: if no deposit, then MUST be blind bid
+    /// - updates: user CAN update bid by calling this fn multiple times
+    ///
+    /// Blind auctions require a commit/reveal setup. In this way, we can create a time boundary to give
+    /// auctions a more fair price outcome. Winner is still the highest bid, but with reveal phase outside
+    /// the normal bid phase, we can guarantee frontrunning doesnt skew price to some extent.
+    /// Commit in this context is just a number + salt string that is hashed.
+    ///
+    /// ```bash
+    /// near call _auction_ bid '{"id": "auctioned_account.testnet", "pk": "ed25519:abcd...", "commit": [100,50,10...]}' --accountId youraccount.testnet --amount 13
+    /// ```
+    #[payable]
+    pub fn bid(
+        &mut self,
+        id: AccountId,
+        pk: Base58PublicKey,
+        commit: Option<Vec<u8>>
+    ) {
+        let auc = self.auctions.get(&id).expect("Auction doesnt exist");
+        assert_ne!(
+            auc.underwriter.unwrap(),
+            env::signer_account_id(),
+            "Must not be owner of auction"
+        );
+        assert!(
+            env::block_index() < auc.close_block.unwrap(),
+            "Must be an active auction"
+        );
+
+        let mut auction = self.auctions.get(&id).expect("Auction doesnt exist");
+        let is_blind = auction.is_blind;
+
+        // Check if auction requires blind auction
+        // Otherwise, make sure the bid has a deposit
+        if is_blind && commit.is_none() {
+            panic!("Auction requires blind bid");
+        } else {
+            assert!(
+                env::attached_deposit() > 0,
+                "Must submit bid amount of greater than zero"
+            );
+        }
+
+        // Accept Deposit as bid amount
+        // Keep track of how much balance user sent
+        let bid = Bid {
+            amount: Some(env::attached_deposit()).unwrap_or(0),
+            pk: pk.clone().into(),
+            precommit: Some(commit).unwrap_or(None),
+        };
+        
+        // Update storage
+        auction.bids.insert(&env::signer_account_id(), &bid);
+        self.auctions.insert(&id, &auction);
+    }
+
+    /// Reveal: Optional -- used for Blind Auctions
+    /// Reveal allows the user to unmask their bid amount, and actually pay what they said that would.
+    /// Because the masked amount needs to actually be paid, we expect the sent deposit to match
+    ///
+    /// ```bash
+    /// near call _auction_ reveal '{"id": "auctioned_account.testnet", "salt": "super_secret"}' --accountId youraccount.testnet --amount 1337
+    /// ```
+    #[payable]
+    pub fn reveal(&mut self, id: ValidAccountId, salt: String) {
+        let auc = self.auctions.get(&id.to_string()).expect("Auction doesnt exist");
+        assert_ne!(
+            auc.underwriter.unwrap(),
+            env::signer_account_id(),
+            "Must not be owner of auction"
+        );
+        assert!(
+            env::block_index() > auc.close_block.unwrap()
+            && env::block_index() < auc.close_block.unwrap() + REVEAL_BLOCK_OFFSET,
+            "Must be reveal phase in auction"
+        );
+
+        let mut auction = self.auctions.get(&id.to_string()).expect("Auction doesnt exist");
+        let is_blind = auction.is_blind;
+
+        // auction requires reveal bid data
+        if is_blind && salt.len() < 1 {
+            panic!("Auction requires blind bid");
+        }
+
+        let deposit: u128 = env::attached_deposit();
+        let reveal_str: String = deposit.to_string() + &salt;
+        let reveal_hash: Vec<u8> = bs58::encode(&reveal_str).into_string().as_bytes().to_vec();
+
+        // Check that reveal matches precommit
+        let bid = auction.bids.get(&env::signer_account_id()).expect("No bid found");
+        assert_eq!(bid.precommit.unwrap(), reveal_hash, "Reveal doesnt match original bid");
+
+        // Update storage
+        auction.reveals.insert(&deposit, &env::signer_account_id());
+        self.auctions.insert(&id.to_string(), &auction);
+    }
+
+    /// Cancel Auction:
+    /// removes an auction if owner called it
+    /// sends back all auction bidders their funds
+    ///
+    /// ```bash
+    /// near call _auction_ cancel_auction '{"id": "auctioned_account.testnet"}' --accountId youraccount.testnet
+    /// ```
+    pub fn cancel_auction(&mut self, id: String) {
+        let auction = self.auctions.get(&id).expect("No auction found");
+        assert!(
+            env::block_index() < auction.close_block.unwrap(),
+            "Auction must not be complete"
+        );
+        assert_eq!(
+            auction.underwriter.unwrap(),
+            env::predecessor_account_id(),
+            "Must be owner to cancel auction"
+        );
+
+        // Loop to return bid funds
+        let bids = auction.bids.iter();
+        for (account_id, Bid { amount, pk: _, precommit: _ }) in bids {
+            if amount > 0 {
+                Promise::new(account_id).transfer(amount);
+            }
+        }
+
+        // Release from escrow
+        ext_escrow::close_escrow(
+            id.clone(),
+            env::signer_account_pk(),
+            &self.escrow,
+            0,
+            CLOSE_ESCROW_GAS_FEE,
+        );
+
+        // Clear auction storage, since this is over
+        self.auctions.remove(&id);
+        self.total_canceled_auctions += 1;
+    }
+
+    /// Finalize Auction:
+    /// - award winner the asset, if they were highest bidder
+    /// - all bidders get their bid amounts back, minus fees
+    ///
+    /// NOTE: anyone can call this method, as it is paid by the person wanting the final outcome
+    /// NOTE: cron.cat can also execute this function immediately after the close block
+    ///
+    /// ```bash
+    /// near call _auction_ finalize_auction '{"id": "auctioned_account.testnet"}' --accountId youraccount.testnet
+    /// ```
+    pub fn finalize_auction(&mut self, id: AccountId) {
+        // Get auction details
+        let auction = self.auctions.get(&id).expect("No auction found");
+        assert!(
+            env::block_index() > auction.close_block.unwrap(),
+            "Auction must be complete"
+        );
+        log!("Finalize Auction: {}", &id);
+
+        // Find winner, refund others
+        let mut winner_id: AccountId = "".to_string();
+        let mut winner_pk: PublicKey = vec![0];
+        let mut highest_balance: Balance = 0;
+
+        let bids = auction.bids;
+        let reveals = auction.reveals;
+
+        if auction.is_blind {
+            // Since reveals is treemap, just sort by highest bid amount (key)
+            let winning_key = reveals.max().expect("No reveals found");
+            let winning_account_id = reveals.get(&winning_key).expect("No reveal account found");
+            let winning_bid = bids.get(&winning_account_id).expect("No bid found for reveal");
+            winner_id = winning_account_id;
+            winner_pk = winning_bid.pk;
+        } else {
+            // Loop to find winner
+            for (account_id, Bid { amount, pk, precommit: _}) in bids.iter() {
+                if highest_balance < amount {
+                    highest_balance = amount;
+                    winner_id = account_id;
+                    winner_pk = pk;
+                }
+            }
+        }
+
+        // Loop to return losing funds, minus fees
+        for (account_id, Bid { amount, pk: _, precommit: _ }) in bids.iter() {
+            if winner_id != account_id && amount > self.base_fee {
+                Promise::new(account_id).transfer(amount - self.base_fee);
+            }
+        }
+
+        // Release from escrow
+        ext_escrow::close_escrow(
+            id.clone(),
+            winner_pk,
+            &self.escrow,
+            0,
+            CLOSE_ESCROW_GAS_FEE,
+        );
+
+        // Clear auction storage, since this is over
+        self.auctions.remove(&id);
+        self.total_completed_auctions += 1;
+    }
+
+    /// Get the current list of auctions
+    ///
+    /// ```bash
+    /// near view _auction_ get_auction_keys
+    /// ```
+    pub fn get_auction_keys(&self) -> Vec<AccountId> {
+        self.auctions.keys().collect()
+    }
+
+    /// return single auction item
+    ///
+    /// ```bash
+    /// near view _auction_ get_auction_byid '{"id": "account_to_auction.testnet"}'
+    /// ```
+    pub fn get_auction_by_id(&self, id: AccountId) -> String {
+        let auction = self.auctions.get(&id).expect("No auction found");
+
+        json!({
+            "underwriter": auction.underwriter,
+            "winner_id": auction.winner_id.unwrap_or_default(),
+            "title": auction.title,
+            "close_block": auction.close_block,
+            // TODO: Stringify this
+            "bids": auction.bids.len(),
+            "reveals": auction.reveals.len(),
+            // "bids": json!(auction.bids).to_string(),
+            // "reveals": auction.reveals.to_string()
+        }).to_string()
+    }
+
+    /// Gets settings
+    ///
+    /// ```bash
+    /// near view _auction_ get_settings
+    /// ```
+    pub fn get_settings(&self) -> (
+        bool,
+        Balance,
+        StorageUsage,
+        AccountId,
+        Option<AccountId>,
+    ) {
+        (
+            self.paused,
+            self.base_fee,
+            self.base_storage_usage,
+            self.escrow.clone(),
+            self.dao.clone(),
+        )
+    }
+
+    /// change the contract basic parameters, in case of needing to upgrade
+    /// or change to different account IDs later.
+    /// Can only be called by the DAO contract (if originally configured)
+    ///
+    /// ```bash
+    /// near call _auction_ update_settings '{"dao": "dao.sputnik.testnet", "registrar": "registrar.alias.testnet"}' --accountId dao.sputnik.testnet
+    /// ```
+    pub fn update_settings(
+        &mut self,
+        paused: Option<bool>,
+        base_fee: Option<Balance>,
+        escrow: Option<AccountId>,
+        dao: Option<AccountId>,
+    ) {
+        assert!(self.dao.is_some(), "No ownership, cannot change settings");
+        assert_eq!(self.dao.clone().unwrap(), env::predecessor_account_id(), "Callee must be dao contract");
+        
+        // Update each individual setting
+        if paused.is_some() { self.paused = paused.unwrap(); }
+        if base_fee.is_some() { self.base_fee = base_fee.unwrap(); }
+        if escrow.is_some() { self.escrow = escrow.unwrap().to_string(); }
+        if dao.is_some() { self.dao = dao; }
+    }
+
+    /// Returns semver of this contract.
+    ///
+    /// ```bash
+    /// near view _auction_ version
+    /// ```
+    pub fn version(&self) -> String {
+        env!("CARGO_PKG_VERSION").to_string()
+    }
+
+    /// Returns semver of this contract.
+    ///
+    /// ```bash
+    /// near view _auction_ stats
+    /// ```
+    pub fn stats(&self) -> (u64, u64, u64, u64) {
+        (
+            self.auctions.len(),
+            self.total_auctions,
+            self.total_canceled_auctions,
+            self.total_completed_auctions,
+        )
+    }
+
+    /// Hash:
+    /// Tiny helper method to calculate a base58 hash of an amount + salt
+    /// NOTE: using the command below should only be used for testing, network requests reveal real information to RPC runners.
+    ///
+    /// ```bash
+    /// near view _auction_ hash '{"amount": 10, "salt": "super_secret"}'
+    /// ```
+    pub fn hash(&self, amount: Balance, salt: String) ->  Vec<u8> {
+        bs58::encode(amount.to_string() + &salt).into_string().as_bytes().to_vec()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::MockedBlockchain;
+    use near_sdk::{testing_env};
+    use std::convert::TryFrom;
+
+    // registrar (me): Acct 0
+    // auction: Acct 1
+    // escrow: Acct 2
+    fn create_blank_registrar() -> Registrar {
+        Registrar::new(
+            ValidAccountId::try_from("escrow_near").unwrap(),
+            Some(ValidAccountId::try_from("dao_near").unwrap()),
+            Some(ValidAccountId::try_from("cron_near").unwrap()),
+        )
+    }
+
+    fn get_context(c: ValidAccountId, s: ValidAccountId, p: ValidAccountId, is_view: Option<bool>) -> VMContextBuilder {
+        let mut builder = VMContextBuilder::new();
+        builder
+            .current_account_id(c)
+            .signer_account_id(s)
+            .predecessor_account_id(p)
+            .is_view(is_view.unwrap_or(false));
+        builder
+    }
+
+    #[test]
+    fn test_init() {
+        let context = get_context(accounts(3), accounts(3), accounts(3), Some(false));
+        testing_env!(context.build());
+        // Init with escrow data
+        let contract = create_blank_registrar();
+
+        assert_eq!(
+            false, contract.paused,
+            "Auction MUST not be paused initially"
+        );
+
+        assert_eq!(
+            "escrow_near".to_string(),
+            contract.escrow,
+            "Escrow account ID is set appropriately"
+        );
+
+        // TODO: Figure out how to test this!
+        // assert_eq!(
+        //     env::signer_account_pk(),
+        //     // HOw do i get contract full access keys list?,
+        //     "Ensure the contract is owned by deployment signer"
+        // );
+    }
+
+    #[test]
+    #[should_panic(expected = "Auction is already happening")]
+    fn new_auction_item_same_during_auction() {
+        let mut context = get_context(accounts(3), accounts(3), accounts(3), Some(true));
+        testing_env!(context.build());
+        // Init with escrow data
+        let mut contract = create_blank_registrar();
+        // ----------------------------------------------------------------
+        // THIS IS HOW THE BLOCKCHAIN PROGRESSES STATE
+        // IF YOU ARE USING ANY TYPE OF PROMISE OR NON-VIEW FN,
+        // YOU MUST CHANGE "is_view" TO SHOW THE TEST RUNNER TO DO THE SHITS
+        // ----------------------------------------------------------------
+        context.is_view(false);
+        testing_env!(context.build());
+
+        // call the contract create twice, so we can panic when the auction item already exists
+        // AND is active (within the current block height)
+        contract.create(
+            ValidAccountId::try_from("zanzibar_near").unwrap(),
+            Some(env::block_index() + 1_000),
+            Some(false)
+        );
+        testing_env!(context.build());
+        contract.create(
+            ValidAccountId::try_from("zanzibar_near").unwrap(),
+            Some(1_000),
+            Some(false)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Auction cannot be signer name")]
+    fn new_auction_item_not_same_as_signer() {
+        let context = get_context(accounts(3), accounts(3), accounts(3), Some(false));
+        testing_env!(context.build());
+        // Init with escrow data
+        let mut contract = create_blank_registrar();
+
+        // call the contract create twice, so we can panic when the auction item already exists
+        // AND is active (within the current block height)
+        contract.create(
+            ValidAccountId::try_from("bob_near").unwrap(),
+            Some(env::block_index() + 1_000),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn create_auction_item() {
+        let context = get_context(accounts(3), accounts(3), accounts(3), Some(false));
+        testing_env!(context.build());
+        // Init with escrow data
+        let mut contract = create_blank_registrar();
+
+        // check all the auction item THANGS
+        contract.create(
+            ValidAccountId::try_from("zanzibar_near").unwrap(),
+            Some(env::block_index() + 1_000),
+            Some(false)
+        );
+
+        assert_eq!(
+            1,
+            contract.auctions.len(),
+            "Contract: Creates new auction item"
+        );
+
+        // assert!("Contract: Adds Auction House as full access key");
+
+        // assert!("Contract: Removes all other access keys");
+
+        // assert!("Contract: Returns newly created auction item ID");
+    }
+}
+
+'''
+'''--- simple_auction.sh ---
+#!/bin/bash
+# Uncomment the desired network
+export NEAR_ENV=testnet
+# export NEAR_ENV=mainnet
+
+export FACTORY=testnet
+# export FACTORY=near
+# export FACTORY=registrar
+
+export MASTER_ACCOUNT=nym.testnet
+export UNDERWRITER_ACCOUNT_ID=underwriter_bash.$MASTER_ACCOUNT
+export ESCROW_ACCOUNT_ID=escrow_bash.$MASTER_ACCOUNT
+export REGISTRAR_ACCOUNT_ID=registrar_bash.$MASTER_ACCOUNT
+export CRON_ACCOUNT_ID=cron.in.testnet
+export DAO_ACCOUNT_ID=dao.sputnikv2.testnet
+
+export TITLE_ACCOUNT_ID=acct00000001.testnet
+export TITLE_PK=ed25519:6Mzi9dRMSiPWYp7BgLJ2Lj6KPCcs48FwB93NgQ4LKSBo
+
+# Deploy the deed to escrow
+near deploy --wasmFile res/deed.wasm --initFunction new --initArgs '{"escrow": "'$ESCROW_ACCOUNT_ID'", "underwriter": "'$UNDERWRITER_ACCOUNT_ID'"}' --accountId $TITLE_ACCOUNT_ID --initGas 300000000000000 --initDeposit 1
+
+# Check escrow has it
+near view $ESCROW_ACCOUNT_ID in_escrow '{"title": "'$TITLE_ACCOUNT_ID'"}'
+
+# Register new auction
+near call $REGISTRAR_ACCOUNT_ID create '{"title": "'$TITLE_ACCOUNT_ID'"}' --accountId $UNDERWRITER_ACCOUNT_ID --amount 2 --gas 300000000000000
+# , "auction_close_block": 41000000, "is_blind": true
+
+# Check registrar has it
+near view $REGISTRAR_ACCOUNT_ID get_auction_by_id '{"id": "'$TITLE_ACCOUNT_ID'"}'
+
+echo "Auction Created"
+'''

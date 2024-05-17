@@ -1,0 +1,1982 @@
+*GitHub Repository "PhantomOz/pix_market_contract"*
+
+'''--- Cargo.toml ---
+[package]
+name = "pix_market_contract"
+version = "0.1.0"
+edition = "2021"
+authors = ["Favour Aniogor <@SuperDevFavor> <faniogor@gmail.com>"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+near-sdk = "4.1.1"
+serde_json = "1.0.107"
+
+[patch.crates-io]
+parity-secp256k1 = { git = 'https://github.com/paritytech/rust-secp256k1.git' }
+
+[profile.release]
+codegen-units = 1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+
+'''
+'''--- ReadMe.md ---
+
+# Pixicle - A NFT Marketplace For The Near Horizon Hackathon
+
+## Description
+
+This is a smart contract for a NFT marketplace on the Near blockchain. It allows users to create, buy, and sell digital collectibles using NEAR tokens.
+
+## Features
+
+- Mint NFTs with custom metadata and royalty fees
+- List NFTs for sale with fixed or dynamic prices
+- Buy NFTs with NEAR tokens and transfer ownership
+- Receive royalties from secondary sales of your NFTs
+- Browse and search NFTs by owner and collection
+
+## Near Explorer
+
+You can see the contract `pixil.phlay.testnet` on Near Explorer here: [Pixicle contract](https://explorer.testnet.near.org/accounts/pixil.phlay.testnet).
+
+Made with &heart; by [Favour Aniogor](https://github.com/PhantomOz).
+
+'''
+'''--- src/approval.rs ---
+use crate::*;
+use near_sdk::{assert_one_yocto, ext_contract};
+pub trait NonFungibleTokenCore {
+    fn nft_approve(&mut self, token_id: TokenId, account_id: AccountId, msg: Option<String>);
+    fn nft_is_approved(
+        &self,
+        token_id: TokenId,
+        account_id: AccountId,
+        approval_id: Option<u64>,
+    ) -> bool;
+    fn nft_revoke(&mut self, token_id: TokenId, account_id: AccountId);
+    fn nft_revoke_all(&mut self, token_id: TokenId);
+}
+
+#[ext_contract(ext_non_fungible_approval_receiver)]
+trait NonFungibleApprovalReceiver {
+    fn nft_on_approve(
+        &mut self,
+        token_id: TokenId,
+        owner_id: AccountId,
+        approval_id: u64,
+        msg: String,
+    );
+}
+
+#[ext_contract(ext_contract)]
+trait ExtContract {
+    fn nft_transfer_payout(
+        &mut self,
+        receiver_id: AccountId, //purchaser (person to transfer the NFT to)
+        token_id: TokenId,      //token ID to transfer
+        approval_id: u64, //market contract's approval ID in order to transfer the token on behalf of the owner
+        memo: String,     //memo (to include some context)
+        /*
+            the price that the token was purchased for. This will be used in conjunction with the royalty percentages
+            for the token in order to determine how much money should go to which account.
+        */
+        balance: U128,
+        //the maximum amount of accounts the market can payout at once (this is limited by GAS)
+        max_len_payout: u32,
+    );
+}
+
+#[near_bindgen]
+impl NonFungibleTokenCore for Contract {
+    #[payable]
+    fn nft_approve(&mut self, token_id: TokenId, owner_id: AccountId, msg: Option<String>) {
+        assert_at_least_one_yocto();
+        let mut token = self.token_by_id.get(&token_id).expect("No token");
+
+        assert_eq!(
+            &env::predecessor_account_id(),
+            &token.owner_id,
+            "You are not the token Owner."
+        );
+
+        let approval_id: u64 = token.next_approval_id;
+
+        let is_new_approval = token
+            .approved_account_ids
+            .insert(owner_id.clone(), approval_id)
+            .is_none();
+
+        let storage_used = if is_new_approval {
+            bytes_for_approved_account_id(&owner_id)
+        } else {
+            0
+        };
+
+        token.next_approval_id += 1;
+        self.token_by_id.insert(&token_id, &token);
+
+        refund_deposit(storage_used);
+
+        if let Some(msg) = msg {
+            ext_non_fungible_approval_receiver::ext(owner_id)
+                .nft_on_approve(token_id, token.owner_id, approval_id, msg)
+                .as_return();
+        }
+    }
+
+    fn nft_is_approved(
+        &self,
+        token_id: TokenId,
+        account_id: AccountId,
+        approval_id: Option<u64>,
+    ) -> bool {
+        let token = self.token_by_id.get(&token_id).expect("No token");
+
+        let approval = token.approved_account_ids.get(&account_id);
+
+        if let Some(approval) = approval {
+            if let Some(approval_id) = approval_id {
+                approval_id == *approval
+            } else {
+                true
+            }
+        } else {
+            false
+        }
+    }
+
+    #[payable]
+    fn nft_revoke(&mut self, token_id: TokenId, account_id: AccountId) {
+        assert_one_yocto();
+        let mut token = self.token_by_id.get(&token_id).expect("No token");
+
+        let predecessor_account_id = env::predecessor_account_id();
+        assert_eq!(&predecessor_account_id, &token.owner_id);
+
+        if token.approved_account_ids.remove(&account_id).is_some() {
+            refund_approved_account_ids_iter(predecessor_account_id, [account_id].iter());
+
+            self.token_by_id.insert(&token_id, &token);
+        }
+    }
+
+    #[payable]
+    fn nft_revoke_all(&mut self, token_id: TokenId) {
+        assert_one_yocto();
+
+        let mut token = self.token_by_id.get(&token_id).expect("No token");
+        let predecessor_account_id = env::predecessor_account_id();
+        assert_eq!(&predecessor_account_id, &token.owner_id);
+
+        if !token.approved_account_ids.is_empty() {
+            refund_approved_account_ids(predecessor_account_id, &token.approved_account_ids);
+            token.approved_account_ids.clear();
+            self.token_by_id.insert(&token_id, &token);
+        }
+    }
+}
+
+#[near_bindgen]
+impl NonFungibleApprovalReceiver for Contract {
+    /// where we add the sale because we know nft owner can only call nft_approve
+
+    fn nft_on_approve(
+        &mut self,
+        token_id: TokenId,
+        owner_id: AccountId,
+        approval_id: u64,
+        msg: String,
+    ) {
+        // get the contract ID which is the predecessor
+        let nft_contract_id = env::predecessor_account_id();
+        //get the signer which is the person who initiated the transaction
+        let signer_id = env::signer_account_id();
+
+        //make sure that the signer isn't the predecessor. This is so that we're sure
+        //this was called via a cross-contract call
+        assert_ne!(
+            nft_contract_id, signer_id,
+            "nft_on_approve should only be called via cross-contract call"
+        );
+        //make sure the owner ID is the signer.
+        assert_eq!(owner_id, signer_id, "owner_id should be signer_id");
+
+        //we need to enforce that the user has enough storage for 1 EXTRA sale.
+
+        //get the storage for a sale. dot 0 converts from U128 to u128
+        let storage_amount = self.storage_minimum_balance().0;
+        //get the total storage paid by the owner
+        let owner_paid_storage = self.storage_deposits.get(&signer_id).unwrap_or(0);
+        //get the storage required which is simply the storage for the number of sales they have + 1
+        let signer_storage_required =
+            (self.get_supply_by_owner_id(signer_id).0 + 1) as u128 * storage_amount;
+
+        //make sure that the total paid is >= the required storage
+        assert!(
+            owner_paid_storage >= signer_storage_required,
+            "Insufficient storage paid: {}, for {} sales at {} rate of per sale",
+            owner_paid_storage,
+            signer_storage_required / STORAGE_PER_SALE,
+            STORAGE_PER_SALE
+        );
+
+        //if all these checks pass we can create the sale conditions object.
+        let SaleArgs { sale_conditions } =
+            //the sale conditions come from the msg field. The market assumes that the user passed
+            //in a proper msg. If they didn't, it panics. 
+            near_sdk::serde_json::from_str(&msg).expect("Not valid SaleArgs");
+
+        //create the unique sale ID which is the contract + DELIMITER + token ID
+        let contract_and_token_id = format!("{}{}{}", nft_contract_id, DELIMETER, token_id);
+
+        //insert the key value pair into the sales map. Key is the unique ID. value is the sale object
+        self.sales.insert(
+            &contract_and_token_id,
+            &Sale {
+                owner_id: owner_id.clone(),                   //owner of the sale / token
+                approval_id, //approval ID for that token that was given to the market
+                nft_contract_id: nft_contract_id.to_string(), //NFT contract the token was minted on
+                token_id: token_id.clone(), //the actual token ID
+                sale_conditions, //the sale conditions
+            },
+        );
+
+        //Extra functionality that populates collections necessary for the view calls
+
+        //get the sales by owner ID for the given owner. If there are none, we create a new empty set
+        let mut by_owner_id = self.sale_by_owner.get(&owner_id).unwrap_or_else(|| {
+            UnorderedSet::new(
+                StorageKey::SaleByOwnerIdInner {
+                    //we get a new unique prefix for the collection by hashing the owner
+                    account_id_hash: hash_account_id(&owner_id),
+                }
+                .try_to_vec()
+                .unwrap(),
+            )
+        });
+
+        //insert the unique sale ID into the set
+        by_owner_id.insert(&contract_and_token_id);
+        //insert that set back into the collection for the owner
+        self.sale_by_owner.insert(&owner_id, &by_owner_id);
+
+        //get the token IDs for the given nft contract ID. If there are none, we create a new empty set
+        let mut by_nft_contract_id = self
+            .by_nft_contract_id
+            .get(&nft_contract_id)
+            .unwrap_or_else(|| {
+                UnorderedSet::new(
+                    StorageKey::ByNFTContractIdInner {
+                        //we get a new unique prefix for the collection by hashing the owner
+                        account_id_hash: hash_account_id(&nft_contract_id),
+                    }
+                    .try_to_vec()
+                    .unwrap(),
+                )
+            });
+
+        //insert the token ID into the set
+        by_nft_contract_id.insert(&token_id);
+        //insert the set back into the collection for the given nft contract ID
+        self.by_nft_contract_id
+            .insert(&nft_contract_id, &by_nft_contract_id);
+    }
+}
+
+'''
+'''--- src/enumeration.rs ---
+use crate::{nft_core::NonFungibleTokenCore, *};
+
+#[near_bindgen]
+impl Contract {
+    pub fn nft_total_supply(&self) -> U128 {
+        U128(self.token_metadata_by_id.len() as u128)
+    }
+
+    pub fn nft_tokens(&self, from_index: Option<U128>, limit: Option<u64>) -> Vec<JsonToken> {
+        let start = u128::from(from_index.unwrap_or(U128(0)));
+        self.token_metadata_by_id
+            .keys()
+            .skip(start as usize)
+            .take(limit.unwrap_or(50) as usize)
+            .map(|token_id| self.nft_token(token_id.clone()).unwrap())
+            .collect()
+    }
+
+    pub fn nft_supply_for_owner(&self, account_id: AccountId) -> U128 {
+        let tokens_for_owner_set = self.token_per_owner.get(&account_id);
+        if let Some(tokens_for_owner_set) = tokens_for_owner_set {
+            U128(tokens_for_owner_set.len() as u128)
+        } else {
+            U128(0)
+        }
+    }
+
+    pub fn nft_tokens_for_owner(
+        &self,
+        account_id: AccountId,
+        from_index: Option<U128>,
+        limit: Option<u64>,
+    ) -> Vec<JsonToken> {
+        let tokens_for_owner_set = self.token_per_owner.get(&account_id);
+        let tokens = if let Some(tokens_for_owner_set) = tokens_for_owner_set {
+            tokens_for_owner_set
+        } else {
+            return vec![];
+        };
+
+        let start = u128::from(from_index.unwrap_or(U128(0)));
+
+        tokens
+            .iter()
+            .skip(start as usize)
+            .take(limit.unwrap_or(50) as usize)
+            .map(|token_id| self.nft_token(token_id.clone()).unwrap())
+            .collect()
+    }
+
+    /// Paginate through NFTs within a given series
+    pub fn nft_tokens_for_series(
+        &self,
+        id: u64,
+        from_index: Option<U128>,
+        limit: Option<u64>,
+    ) -> Vec<JsonToken> {
+        // Get the series and its tokens
+        let series = self.series_by_id.get(&id);
+        let tokens = if let Some(series) = series {
+            series.tokens
+        } else {
+            return vec![];
+        };
+
+        //where to start pagination - if we have a from_index, we'll use that - otherwise start from 0 index
+        let start = u128::from(from_index.unwrap_or(U128(0)));
+
+        //iterate through the tokens
+        tokens
+            .iter()
+            //skip to the index we specified in the start variable
+            .skip(start as usize)
+            //take the first "limit" elements in the vector. If we didn't specify a limit, use 50
+            .take(limit.unwrap_or(50) as usize)
+            //we'll map the token IDs which are strings into Json Tokens
+            .map(|token_id| self.nft_token(token_id.clone()).unwrap())
+            //since we turned the keys into an iterator, we need to turn it back into a vector to return
+            .collect()
+    }
+}
+
+'''
+'''--- src/events.rs ---
+use std::fmt;
+
+use near_sdk::serde::{Deserialize, Serialize};
+
+/// Enum that represents the data type of the EventLog.
+/// The enum can either be an NftMint or an NftTransfer.
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "event", content = "data")]
+#[serde(rename_all = "snake_case")]
+#[serde(crate = "near_sdk::serde")]
+#[non_exhaustive]
+pub enum EventLogVariant {
+    NftMint(Vec<NftMintLog>),
+    NftTransfer(Vec<NftTransferLog>),
+}
+
+/// Interface to capture data about an event
+///
+/// Arguments:
+/// * `standard`: name of standard e.g. nep171
+/// * `version`: e.g. 1.0.0
+/// * `event`: associate event data
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct EventLog {
+    pub standard: String,
+    pub version: String,
+
+    // `flatten` to not have "event": {<EventLogVariant>} in the JSON, just have the contents of {<EventLogVariant>}.
+    #[serde(flatten)]
+    pub event: EventLogVariant,
+}
+
+impl fmt::Display for EventLog {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_fmt(format_args!(
+            "EVENT_JSON:{}",
+            &serde_json::to_string(self).map_err(|_| fmt::Error)?
+        ))
+    }
+}
+
+/// An event log to capture token minting
+///
+/// Arguments
+/// * `owner_id`: "account.near"
+/// * `token_ids`: ["1", "abc"]
+/// * `memo`: optional message
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct NftMintLog {
+    pub owner_id: String,
+    pub token_ids: Vec<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
+}
+
+/// An event log to capture token transfer
+///
+/// Arguments
+/// * `authorized_id`: approved account to transfer
+/// * `old_owner_id`: "owner.near"
+/// * `new_owner_id`: "receiver.near"
+/// * `token_ids`: ["1", "12345abc"]
+/// * `memo`: optional message
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct NftTransferLog {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorized_id: Option<String>,
+
+    pub old_owner_id: String,
+    pub new_owner_id: String,
+    pub token_ids: Vec<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
+}
+
+'''
+'''--- src/internal.rs ---
+use crate::*;
+use near_sdk::CryptoHash;
+use std::mem::size_of;
+
+pub(crate) fn royalty_to_payout(percentage: u32, amount_to_pay: Balance) -> U128 {
+    U128((percentage as u128 * amount_to_pay) / 10_000u128)
+}
+
+pub(crate) fn bytes_for_approved_account_id(account_id: &AccountId) -> u64 {
+    account_id.as_str().len() as u64 + 4 + size_of::<u64>() as u64
+}
+
+//Assert that the user has attached at least 1 yoctoNEAR (for security reasons and to pay for storage)
+pub(crate) fn assert_at_least_one_yocto() {
+    assert!(
+        env::attached_deposit() >= 1,
+        "Requires attached deposit of at least 1 yoctoNEAR",
+    )
+}
+
+pub(crate) fn refund_approved_account_ids_iter<'a, I>(
+    account_id: AccountId,
+    approved_account_ids: I,
+) -> Promise
+where
+    I: Iterator<Item = &'a AccountId>,
+{
+    let storage_released: u64 = approved_account_ids
+        .map(bytes_for_approved_account_id)
+        .sum();
+    Promise::new(account_id).transfer(Balance::from(storage_released) * env::storage_byte_cost())
+}
+
+pub(crate) fn refund_approved_account_ids(
+    account_id: AccountId,
+    approved_account_ids: &HashMap<AccountId, u64>,
+) -> Promise {
+    refund_approved_account_ids_iter(account_id, approved_account_ids.keys())
+}
+
+pub(crate) fn hash_account_id(account_id: &AccountId) -> CryptoHash {
+    let mut hash = CryptoHash::default();
+    hash.copy_from_slice(&env::sha256(account_id.as_bytes()));
+    hash
+}
+
+pub(crate) fn refund_deposit(storage_used: u64) {
+    let required_cost = env::storage_byte_cost() * Balance::from(storage_used);
+
+    let attached_deposit = env::attached_deposit();
+
+    assert!(
+        required_cost <= attached_deposit,
+        "Not enough deposit to cover storage, {} yoctoNEAR required",
+        required_cost,
+    );
+
+    let refund = attached_deposit - required_cost;
+
+    if refund > 1 {
+        Promise::new(env::predecessor_account_id()).transfer(refund);
+    }
+}
+
+impl Contract {
+    pub(crate) fn internal_add_token_to_owner(
+        &mut self,
+        account_id: &AccountId,
+        token_id: &TokenId,
+    ) {
+        let mut tokens_set = self.token_per_owner.get(account_id).unwrap_or_else(|| {
+            UnorderedSet::new(
+                StorageKey::TokenPerOwnerInner {
+                    account_id_hash: hash_account_id(&account_id),
+                }
+                .try_to_vec()
+                .unwrap(),
+            )
+        });
+        tokens_set.insert(token_id);
+        self.token_per_owner.insert(account_id, &tokens_set);
+    }
+
+    pub(crate) fn internal_add_series_to_owner(
+        &mut self,
+        account_id: &AccountId,
+        series_id: &SeriesId,
+    ) {
+        let mut series_set = self.series_per_owner.get(account_id).unwrap_or_else(|| {
+            UnorderedSet::new(
+                StorageKey::SeriesPerOwnerInner {
+                    account_id_hash: hash_account_id(&account_id),
+                }
+                .try_to_vec()
+                .unwrap(),
+            )
+        });
+        series_set.insert(series_id);
+        self.series_per_owner.insert(account_id, &series_set);
+    }
+
+    pub(crate) fn internal_transfer(
+        &mut self,
+        sender_id: &AccountId,
+        receiver_id: &AccountId,
+        token_id: &TokenId,
+        approval_id: Option<u64>,
+        memo: Option<String>,
+    ) -> Token {
+        let token = self.token_by_id.get(token_id).expect("No token");
+
+        if sender_id != &token.owner_id {
+            if !token.approved_account_ids.contains_key(sender_id) {
+                env::panic_str("Unauthorized");
+            }
+
+            if let Some(enforced_approval_id) = approval_id {
+                let actual_approval_id = token
+                    .approved_account_ids
+                    .get(sender_id)
+                    .expect("Sender is not approved account");
+                assert_eq!(
+                    actual_approval_id, &enforced_approval_id,
+                    "The actual approval_id {} is different from the given approval_id {}",
+                    actual_approval_id, enforced_approval_id,
+                );
+            }
+        }
+        assert_ne!(
+            &token.owner_id, receiver_id,
+            "The token is already owned by the receiver"
+        );
+
+        self.internal_remove_token_from_owner(&token.owner_id, token_id);
+        self.internal_add_token_to_owner(receiver_id, token_id);
+
+        let new_token = Token {
+            series_id: token.series_id,
+            owner_id: receiver_id.clone(),
+            approved_account_ids: Default::default(),
+            next_approval_id: 0,
+            royalty: token.royalty.clone(), //change this  when listing
+        };
+
+        self.token_by_id.insert(token_id, &new_token);
+
+        if let Some(memo) = memo.as_ref() {
+            env::log_str(&format!("memo: {}", memo).to_string());
+        }
+
+        // Default the authorized ID to be None for the logs.
+        let mut authorized_id = None;
+        //if the approval ID was provided, set the authorized ID equal to the sender
+        if approval_id.is_some() {
+            authorized_id = Some(sender_id.to_string());
+        }
+
+        // Construct the transfer log as per the events standard.
+        let nft_transfer_log: EventLog = EventLog {
+            // Standard name ("nep171").
+            standard: NFT_STANDARD_NAME.to_string(),
+            // Version of the standard ("nft-1.0.0").
+            version: NFT_METADATA_SPEC.to_string(),
+            // The data related with the event stored in a vector.
+            event: EventLogVariant::NftTransfer(vec![NftTransferLog {
+                // The optional authorized account ID to transfer the token on behalf of the old owner.
+                authorized_id,
+                // The old owner's account ID.
+                old_owner_id: token.owner_id.to_string(),
+                // The account ID of the new owner of the token.
+                new_owner_id: receiver_id.to_string(),
+                // A vector containing the token IDs as strings.
+                token_ids: vec![token_id.to_string()],
+                // An optional memo to include.
+                memo,
+            }]),
+        };
+
+        // Log the serialized json.
+        env::log_str(&nft_transfer_log.to_string());
+
+        token
+    }
+
+    pub(crate) fn internal_remove_token_from_owner(
+        &mut self,
+        account_id: &AccountId,
+        token_id: &TokenId,
+    ) {
+        let mut tokens_set = self
+            .token_per_owner
+            .get(account_id)
+            .expect("Token should be owned by the sender");
+        tokens_set.remove(token_id);
+        if tokens_set.is_empty() {
+            self.token_per_owner.remove(account_id);
+        } else {
+            self.token_per_owner.insert(account_id, &tokens_set);
+        }
+    }
+
+    pub(crate) fn internal_remove_sale(
+        &mut self,
+        nft_contract_id: AccountId,
+        token_id: TokenId,
+    ) -> Sale {
+        //get the unique sale ID (contract + DELIMITER + token ID)
+        let contract_and_token_id = format!("{}{}{}", &nft_contract_id, DELIMETER, token_id);
+        //get the sale object by removing the unique sale ID. If there was no sale, panic
+        let sale = self.sales.remove(&contract_and_token_id).expect("No sale");
+
+        //get the set of sales for the sale's owner. If there's no sale, panic.
+        let mut by_owner_id = self
+            .sale_by_owner
+            .get(&sale.owner_id)
+            .expect("No sale by_owner_id");
+        //remove the unique sale ID from the set of sales
+        by_owner_id.remove(&contract_and_token_id);
+
+        //if the set of sales is now empty after removing the unique sale ID, we simply remove that owner from the map
+        if by_owner_id.is_empty() {
+            self.sale_by_owner.remove(&sale.owner_id);
+        //if the set of sales is not empty after removing, we insert the set back into the map for the owner
+        } else {
+            self.sale_by_owner.insert(&sale.owner_id, &by_owner_id);
+        }
+
+        //get the set of token IDs for sale for the nft contract ID. If there's no sale, panic.
+        let mut by_nft_contract_id = self
+            .by_nft_contract_id
+            .get(&nft_contract_id)
+            .expect("No sale by nft_contract_id");
+
+        //remove the token ID from the set
+        by_nft_contract_id.remove(&token_id);
+
+        //if the set is now empty after removing the token ID, we remove that nft contract ID from the map
+        if by_nft_contract_id.is_empty() {
+            self.by_nft_contract_id.remove(&nft_contract_id);
+        //if the set is not empty after removing, we insert the set back into the map for the nft contract ID
+        } else {
+            self.by_nft_contract_id
+                .insert(&nft_contract_id, &by_nft_contract_id);
+        }
+
+        //return the sale object
+        sale
+    }
+}
+
+'''
+'''--- src/lib.rs ---
+use std::collections::HashMap;
+
+use near_sdk::{
+    assert_one_yocto,
+    borsh::{self, BorshDeserialize, BorshSerialize},
+    collections::{LazyOption, LookupMap, UnorderedMap, UnorderedSet},
+    env::{self, STORAGE_PRICE_PER_BYTE},
+    json_types::{Base64VecU8, U128},
+    near_bindgen, require,
+    serde::{Deserialize, Serialize},
+    AccountId, Balance, BorshStorageKey, CryptoHash, Gas, PanicOnDefault, Promise, PromiseOrValue,
+};
+
+pub use crate::approval::*;
+pub use crate::events::*;
+use crate::internal::*;
+pub use crate::metadata::*;
+pub use crate::mint::*;
+pub use crate::nft_core::*;
+pub use crate::royalties::*;
+pub use crate::sale::*;
+pub use crate::sale_views::*;
+pub use crate::series::*;
+pub use crate::user::*;
+
+mod approval;
+mod enumeration;
+mod events;
+mod internal;
+mod metadata;
+mod mint;
+mod nft_core;
+mod royalties;
+mod sale;
+mod sale_views;
+mod series;
+mod user;
+
+pub const NFT_METADATA_SPEC: &str = "1.0.0";
+pub const NFT_STANDARD_NAME: &str = "nep171";
+//the minimum storage to have a sale on the contract.
+const STORAGE_PER_SALE: u128 = 1000 * STORAGE_PRICE_PER_BYTE;
+
+//every sale will have a unique ID which is `CONTRACT + DELIMITER + TOKEN_ID`
+static DELIMETER: &str = ".";
+const GAS_FOR_RESOLVE_TRANSFER: Gas = Gas(10_000_000_000_000);
+const GAS_FOR_NFT_ON_TRANSFER: Gas = Gas(25_000_000_000_000);
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Contract {
+    pub owner_id: AccountId,
+    pub token_per_owner: LookupMap<AccountId, UnorderedSet<TokenId>>,
+    pub token_by_id: LookupMap<TokenId, Token>,
+    pub token_metadata_by_id: UnorderedMap<TokenId, TokenMetadata>,
+    pub user_metadata_by_owner: UnorderedMap<AccountId, UserMetadata>,
+    pub metadata: LazyOption<NFTContractMetadata>,
+    pub series_by_id: UnorderedMap<SeriesId, Series>,
+    pub series_per_owner: LookupMap<AccountId, UnorderedSet<SeriesId>>,
+    pub storage_deposits: LookupMap<AccountId, Balance>,
+    pub sale_by_owner: UnorderedMap<AccountId, UnorderedSet<TokenId>>,
+    pub sales: UnorderedMap<TokenId, Sale>,
+    pub by_nft_contract_id: LookupMap<AccountId, UnorderedSet<TokenId>>,
+}
+
+#[derive(BorshStorageKey, BorshSerialize)]
+pub enum StorageKey {
+    TokenPerOwner,
+    TokenById,
+    TokenMetadataById,
+    UserMetadataByOwner,
+    UserMetadataByOwnerInner { account_id_hash: CryptoHash },
+    NFTContractMetadata,
+    TokenPerOwnerInner { account_id_hash: CryptoHash },
+    SeriesByIdInner { account_id_hash: CryptoHash },
+    SeriesById,
+    SeriesPerOwner,
+    SeriesPerOwnerInner { account_id_hash: CryptoHash },
+    StorageDeposits,
+    SaleByOwner,
+    Sales,
+    ByNFTContractId,
+    SaleByOwnerIdInner { account_id_hash: CryptoHash },
+    ByNFTContractIdInner { account_id_hash: CryptoHash },
+}
+
+#[near_bindgen]
+impl Contract {
+    #[init]
+    pub fn new_default(owner_id: AccountId) -> Self {
+        Self::new(
+            owner_id,
+            NFTContractMetadata {
+                spec: "Pixicle_1.0".to_string(),
+                name: "Pixicle".to_string(),
+                symbol: "PIX".to_string(),
+                icon: None,
+                base_uri: None,
+                reference: None,
+                reference_hash: None,
+            },
+        )
+    }
+
+    #[init]
+    pub fn new(owner_id: AccountId, metadata: NFTContractMetadata) -> Self {
+        Self {
+            owner_id,
+            token_per_owner: LookupMap::new(StorageKey::TokenPerOwner),
+            token_by_id: LookupMap::new(StorageKey::TokenById),
+            token_metadata_by_id: UnorderedMap::new(StorageKey::TokenMetadataById),
+            user_metadata_by_owner: UnorderedMap::new(StorageKey::UserMetadataByOwner),
+            series_by_id: UnorderedMap::new(StorageKey::SeriesById),
+            series_per_owner: LookupMap::new(StorageKey::SeriesPerOwner),
+            metadata: LazyOption::new(
+                StorageKey::NFTContractMetadata.try_to_vec().unwrap(),
+                Some(&metadata),
+            ),
+            storage_deposits: LookupMap::new(StorageKey::StorageDeposits),
+            sale_by_owner: UnorderedMap::new(StorageKey::SaleByOwner),
+            sales: UnorderedMap::new(StorageKey::Sales),
+            by_nft_contract_id: LookupMap::new(StorageKey::ByNFTContractId),
+        }
+    }
+
+    #[payable]
+    pub fn storage_deposit(&mut self, account_id: Option<AccountId>) {
+        //get the account ID to pay for storage for
+        let storage_account_id = account_id
+            //convert the valid account ID into an account ID
+            .map(|a| a.into())
+            //if we didn't specify an account ID, we simply use the caller of the function
+            .unwrap_or_else(env::predecessor_account_id);
+
+        //get the deposit value which is how much the user wants to add to their storage
+        let deposit = env::attached_deposit();
+
+        //make sure the deposit is greater than or equal to the minimum storage for a sale
+        assert!(
+            deposit >= STORAGE_PER_SALE,
+            "Requires minimum deposit of {}",
+            STORAGE_PER_SALE
+        );
+
+        //get the balance of the account (if the account isn't in the map we default to a balance of 0)
+        let mut balance: u128 = self.storage_deposits.get(&storage_account_id).unwrap_or(0);
+        //add the deposit to their balance
+        balance += deposit;
+        //insert the balance back into the map for that account ID
+        self.storage_deposits.insert(&storage_account_id, &balance);
+    }
+
+    //Allows users to withdraw any excess storage that they're not using. Say Bob pays 0.01N for 1 sale
+    //Alice then buys Bob's token. This means bob has paid 0.01N for a sale that's no longer on the marketplace
+    //Bob could then withdraw this 0.01N back into his account.
+    #[payable]
+    pub fn storage_withdraw(&mut self) {
+        //make sure the user attaches exactly 1 yoctoNEAR for security purposes.
+        //this will redirect them to the NEAR wallet (or requires a full access key).
+        assert_one_yocto();
+
+        //the account to withdraw storage to is always the function caller
+        let owner_id = env::predecessor_account_id();
+        //get the amount that the user has by removing them from the map. If they're not in the map, default to 0
+        let mut amount = self.storage_deposits.remove(&owner_id).unwrap_or(0);
+
+        //how many sales is that user taking up currently. This returns a set
+        let sales = self.sale_by_owner.get(&owner_id);
+        //get the length of that set.
+        let len = sales.map(|s| s.len()).unwrap_or_default();
+        //how much NEAR is being used up for all the current sales on the account
+        let diff = u128::from(len) * STORAGE_PER_SALE;
+
+        //the excess to withdraw is the total storage paid - storage being used up.
+        amount -= diff;
+
+        //if that excess to withdraw is > 0, we transfer the amount to the user.
+        if amount > 0 {
+            Promise::new(owner_id.clone()).transfer(amount);
+        }
+        //we need to add back the storage being used up into the map if it's greater than 0.
+        //this is so that if the user had 500 sales on the market, we insert that value here so
+        //if those sales get taken down, the user can then go and withdraw 500 sales worth of storage.
+        if diff > 0 {
+            self.storage_deposits.insert(&owner_id, &diff);
+        }
+    }
+
+    /// views
+    //return the minimum storage for 1 sale
+    pub fn storage_minimum_balance(&self) -> U128 {
+        U128(STORAGE_PER_SALE)
+    }
+
+    //return how much storage an account has paid for
+    pub fn storage_balance_of(&self, account_id: AccountId) -> U128 {
+        U128(self.storage_deposits.get(&account_id).unwrap_or(0))
+    }
+}
+
+'''
+'''--- src/metadata.rs ---
+use crate::*;
+
+pub type TokenId = String;
+pub type SeriesId = u64;
+pub type SalePriceInYoctoNear = U128;
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Payout {
+    pub payout: HashMap<AccountId, U128>,
+}
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone)]
+#[serde(crate = "near_sdk::serde")]
+pub struct NFTContractMetadata {
+    pub spec: String,
+    pub name: String,
+    pub symbol: String,
+    pub icon: Option<String>,
+    pub base_uri: Option<String>,
+    pub reference: Option<String>,
+    pub reference_hash: Option<Base64VecU8>,
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct TokenMetadata {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub media: Option<String>,
+    pub media_hash: Option<String>,
+    pub copies: Option<u64>,
+    pub issued_at: Option<String>,
+    pub extra: Option<String>,
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Token {
+    pub series_id: u64,
+    pub owner_id: AccountId,
+    pub approved_account_ids: HashMap<AccountId, u64>,
+    pub next_approval_id: u64,
+    pub royalty: HashMap<AccountId, u32>,
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct SeriesMetadata {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub category: Option<String>,
+    pub logo_media: Option<String>,
+    pub banner_media: Option<String>,
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct UserMetadata {
+    pub name: Option<String>,
+    pub image_url: Option<String>,
+    pub banner_url: Option<String>,
+}
+
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct Series {
+    // Royalty used for all tokens in the collection
+    pub royalty: Option<HashMap<AccountId, u32>>,
+    // Set of tokens in the collection
+    pub tokens: UnorderedSet<TokenId>,
+    // What is the price of each token in this series? If this is specified, when minting,
+    // Users will need to attach enough $NEAR to cover the price.
+    pub price: Option<Balance>,
+    //total price of the series
+    pub volume: Option<Balance>,
+    // Owner of the collection
+    pub owner_id: AccountId,
+    //collection logo
+    pub metadata: SeriesMetadata,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct JsonToken {
+    pub series_id: SeriesId,
+    pub token_id: TokenId,
+    pub owner_id: AccountId,
+    pub metadata: TokenMetadata,
+    pub approved_account_ids: HashMap<AccountId, u64>,
+    pub royalty: HashMap<AccountId, u32>,
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct JsonSeries {
+    pub series_id: SeriesId,
+    // Metadata including title, num copies etc.. that all tokens will derive from
+    pub metadata: SeriesMetadata,
+    // Royalty used for all tokens in the collection
+    pub royalty: Option<HashMap<AccountId, u32>>,
+    // Owner of the collection
+    pub owner_id: AccountId,
+    //volume
+    pub volume: Option<Balance>,
+    // price
+    pub price: Option<Balance>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct SaleArgs {
+    pub sale_conditions: SalePriceInYoctoNear,
+}
+
+pub trait NonFungibleTokenMetadata {
+    fn nft_metadata(&self) -> NFTContractMetadata;
+}
+
+#[near_bindgen]
+impl NonFungibleTokenMetadata for Contract {
+    fn nft_metadata(&self) -> NFTContractMetadata {
+        self.metadata.get().unwrap()
+    }
+}
+
+'''
+'''--- src/mint.rs ---
+use near_sdk::json_types::U64;
+
+use crate::*;
+
+#[near_bindgen]
+impl Contract {
+    #[payable]
+    pub fn nft_mint(
+        &mut self,
+        id: U64,
+        token_id: TokenId,
+        metadata: TokenMetadata,
+        receiver_id: AccountId,
+        perpetual_royalties: Option<HashMap<AccountId, u32>>,
+    ) {
+        let initial_storage_usage = env::storage_usage();
+
+        // Get the series and how many tokens currently exist (edition number = cur_len + 1)
+        let mut series = self.series_by_id.get(&id.0).expect("Not a series");
+
+        //Change this when listing
+        let mut royalty = HashMap::new();
+
+        if let Some(perpetual_royalties) = perpetual_royalties {
+            assert!(
+                perpetual_royalties.len() < 7,
+                "Cannot add more than 6 perpetual royalty amounts"
+            );
+            for (account, amount) in perpetual_royalties {
+                royalty.insert(account, amount);
+            }
+        }
+        // finish up
+
+        let token = Token {
+            series_id: id.0,
+            owner_id: receiver_id,
+            approved_account_ids: Default::default(),
+            next_approval_id: 0,
+            royalty: royalty, //also this
+        };
+
+        assert!(
+            self.token_by_id.insert(&token_id, &token).is_none(),
+            "Token already exists"
+        );
+        series.tokens.insert(&token_id);
+
+        self.token_metadata_by_id.insert(&token_id, &metadata);
+
+        self.internal_add_token_to_owner(&token.owner_id, &token_id);
+
+        let nft_mint_log: EventLog = EventLog {
+            // Standard name ("nep171").
+            standard: NFT_STANDARD_NAME.to_string(),
+            // Version of the standard ("nft-1.0.0").
+            version: NFT_METADATA_SPEC.to_string(),
+            // The data related with the event stored in a vector.
+            event: EventLogVariant::NftMint(vec![NftMintLog {
+                // Owner of the token.
+                owner_id: token.owner_id.to_string(),
+                // Vector of token IDs that were minted.
+                token_ids: vec![token_id.to_string()],
+                // An optional memo to include.
+                memo: None,
+            }]),
+        };
+
+        // Log the serialized json.
+        env::log_str(&nft_mint_log.to_string());
+
+        let required_storage_in_bytes = env::storage_usage() - initial_storage_usage;
+
+        refund_deposit(required_storage_in_bytes);
+    }
+}
+
+'''
+'''--- src/nft_core.rs ---
+use crate::*;
+use near_sdk::{assert_one_yocto, ext_contract, PromiseResult};
+
+pub trait NonFungibleTokenCore {
+    fn nft_transfer(
+        &mut self,
+        receiver_id: AccountId,
+        token_id: TokenId,
+        memo: Option<String>,
+        approval_id: Option<u64>,
+    );
+    fn nft_transfer_call(
+        &mut self,
+        receiver_id: AccountId,
+        token_id: TokenId,
+        memo: Option<String>,
+        msg: String,
+        approval_id: Option<u64>,
+    ) -> PromiseOrValue<bool>;
+
+    fn nft_token(&self, token_id: TokenId) -> Option<JsonToken>;
+}
+
+#[ext_contract(ext_non_fungible_token_receiver)]
+trait NonFungibleTokenReceiver {
+    fn nft_on_transfer(
+        &mut self,
+        sender_id: AccountId,
+        previous_owner_id: AccountId,
+        token_id: TokenId,
+        msg: String,
+    ) -> Promise;
+}
+
+#[ext_contract(ext_self)]
+trait NonFungibleTokenResolver {
+    fn nft_resolve_transfer(
+        &mut self,
+        authorized_id: Option<String>,
+        owner_id: AccountId,
+        receiver_id: AccountId,
+        token_id: TokenId,
+        approved_account_ids: HashMap<AccountId, u64>,
+        memo: Option<String>,
+    ) -> bool;
+}
+
+#[near_bindgen]
+impl NonFungibleTokenCore for Contract {
+    #[payable]
+    fn nft_transfer(
+        &mut self,
+        receiver_id: AccountId,
+        token_id: TokenId,
+        memo: Option<String>,
+        approval_id: Option<u64>,
+    ) {
+        assert_one_yocto();
+
+        let sender_id = env::predecessor_account_id();
+
+        let previous_token =
+            self.internal_transfer(&sender_id, &receiver_id, &token_id, approval_id, memo);
+
+        refund_approved_account_ids(
+            previous_token.owner_id.clone(),
+            &previous_token.approved_account_ids,
+        );
+    }
+
+    #[payable]
+    fn nft_transfer_call(
+        &mut self,
+        receiver_id: AccountId,
+        token_id: TokenId,
+        memo: Option<String>,
+        msg: String,
+        approval_id: Option<u64>,
+    ) -> PromiseOrValue<bool> {
+        assert_one_yocto();
+
+        let sender_id = env::predecessor_account_id();
+
+        let previous_token = self.internal_transfer(
+            &sender_id,
+            &receiver_id,
+            &token_id,
+            approval_id,
+            memo.clone(),
+        );
+
+        let mut authorized_id = None;
+        //if the sender isn't the owner of the token, we set the authorized ID equal to the sender.
+        if sender_id != previous_token.owner_id {
+            authorized_id = Some(sender_id.to_string());
+        }
+
+        ext_non_fungible_token_receiver::ext(receiver_id.clone())
+            .with_static_gas(GAS_FOR_NFT_ON_TRANSFER)
+            .nft_on_transfer(
+                sender_id,
+                previous_token.owner_id.clone(),
+                token_id.clone(),
+                msg,
+            )
+            .then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(GAS_FOR_RESOLVE_TRANSFER)
+                    .nft_resolve_transfer(
+                        authorized_id,
+                        previous_token.owner_id,
+                        receiver_id,
+                        token_id,
+                        previous_token.approved_account_ids,
+                        memo,
+                    ),
+            )
+            .into()
+    }
+
+    fn nft_token(&self, token_id: TokenId) -> Option<JsonToken> {
+        if let Some(token) = self.token_by_id.get(&token_id) {
+            let metadata = self.token_metadata_by_id.get(&token_id).unwrap();
+
+            Some(JsonToken {
+                series_id: token.series_id,
+                token_id,
+                owner_id: token.owner_id,
+                metadata,
+                approved_account_ids: token.approved_account_ids,
+                royalty: token.royalty,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+#[near_bindgen]
+impl NonFungibleTokenResolver for Contract {
+    #[private]
+    fn nft_resolve_transfer(
+        &mut self,
+        authorized_id: Option<String>,
+        owner_id: AccountId,
+        receiver_id: AccountId,
+        token_id: TokenId,
+        approved_account_ids: HashMap<AccountId, u64>,
+        memo: Option<String>,
+    ) -> bool {
+        if let PromiseResult::Successful(value) = env::promise_result(0) {
+            if let Ok(return_token) = near_sdk::serde_json::from_slice::<bool>(&value) {
+                if !return_token {
+                    refund_approved_account_ids(owner_id, &approved_account_ids);
+                    return true;
+                }
+            }
+        }
+
+        let mut token = if let Some(token) = self.token_by_id.get(&token_id) {
+            if token.owner_id != receiver_id {
+                refund_approved_account_ids(owner_id, &approved_account_ids);
+                return true;
+            }
+            token
+        } else {
+            refund_approved_account_ids(owner_id, &approved_account_ids);
+            return true;
+        };
+
+        self.internal_remove_token_from_owner(&receiver_id.clone(), &token_id);
+        self.internal_add_token_to_owner(&owner_id, &token_id);
+
+        token.owner_id = owner_id.clone();
+
+        refund_approved_account_ids(receiver_id.clone(), &token.approved_account_ids);
+        token.approved_account_ids = approved_account_ids;
+
+        self.token_by_id.insert(&token_id, &token);
+
+        let nft_transfer_log: EventLog = EventLog {
+            // Standard name ("nep171").
+            standard: NFT_STANDARD_NAME.to_string(),
+            // Version of the standard ("nft-1.0.0").
+            version: NFT_METADATA_SPEC.to_string(),
+            // The data related with the event stored in a vector.
+            event: EventLogVariant::NftTransfer(vec![NftTransferLog {
+                // The optional authorized account ID to transfer the token on behalf of the old owner.
+                authorized_id,
+                // The old owner's account ID.
+                old_owner_id: receiver_id.to_string(),
+                // The account ID of the new owner of the token.
+                new_owner_id: owner_id.to_string(),
+                // A vector containing the token IDs as strings.
+                token_ids: vec![token_id.to_string()],
+                // An optional memo to include.
+                memo,
+            }]),
+        };
+
+        //we perform the actual logging
+        env::log_str(&nft_transfer_log.to_string());
+
+        //return false
+        false
+    }
+}
+
+'''
+'''--- src/royalties.rs ---
+use near_sdk::assert_one_yocto;
+
+use crate::*;
+trait NonFungibleTokenMe {
+    fn nft_payout(&self, token_id: TokenId, balance: u128, max_len_payout: u32) -> Payout;
+    fn nft_transfer_payout(
+        &mut self,
+        receiver_id: AccountId,
+        token_id: TokenId,
+        approval_id: u64,
+        memo: Option<String>,
+        balance: u128,
+        max_len_payout: u32,
+    ) -> Payout;
+}
+
+#[near_bindgen]
+impl NonFungibleTokenMe for Contract {
+    fn nft_payout(&self, token_id: TokenId, balance: u128, max_len_payout: u32) -> Payout {
+        let token = self.token_by_id.get(&token_id).expect("No token");
+
+        let owner_id = token.owner_id;
+        let mut total_perpetual = 0;
+        let balance_u128 = u128::from(balance);
+        let mut payout_object = Payout {
+            payout: HashMap::new(),
+        };
+        let royalty = token.royalty;
+
+        assert!(
+            royalty.len() as u32 <= max_len_payout,
+            "Market cannot payout to that many receivers"
+        );
+
+        for (k, v) in royalty.iter() {
+            let key = k.clone();
+            if key != owner_id {
+                payout_object
+                    .payout
+                    .insert(key, royalty_to_payout(*v, balance_u128));
+                total_perpetual += *v;
+            }
+        }
+
+        payout_object.payout.insert(
+            owner_id,
+            royalty_to_payout(10000 - total_perpetual, balance_u128),
+        );
+
+        payout_object
+    }
+
+    fn nft_transfer_payout(
+        &mut self,
+        receiver_id: AccountId,
+        token_id: TokenId,
+        approval_id: u64,
+        memo: Option<String>,
+        balance: u128,
+        max_len_payout: u32,
+    ) -> Payout {
+        assert_one_yocto();
+
+        let sender_id = env::predecessor_account_id();
+
+        let previous_token =
+            self.internal_transfer(&sender_id, &receiver_id, &token_id, Some(approval_id), memo);
+
+        refund_approved_account_ids(
+            previous_token.owner_id.clone(),
+            &previous_token.approved_account_ids,
+        );
+
+        let owner_id = previous_token.owner_id;
+
+        let mut total_perpetual = 0;
+
+        let balance_u128 = u128::from(balance);
+
+        let mut payout_object = Payout {
+            payout: HashMap::new(),
+        };
+
+        let royalty = previous_token.royalty;
+
+        assert!(
+            royalty.len() as u32 <= max_len_payout,
+            "Market cannot payout to that many receivers"
+        );
+
+        for (k, v) in royalty.iter() {
+            let key = k.clone();
+            if key != owner_id {
+                payout_object
+                    .payout
+                    .insert(key, royalty_to_payout(*v, balance_u128));
+                total_perpetual += *v;
+            }
+        }
+
+        payout_object.payout.insert(
+            owner_id,
+            royalty_to_payout(10000 - total_perpetual, balance_u128),
+        );
+
+        payout_object
+    }
+}
+
+'''
+'''--- src/sale.rs ---
+use near_sdk::{ext_contract, promise_result_as_success};
+
+use crate::*;
+
+const GAS_FOR_RESOLVE_PURCHASE: Gas = Gas(115_000_000_000_000);
+const GAS_FOR_NFT_TRANSFER: Gas = Gas(15_000_000_000_000);
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Sale {
+    //owner of the sale
+    pub owner_id: AccountId,
+    //market contract's approval ID to transfer the token on behalf of the owner
+    pub approval_id: u64,
+    //nft contract where the token was minted
+    pub nft_contract_id: String,
+    //actual token ID for sale
+    pub token_id: String,
+    //sale price in yoctoNEAR that the token is listed for
+    pub sale_conditions: SalePriceInYoctoNear,
+}
+
+#[near_bindgen]
+impl Contract {
+    #[payable]
+    pub fn add_on_sale(&mut self, owner_id: AccountId, token_id: String, msg: Option<String>) {
+        self.nft_approve(token_id, owner_id, msg);
+    }
+
+    #[payable]
+    pub fn remove_sale(&mut self, nft_contract_id: AccountId, token_id: String) {
+        //assert that the user has attached exactly 1 yoctoNEAR (for security reasons)
+        assert_one_yocto();
+        //get the sale object as the return value from removing the sale internally
+        let sale = self.internal_remove_sale(nft_contract_id.into(), token_id);
+        //get the predecessor of the call and make sure they're the owner of the sale
+        let owner_id = env::predecessor_account_id();
+        //if this fails, the remove sale will revert
+        assert_eq!(owner_id, sale.owner_id, "Must be sale owner");
+    }
+
+    #[payable]
+    pub fn update_price(&mut self, nft_contract_id: AccountId, token_id: String, price: U128) {
+        //assert that the user has attached exactly 1 yoctoNEAR (for security reasons)
+        assert_one_yocto();
+
+        //create the unique sale ID from the nft contract and token
+        let contract_id: AccountId = nft_contract_id.into();
+        let contract_and_token_id = format!("{}{}{}", contract_id, DELIMETER, token_id);
+
+        //get the sale object from the unique sale ID. If there is no token, panic.
+        let mut sale = self.sales.get(&contract_and_token_id).expect("No sale");
+
+        //assert that the caller of the function is the sale owner
+        assert_eq!(
+            env::predecessor_account_id(),
+            sale.owner_id,
+            "Must be sale owner"
+        );
+
+        //set the sale conditions equal to the passed in price
+        sale.sale_conditions = price;
+        //insert the sale back into the map for the unique sale ID
+        self.sales.insert(&contract_and_token_id, &sale);
+    }
+
+    #[payable]
+    pub fn offer(&mut self, nft_contract_id: AccountId, token_id: String) {
+        //get the attached deposit and make sure it's greater than 0
+        let deposit = env::attached_deposit();
+        assert!(deposit > 0, "Attached deposit must be greater than 0");
+
+        //convert the nft_contract_id from a AccountId to an AccountId
+        let contract_id: AccountId = nft_contract_id.into();
+        //get the unique sale ID (contract + DELIMITER + token ID)
+        let contract_and_token_id = format!("{}{}{}", contract_id, DELIMETER, token_id);
+
+        //get the sale object from the unique sale ID. If the sale doesn't exist, panic.
+        let sale = self.sales.get(&contract_and_token_id).expect("No sale");
+
+        //get the buyer ID which is the person who called the function and make sure they're not the owner of the sale
+        let buyer_id = env::predecessor_account_id();
+        assert_ne!(sale.owner_id, buyer_id, "Cannot bid on your own sale.");
+
+        //get the u128 price of the token (dot 0 converts from U128 to u128)
+        let price = sale.sale_conditions.0;
+
+        //make sure the deposit is greater than the price
+        assert!(
+            deposit >= price,
+            "Attached deposit must be greater than or equal to the current price: {:?}",
+            price
+        );
+
+        //process the purchase (which will remove the sale, transfer and get the payout from the nft contract, and then distribute royalties)
+        self.process_purchase(contract_id, token_id, U128(deposit), buyer_id);
+    }
+
+    #[private]
+    pub fn process_purchase(
+        &mut self,
+        nft_contract_id: AccountId,
+        token_id: String,
+        price: U128,
+        buyer_id: AccountId,
+    ) -> Promise {
+        //get the sale object by removing the sale
+        let sale = self.internal_remove_sale(nft_contract_id.clone(), token_id.clone());
+
+        //initiate a cross contract call to the nft contract. This will transfer the token to the buyer and return
+        //a payout object used for the market to distribute funds to the appropriate accounts.
+        ext_contract::ext(nft_contract_id)
+            // Attach 1 yoctoNEAR with static GAS equal to the GAS for nft transfer. Also attach an unused GAS weight of 1 by default.
+            .with_attached_deposit(1)
+            .with_static_gas(GAS_FOR_NFT_TRANSFER)
+            .nft_transfer_payout(
+                buyer_id.clone(),                 //purchaser (person to transfer the NFT to)
+                token_id,                         //token ID to transfer
+                sale.approval_id, //market contract's approval ID in order to transfer the token on behalf of the owner
+                "payout from market".to_string(), //memo (to include some context)
+                /*
+                    the price that the token was purchased for. This will be used in conjunction with the royalty percentages
+                    for the token in order to determine how much money should go to which account.
+                */
+                price,
+                10, //the maximum amount of accounts the market can payout at once (this is limited by GAS)
+            )
+            //after the transfer payout has been initiated, we resolve the promise by calling our own resolve_purchase function.
+            //resolve purchase will take the payout object returned from the nft_transfer_payout and actually pay the accounts
+            .then(
+                // No attached deposit with static GAS equal to the GAS for resolving the purchase. Also attach an unused GAS weight of 1 by default.
+                Self::ext(env::current_account_id())
+                    .with_static_gas(GAS_FOR_RESOLVE_PURCHASE)
+                    .resolve_purchase(
+                        buyer_id, //the buyer and price are passed in incase something goes wrong and we need to refund the buyer
+                        price,
+                    ),
+            )
+    }
+
+    #[private]
+    pub fn resolve_purchase(&mut self, buyer_id: AccountId, price: U128) -> U128 {
+        // checking for payout information returned from the nft_transfer_payout method
+        let payout_option = promise_result_as_success().and_then(|value| {
+            //if we set the payout_option to None, that means something went wrong and we should refund the buyer
+            near_sdk::serde_json::from_slice::<Payout>(&value)
+                //converts the result to an optional value
+                .ok()
+                //returns None if the none. Otherwise executes the following logic
+                .and_then(|payout_object| {
+                    //we'll check if length of the payout object is > 10 or it's empty. In either case, we return None
+                    if payout_object.payout.len() > 10 || payout_object.payout.is_empty() {
+                        env::log_str("Cannot have more than 10 royalties");
+                        None
+
+                    //if the payout object is the correct length, we move forward
+                    } else {
+                        //we'll keep track of how much the nft contract wants us to payout. Starting at the full price payed by the buyer
+                        let mut remainder = price.0;
+
+                        //loop through the payout and subtract the values from the remainder.
+                        for &value in payout_object.payout.values() {
+                            //checked sub checks for overflow or any errors and returns None if there are problems
+                            remainder = remainder.checked_sub(value.0)?;
+                        }
+                        //Check to see if the NFT contract sent back a faulty payout that requires us to pay more or too little.
+                        //The remainder will be 0 if the payout summed to the total price. The remainder will be 1 if the royalties
+                        //we something like 3333 + 3333 + 3333.
+                        if remainder == 0 || remainder == 1 {
+                            //set the payout_option to be the payout because nothing went wrong
+                            Some(payout_object.payout)
+                        } else {
+                            //if the remainder was anything but 1 or 0, we return None
+                            None
+                        }
+                    }
+                })
+        });
+
+        // if the payout option was some payout, we set this payout variable equal to that some payout
+        let payout = if let Some(payout_option) = payout_option {
+            payout_option
+        //if the payout option was None, we refund the buyer for the price they payed and return
+        } else {
+            Promise::new(buyer_id).transfer(u128::from(price));
+            // leave function and return the price that was refunded
+            return price;
+        };
+
+        // NEAR payouts
+        for (receiver_id, amount) in payout {
+            Promise::new(receiver_id).transfer(amount.0);
+        }
+
+        //return the price payout out
+        price
+    }
+}
+
+#[ext_contract(ext_self)]
+trait ExtSelf {
+    fn resolve_purchase(&mut self, buyer_id: AccountId, price: U128) -> Promise;
+}
+
+'''
+'''--- src/sale_views.rs ---
+use near_sdk::json_types::U64;
+
+use crate::*;
+
+#[near_bindgen]
+impl Contract {
+    /// views
+
+    //returns the number of sales the marketplace has up (as a string)
+    pub fn get_supply_sales(&self) -> U64 {
+        //returns the sales object length wrapped as a U64
+        U64(self.sales.len())
+    }
+
+    //returns the number of sales for a given account (result is a string)
+    pub fn get_supply_by_owner_id(&self, account_id: AccountId) -> U64 {
+        //get the set of sales for the given owner Id
+        let by_owner_id = self.sale_by_owner.get(&account_id);
+
+        //if there as some set, we return the length but if there wasn't a set, we return 0
+        if let Some(by_owner_id) = by_owner_id {
+            U64(by_owner_id.len())
+        } else {
+            U64(0)
+        }
+    }
+
+    //returns paginated sale objects for a given account. (result is a vector of sales)
+    pub fn get_sales_by_owner_id(
+        &self,
+        account_id: AccountId,
+        from_index: Option<U128>,
+        limit: Option<u64>,
+    ) -> Vec<Sale> {
+        //get the set of token IDs for sale for the given account ID
+        let by_owner_id = self.sale_by_owner.get(&account_id);
+        //if there was some set, we set the sales variable equal to that set. If there wasn't, sales is set to an empty vector
+        let sales = if let Some(by_owner_id) = by_owner_id {
+            by_owner_id
+        } else {
+            return vec![];
+        };
+
+        //we'll convert the UnorderedSet into a vector of strings
+        let keys = sales.as_vector();
+
+        //where to start pagination - if we have a from_index, we'll use that - otherwise start from 0 index
+        let start = u128::from(from_index.unwrap_or(U128(0)));
+
+        //iterate through the keys vector
+        keys.iter()
+            //skip to the index we specified in the start variable
+            .skip(start as usize)
+            //take the first "limit" elements in the vector. If we didn't specify a limit, use 0
+            .take(limit.unwrap_or(0) as usize)
+            //we'll map the token IDs which are strings into Sale objects
+            .map(|token_id| self.sales.get(&token_id).unwrap())
+            //since we turned the keys into an iterator, we need to turn it back into a vector to return
+            .collect()
+    }
+
+    //get the number of sales for an nft contract. (returns a string)
+    pub fn get_supply_by_nft_contract_id(&self, nft_contract_id: AccountId) -> U64 {
+        //get the set of tokens for associated with the given nft contract
+        let by_nft_contract_id = self.by_nft_contract_id.get(&nft_contract_id);
+
+        //if there was some set, return it's length. Otherwise return 0
+        if let Some(by_nft_contract_id) = by_nft_contract_id {
+            U64(by_nft_contract_id.len())
+        } else {
+            U64(0)
+        }
+    }
+
+    //returns paginated sale objects associated with a given nft contract. (result is a vector of sales)
+    pub fn get_sales_by_nft_contract_id(
+        &self,
+        nft_contract_id: AccountId,
+        from_index: Option<U128>,
+        limit: Option<u64>,
+    ) -> Vec<Sale> {
+        //get the set of token IDs for sale for the given contract ID
+        let by_nft_contract_id = self.by_nft_contract_id.get(&nft_contract_id);
+
+        //if there was some set, we set the sales variable equal to that set. If there wasn't, sales is set to an empty vector
+        let sales = if let Some(by_nft_contract_id) = by_nft_contract_id {
+            by_nft_contract_id
+        } else {
+            return vec![];
+        };
+
+        //we'll convert the UnorderedSet into a vector of strings
+        let keys = sales.as_vector();
+
+        //where to start pagination - if we have a from_index, we'll use that - otherwise start from 0 index
+        let start = u128::from(from_index.unwrap_or(U128(0)));
+
+        //iterate through the keys vector
+        keys.iter()
+            //skip to the index we specified in the start variable
+            .skip(start as usize)
+            //take the first "limit" elements in the vector. If we didn't specify a limit, use 0
+            .take(limit.unwrap_or(0) as usize)
+            //we'll map the token IDs which are strings into Sale objects by passing in the unique sale ID (contract + DELIMITER + token ID)
+            .map(|token_id| {
+                self.sales
+                    .get(&format!("{}{}{}", nft_contract_id, DELIMETER, token_id))
+                    .unwrap()
+            })
+            //since we turned the keys into an iterator, we need to turn it back into a vector to return
+            .collect()
+    }
+
+    //get a sale information for a given unique sale ID (contract + DELIMITER + token ID)
+    pub fn get_sale(&self, nft_contract_token: TokenId) -> Option<Sale> {
+        //try and get the sale object for the given unique sale ID. Will return an option since
+        //we're not guaranteed that the unique sale ID passed in will be valid.
+        self.sales.get(&nft_contract_token)
+    }
+}
+
+'''
+'''--- src/series.rs ---
+use crate::*;
+
+#[near_bindgen]
+impl Contract {
+    // Get the total supply of series on the contract
+    pub fn get_series_total_supply(&self) -> u64 {
+        self.series_by_id.len()
+    }
+
+    // Paginate through all the series on the contract and return the a vector of JsonSeries
+    pub fn get_series(&self, from_index: Option<U128>, limit: Option<u64>) -> Vec<JsonSeries> {
+        //where to start pagination - if we have a from_index, we'll use that - otherwise start from 0 index
+        let start = u128::from(from_index.unwrap_or(U128(0)));
+
+        //iterate through each series using an iterator
+        self.series_by_id
+            .keys()
+            //skip to the index we specified in the start variable
+            .skip(start as usize)
+            //take the first "limit" elements in the vector. If we didn't specify a limit, use 50
+            .take(limit.unwrap_or(50) as usize)
+            //we'll map the series IDs which are strings into Json Series
+            .map(|series_id| self.get_series_details(series_id.clone()).unwrap())
+            //since we turned the keys into an iterator, we need to turn it back into a vector to return
+            .collect()
+    }
+
+    //get series by owner
+    pub fn get_series_by_owner(
+        &self,
+        owner_id: AccountId,
+        from_index: Option<U128>,
+        limit: Option<u64>,
+    ) -> Vec<JsonSeries> {
+        let series_for_owner_set = self.series_per_owner.get(&owner_id);
+        let series = if let Some(series_for_owner_set) = series_for_owner_set {
+            series_for_owner_set
+        } else {
+            return vec![];
+        };
+
+        let start = u128::from(from_index.unwrap_or(U128(0)));
+
+        series
+            .iter()
+            .skip(start as usize)
+            .take(limit.unwrap_or(50) as usize)
+            .map(|series_id| self.get_series_details(series_id.clone()).unwrap())
+            .collect()
+    }
+
+    // get info for a specific series
+    pub fn get_series_details(&self, id: u64) -> Option<JsonSeries> {
+        //get the series from the map
+        let series = self.series_by_id.get(&id);
+        //if there is some series, we'll return the series
+        if let Some(series) = series {
+            Some(JsonSeries {
+                series_id: id,
+                metadata: series.metadata,
+                royalty: series.royalty,
+                owner_id: series.owner_id,
+                volume: series.volume,
+                price: series.price,
+            })
+        } else {
+            //if there isn't a series, we'll return None
+            None
+        }
+    }
+
+    //get the total supply of NFTs on a current series
+    pub fn nft_supply_for_series(&self, id: u64) -> U128 {
+        //get the series
+        let series = self.series_by_id.get(&id);
+
+        //if there is some series, get the length of the tokens. Otherwise return -
+        if let Some(series) = series {
+            U128(series.tokens.len() as u128)
+        } else {
+            U128(0)
+        }
+    }
+
+    #[payable]
+    pub fn create_series(&mut self, metadata: SeriesMetadata) {
+        // Measure the initial storage being used on the contract
+        let initial_storage_usage = env::storage_usage();
+
+        // Ensure the caller is an approved creator
+        let caller = env::predecessor_account_id();
+        let owner = env::predecessor_account_id();
+        // require!(
+        //     self.approved_creators.contains(&caller) == true,
+        //     "only approved creators can add a type"
+        // );
+        let id = self.get_series_total_supply() + 1;
+        // Insert the series and ensure it doesn't already exist
+        require!(
+            self.series_by_id
+                .insert(
+                    &id,
+                    &Series {
+                        metadata,
+                        volume: None,
+                        royalty: None,
+                        tokens: UnorderedSet::new(StorageKey::SeriesByIdInner {
+                            // We get a new unique prefix for the collection
+                            account_id_hash: hash_account_id(&caller),
+                        }),
+                        owner_id: caller,
+                        price: None,
+                    }
+                )
+                .is_none(),
+            "collection ID already exists"
+        );
+
+        self.internal_add_series_to_owner(&owner, &id);
+
+        //calculate the required storage which was the used - initial
+        let required_storage_in_bytes = env::storage_usage() - initial_storage_usage;
+
+        //refund any excess storage if the user attached too much. Panic if they didn't attach enough to cover the required.
+        refund_deposit(required_storage_in_bytes);
+    }
+}
+
+'''
+'''--- src/user.rs ---
+use crate::*;
+
+trait UserMetadataCore {
+    fn get_user_metadata(&self, owner_Id: AccountId) -> Option<UserMetadata>;
+    fn set_user_banner_image(&mut self, owner_id: AccountId, img_url: Option<String>) -> bool;
+    fn set_user_image(&mut self, owner_id: AccountId, img_url: Option<String>) -> bool;
+    fn set_user_name(&mut self, owner_id: AccountId, name: Option<String>) -> bool;
+}
+
+#[near_bindgen]
+impl UserMetadataCore for Contract {
+    fn get_user_metadata(&self, owner_id: AccountId) -> Option<UserMetadata> {
+        if let Some(user_metadata) = self.user_metadata_by_owner.get(&owner_id) {
+            return Some(UserMetadata {
+                name: user_metadata.name,
+                image_url: user_metadata.image_url,
+                banner_url: user_metadata.banner_url,
+            });
+        } else {
+            None
+        }
+    }
+
+    fn set_user_banner_image(&mut self, owner_id: AccountId, img_url: Option<String>) -> bool {
+        if let Some(user_metadata) = self.user_metadata_by_owner.get(&owner_id) {
+            let metadata = UserMetadata {
+                name: user_metadata.name,
+                image_url: user_metadata.image_url,
+                banner_url: img_url,
+            };
+            self.user_metadata_by_owner.insert(&owner_id, &metadata);
+        } else {
+            let metadata = UserMetadata {
+                name: None,
+                image_url: None,
+                banner_url: img_url,
+            };
+            self.user_metadata_by_owner.insert(&owner_id, &metadata);
+        }
+        return true;
+    }
+
+    fn set_user_image(&mut self, owner_id: AccountId, img_url: Option<String>) -> bool {
+        if let Some(user_metadata) = self.user_metadata_by_owner.get(&owner_id) {
+            let metadata = UserMetadata {
+                name: user_metadata.name,
+                image_url: img_url,
+                banner_url: user_metadata.banner_url,
+            };
+            self.user_metadata_by_owner.insert(&owner_id, &metadata);
+        } else {
+            let metadata = UserMetadata {
+                name: None,
+                image_url: img_url,
+                banner_url: None,
+            };
+            self.user_metadata_by_owner.insert(&owner_id, &metadata);
+        }
+        return true;
+    }
+
+    fn set_user_name(&mut self, owner_id: AccountId, name: Option<String>) -> bool {
+        if let Some(user_metadata) = self.user_metadata_by_owner.get(&owner_id) {
+            let metadata = UserMetadata {
+                name: name,
+                image_url: user_metadata.image_url,
+                banner_url: user_metadata.banner_url,
+            };
+            self.user_metadata_by_owner.insert(&owner_id, &metadata);
+        } else {
+            let metadata = UserMetadata {
+                name: name,
+                image_url: None,
+                banner_url: None,
+            };
+            self.user_metadata_by_owner.insert(&owner_id, &metadata);
+        }
+        return true;
+    }
+}
+
+'''

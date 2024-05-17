@@ -1,0 +1,2568 @@
+*GitHub Repository "frol/near-lake-flows-into-sql-base"*
+
+'''--- Cargo.toml ---
+[package]
+name = "near-lake-flows-into-sql"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.58.1"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+anyhow = "1.0.51"
+avro-rs = "0.13.0"
+base64 = "0.11"
+bigdecimal = { version = "0.2", features = ["serde"] }
+cached = "0.23.0"
+dotenv = "0.15.0"
+futures = "0.3.5"
+hex = "0.4"
+itertools = "0.9.0"
+num-traits = "0.2.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.55"
+sqlx = { version = "0.5.11", features = ["runtime-tokio-native-tls", "mysql", "bigdecimal", "json"] }
+syn = "1.0.90"
+tempfile = "3.3.0"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1" }
+tracing = "0.1.13"
+tracing-subscriber = "0.2.4"
+quote = "1.0.17"
+
+near-indexer-primitives = { git = "https://github.com/near/nearcore", rev = "5f09a3bf042b32d1ff26554433ad6449199ea02a" }
+near-crypto = { git = "https://github.com/near/nearcore", rev = "5f09a3bf042b32d1ff26554433ad6449199ea02a" }
+near-lake-framework = { git = "https://github.com/near/near-lake-framework", rev = "582c2996b77eb3a2ea96bca839249f55c209a015" }
+
+'''
+'''--- README.md ---
+This is a tool to move the data from S3 to SingleStore in a structured way.
+
+## Migration
+
+```bash
+# Add the new migration
+sqlx migrate add migration_name
+
+# Apply migrations
+sqlx migrate run
+```
+
+'''
+'''--- migrations/20220221161526_initial.sql ---
+-- https://docs.singlestore.com/db/v7.6/en/reference/sql-reference/data-definition-language-ddl/create-table.html--create-table
+-- https://docs.singlestore.com/managed-service/en/reference/sql-reference/data-types/other-types.html
+
+-- Short cheatsheet from the doc:
+-- - all the tables in this project are columnstore tables
+-- - Shard key is the way to identify which shard stores each row
+-- - Unique key is a superset of the shard key
+-- - There is only one sort key per table, and only one way to make fast range queries based on the sort
+-- - Merging tables work fast if they have the same sort order -> we sort everything by timestamp
+-- - `key ... using hash` gives fast queries by equality
+-- - all the columns in hash keys should also be in shard key
+-- - we don't use enum type because it' not allowed to use enums in keys
+
+-- TODO rename the tables and the fields
+
+-- update_reason options:
+--     {
+--         'TRANSACTION_PROCESSING',
+--         'ACTION_RECEIPT_PROCESSING_STARTED',
+--         'ACTION_RECEIPT_GAS_REWARD',
+--         'RECEIPT_PROCESSING',
+--         'POSTPONED_RECEIPT',
+--         'UPDATED_DELAYED_RECEIPTS',
+--         'VALIDATOR_ACCOUNTS_UPDATE',
+--         'MIGRATION',
+--         'RESHARDING'
+--     }
+CREATE TABLE account_changes
+(
+    affected_account_id                text           NOT NULL,
+    changed_in_block_timestamp         numeric(20, 0) NOT NULL,
+    changed_in_block_hash              text           NOT NULL,
+    caused_by_transaction_hash         text,
+    caused_by_receipt_id               text,
+    update_reason                      text           NOT NULL,
+    affected_account_nonstaked_balance numeric(45, 0) NOT NULL,
+    affected_account_staked_balance    numeric(45, 0) NOT NULL,
+    affected_account_storage_usage     numeric(20, 0) NOT NULL,
+    index_in_block                     integer        NOT NULL,
+    SHARD KEY (affected_account_id, changed_in_block_hash),
+    SORT KEY (changed_in_block_timestamp, index_in_block),
+    UNIQUE KEY (affected_account_id,
+        changed_in_block_hash,
+        caused_by_transaction_hash,
+        caused_by_receipt_id,
+        update_reason,
+        affected_account_nonstaked_balance,
+        affected_account_staked_balance,
+        affected_account_storage_usage),
+    KEY (affected_account_id) USING HASH,
+    KEY (changed_in_block_hash) USING HASH,
+    KEY (changed_in_block_timestamp) USING HASH,
+    KEY (caused_by_receipt_id) USING HASH,
+    KEY (caused_by_transaction_hash) USING HASH
+);
+
+-- action_kind options:
+--      {
+--         'CREATE_ACCOUNT',
+--         'DEPLOY_CONTRACT',
+--         'FUNCTION_CALL',
+--         'TRANSFER',
+--         'STAKE',
+--         'ADD_KEY',
+--         'DELETE_KEY',
+--         'DELETE_ACCOUNT'
+--      }
+CREATE TABLE action_receipt_actions
+(
+    receipt_id                          text           NOT NULL,
+    --     TODO we can drop it since we have index_in_block
+    index_in_action_receipt             integer        NOT NULL,
+    action_kind                         text           NOT NULL,
+    args                                json           NOT NULL,
+    receipt_predecessor_account_id      text           NOT NULL,
+    receipt_receiver_account_id         text           NOT NULL,
+    receipt_included_in_block_timestamp numeric(20, 0) NOT NULL,
+
+    -- TODO should we add hash keys on the new columns?
+    -- TODO add the column
+--     index_in_block                      integer        NOT NULL,
+
+--     method_name AS args::%method_name PERSISTED text,
+--     KEY(method_name) USING HASH
+
+    SHARD KEY (receipt_id),
+    SORT KEY (receipt_included_in_block_timestamp),
+    UNIQUE KEY (receipt_id, index_in_action_receipt),
+    KEY (action_kind) USING HASH,
+    KEY (receipt_predecessor_account_id) USING HASH,
+    KEY (receipt_receiver_account_id) USING HASH,
+    KEY (receipt_included_in_block_timestamp) USING HASH,
+    KEY (receipt_receiver_account_id, receipt_included_in_block_timestamp) USING HASH
+
+-- TODO discuss indexes on json fields
+-- https://docs.singlestore.com/db/v7.6/en/create-your-database/physical-database-schema-design/procedures-for-physical-database-schema-design/using-json.html#indexing-data-in-json-columns
+-- CREATE INDEX action_receipt_actions_args_receiver_id_idx ON action_receipt_actions ((args -> 'args_json' ->> 'receiver_id')) WHERE action_receipt_actions.action_kind = 'FUNCTION_CALL' AND
+--           (action_receipt_actions.args ->> 'args_json') IS NOT NULL;
+);
+
+CREATE TABLE action_receipt_input_data
+(
+    block_timestamp     numeric(20, 0) NOT NULL,
+    input_data_id       text           NOT NULL,
+    input_to_receipt_id text           NOT NULL,
+
+-- TODO should we add hash keys on the new columns?
+    -- TODO add the column
+--     index_in_block      integer        NOT NULL,
+
+    SHARD KEY (input_to_receipt_id),
+    SORT KEY (block_timestamp),
+    UNIQUE KEY (input_data_id, input_to_receipt_id),
+    KEY (block_timestamp) USING HASH,
+    KEY (input_data_id) USING HASH,
+    KEY (input_to_receipt_id) USING HASH
+);
+
+CREATE TABLE action_receipt_output_data
+(
+    block_timestamp        numeric(20, 0) NOT NULL,
+    output_data_id         text           NOT NULL,
+    output_from_receipt_id text           NOT NULL,
+    receiver_account_id    text           NOT NULL,
+
+    -- TODO should we add hash keys on the new columns?
+    -- TODO add the column
+--     index_in_block         integer        NOT NULL,
+
+    SHARD KEY (output_from_receipt_id),
+    SORT KEY (block_timestamp),
+    UNIQUE KEY (output_data_id, output_from_receipt_id),
+    KEY (block_timestamp) USING HASH,
+    KEY (output_data_id) USING HASH,
+    KEY (output_from_receipt_id) USING HASH,
+    KEY (receiver_account_id) USING HASH
+);
+
+CREATE TABLE action_receipts
+(
+    receipt_id                       text           NOT NULL,
+    included_in_block_hash           text           NOT NULL,
+    included_in_chunk_hash           text           NOT NULL,
+    --     TODO we can drop it since we have index_in_block
+    index_in_chunk                   integer        NOT NULL,
+    included_in_block_timestamp      numeric(20, 0) NOT NULL,
+    predecessor_account_id           text           NOT NULL,
+    receiver_account_id              text           NOT NULL,
+    originated_from_transaction_hash text           NOT NULL,
+    signer_account_id                text           NOT NULL,
+    signer_public_key                text           NOT NULL,
+    gas_price                        numeric(45, 0) NOT NULL,
+
+    -- TODO should we add hash keys on the new columns?
+    -- TODO add the column
+--     index_in_block                   integer        NOT NULL,
+
+    SHARD KEY (receipt_id),
+    SORT KEY (included_in_block_timestamp),
+    UNIQUE KEY (receipt_id),
+    KEY (included_in_block_hash) USING HASH,
+    KEY (included_in_chunk_hash) USING HASH,
+    KEY (predecessor_account_id) USING HASH,
+    KEY (receiver_account_id) USING HASH,
+    KEY (included_in_block_timestamp) USING HASH,
+    KEY (originated_from_transaction_hash) USING HASH,
+    KEY (signer_account_id) USING HASH
+);
+
+CREATE TABLE blocks
+(
+    block_height      numeric(20, 0) NOT NULL,
+    block_hash        text           NOT NULL,
+    prev_block_hash   text           NOT NULL,
+    block_timestamp   numeric(20, 0) NOT NULL,
+    total_supply      numeric(45, 0) NOT NULL,
+    gas_price         numeric(45, 0) NOT NULL,
+    author_account_id text           NOT NULL,
+
+    SHARD KEY (block_hash),
+    SORT KEY (block_timestamp),
+    UNIQUE KEY (block_hash),
+    KEY (block_height) USING HASH,
+    KEY (prev_block_hash) USING HASH,
+    KEY (block_timestamp) USING HASH
+);
+
+CREATE TABLE chunks
+(
+    block_timestamp        numeric(20, 0) NOT NULL,
+    included_in_block_hash text           NOT NULL,
+    chunk_hash             text           NOT NULL,
+    shard_id               integer        NOT NULL,
+    signature              text           NOT NULL,
+    gas_limit              numeric(20, 0) NOT NULL,
+    gas_used               numeric(20, 0) NOT NULL,
+    author_account_id      text           NOT NULL,
+
+    SHARD KEY (chunk_hash),
+    SORT KEY (block_timestamp, shard_id),
+    UNIQUE KEY (chunk_hash),
+    KEY (block_timestamp) USING HASH,
+    KEY (included_in_block_hash) USING HASH
+);
+
+-- TODO do we want to use MEDIUMBLOB or VARBINARY?
+-- https://docs.singlestore.com/managed-service/en/reference/sql-reference/data-types/blob-types.html
+CREATE TABLE data_receipts
+(
+    receipt_id                       text           NOT NULL,
+    included_in_block_hash           text           NOT NULL,
+    included_in_chunk_hash           text           NOT NULL,
+    --     TODO we can drop it since we have index_in_block
+    index_in_chunk                   integer        NOT NULL,
+    included_in_block_timestamp      numeric(20, 0) NOT NULL,
+    predecessor_account_id           text           NOT NULL,
+    receiver_account_id              text           NOT NULL,
+    originated_from_transaction_hash text           NOT NULL,
+    data_id                          text           NOT NULL,
+    data                             blob,
+
+    -- TODO should we add hash keys on the new columns?
+    -- TODO add the column
+--     index_in_block                   integer        NOT NULL,
+
+    SHARD KEY (data_id),
+    SORT KEY (included_in_block_timestamp),
+    UNIQUE KEY (data_id),
+    KEY (receipt_id) USING HASH,
+    KEY (included_in_block_hash) USING HASH,
+    KEY (included_in_chunk_hash) USING HASH,
+    KEY (predecessor_account_id) USING HASH,
+    KEY (receiver_account_id) USING HASH,
+    KEY (included_in_block_timestamp) USING HASH,
+    KEY (originated_from_transaction_hash) USING HASH
+);
+
+CREATE TABLE execution_outcome_receipts
+(
+    block_timestamp            numeric(20, 0) NOT NULL,
+    executed_receipt_id        text           NOT NULL,
+    --     TODO we can drop it since we have index_in_block
+    index_in_execution_outcome integer        NOT NULL,
+    produced_receipt_id        text           NOT NULL,
+
+    -- TODO should we add hash keys on the new columns?
+    -- TODO add the column
+--     index_in_block             integer        NOT NULL,
+
+    SHARD KEY (executed_receipt_id),
+    SORT KEY (block_timestamp),
+    UNIQUE KEY (executed_receipt_id, index_in_execution_outcome, produced_receipt_id),
+    KEY (block_timestamp) USING HASH,
+    KEY (produced_receipt_id) USING HASH
+);
+
+-- status options:
+--      {
+--         'UNKNOWN',
+--         'FAILURE',
+--         'SUCCESS_VALUE',
+--         'SUCCESS_RECEIPT_ID'
+--      }
+CREATE TABLE execution_outcomes
+(
+    receipt_id                  text           NOT NULL,
+    executed_in_block_hash      text           NOT NULL,
+    executed_in_block_timestamp numeric(20, 0) NOT NULL,
+--     TODO we can drop it since we have index_in_block
+    index_in_chunk              integer        NOT NULL,
+    gas_burnt                   numeric(20, 0) NOT NULL,
+    tokens_burnt                numeric(45, 0) NOT NULL,
+    executor_account_id         text           NOT NULL,
+    status                      text           NOT NULL,
+    shard_id                    numeric(20, 0) NOT NULL,
+
+    -- TODO should we add hash keys on the new columns?
+    -- TODO add the column
+--     index_in_block              integer        NOT NULL,
+
+    SHARD KEY (receipt_id),
+    SORT KEY (executed_in_block_timestamp),
+    UNIQUE KEY (receipt_id),
+    KEY (executed_in_block_timestamp) USING HASH,
+    KEY (executed_in_block_hash) USING HASH,
+    KEY (status) USING HASH
+);
+
+-- status options:
+--      {
+--         'UNKNOWN',
+--         'FAILURE',
+--         'SUCCESS_VALUE',
+--         'SUCCESS_RECEIPT_ID'
+--      }
+CREATE TABLE transactions
+(
+    transaction_hash                text           NOT NULL,
+    included_in_block_hash          text           NOT NULL,
+    included_in_chunk_hash          text           NOT NULL,
+    --     TODO we can drop it since we have index_in_block
+    index_in_chunk                  integer        NOT NULL,
+    block_timestamp                 numeric(20, 0) NOT NULL,
+    signer_account_id               text           NOT NULL,
+    signer_public_key               text           NOT NULL,
+    nonce                           numeric(20, 0) NOT NULL,
+    receiver_account_id             text           NOT NULL,
+    signature                       text           NOT NULL,
+    status                          text           NOT NULL,
+    converted_into_receipt_id       text           NOT NULL,
+    receipt_conversion_gas_burnt    numeric(20, 0),
+    receipt_conversion_tokens_burnt numeric(45, 0),
+
+    -- TODO should we add hash keys on the new columns?
+    -- TODO add the column
+--     index_in_block                  integer        NOT NULL,
+
+    SHARD KEY (transaction_hash),
+    SORT KEY (block_timestamp),
+    UNIQUE KEY (transaction_hash),
+    KEY (converted_into_receipt_id) USING HASH,
+    KEY (included_in_block_hash) USING HASH,
+    KEY (block_timestamp) USING HASH,
+    KEY (included_in_chunk_hash) USING HASH,
+    KEY (signer_account_id) USING HASH,
+    KEY (signer_public_key) USING HASH,
+    KEY (receiver_account_id) USING HASH
+);
+
+'''
+'''--- src/db_adapters/account_changes.rs ---
+use crate::models;
+
+use itertools::Itertools;
+
+// todo recheck first block on mainnet. Looks like we miss the data in S3
+pub(crate) async fn store_account_changes(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    state_changes: &near_indexer_primitives::views::StateChangesView,
+    block_hash: &near_indexer_primitives::CryptoHash,
+    block_timestamp: u64,
+) -> anyhow::Result<()> {
+    if state_changes.is_empty() {
+        return Ok(());
+    }
+
+    for account_changes_part in &state_changes
+        .iter()
+        .filter_map(|state_change| {
+            models::account_changes::AccountChange::from_state_change_with_cause(
+                state_change,
+                block_hash,
+                block_timestamp,
+                0, // we will fill it later
+            )
+        })
+        .enumerate()
+        .chunks(crate::db_adapters::CHUNK_SIZE_FOR_BATCH_INSERT)
+    {
+        let mut args = sqlx::mysql::MySqlArguments::default();
+        let mut changes_count = 0;
+
+        account_changes_part.for_each(|(i, mut account_change)| {
+            account_change.index_in_block = i as i32;
+            account_change.add_to_args(&mut args);
+            changes_count += 1;
+        });
+
+        let query = models::account_changes::AccountChange::get_query(changes_count)?;
+        sqlx::query_with(&query, args).execute(pool).await?;
+    }
+
+    Ok(())
+}
+
+'''
+'''--- src/db_adapters/blocks.rs ---
+use crate::models;
+
+pub(crate) async fn store_block(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    block: &near_indexer_primitives::views::BlockView,
+) -> anyhow::Result<()> {
+    let mut args = sqlx::mysql::MySqlArguments::default();
+    models::blocks::Block::from_block_view(block).add_to_args(&mut args);
+    let query = models::blocks::Block::get_query(1)?;
+    sqlx::query_with(&query, args).execute(pool).await?;
+    Ok(())
+}
+
+// /// Gets the latest block's height from database
+// pub(crate) async fn latest_block_height(
+//     pool: &actix_diesel::Database<PgConnection>,
+// ) -> Result<Option<u64>, String> {
+//     tracing::debug!(target: crate::INDEXER_FOR_EXPLORER, "fetching latest");
+//     Ok(schema::blocks::table
+//         .select((schema::blocks::dsl::block_height,))
+//         .order(schema::blocks::dsl::block_height.desc())
+//         .limit(1)
+//         .get_optional_result_async::<(bigdecimal::BigDecimal,)>(pool)
+//         .await
+//         .map_err(|err| format!("DB Error: {}", err))?
+//         .and_then(|(block_height,)| block_height.to_u64()))
+// }
+//
+// pub(crate) async fn get_latest_block_before_timestamp(
+//     pool: &actix_diesel::Database<PgConnection>,
+//     timestamp: u64,
+// ) -> anyhow::Result<models::Block> {
+//     Ok(schema::blocks::table
+//         .filter(schema::blocks::dsl::block_timestamp.le(BigDecimal::from(timestamp)))
+//         .order(schema::blocks::dsl::block_timestamp.desc())
+//         .first_async::<models::Block>(pool)
+//         .await
+//         .context("DB Error")?)
+// }
+
+'''
+'''--- src/db_adapters/chunks.rs ---
+use crate::models;
+use itertools::Itertools;
+
+pub(crate) async fn store_chunks(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    shards: &[near_indexer_primitives::IndexerShard],
+    block_hash: &near_indexer_primitives::CryptoHash,
+    block_timestamp: u64,
+) -> anyhow::Result<()> {
+    // Processing by parts to avoid huge bulk insert statements
+    for chunks_part in &shards
+        .iter()
+        .filter_map(|shard| shard.chunk.as_ref())
+        .chunks(crate::db_adapters::CHUNK_SIZE_FOR_BATCH_INSERT)
+    {
+        let mut args = sqlx::mysql::MySqlArguments::default();
+        let mut chunks_count = 0;
+
+        chunks_part.for_each(|chunk| {
+            models::chunks::Chunk::from_chunk_view(chunk, block_hash, block_timestamp)
+                .add_to_args(&mut args);
+            chunks_count += 1;
+        });
+
+        let query = models::chunks::Chunk::get_query(chunks_count)?;
+        sqlx::query_with(&query, args).execute(pool).await?;
+    }
+
+    Ok(())
+}
+
+'''
+'''--- src/db_adapters/execution_outcomes.rs ---
+use cached::Cached;
+use futures::future::try_join_all;
+
+use crate::models;
+
+pub(crate) async fn store_execution_outcomes(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    shards: &[near_indexer_primitives::IndexerShard],
+    block_timestamp: u64,
+    receipts_cache: crate::ReceiptsCache,
+) -> anyhow::Result<()> {
+    let futures = shards.iter().map(|shard| {
+        store_execution_outcomes_for_chunk(
+            pool,
+            &shard.receipt_execution_outcomes,
+            shard.shard_id,
+            block_timestamp,
+            std::sync::Arc::clone(&receipts_cache),
+        )
+    });
+
+    try_join_all(futures).await.map(|_| ())
+}
+
+/// Saves ExecutionOutcome to database and then saves ExecutionOutcomesReceipts
+pub async fn store_execution_outcomes_for_chunk(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    execution_outcomes: &[near_indexer_primitives::IndexerExecutionOutcomeWithReceipt],
+    shard_id: near_indexer_primitives::types::ShardId,
+    block_timestamp: u64,
+    receipts_cache: crate::ReceiptsCache,
+) -> anyhow::Result<()> {
+    let mut outcome_models: Vec<models::execution_outcomes::ExecutionOutcome> = vec![];
+    let mut outcome_receipt_models: Vec<models::execution_outcomes::ExecutionOutcomeReceipt> =
+        vec![];
+    let mut receipts_cache_lock = receipts_cache.lock().await;
+    for (index_in_chunk, outcome) in execution_outcomes.iter().enumerate() {
+        // Trying to take the parent Transaction hash for the Receipt from ReceiptsCache
+        // remove it from cache once found as it is not expected to observe the Receipt for
+        // second time
+        let parent_transaction_hash = receipts_cache_lock.cache_remove(
+            &crate::ReceiptOrDataId::ReceiptId(outcome.execution_outcome.id),
+        );
+
+        let model = models::execution_outcomes::ExecutionOutcome::from_execution_outcome(
+            &outcome.execution_outcome,
+            index_in_chunk as i32,
+            block_timestamp,
+            shard_id,
+        );
+        outcome_models.push(model);
+
+        outcome_receipt_models.extend(
+            outcome
+                .execution_outcome
+                .outcome
+                .receipt_ids
+                .iter()
+                .enumerate()
+                .map(|(index, receipt_id)| {
+                    // if we have `parent_transaction_hash` from cache, then we put all "produced" Receipt IDs
+                    // as key and `parent_transaction_hash` as value, so the Receipts from one of the next blocks
+                    // could find their parents in cache
+                    if let Some(transaction_hash) = &parent_transaction_hash {
+                        receipts_cache_lock.cache_set(
+                            crate::ReceiptOrDataId::ReceiptId(*receipt_id),
+                            transaction_hash.clone(),
+                        );
+                    }
+                    models::execution_outcomes::ExecutionOutcomeReceipt {
+                        block_timestamp: block_timestamp.into(),
+                        executed_receipt_id: outcome.execution_outcome.id.to_string(),
+                        index_in_execution_outcome: index as i32,
+                        produced_receipt_id: receipt_id.to_string(),
+                    }
+                }),
+        );
+    }
+
+    drop(receipts_cache_lock);
+
+    for execution_outcomes_part in
+        outcome_models.chunks(crate::db_adapters::CHUNK_SIZE_FOR_BATCH_INSERT)
+    {
+        let mut args = sqlx::mysql::MySqlArguments::default();
+        let mut execution_outcomes_count = 0;
+
+        execution_outcomes_part
+            .iter()
+            .for_each(|execution_outcome| {
+                execution_outcome.add_to_args(&mut args);
+                execution_outcomes_count += 1;
+            });
+
+        let query =
+            models::execution_outcomes::ExecutionOutcome::get_query(execution_outcomes_count)?;
+        sqlx::query_with(&query, args).execute(pool).await?;
+    }
+
+    for outcome_receipts_part in
+        outcome_receipt_models.chunks(crate::db_adapters::CHUNK_SIZE_FOR_BATCH_INSERT)
+    {
+        let mut args = sqlx::mysql::MySqlArguments::default();
+        let mut outcome_receipts_count = 0;
+
+        outcome_receipts_part.iter().for_each(|outcome_receipt| {
+            outcome_receipt.add_to_args(&mut args);
+            outcome_receipts_count += 1;
+        });
+
+        let query =
+            models::execution_outcomes::ExecutionOutcomeReceipt::get_query(outcome_receipts_count)?;
+        sqlx::query_with(&query, args).execute(pool).await?;
+    }
+
+    Ok(())
+}
+
+'''
+'''--- src/db_adapters/genesis.rs ---
+// TODO how to store genesis? How it's stored in S3?
+use actix_diesel::Database;
+use diesel::PgConnection;
+
+use crate::db_adapters::access_keys::store_access_keys_from_genesis;
+use crate::db_adapters::accounts::store_accounts_from_genesis;
+
+/// This is an ugly hack that allows to execute an async body on a specified actix runtime.
+/// You should only call it from a separate thread!
+///
+/// ```ignore
+/// async fn some_async_function() {
+///     let current_actix_system = actix::System::current();
+///     tokio::tasks::spawn_blocking(move || {
+///         let x = vec![0, 1, 2];
+///         x.map(|i| {
+///             block_on(current_actix_system, async move {
+///                 reqwest::get(...).await.text().await
+///             })
+///         });
+///     }
+/// }
+fn block_on<Fut, T>(
+    actix_arbiter: &actix_rt::ArbiterHandle,
+    f: Fut,
+) -> Result<T, std::sync::mpsc::RecvError>
+where
+    T: Send + 'static,
+    Fut: std::future::Future<Output = T> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    actix_arbiter.spawn(async move {
+        let result = f.await;
+        let _ = tx.send(result);
+    });
+    rx.recv()
+}
+
+/// Iterates over GenesisRecords and stores selected ones (Accounts, AccessKeys)
+/// to database.
+/// Separately stores records divided in portions by 5000 to optimize
+/// memory usage and minimize database queries
+pub(crate) async fn store_genesis_records(
+    pool: Database<PgConnection>,
+    near_config: near_indexer::NearConfig,
+) -> anyhow::Result<()> {
+    tracing::info!(
+        target: crate::INDEXER_FOR_EXPLORER,
+        "Storing genesis records to database...",
+    );
+    let genesis_height = near_config.genesis.config.genesis_height;
+
+    // Remember the current actix runtime thread in order to be able to
+    // schedule async function on it from the thread that processes genesis in
+    // a blocking way.
+    let actix_system = actix::System::current();
+    // Spawn the blocking genesis processing on a separate thread
+    tokio::task::spawn_blocking(move || {
+        let actix_arbiter = actix_system.arbiter();
+
+        let mut accounts_to_store: Vec<crate::models::accounts::Account> = vec![];
+        let mut access_keys_to_store: Vec<crate::models::access_keys::AccessKey> = vec![];
+
+        near_config.genesis.for_each_record(|record| {
+            if accounts_to_store.len() == 5_000 {
+                let mut accounts_to_store_chunk = vec![];
+                std::mem::swap(&mut accounts_to_store, &mut accounts_to_store_chunk);
+                let pool = pool.clone();
+                block_on(
+                    actix_arbiter,
+                    store_accounts_from_genesis(pool, accounts_to_store_chunk),
+                )
+                .expect("storing accounts from genesis failed")
+                .expect("storing accounts from genesis failed");
+            }
+            if access_keys_to_store.len() == 5_000 {
+                let mut access_keys_to_store_chunk = vec![];
+                std::mem::swap(&mut access_keys_to_store, &mut access_keys_to_store_chunk);
+                let pool = pool.clone();
+                block_on(
+                    actix_arbiter,
+                    store_access_keys_from_genesis(pool, access_keys_to_store_chunk),
+                )
+                .expect("storing access keys from genesis failed")
+                .expect("storing access keys from genesis failed");
+            }
+
+            match record {
+                near_indexer::near_primitives::state_record::StateRecord::Account {
+                    account_id,
+                    ..
+                } => {
+                    accounts_to_store.push(crate::models::accounts::Account::new_from_genesis(
+                        account_id,
+                        genesis_height,
+                    ));
+                }
+                near_indexer::near_primitives::state_record::StateRecord::AccessKey {
+                    account_id,
+                    public_key,
+                    access_key,
+                } => {
+                    access_keys_to_store.push(crate::models::access_keys::AccessKey::from_genesis(
+                        public_key,
+                        account_id,
+                        access_key,
+                        genesis_height,
+                    ));
+                }
+                _ => {}
+            };
+        });
+
+        let fut = || async move {
+            store_accounts_from_genesis(pool.clone(), accounts_to_store).await?;
+            store_access_keys_from_genesis(pool, access_keys_to_store).await?;
+            anyhow::Result::<()>::Ok(())
+        };
+        block_on(actix_arbiter, fut())
+            .expect("storing leftover accounts and access keys from genesis failed")
+            .expect("storing leftover accounts and access keys from genesis failed");
+    })
+    .await?;
+
+    tracing::info!(
+        target: crate::INDEXER_FOR_EXPLORER,
+        "Genesis records has been stored.",
+    );
+    Ok(())
+}
+
+'''
+'''--- src/db_adapters/mod.rs ---
+pub(crate) mod account_changes;
+pub(crate) mod blocks;
+pub(crate) mod chunks;
+pub(crate) mod execution_outcomes;
+// pub(crate) mod genesis;
+pub(crate) mod receipts;
+pub(crate) mod transactions;
+
+pub(crate) const CHUNK_SIZE_FOR_BATCH_INSERT: usize = 100;
+
+'''
+'''--- src/db_adapters/receipts.rs ---
+use crate::{models, ParentTransactionHashString, ReceiptOrDataId};
+use cached::Cached;
+use futures::future::try_join_all;
+use futures::try_join;
+use itertools::{Either, Itertools};
+use num_traits::FromPrimitive;
+use sqlx::{Arguments, Row};
+use std::collections::HashMap;
+use std::str::FromStr;
+use tracing::warn;
+
+/// Saves receipts to database
+pub(crate) async fn store_receipts(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    shards: &[near_indexer_primitives::IndexerShard],
+    block_hash: &near_indexer_primitives::CryptoHash,
+    block_timestamp: u64,
+    receipts_cache: crate::ReceiptsCache,
+) -> anyhow::Result<()> {
+    let futures = shards
+        .iter()
+        .filter_map(|shard| shard.chunk.as_ref())
+        .filter(|chunk| !chunk.receipts.is_empty())
+        .map(|chunk| {
+            store_chunk_receipts(
+                pool,
+                &chunk.receipts,
+                block_hash,
+                &chunk.header.chunk_hash,
+                block_timestamp,
+                receipts_cache.clone(),
+            )
+        });
+
+    try_join_all(futures).await.map(|_| ())
+}
+
+async fn store_chunk_receipts(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    receipts: &[near_indexer_primitives::views::ReceiptView],
+    block_hash: &near_indexer_primitives::CryptoHash,
+    chunk_hash: &near_indexer_primitives::CryptoHash,
+    block_timestamp: u64,
+    receipts_cache: crate::ReceiptsCache,
+) -> anyhow::Result<()> {
+    let tx_hashes_for_receipts: HashMap<ReceiptOrDataId, ParentTransactionHashString> =
+        find_tx_hashes_for_receipts(
+            pool,
+            receipts.to_vec(),
+            block_hash,
+            chunk_hash,
+            std::sync::Arc::clone(&receipts_cache),
+        )
+        .await?;
+
+    // At the moment we can observe output data in the Receipt it's impossible to know
+    // the Receipt Id of that Data Receipt. That's why we insert the pair DataId<>ParentTransactionHash
+    // to ReceiptsCache
+    let mut receipts_cache_lock = receipts_cache.lock().await;
+    for receipt in receipts {
+        if let near_indexer_primitives::views::ReceiptEnumView::Action {
+            output_data_receivers,
+            ..
+        } = &receipt.receipt
+        {
+            if !output_data_receivers.is_empty() {
+                if let Some(transaction_hash) = tx_hashes_for_receipts
+                    .get(&crate::ReceiptOrDataId::ReceiptId(receipt.receipt_id))
+                {
+                    for data_receiver in output_data_receivers {
+                        receipts_cache_lock.cache_set(
+                            crate::ReceiptOrDataId::DataId(data_receiver.data_id),
+                            transaction_hash.clone(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // releasing the lock
+    drop(receipts_cache_lock);
+
+    let (action_receipts, data_receipts): (
+        Vec<(usize, &near_indexer_primitives::views::ReceiptView)>,
+        Vec<models::DataReceipt>,
+    ) = receipts
+        .iter()
+        .enumerate()
+        .partition_map(|(index, receipt)| match receipt.receipt {
+            near_indexer_primitives::views::ReceiptEnumView::Action { .. } => {
+                Either::Left((index, receipt))
+            }
+            near_indexer_primitives::views::ReceiptEnumView::Data { data_id, .. } => {
+                // todo it's not good to do it like that. get rid of expect
+                let transaction_hash = tx_hashes_for_receipts
+                    .get(&crate::ReceiptOrDataId::DataId(data_id))
+                    .expect("");
+                Either::Right(
+                    models::DataReceipt::try_from_data_receipt_view(
+                        receipt,
+                        block_hash,
+                        transaction_hash,
+                        chunk_hash,
+                        index as i32,
+                        block_timestamp,
+                    )
+                    .expect("DataReceipt should be converted smoothly"),
+                )
+            }
+        });
+
+    let process_receipt_actions_future = store_receipt_actions(
+        pool,
+        action_receipts,
+        &tx_hashes_for_receipts,
+        block_hash,
+        chunk_hash,
+        block_timestamp,
+    );
+
+    let process_receipt_data_future = store_data_receipts(pool, &data_receipts);
+
+    try_join!(process_receipt_actions_future, process_receipt_data_future)?;
+    Ok(())
+}
+
+/// Looks for already created parent transaction hash for given receipts
+async fn find_tx_hashes_for_receipts(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    mut receipts: Vec<near_indexer_primitives::views::ReceiptView>,
+    // TODO we need to add sort of retry logic, these vars could be helpful
+    block_hash: &near_indexer_primitives::CryptoHash,
+    chunk_hash: &near_indexer_primitives::CryptoHash,
+    receipts_cache: crate::ReceiptsCache,
+) -> anyhow::Result<HashMap<crate::ReceiptOrDataId, crate::ParentTransactionHashString>> {
+    let mut tx_hashes_for_receipts: HashMap<
+        crate::ReceiptOrDataId,
+        crate::ParentTransactionHashString,
+    > = HashMap::new();
+
+    let mut receipts_cache_lock = receipts_cache.lock().await;
+    // add receipt-transaction pairs from the cache to the response
+    tx_hashes_for_receipts.extend(receipts.iter().filter_map(|receipt| {
+        match receipt.receipt {
+            near_indexer_primitives::views::ReceiptEnumView::Action { .. } => receipts_cache_lock
+                .cache_get(&crate::ReceiptOrDataId::ReceiptId(receipt.receipt_id))
+                .map(|parent_transaction_hash| {
+                    (
+                        crate::ReceiptOrDataId::ReceiptId(receipt.receipt_id),
+                        parent_transaction_hash.clone(),
+                    )
+                }),
+            near_indexer_primitives::views::ReceiptEnumView::Data { data_id, .. } => {
+                // Pair DataId:ParentTransactionHash won't be used after this moment
+                // We want to clean it up to prevent our cache from growing
+                receipts_cache_lock
+                    .cache_remove(&crate::ReceiptOrDataId::DataId(data_id))
+                    .map(|parent_transaction_hash| {
+                        (
+                            crate::ReceiptOrDataId::DataId(data_id),
+                            parent_transaction_hash,
+                        )
+                    })
+            }
+        }
+    }));
+    // releasing the lock
+    drop(receipts_cache_lock);
+
+    // discard the Receipts already in cache from the attempts to search
+    receipts.retain(|r| match r.receipt {
+        near_indexer_primitives::views::ReceiptEnumView::Data { data_id, .. } => {
+            !tx_hashes_for_receipts.contains_key(&crate::ReceiptOrDataId::DataId(data_id))
+        }
+        near_indexer_primitives::views::ReceiptEnumView::Action { .. } => {
+            !tx_hashes_for_receipts.contains_key(&crate::ReceiptOrDataId::ReceiptId(r.receipt_id))
+        }
+    });
+
+    if receipts.is_empty() {
+        return Ok(tx_hashes_for_receipts);
+    }
+
+    warn!(
+        target: crate::INDEXER,
+        "Looking for parent transaction hash in database for {} receipts {:#?}",
+        &receipts.len(),
+        &receipts,
+    );
+
+    let (action_receipt_ids, data_ids): (Vec<String>, Vec<String>) =
+        receipts.iter().partition_map(|r| match r.receipt {
+            near_indexer_primitives::views::ReceiptEnumView::Action { .. } => {
+                Either::Left(r.receipt_id.to_string())
+            }
+            near_indexer_primitives::views::ReceiptEnumView::Data { data_id, .. } => {
+                Either::Right(data_id.to_string())
+            }
+        });
+
+    if !data_ids.is_empty() {
+        let tx_hashes_for_data_receipts =
+            find_transaction_hashes_for_data_receipts(pool, &data_ids, &receipts).await?;
+        tx_hashes_for_receipts.extend(tx_hashes_for_data_receipts.clone());
+
+        receipts.retain(|r| {
+            !tx_hashes_for_data_receipts
+                .contains_key(&crate::ReceiptOrDataId::ReceiptId(r.receipt_id))
+        });
+        if receipts.is_empty() {
+            return Ok(tx_hashes_for_receipts);
+        }
+    }
+
+    let tx_hashes_for_receipts_via_outcomes =
+        find_transaction_hashes_for_receipts_via_outcomes(pool, &action_receipt_ids).await?;
+    tx_hashes_for_receipts.extend(tx_hashes_for_receipts_via_outcomes.clone());
+
+    receipts.retain(|r| {
+        !tx_hashes_for_receipts_via_outcomes
+            .contains_key(&crate::ReceiptOrDataId::ReceiptId(r.receipt_id))
+    });
+    if receipts.is_empty() {
+        return Ok(tx_hashes_for_receipts);
+    }
+
+    let tx_hashes_for_receipt_via_transactions =
+        find_transaction_hashes_for_receipt_via_transactions(pool, &action_receipt_ids).await?;
+    tx_hashes_for_receipts.extend(tx_hashes_for_receipt_via_transactions.clone());
+
+    receipts.retain(|r| {
+        !tx_hashes_for_receipt_via_transactions
+            .contains_key(&crate::ReceiptOrDataId::ReceiptId(r.receipt_id))
+    });
+    if !receipts.is_empty() {
+        panic!("all the transactions should be found by this place");
+    }
+
+    Ok(tx_hashes_for_receipts)
+}
+
+async fn find_transaction_hashes_for_data_receipts(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    data_ids: &[String],
+    receipts: &[near_indexer_primitives::views::ReceiptView],
+) -> anyhow::Result<HashMap<crate::ReceiptOrDataId, crate::ParentTransactionHashString>> {
+    let query = "SELECT action_receipt_output_data.output_data_id, receipts.originated_from_transaction_hash
+                        FROM action_receipt_output_data JOIN receipts ON action_receipt_output_data.output_from_receipt_id = receipts.receipt_id
+                        WHERE action_receipt_output_data.output_data_id IN ".to_owned() + &crate::models::create_placeholder(data_ids.len())?;
+    let mut args = sqlx::mysql::MySqlArguments::default();
+    data_ids.iter().for_each(|data_id| {
+        args.add(data_id);
+    });
+
+    let res = sqlx::query_with(&query, args).fetch_all(pool).await?;
+
+    let tx_hashes_for_data_id_via_data_output_hashmap: HashMap<
+        crate::ReceiptOrDataId,
+        crate::ParentTransactionHashString,
+    > = res
+        .iter()
+        .map(|q| (q.get(0), q.get(1)))
+        .map(
+            |(receipt_id_string, transaction_hash_string): (String, String)| {
+                (
+                    crate::ReceiptOrDataId::DataId(
+                        near_indexer_primitives::CryptoHash::from_str(&receipt_id_string)
+                            .expect("Failed to convert String to CryptoHash"),
+                    ),
+                    transaction_hash_string,
+                )
+            },
+        )
+        .collect();
+
+    Ok(receipts
+        .iter()
+        .filter_map(|r| match r.receipt {
+            near_indexer_primitives::views::ReceiptEnumView::Data { data_id, .. } => {
+                tx_hashes_for_data_id_via_data_output_hashmap
+                    .get(&crate::ReceiptOrDataId::DataId(data_id))
+                    .map(|tx_hash| {
+                        (
+                            crate::ReceiptOrDataId::ReceiptId(r.receipt_id),
+                            tx_hash.to_string(),
+                        )
+                    })
+            }
+            _ => None,
+        })
+        .collect())
+}
+
+async fn find_transaction_hashes_for_receipts_via_outcomes(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    action_receipt_ids: &[String],
+) -> anyhow::Result<HashMap<crate::ReceiptOrDataId, crate::ParentTransactionHashString>> {
+    let query = "SELECT execution_outcome_receipts.produced_receipt_id, receipts.originated_from_transaction_hash
+                        FROM execution_outcome_receipts JOIN receipts ON execution_outcome_receipts.executed_receipt_id = receipts.receipt_id
+                        WHERE execution_outcome_receipts.produced_receipt_id IN ".to_owned() + &crate::models::create_placeholder(action_receipt_ids.len())?;
+    let mut args = sqlx::mysql::MySqlArguments::default();
+    action_receipt_ids.iter().for_each(|data_id| {
+        args.add(data_id);
+    });
+
+    let res = sqlx::query_with(&query, args).fetch_all(pool).await?;
+
+    Ok(res
+        .iter()
+        .map(|q| (q.get(0), q.get(1)))
+        .map(
+            |(receipt_id_string, transaction_hash_string): (String, String)| {
+                (
+                    crate::ReceiptOrDataId::ReceiptId(
+                        near_indexer_primitives::CryptoHash::from_str(&receipt_id_string)
+                            .expect("Failed to convert String to CryptoHash"),
+                    ),
+                    transaction_hash_string,
+                )
+            },
+        )
+        .collect())
+}
+
+async fn find_transaction_hashes_for_receipt_via_transactions(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    action_receipt_ids: &[String],
+) -> anyhow::Result<HashMap<crate::ReceiptOrDataId, crate::ParentTransactionHashString>> {
+    let query = "SELECT converted_into_receipt_id, transaction_hash
+                        FROM transactions
+                        WHERE converted_into_receipt_id IN "
+        .to_owned()
+        + &crate::models::create_placeholder(action_receipt_ids.len())?;
+    let mut args = sqlx::mysql::MySqlArguments::default();
+    action_receipt_ids.iter().for_each(|data_id| {
+        args.add(data_id);
+    });
+
+    let res = sqlx::query_with(&query, args).fetch_all(pool).await?;
+
+    Ok(res
+        .iter()
+        .map(|q| (q.get(0), q.get(1)))
+        .map(
+            |(receipt_id_string, transaction_hash_string): (String, String)| {
+                (
+                    crate::ReceiptOrDataId::ReceiptId(
+                        near_indexer_primitives::CryptoHash::from_str(&receipt_id_string)
+                            .expect("Failed to convert String to CryptoHash"),
+                    ),
+                    transaction_hash_string,
+                )
+            },
+        )
+        .collect())
+}
+
+async fn store_receipt_actions(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    receipts: Vec<(usize, &near_indexer_primitives::views::ReceiptView)>,
+    tx_hashes_for_receipts: &HashMap<ReceiptOrDataId, ParentTransactionHashString>,
+    block_hash: &near_indexer_primitives::CryptoHash,
+    chunk_hash: &near_indexer_primitives::CryptoHash,
+    block_timestamp: u64,
+) -> anyhow::Result<()> {
+    let receipt_actions: Vec<models::ActionReceipt> = receipts
+        .iter()
+        .filter_map(|(index, receipt)| {
+            let transaction_hash = tx_hashes_for_receipts
+                .get(&crate::ReceiptOrDataId::ReceiptId(receipt.receipt_id))
+                .expect("");
+            models::ActionReceipt::try_from_action_receipt_view(
+                receipt,
+                block_hash,
+                transaction_hash,
+                chunk_hash,
+                *index as i32,
+                block_timestamp,
+            )
+            .ok()
+        })
+        .collect();
+
+    let receipt_action_actions: Vec<models::ActionReceiptAction> = receipts
+        .iter()
+        .filter_map(|(_, receipt)| {
+            if let near_indexer_primitives::views::ReceiptEnumView::Action { actions, .. } =
+                &receipt.receipt
+            {
+                Some(actions.iter().enumerate().map(move |(index, action)| {
+                    models::ActionReceiptAction::from_action_view(
+                        receipt.receipt_id.to_string(),
+                        i32::from_usize(index).expect("We expect usize to not overflow i32 here"),
+                        action,
+                        receipt.predecessor_id.to_string(),
+                        receipt.receiver_id.to_string(),
+                        block_timestamp,
+                    )
+                }))
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .collect();
+
+    let receipt_action_input_data: Vec<models::ActionReceiptInputData> = receipts
+        .iter()
+        .filter_map(|(_, receipt)| {
+            if let near_indexer_primitives::views::ReceiptEnumView::Action {
+                input_data_ids, ..
+            } = &receipt.receipt
+            {
+                Some(input_data_ids.iter().map(move |data_id| {
+                    models::ActionReceiptInputData::from_data_id(
+                        block_timestamp,
+                        receipt.receipt_id.to_string(),
+                        data_id.to_string(),
+                    )
+                }))
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .collect();
+
+    let receipt_action_output_data: Vec<models::ActionReceiptOutputData> = receipts
+        .iter()
+        .filter_map(|(_, receipt)| {
+            if let near_indexer_primitives::views::ReceiptEnumView::Action {
+                output_data_receivers,
+                ..
+            } = &receipt.receipt
+            {
+                Some(output_data_receivers.iter().map(move |receiver| {
+                    models::ActionReceiptOutputData::from_data_receiver(
+                        block_timestamp,
+                        receipt.receipt_id.to_string(),
+                        receiver,
+                    )
+                }))
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .collect();
+
+    try_join!(
+        store_action_receipts(pool, &receipt_actions),
+        store_action_receipt_actions(pool, &receipt_action_actions),
+        store_action_receipts_input_data(pool, &receipt_action_input_data),
+        store_action_receipts_output_data(pool, &receipt_action_output_data),
+    )?;
+
+    Ok(())
+}
+
+async fn store_action_receipts(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    receipts: &[models::ActionReceipt],
+) -> anyhow::Result<()> {
+    for action_receipts_part in receipts.chunks(crate::db_adapters::CHUNK_SIZE_FOR_BATCH_INSERT) {
+        let mut args = sqlx::mysql::MySqlArguments::default();
+        let mut action_receipts_count = 0;
+
+        action_receipts_part.iter().for_each(|action_receipt| {
+            action_receipt.add_to_args(&mut args);
+            action_receipts_count += 1;
+        });
+
+        let query = models::receipts::ActionReceipt::get_query(action_receipts_count)?;
+        sqlx::query_with(&query, args).execute(pool).await?;
+    }
+
+    Ok(())
+}
+
+async fn store_action_receipt_actions(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    receipts: &[models::ActionReceiptAction],
+) -> anyhow::Result<()> {
+    for action_receipts_part in receipts.chunks(crate::db_adapters::CHUNK_SIZE_FOR_BATCH_INSERT) {
+        let mut args = sqlx::mysql::MySqlArguments::default();
+        let mut action_receipts_count = 0;
+
+        action_receipts_part.iter().for_each(|action_receipt| {
+            action_receipt.add_to_args(&mut args);
+            action_receipts_count += 1;
+        });
+
+        let query = models::receipts::ActionReceiptAction::get_query(action_receipts_count)?;
+        sqlx::query_with(&query, args).execute(pool).await?;
+    }
+
+    Ok(())
+}
+
+async fn store_action_receipts_input_data(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    receipts: &[models::ActionReceiptInputData],
+) -> anyhow::Result<()> {
+    for action_receipts_part in receipts.chunks(crate::db_adapters::CHUNK_SIZE_FOR_BATCH_INSERT) {
+        let mut args = sqlx::mysql::MySqlArguments::default();
+        let mut action_receipts_count = 0;
+
+        action_receipts_part.iter().for_each(|action_receipt| {
+            action_receipt.add_to_args(&mut args);
+            action_receipts_count += 1;
+        });
+
+        let query = models::receipts::ActionReceiptInputData::get_query(action_receipts_count)?;
+        sqlx::query_with(&query, args).execute(pool).await?;
+    }
+
+    Ok(())
+}
+
+async fn store_action_receipts_output_data(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    receipts: &[models::ActionReceiptOutputData],
+) -> anyhow::Result<()> {
+    for action_receipts_part in receipts.chunks(crate::db_adapters::CHUNK_SIZE_FOR_BATCH_INSERT) {
+        let mut args = sqlx::mysql::MySqlArguments::default();
+        let mut action_receipts_count = 0;
+
+        action_receipts_part.iter().for_each(|action_receipt| {
+            action_receipt.add_to_args(&mut args);
+            action_receipts_count += 1;
+        });
+
+        let query = models::receipts::ActionReceiptOutputData::get_query(action_receipts_count)?;
+        sqlx::query_with(&query, args).execute(pool).await?;
+    }
+
+    Ok(())
+}
+
+async fn store_data_receipts(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    receipts: &[models::DataReceipt],
+) -> anyhow::Result<()> {
+    for data_receipts_part in receipts.chunks(crate::db_adapters::CHUNK_SIZE_FOR_BATCH_INSERT) {
+        let mut args = sqlx::mysql::MySqlArguments::default();
+        let mut data_receipts_count = 0;
+
+        data_receipts_part.iter().for_each(|data_receipt| {
+            data_receipt.add_to_args(&mut args);
+            data_receipts_count += 1;
+        });
+
+        let query = models::receipts::DataReceipt::get_query(data_receipts_count)?;
+        sqlx::query_with(&query, args).execute(pool).await?;
+    }
+
+    Ok(())
+}
+
+'''
+'''--- src/db_adapters/transactions.rs ---
+use cached::Cached;
+use futures::future::try_join_all;
+use itertools::Itertools;
+
+use crate::models;
+
+pub(crate) async fn store_transactions(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    shards: &[near_indexer_primitives::IndexerShard],
+    block_hash: &near_indexer_primitives::CryptoHash,
+    block_timestamp: u64,
+    receipts_cache: crate::ReceiptsCache,
+) -> anyhow::Result<()> {
+    let tx_futures = shards
+        .iter()
+        .filter_map(|shard| shard.chunk.as_ref())
+        .filter(|chunk| !chunk.transactions.is_empty())
+        .map(|chunk| {
+            store_chunk_transactions(
+                pool,
+                chunk.transactions.iter().enumerate().collect::<Vec<(
+                    usize,
+                    &near_indexer_primitives::IndexerTransactionWithOutcome,
+                )>>(),
+                &chunk.header.chunk_hash,
+                block_hash,
+                block_timestamp,
+                "",
+                receipts_cache.clone(),
+            )
+        });
+
+    try_join_all(tx_futures).await?;
+    Ok(())
+}
+
+async fn store_chunk_transactions(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    transactions: Vec<(
+        usize,
+        &near_indexer_primitives::IndexerTransactionWithOutcome,
+    )>,
+    chunk_hash: &near_indexer_primitives::CryptoHash,
+    block_hash: &near_indexer_primitives::CryptoHash,
+    block_timestamp: u64,
+    // hack for supporting duplicated transaction hashes. Empty for most of transactions
+    // TODO it's a rudiment of previous solution. Create the solution again
+    transaction_hash_suffix: &str,
+    receipts_cache: crate::ReceiptsCache,
+) -> anyhow::Result<()> {
+    // Processing by parts to avoid huge bulk insert statements
+    for transactions_part in &transactions
+        .iter()
+        .chunks(crate::db_adapters::CHUNK_SIZE_FOR_BATCH_INSERT)
+    {
+        let mut args = sqlx::mysql::MySqlArguments::default();
+        let mut transaction_count = 0;
+        let mut receipts_cache_lock = receipts_cache.lock().await;
+
+        transactions_part.for_each(|(index, tx)| {
+            let transaction_hash = tx.transaction.hash.to_string() + transaction_hash_suffix;
+            let converted_into_receipt_id = tx
+                .outcome
+                .execution_outcome
+                .outcome
+                .receipt_ids
+                .first()
+                .expect("`receipt_ids` must contain one Receipt Id");
+
+            // Save this Transaction hash to ReceiptsCache
+            // we use the Receipt ID to which this transaction was converted
+            // and the Transaction hash as a value.
+            // Later, while Receipt will be looking for a parent Transaction hash
+            // it will be able to find it in the ReceiptsCache
+            receipts_cache_lock.cache_set(
+                crate::ReceiptOrDataId::ReceiptId(*converted_into_receipt_id),
+                transaction_hash.clone(),
+            );
+
+            models::Transaction::from_indexer_transaction(
+                tx,
+                &transaction_hash,
+                &converted_into_receipt_id.to_string(),
+                block_hash,
+                chunk_hash,
+                block_timestamp,
+                *index as i32,
+            )
+            .add_to_args(&mut args);
+            transaction_count += 1;
+        });
+        // releasing the lock
+        drop(receipts_cache_lock);
+
+        let query = models::transactions::Transaction::get_query(transaction_count)?;
+        sqlx::query_with(&query, args).execute(pool).await?;
+    }
+
+    Ok(())
+}
+
+'''
+'''--- src/lib.rs ---
+use proc_macro::TokenStream;
+use quote::quote;
+use syn::{parse_macro_input, ItemStruct};
+
+#[proc_macro_derive(FieldCount)]
+pub fn derive_field_count(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as ItemStruct);
+
+    let name = &input.ident;
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+    let field_count = input.fields.iter().count();
+
+    let output = quote! {
+        impl #impl_generics FieldCount for #name #ty_generics #where_clause {
+            fn field_count() -> usize {
+                #field_count
+            }
+        }
+    };
+
+    TokenStream::from(output)
+}
+
+'''
+'''--- src/main.rs ---
+// TODO cleanup imports in all the files in the end
+use cached::SizedCache;
+use dotenv::dotenv;
+use futures::future::try_join_all;
+use futures::{try_join, StreamExt};
+use near_lake_framework::LakeConfig;
+use std::env;
+use tokio::sync::Mutex;
+use tracing_subscriber::EnvFilter;
+
+mod db_adapters;
+mod models;
+
+// Categories for logging
+// TODO naming
+pub(crate) const INDEXER: &str = "indexer";
+
+#[derive(Clone, Hash, PartialEq, Eq, Debug)]
+pub enum ReceiptOrDataId {
+    ReceiptId(near_indexer_primitives::CryptoHash),
+    DataId(near_indexer_primitives::CryptoHash),
+}
+// Creating type aliases to make HashMap types for cache more explicit
+pub type ParentTransactionHashString = String;
+// Introducing a simple cache for Receipts to find their parent Transactions without
+// touching the database
+// The key is ReceiptID
+// The value is TransactionHash (the very parent of the Receipt)
+pub type ReceiptsCache =
+    std::sync::Arc<Mutex<SizedCache<ReceiptOrDataId, ParentTransactionHashString>>>;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    dotenv().ok();
+
+    let pool = sqlx::MySqlPool::connect(&env::var("DATABASE_URL")?).await?;
+    // TODO Error: while executing migrations: error returned from database: 1128 (HY000): Function 'near_indexer.GET_LOCK' is not defined
+    // sqlx::migrate!().run(&pool).await?;
+
+    init_tracing();
+
+    let config = LakeConfig {
+        // //  for testnet, lake starts streaming from 42839521
+        //     s3_bucket_name: "near-lake-data-testnet".to_string(),
+        //     s3_region_name: "eu-central-1".to_string(),
+        //     start_block_height: 42376888 //42376923, // want to start from the first to fill in the cache correctly // 42376888
+        s3_bucket_name: "near-lake-data-mainnet".to_string(),
+        s3_region_name: "eu-central-1".to_string(),
+        start_block_height: 9820210, //9825208, //12117820, //9823031, //9820214, // 9820210 9823031 12117827 data receipt
+    };
+    let stream = near_lake_framework::streamer(config);
+
+    // We want to prevent unnecessary SELECT queries to the database to find
+    // the Transaction hash for the Receipt.
+    // Later we need to find the Receipt which is a parent to underlying Receipts.
+    // Receipt ID will of the child will be stored as key and parent Transaction hash/Receipt ID
+    // will be stored as a value
+    let receipts_cache: ReceiptsCache =
+        std::sync::Arc::new(Mutex::new(SizedCache::with_size(100_000)));
+
+    let mut handlers = tokio_stream::wrappers::ReceiverStream::new(stream)
+        .map(|streamer_message| {
+            handle_streamer_message(
+                streamer_message,
+                &pool,
+                std::sync::Arc::clone(&receipts_cache),
+            )
+        })
+        .buffer_unordered(1usize);
+
+    let mut time_now = std::time::Instant::now();
+    while let Some(handle_message) = handlers.next().await {
+        match handle_message {
+            Ok(_) => {}
+            Err(e) => {
+                return Err(anyhow::anyhow!(e));
+            }
+        }
+        let elapsed = time_now.elapsed();
+        println!("Elapsed: {:.3?}", elapsed);
+        time_now = std::time::Instant::now();
+    }
+
+    Ok(())
+}
+
+async fn handle_streamer_message(
+    streamer_message: near_lake_framework::near_indexer_primitives::StreamerMessage,
+    pool: &sqlx::Pool<sqlx::MySql>,
+    receipts_cache: ReceiptsCache,
+) -> anyhow::Result<()> {
+    eprintln!(
+        "{} / shards {}",
+        streamer_message.block.header.height,
+        streamer_message.shards.len()
+    );
+
+    let blocks_future = db_adapters::blocks::store_block(pool, &streamer_message.block);
+
+    let chunks_future = db_adapters::chunks::store_chunks(
+        pool,
+        &streamer_message.shards,
+        &streamer_message.block.header.hash,
+        streamer_message.block.header.timestamp,
+    );
+
+    let transactions_future = db_adapters::transactions::store_transactions(
+        pool,
+        &streamer_message.shards,
+        &streamer_message.block.header.hash,
+        streamer_message.block.header.timestamp,
+        std::sync::Arc::clone(&receipts_cache),
+    );
+
+    let receipts_future = db_adapters::receipts::store_receipts(
+        pool,
+        &streamer_message.shards,
+        &streamer_message.block.header.hash,
+        streamer_message.block.header.timestamp,
+        std::sync::Arc::clone(&receipts_cache),
+    );
+
+    let execution_outcomes_future = db_adapters::execution_outcomes::store_execution_outcomes(
+        pool,
+        &streamer_message.shards,
+        streamer_message.block.header.timestamp,
+        std::sync::Arc::clone(&receipts_cache),
+    );
+
+    let account_changes_future = async {
+        let futures = streamer_message.shards.iter().map(|shard| {
+            db_adapters::account_changes::store_account_changes(
+                pool,
+                &shard.state_changes,
+                &streamer_message.block.header.hash,
+                streamer_message.block.header.timestamp,
+            )
+        });
+
+        try_join_all(futures).await.map(|_| ())
+    };
+
+    try_join!(blocks_future, chunks_future, transactions_future)?;
+    try_join!(receipts_future)?; // this guy can contain local receipts, so we have to do that after transactions_future finished the work
+    try_join!(execution_outcomes_future, account_changes_future)?; // this guy thinks that receipts_future finished, and clears the cache
+    Ok(())
+}
+
+fn init_tracing() {
+    let mut env_filter = EnvFilter::new("near_lake_framework=info");
+
+    if let Ok(rust_log) = std::env::var("RUST_LOG") {
+        if !rust_log.is_empty() {
+            for directive in rust_log.split(',').filter_map(|s| match s.parse() {
+                Ok(directive) => Some(directive),
+                Err(err) => {
+                    eprintln!("Ignoring directive `{}`: {}", s, err);
+                    None
+                }
+            }) {
+                env_filter = env_filter.add_directive(directive);
+            }
+        }
+    }
+
+    tracing_subscriber::fmt::Subscriber::builder()
+        .with_env_filter(env_filter)
+        .with_writer(std::io::stderr)
+        .init();
+}
+
+'''
+'''--- src/models/account_changes.rs ---
+use std::str::FromStr;
+
+use bigdecimal::BigDecimal;
+use sqlx::Arguments;
+
+use crate::models::{FieldCount, PrintEnum};
+
+#[derive(Debug, sqlx::FromRow, FieldCount)]
+pub struct AccountChange {
+    pub affected_account_id: String,
+    pub changed_in_block_timestamp: BigDecimal,
+    pub changed_in_block_hash: String,
+    pub caused_by_transaction_hash: Option<String>,
+    pub caused_by_receipt_id: Option<String>,
+    pub update_reason: String,
+    pub affected_account_nonstaked_balance: BigDecimal,
+    pub affected_account_staked_balance: BigDecimal,
+    pub affected_account_storage_usage: BigDecimal,
+    pub index_in_block: i32,
+}
+
+impl AccountChange {
+    pub fn from_state_change_with_cause(
+        state_change_with_cause: &near_indexer_primitives::views::StateChangeWithCauseView,
+        changed_in_block_hash: &near_indexer_primitives::CryptoHash,
+        changed_in_block_timestamp: u64,
+        index_in_block: i32,
+    ) -> Option<Self> {
+        let near_indexer_primitives::views::StateChangeWithCauseView { cause, value } =
+            state_change_with_cause;
+
+        let (account_id, account): (String, Option<&near_indexer_primitives::views::AccountView>) =
+            match value {
+                near_indexer_primitives::views::StateChangeValueView::AccountUpdate {
+                    account_id,
+                    account,
+                } => (account_id.to_string(), Some(account)),
+                near_indexer_primitives::views::StateChangeValueView::AccountDeletion {
+                    account_id,
+                } => (account_id.to_string(), None),
+                _ => return None,
+            };
+
+        Some(Self {
+            affected_account_id: account_id,
+            changed_in_block_timestamp: changed_in_block_timestamp.into(),
+            changed_in_block_hash: changed_in_block_hash.to_string(),
+            caused_by_transaction_hash: if let near_indexer_primitives::views::StateChangeCauseView::TransactionProcessing {tx_hash } = cause {
+                Some(tx_hash.to_string())
+            } else {
+                None
+            },
+            caused_by_receipt_id: match cause {
+                near_indexer_primitives::views::StateChangeCauseView::ActionReceiptProcessingStarted { receipt_hash} => Some(receipt_hash.to_string()),
+                near_indexer_primitives::views::StateChangeCauseView::ActionReceiptGasReward { receipt_hash } => Some(receipt_hash.to_string()),
+                near_indexer_primitives::views::StateChangeCauseView::ReceiptProcessing { receipt_hash } => Some(receipt_hash.to_string()),
+                near_indexer_primitives::views::StateChangeCauseView::PostponedReceipt { receipt_hash } => Some(receipt_hash.to_string()),
+                _ => None,
+            },
+            update_reason: cause.print().to_string(),
+            affected_account_nonstaked_balance: if let Some(acc) = account {
+                BigDecimal::from_str(acc.amount.to_string().as_str())
+                    .expect("`amount` expected to be u128")
+            } else {
+                BigDecimal::from(0)
+            },
+            affected_account_staked_balance: if let Some(acc) = account {
+                BigDecimal::from_str(acc.locked.to_string().as_str())
+                    .expect("`locked` expected to be u128")
+            } else {
+                BigDecimal::from(0)
+            },
+            affected_account_storage_usage: if let Some(acc) = account {
+                acc.storage_usage.into()
+            } else {
+                BigDecimal::from(0)
+            },
+            index_in_block
+        })
+    }
+
+    pub fn add_to_args(&self, args: &mut sqlx::mysql::MySqlArguments) {
+        args.add(&self.affected_account_id);
+        args.add(&self.changed_in_block_timestamp);
+        args.add(&self.changed_in_block_hash);
+        args.add(&self.caused_by_transaction_hash);
+        args.add(&self.caused_by_receipt_id);
+        args.add(&self.update_reason);
+        args.add(&self.affected_account_nonstaked_balance);
+        args.add(&self.affected_account_staked_balance);
+        args.add(&self.affected_account_storage_usage);
+        args.add(&self.index_in_block);
+    }
+
+    pub fn get_query(account_changes_count: usize) -> anyhow::Result<String> {
+        crate::models::create_query_with_placeholders(
+            "INSERT IGNORE INTO account_changes VALUES",
+            account_changes_count,
+            AccountChange::field_count(),
+        )
+    }
+}
+
+'''
+'''--- src/models/blocks.rs ---
+use std::str::FromStr;
+
+use bigdecimal::BigDecimal;
+use sqlx::Arguments;
+
+use crate::models::FieldCount;
+
+#[derive(Debug, sqlx::FromRow, FieldCount)]
+pub struct Block {
+    pub block_height: BigDecimal,
+    pub block_hash: String,
+    pub prev_block_hash: String,
+    pub block_timestamp: BigDecimal,
+    pub total_supply: BigDecimal,
+    pub gas_price: BigDecimal,
+    pub author_account_id: String,
+}
+
+impl Block {
+    pub fn from_block_view(block_view: &near_indexer_primitives::views::BlockView) -> Self {
+        Self {
+            block_height: block_view.header.height.into(),
+            block_hash: block_view.header.hash.to_string(),
+            prev_block_hash: block_view.header.prev_hash.to_string(),
+            block_timestamp: block_view.header.timestamp.into(),
+            total_supply: BigDecimal::from_str(block_view.header.total_supply.to_string().as_str())
+                .expect("`total_supply` expected to be u128"),
+            gas_price: BigDecimal::from_str(block_view.header.gas_price.to_string().as_str())
+                .expect("`gas_price` expected to be u128"),
+            author_account_id: block_view.author.to_string(),
+        }
+    }
+
+    pub fn add_to_args(&self, args: &mut sqlx::mysql::MySqlArguments) {
+        args.add(&self.block_height);
+        args.add(&self.block_hash);
+        args.add(&self.prev_block_hash);
+        args.add(&self.block_timestamp);
+        args.add(&self.total_supply);
+        args.add(&self.gas_price);
+        args.add(&self.author_account_id);
+    }
+
+    pub fn get_query(blocks_count: usize) -> anyhow::Result<String> {
+        crate::models::create_query_with_placeholders(
+            "INSERT IGNORE INTO blocks VALUES",
+            blocks_count,
+            Block::field_count(),
+        )
+    }
+}
+
+'''
+'''--- src/models/chunks.rs ---
+use bigdecimal::BigDecimal;
+use sqlx::Arguments;
+
+use crate::models::FieldCount;
+
+#[derive(Debug, sqlx::FromRow, FieldCount)]
+pub struct Chunk {
+    pub block_timestamp: BigDecimal,
+    pub included_in_block_hash: String,
+    pub chunk_hash: String,
+    pub shard_id: BigDecimal,
+    pub signature: String,
+    pub gas_limit: BigDecimal,
+    pub gas_used: BigDecimal,
+    pub author_account_id: String,
+}
+
+impl Chunk {
+    pub fn from_chunk_view(
+        chunk_view: &near_indexer_primitives::IndexerChunkView,
+        block_hash: &near_indexer_primitives::CryptoHash,
+        block_timestamp: u64,
+    ) -> Self {
+        Self {
+            block_timestamp: block_timestamp.into(),
+            included_in_block_hash: block_hash.to_string(),
+            chunk_hash: chunk_view.header.chunk_hash.to_string(),
+            shard_id: chunk_view.header.shard_id.into(),
+            signature: chunk_view.header.signature.to_string(),
+            gas_limit: chunk_view.header.gas_limit.into(),
+            gas_used: chunk_view.header.gas_used.into(),
+            author_account_id: chunk_view.author.to_string(),
+        }
+    }
+
+    pub fn add_to_args(&self, args: &mut sqlx::mysql::MySqlArguments) {
+        args.add(&self.block_timestamp);
+        args.add(&self.included_in_block_hash);
+        args.add(&self.chunk_hash);
+        args.add(&self.shard_id);
+        args.add(&self.signature);
+        args.add(&self.gas_limit);
+        args.add(&self.gas_used);
+        args.add(&self.author_account_id);
+    }
+
+    pub fn get_query(chunks_count: usize) -> anyhow::Result<String> {
+        crate::models::create_query_with_placeholders(
+            "INSERT IGNORE INTO chunks VALUES",
+            chunks_count,
+            Chunk::field_count(),
+        )
+    }
+}
+
+'''
+'''--- src/models/execution_outcomes.rs ---
+use std::str::FromStr;
+
+use bigdecimal::BigDecimal;
+use sqlx::Arguments;
+
+use crate::models::{FieldCount, PrintEnum};
+
+#[derive(Debug, sqlx::FromRow, FieldCount)]
+pub struct ExecutionOutcome {
+    pub receipt_id: String,
+    pub executed_in_block_hash: String,
+    pub executed_in_block_timestamp: BigDecimal,
+    pub index_in_chunk: i32,
+    pub gas_burnt: BigDecimal,
+    pub tokens_burnt: BigDecimal,
+    pub executor_account_id: String,
+    pub status: String,
+    pub shard_id: BigDecimal,
+}
+
+impl ExecutionOutcome {
+    pub fn from_execution_outcome(
+        execution_outcome: &near_indexer_primitives::views::ExecutionOutcomeWithIdView,
+        index_in_chunk: i32,
+        executed_in_block_timestamp: u64,
+        shard_id: u64,
+    ) -> Self {
+        Self {
+            executed_in_block_hash: execution_outcome.block_hash.to_string(),
+            executed_in_block_timestamp: executed_in_block_timestamp.into(),
+            index_in_chunk,
+            receipt_id: execution_outcome.id.to_string(),
+            gas_burnt: execution_outcome.outcome.gas_burnt.into(),
+            tokens_burnt: BigDecimal::from_str(
+                execution_outcome.outcome.tokens_burnt.to_string().as_str(),
+            )
+            .expect("`tokens_burnt` expected to be u128"),
+            executor_account_id: execution_outcome.outcome.executor_id.to_string(),
+            status: execution_outcome.outcome.status.print().to_string(),
+            shard_id: shard_id.into(),
+        }
+    }
+
+    pub fn add_to_args(&self, args: &mut sqlx::mysql::MySqlArguments) {
+        args.add(&self.receipt_id);
+        args.add(&self.executed_in_block_hash);
+        args.add(&self.executed_in_block_timestamp);
+        args.add(&self.index_in_chunk);
+        args.add(&self.gas_burnt);
+        args.add(&self.tokens_burnt);
+        args.add(&self.executor_account_id);
+        args.add(&self.status);
+        args.add(&self.shard_id);
+    }
+
+    pub fn get_query(execution_outcome_count: usize) -> anyhow::Result<String> {
+        crate::models::create_query_with_placeholders(
+            "INSERT IGNORE INTO execution_outcomes VALUES",
+            execution_outcome_count,
+            ExecutionOutcome::field_count(),
+        )
+    }
+}
+
+#[derive(Debug, sqlx::FromRow, FieldCount)]
+pub struct ExecutionOutcomeReceipt {
+    pub block_timestamp: BigDecimal,
+    pub executed_receipt_id: String,
+    pub index_in_execution_outcome: i32,
+    pub produced_receipt_id: String,
+}
+
+impl ExecutionOutcomeReceipt {
+    pub fn add_to_args(&self, args: &mut sqlx::mysql::MySqlArguments) {
+        args.add(&self.block_timestamp);
+        args.add(&self.executed_receipt_id);
+        args.add(&self.index_in_execution_outcome);
+        args.add(&self.produced_receipt_id);
+    }
+
+    pub fn get_query(execution_outcome_receipt_count: usize) -> anyhow::Result<String> {
+        crate::models::create_query_with_placeholders(
+            "INSERT IGNORE INTO execution_outcome_receipts VALUES",
+            execution_outcome_receipt_count,
+            ExecutionOutcomeReceipt::field_count(),
+        )
+    }
+}
+
+'''
+'''--- src/models/mod.rs ---
+use near_indexer_primitives::views::{
+    AccessKeyPermissionView, ExecutionStatusView, StateChangeCauseView,
+};
+
+pub use near_lake_flows_into_sql::FieldCount;
+pub use receipts::{
+    ActionReceipt, ActionReceiptAction, ActionReceiptInputData, ActionReceiptOutputData,
+    DataReceipt,
+};
+pub use transactions::Transaction;
+
+pub(crate) use serializers::extract_action_type_and_value_from_action_view;
+
+pub(crate) mod account_changes;
+pub(crate) mod blocks;
+pub(crate) mod chunks;
+pub(crate) mod execution_outcomes;
+pub(crate) mod receipts;
+mod serializers;
+pub(crate) mod transactions;
+
+pub trait FieldCount {
+    /// Get the number of fields on a struct.
+    fn field_count() -> usize;
+}
+
+fn create_query_with_placeholders(
+    query: &str,
+    mut items_count: usize,
+    fields_count: usize,
+) -> anyhow::Result<String> {
+    if items_count < 1 {
+        return Err(anyhow::anyhow!("At least 1 item expected"));
+    }
+
+    let placeholder = create_placeholder(fields_count)?;
+    // Generates `INSERT INTO table VALUES (?, ?, ?), (?, ?, ?)`
+    let mut res = query.to_owned() + " " + &placeholder;
+    items_count -= 1;
+    while items_count > 0 {
+        res += ", ";
+        res += &placeholder;
+        items_count -= 1;
+    }
+
+    Ok(res)
+}
+
+// Generates `(?, ?, ?)`
+pub fn create_placeholder(mut fields_count: usize) -> anyhow::Result<String> {
+    if fields_count < 1 {
+        return Err(anyhow::anyhow!("At least 1 field expected"));
+    }
+    let mut item = "(?".to_owned();
+    fields_count -= 1;
+    while fields_count > 0 {
+        item += ", ?";
+        fields_count -= 1;
+    }
+    item += ")";
+    Ok(item)
+}
+
+pub(crate) trait PrintEnum {
+    fn print(&self) -> &str;
+}
+
+impl PrintEnum for ExecutionStatusView {
+    fn print(&self) -> &str {
+        match self {
+            ExecutionStatusView::Unknown => "UNKNOWN",
+            ExecutionStatusView::Failure(_) => "FAILURE",
+            ExecutionStatusView::SuccessValue(_) => "SUCCESS_VALUE",
+            ExecutionStatusView::SuccessReceiptId(_) => "SUCCESS_RECEIPT_ID",
+        }
+    }
+}
+
+impl PrintEnum for AccessKeyPermissionView {
+    fn print(&self) -> &str {
+        match self {
+            AccessKeyPermissionView::FunctionCall { .. } => "FUNCTION_CALL",
+            AccessKeyPermissionView::FullAccess => "FULL_ACCESS",
+        }
+    }
+}
+
+impl PrintEnum for StateChangeCauseView {
+    fn print(&self) -> &str {
+        match self {
+            StateChangeCauseView::NotWritableToDisk => {
+                panic!("Unexpected variant {:?} received", self)
+            }
+            StateChangeCauseView::InitialState => panic!("Unexpected variant {:?} received", self),
+            StateChangeCauseView::TransactionProcessing { .. } => "TRANSACTION_PROCESSING",
+            StateChangeCauseView::ActionReceiptProcessingStarted { .. } => {
+                "ACTION_RECEIPT_PROCESSING_STARTED"
+            }
+            StateChangeCauseView::ActionReceiptGasReward { .. } => "ACTION_RECEIPT_GAS_REWARD",
+            StateChangeCauseView::ReceiptProcessing { .. } => "RECEIPT_PROCESSING",
+            StateChangeCauseView::PostponedReceipt { .. } => "POSTPONED_RECEIPT",
+            StateChangeCauseView::UpdatedDelayedReceipts => "UPDATED_DELAYED_RECEIPTS",
+            StateChangeCauseView::ValidatorAccountsUpdate => "VALIDATOR_ACCOUNTS_UPDATE",
+            StateChangeCauseView::Migration => "MIGRATION",
+            StateChangeCauseView::Resharding => "RESHARDING",
+        }
+    }
+}
+
+'''
+'''--- src/models/receipts.rs ---
+use std::str::FromStr;
+
+use bigdecimal::BigDecimal;
+use sqlx::Arguments;
+
+use crate::models::FieldCount;
+
+#[derive(Debug, sqlx::FromRow, FieldCount)]
+pub struct DataReceipt {
+    pub receipt_id: String,
+    pub included_in_block_hash: String,
+    pub included_in_chunk_hash: String,
+    pub receipt_index_in_chunk: i32,
+    pub included_in_block_timestamp: BigDecimal,
+    pub predecessor_account_id: String,
+    pub receiver_account_id: String,
+    pub originated_from_transaction_hash: String,
+    pub data_id: String,
+    pub data: Option<Vec<u8>>,
+}
+
+impl DataReceipt {
+    pub fn try_from_data_receipt_view(
+        receipt: &near_indexer_primitives::views::ReceiptView,
+        block_hash: &near_indexer_primitives::CryptoHash,
+        transaction_hash: &str,
+        chunk_hash: &near_indexer_primitives::CryptoHash,
+        index_in_chunk: i32,
+        block_timestamp: u64,
+    ) -> anyhow::Result<Self> {
+        if let near_indexer_primitives::views::ReceiptEnumView::Data { data_id, data } =
+            &receipt.receipt
+        {
+            Ok(Self {
+                receipt_id: receipt.receipt_id.to_string(),
+                included_in_block_hash: block_hash.to_string(),
+                included_in_chunk_hash: chunk_hash.to_string(),
+                predecessor_account_id: receipt.predecessor_id.to_string(),
+                receiver_account_id: receipt.receiver_id.to_string(),
+                originated_from_transaction_hash: transaction_hash.to_string(),
+                receipt_index_in_chunk: index_in_chunk,
+                included_in_block_timestamp: block_timestamp.into(),
+                data_id: data_id.to_string(),
+                data: data.clone(),
+            })
+        } else {
+            Err(anyhow::anyhow!("Given ReceiptView is not of Data variant"))
+        }
+    }
+
+    pub fn add_to_args(&self, args: &mut sqlx::mysql::MySqlArguments) {
+        args.add(&self.receipt_id);
+        args.add(&self.included_in_block_hash);
+        args.add(&self.included_in_chunk_hash);
+        args.add(&self.receipt_index_in_chunk);
+        args.add(&self.included_in_block_timestamp);
+        args.add(&self.predecessor_account_id);
+        args.add(&self.receiver_account_id);
+        args.add(&self.originated_from_transaction_hash);
+        args.add(&self.data_id);
+        args.add(&self.data);
+    }
+
+    pub fn get_query(items_count: usize) -> anyhow::Result<String> {
+        crate::models::create_query_with_placeholders(
+            "INSERT IGNORE INTO data_receipts VALUES",
+            items_count,
+            DataReceipt::field_count(),
+        )
+    }
+}
+
+#[derive(Debug, sqlx::FromRow, FieldCount)]
+pub struct ActionReceipt {
+    pub receipt_id: String,
+    pub included_in_block_hash: String,
+    pub included_in_chunk_hash: String,
+    pub receipt_index_in_chunk: i32,
+    pub included_in_block_timestamp: BigDecimal,
+    pub predecessor_account_id: String,
+    pub receiver_account_id: String,
+    pub originated_from_transaction_hash: String,
+    pub signer_account_id: String,
+    pub signer_public_key: String,
+    pub gas_price: BigDecimal,
+}
+
+impl ActionReceipt {
+    pub fn try_from_action_receipt_view(
+        receipt: &near_indexer_primitives::views::ReceiptView,
+        block_hash: &near_indexer_primitives::CryptoHash,
+        transaction_hash: &str,
+        chunk_hash: &near_indexer_primitives::CryptoHash,
+        index_in_chunk: i32,
+        block_timestamp: u64,
+    ) -> anyhow::Result<Self> {
+        if let near_indexer_primitives::views::ReceiptEnumView::Action {
+            signer_id,
+            signer_public_key,
+            gas_price,
+            ..
+        } = &receipt.receipt
+        {
+            Ok(Self {
+                receipt_id: receipt.receipt_id.to_string(),
+                included_in_block_hash: block_hash.to_string(),
+                included_in_chunk_hash: chunk_hash.to_string(),
+                predecessor_account_id: receipt.predecessor_id.to_string(),
+                receiver_account_id: receipt.receiver_id.to_string(),
+                originated_from_transaction_hash: transaction_hash.to_string(),
+                receipt_index_in_chunk: index_in_chunk,
+                included_in_block_timestamp: block_timestamp.into(),
+                signer_account_id: signer_id.to_string(),
+                signer_public_key: signer_public_key.to_string(),
+                gas_price: BigDecimal::from_str(gas_price.to_string().as_str())
+                    .expect("gas_price expected to be u128"),
+            })
+        } else {
+            Err(anyhow::anyhow!(
+                "Given ReceiptView is not of Action variant"
+            ))
+        }
+    }
+
+    pub fn add_to_args(&self, args: &mut sqlx::mysql::MySqlArguments) {
+        args.add(&self.receipt_id);
+        args.add(&self.included_in_block_hash);
+        args.add(&self.included_in_chunk_hash);
+        args.add(&self.receipt_index_in_chunk);
+        args.add(&self.included_in_block_timestamp);
+        args.add(&self.predecessor_account_id);
+        args.add(&self.receiver_account_id);
+        args.add(&self.originated_from_transaction_hash);
+        args.add(&self.signer_account_id);
+        args.add(&self.signer_public_key);
+        args.add(&self.gas_price);
+    }
+
+    pub fn get_query(items_count: usize) -> anyhow::Result<String> {
+        crate::models::create_query_with_placeholders(
+            "INSERT IGNORE INTO action_receipts VALUES",
+            items_count,
+            ActionReceipt::field_count(),
+        )
+    }
+}
+
+#[derive(Debug, sqlx::FromRow, FieldCount)]
+pub struct ActionReceiptAction {
+    pub receipt_id: String,
+    pub index_in_action_receipt: i32,
+    pub action_kind: String,
+    pub args: serde_json::Value,
+    pub receipt_predecessor_account_id: String,
+    pub receipt_receiver_account_id: String,
+    pub receipt_included_in_block_timestamp: BigDecimal,
+}
+
+impl ActionReceiptAction {
+    pub fn from_action_view(
+        receipt_id: String,
+        index: i32,
+        action_view: &near_indexer_primitives::views::ActionView,
+        predecessor_account_id: String,
+        receiver_account_id: String,
+        block_timestamp: u64,
+    ) -> Self {
+        let (action_kind, args) =
+            crate::models::extract_action_type_and_value_from_action_view(action_view);
+
+        Self {
+            receipt_id,
+            index_in_action_receipt: index,
+            args,
+            action_kind,
+            receipt_predecessor_account_id: predecessor_account_id,
+            receipt_receiver_account_id: receiver_account_id,
+            receipt_included_in_block_timestamp: block_timestamp.into(),
+        }
+    }
+
+    pub fn add_to_args(&self, args: &mut sqlx::mysql::MySqlArguments) {
+        args.add(&self.receipt_id);
+        args.add(&self.index_in_action_receipt);
+        args.add(&self.action_kind);
+        args.add(&self.args.to_string());
+        args.add(&self.receipt_predecessor_account_id);
+        args.add(&self.receipt_receiver_account_id);
+        args.add(&self.receipt_included_in_block_timestamp);
+    }
+
+    pub fn get_query(items_count: usize) -> anyhow::Result<String> {
+        crate::models::create_query_with_placeholders(
+            "INSERT IGNORE INTO action_receipt_actions VALUES",
+            items_count,
+            ActionReceiptAction::field_count(),
+        )
+    }
+}
+
+#[derive(Debug, sqlx::FromRow, FieldCount)]
+pub struct ActionReceiptInputData {
+    pub block_timestamp: BigDecimal,
+    pub input_to_receipt_id: String,
+    pub input_data_id: String,
+}
+
+impl ActionReceiptInputData {
+    pub fn from_data_id(block_timestamp: u64, receipt_id: String, data_id: String) -> Self {
+        Self {
+            block_timestamp: block_timestamp.into(),
+            input_to_receipt_id: receipt_id,
+            input_data_id: data_id,
+        }
+    }
+
+    pub fn add_to_args(&self, args: &mut sqlx::mysql::MySqlArguments) {
+        args.add(&self.block_timestamp);
+        args.add(&self.input_to_receipt_id);
+        args.add(&self.input_data_id);
+    }
+
+    pub fn get_query(items_count: usize) -> anyhow::Result<String> {
+        crate::models::create_query_with_placeholders(
+            "INSERT IGNORE INTO action_receipt_input_data VALUES",
+            items_count,
+            ActionReceiptInputData::field_count(),
+        )
+    }
+}
+
+#[derive(Debug, sqlx::FromRow, FieldCount)]
+pub struct ActionReceiptOutputData {
+    pub block_timestamp: BigDecimal,
+    pub output_from_receipt_id: String,
+    pub output_data_id: String,
+    pub receiver_account_id: String,
+}
+
+impl ActionReceiptOutputData {
+    pub fn from_data_receiver(
+        block_timestamp: u64,
+        receipt_id: String,
+        data_receiver: &near_indexer_primitives::views::DataReceiverView,
+    ) -> Self {
+        Self {
+            block_timestamp: block_timestamp.into(),
+            output_from_receipt_id: receipt_id,
+            output_data_id: data_receiver.data_id.to_string(),
+            receiver_account_id: data_receiver.receiver_id.to_string(),
+        }
+    }
+
+    pub fn add_to_args(&self, args: &mut sqlx::mysql::MySqlArguments) {
+        args.add(&self.block_timestamp);
+        args.add(&self.output_from_receipt_id);
+        args.add(&self.output_data_id);
+        args.add(&self.receiver_account_id);
+    }
+
+    pub fn get_query(items_count: usize) -> anyhow::Result<String> {
+        crate::models::create_query_with_placeholders(
+            "INSERT IGNORE INTO action_receipt_output_data VALUES",
+            items_count,
+            ActionReceiptOutputData::field_count(),
+        )
+    }
+}
+
+'''
+'''--- src/models/serializers.rs ---
+use near_indexer_primitives::views::ActionView;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+/// We want to store permission field more explicitly so we are making copy of nearcore struct
+/// to change serde parameters of serialization.
+#[derive(Serialize, Deserialize, Debug, sqlx::FromRow)]
+pub(crate) struct AccessKeyView {
+    pub nonce: near_indexer_primitives::types::Nonce,
+    pub permission: AccessKeyPermissionView,
+}
+
+impl From<&near_indexer_primitives::views::AccessKeyView> for AccessKeyView {
+    fn from(access_key_view: &near_indexer_primitives::views::AccessKeyView) -> Self {
+        Self {
+            nonce: access_key_view.nonce,
+            permission: access_key_view.permission.clone().into(),
+        }
+    }
+}
+
+/// This is a enum we want to store more explicitly, so we copy it from nearcore and provide
+/// different serde representation settings
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub(crate) enum AccessKeyPermissionView {
+    FunctionCall {
+        allowance: Option<near_indexer_primitives::types::Balance>,
+        receiver_id: String,
+        method_names: Vec<String>,
+    },
+    FullAccess,
+}
+
+impl From<near_indexer_primitives::views::AccessKeyPermissionView> for AccessKeyPermissionView {
+    fn from(permission: near_indexer_primitives::views::AccessKeyPermissionView) -> Self {
+        match permission {
+            near_indexer_primitives::views::AccessKeyPermissionView::FullAccess => Self::FullAccess,
+            near_indexer_primitives::views::AccessKeyPermissionView::FunctionCall {
+                allowance,
+                receiver_id,
+                method_names,
+            } => Self::FunctionCall {
+                allowance,
+                receiver_id: receiver_id.escape_default().to_string(),
+                method_names: method_names
+                    .into_iter()
+                    .map(|method_name| method_name.escape_default().to_string())
+                    .collect(),
+            },
+        }
+    }
+}
+
+pub(crate) fn extract_action_type_and_value_from_action_view(
+    action_view: &near_indexer_primitives::views::ActionView,
+) -> (String, serde_json::Value) {
+    match action_view {
+        ActionView::CreateAccount => ("CREATE_ACCOUNT".to_string(), json!({})),
+        ActionView::DeployContract { code } => (
+            "DEPLOY_CONTRACT".to_string(),
+            json!({
+                "code_sha256":  hex::encode(
+                    base64::decode(code).expect("code expected to be encoded to base64")
+                )
+            }),
+        ),
+        ActionView::FunctionCall {
+            method_name,
+            args,
+            gas,
+            deposit,
+        } => {
+            let mut arguments = json!({
+                "method_name": method_name.escape_default().to_string(),
+                "args_base64": args,
+                "gas": gas,
+                "deposit": deposit.to_string(),
+            });
+
+            // During denormalization of action_receipt_actions table we wanted to try to decode
+            // args which is base64 encoded in case if it is a JSON object and put them near initial
+            // args_base64
+            // See for reference https://github.com/near/near-indexer-for-explorer/issues/87
+            if let Ok(decoded_args) = base64::decode(args) {
+                if let Ok(mut args_json) = serde_json::from_slice(&decoded_args) {
+                    escape_json(&mut args_json);
+                    arguments["args_json"] = args_json;
+                }
+            }
+
+            ("FUNCTION_CALL".to_string(), arguments)
+        }
+        ActionView::Transfer { deposit } => (
+            "TRANSFER".to_string(),
+            json!({ "deposit": deposit.to_string() }),
+        ),
+        ActionView::Stake { stake, public_key } => (
+            "STAKE".to_string(),
+            json!({
+                "stake": stake.to_string(),
+                "public_key": public_key,
+            }),
+        ),
+        ActionView::AddKey {
+            public_key,
+            access_key,
+        } => (
+            "ADD_KEY".to_string(),
+            json!({
+                "public_key": public_key,
+                "access_key": crate::models::serializers::AccessKeyView::from(access_key),
+            }),
+        ),
+        ActionView::DeleteKey { public_key } => (
+            "DELETE_KEY".to_string(),
+            json!({
+                "public_key": public_key,
+            }),
+        ),
+        ActionView::DeleteAccount { beneficiary_id } => (
+            "DELETE_ACCOUNT".to_string(),
+            json!({
+                "beneficiary_id": beneficiary_id,
+            }),
+        ),
+    }
+}
+
+/// This function will modify the JSON escaping the values
+/// We can not store data with null-bytes in TEXT or JSONB fields
+/// of PostgreSQL
+/// ref: https://www.commandprompt.com/blog/null-characters-workarounds-arent-good-enough/
+fn escape_json(object: &mut serde_json::Value) {
+    match object {
+        serde_json::Value::Object(ref mut value) => {
+            for (_key, val) in value {
+                escape_json(val);
+            }
+        }
+        serde_json::Value::Array(ref mut values) => {
+            for element in values.iter_mut() {
+                escape_json(element)
+            }
+        }
+        serde_json::Value::String(ref mut value) => *value = value.escape_default().to_string(),
+        _ => {}
+    }
+}
+
+'''
+'''--- src/models/transactions.rs ---
+use std::str::FromStr;
+
+use bigdecimal::BigDecimal;
+use sqlx::Arguments;
+
+use crate::models::{FieldCount, PrintEnum};
+
+#[derive(Debug, sqlx::FromRow, FieldCount)]
+pub struct Transaction {
+    pub transaction_hash: String,
+    pub included_in_block_hash: String,
+    pub included_in_chunk_hash: String,
+    pub index_in_chunk: i32,
+    pub block_timestamp: BigDecimal,
+    pub signer_account_id: String,
+    pub signer_public_key: String,
+    pub nonce: BigDecimal,
+    pub receiver_account_id: String,
+    pub signature: String,
+    pub status: String,
+    pub converted_into_receipt_id: String,
+    pub receipt_conversion_gas_burnt: BigDecimal,
+    pub receipt_conversion_tokens_burnt: BigDecimal,
+}
+
+impl Transaction {
+    pub fn from_indexer_transaction(
+        tx: &near_indexer_primitives::IndexerTransactionWithOutcome,
+        // hack for supporting duplicated transaction hashes
+        transaction_hash: &str,
+        converted_into_receipt_id: &str,
+        block_hash: &near_indexer_primitives::CryptoHash,
+        chunk_hash: &near_indexer_primitives::CryptoHash,
+        block_timestamp: u64,
+        index_in_chunk: i32,
+    ) -> Self {
+        Self {
+            transaction_hash: transaction_hash.to_string(),
+            included_in_block_hash: block_hash.to_string(),
+            block_timestamp: block_timestamp.into(),
+            index_in_chunk,
+            nonce: tx.transaction.nonce.into(),
+            signer_account_id: tx.transaction.signer_id.to_string(),
+            signer_public_key: tx.transaction.public_key.to_string(),
+            signature: tx.transaction.signature.to_string(),
+            receiver_account_id: tx.transaction.receiver_id.to_string(),
+            converted_into_receipt_id: converted_into_receipt_id.to_string(),
+            included_in_chunk_hash: chunk_hash.to_string(),
+            status: tx
+                .outcome
+                .execution_outcome
+                .outcome
+                .status
+                .print()
+                .to_string(),
+            receipt_conversion_gas_burnt: tx.outcome.execution_outcome.outcome.gas_burnt.into(),
+            receipt_conversion_tokens_burnt: BigDecimal::from_str(
+                tx.outcome
+                    .execution_outcome
+                    .outcome
+                    .tokens_burnt
+                    .to_string()
+                    .as_str(),
+            )
+            .expect("`token_burnt` must be u128"),
+        }
+    }
+
+    pub fn add_to_args(&self, args: &mut sqlx::mysql::MySqlArguments) {
+        args.add(&self.transaction_hash);
+        args.add(&self.included_in_block_hash);
+        args.add(&self.included_in_chunk_hash);
+        args.add(&self.index_in_chunk);
+        args.add(&self.block_timestamp);
+        args.add(&self.signer_account_id);
+        args.add(&self.signer_public_key);
+        args.add(&self.nonce);
+        args.add(&self.receiver_account_id);
+        args.add(&self.signature);
+        args.add(&self.status);
+        args.add(&self.converted_into_receipt_id);
+        args.add(&self.receipt_conversion_gas_burnt);
+        args.add(&self.receipt_conversion_tokens_burnt);
+    }
+
+    pub fn get_query(transactions_count: usize) -> anyhow::Result<String> {
+        crate::models::create_query_with_placeholders(
+            "INSERT IGNORE INTO transactions VALUES",
+            transactions_count,
+            Transaction::field_count(),
+        )
+    }
+}
+
+'''

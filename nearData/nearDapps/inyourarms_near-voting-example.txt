@@ -1,0 +1,742 @@
+*GitHub Repository "inyourarms/near-voting-example"*
+
+'''--- .github/workflows/ci.yml ---
+# This is a basic workflow to help you get started with Actions
+
+name: CI
+
+# Controls when the action will run. Triggers the workflow on push or pull request
+# events but only for the master branch
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - master
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  # This workflow contains a single job called "build"
+  build:
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+    - name: Install Rust
+      uses: hecrj/setup-rust-action@v1
+      with:
+        rust-version: nightly-2020-03-19
+
+    # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+    - uses: actions/checkout@v2
+
+    # Build nearcore
+    - name: Build nearcore
+      run: make release
+
+    # Copy binaries to server
+    - name: Copy binaries to a server
+      run: |
+        echo "${{ secrets.SSH_PRIV_KEY }}" | tr -d '\r' > ~/.ssh/id_rsa
+        echo "${{ secrets.SSH_PUB_KEY }}" > ~/.ssh/id_rsa.pub
+        chmod 700 ~/.ssh/id_rsa
+        eval "$(ssh-agent -s)"
+        ssh-add ~/.ssh/id_rsa 
+        ssh-keyscan -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+        
+        scp -r -o StrictHostKeyChecking=no target/release/ ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:~/
+        
+    # Run nearup with binaries
+    - name: Run nearup with binaries
+      run: |
+        ssh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} '~/.nearup/nearup stop && ~/.nearup/nearup guildnet --nodocker --binary-path ~/release/' 
+
+'''
+'''--- .github/workflows/main.yml ---
+name: CICD
+
+env:
+  DOCKER_BUILDKIT: 1 
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        release-name: ["mainnet", "testnet"]
+    steps:
+      - uses: actions/checkout@v2
+      - name: Get Github Tag
+        env: 
+          RELEASE_NAME: ${{ matrix.release-name }}
+        run: |
+          regex=""
+          if [ "$RELEASE_NAME" == "mainnet" ]; then 
+            regex="[0-9]+.[0-9]+.[0-9]+$"
+          elif [ "$RELEASE_NAME" == "testnet" ]; then
+            regex="[0-9]+.[0-9]+.[0-9]+-rc+"
+          elif [ "$RELEASE_NAME" == "betanet" ]; then
+            regex="[0-9]+.[0-9]+.[0-9]+-beta+" 
+          fi
+          echo $(curl -s https://api.github.com/repos/nearprotocol/nearcore/releases | jq -c -r --arg regex "$regex" 'map(select(.tag_name | test($regex)))[0].tag_name') > github-tag.txt
+
+      - name: Install Rust
+        if: ${{ success() }}
+        uses: hecrj/setup-rust-action@v1
+        with:
+          rust-version: nightly-2020-03-19
+
+      - name: Clone NEARCore
+        if: ${{ success() }}
+        uses: actions/checkout@v2
+        with:
+          repository: nearprotocol/nearcore
+          ref: ${{ env.RELEASE_VERSION }}
+
+      - name: Cargo Test
+        run: cargo test
+            
+      - name: Test neard
+        run: cd neard && cargo test    
+
+'''
+'''--- README.md ---
+![Sync Fork](https://github.com/inyourarms/near-voting-example/workflows/Sync%20Fork/badge.svg)
+![CI](https://github.com/inyourarms/near-voting-example/workflows/CI/badge.svg)
+
+Near voting DApp example in Rust Fix-05
+=================================
+
+## Description
+
+This contract implements simple voting dapp backed by storage on blockchain.
+Contract in `contract/src/lib.rs` provides methods to vote / get votes for candidate
+
+## To Run
+
+```
+git clone https://github.com/spdd/near-voting-example
+```
+
+## Setup 
+Install dependencies:
+
+```
+yarn
+```
+
+Make sure you have `near-shell` by running:
+
+```
+near --version
+```
+
+If you need to install `near-shell`:
+
+```
+npm install near-shell -g
+```
+
+## Set your NODE_ENV
+
+```
+export NODE_ENV=development
+```
+
+## Login
+If you do not have a NEAR account, please create one with [NEAR Wallet](https://wallet.nearprotocol.com).
+
+In the project root, login with `near-shell` by following the instructions after this command:
+
+```
+near login
+```
+
+Modify the top of `src/config.js`, changing the `CONTRACT_NAME` to be the NEAR account that was just used to log in.
+
+```javascript
+…
+const CONTRACT_NAME = 'YOUR_ACCOUNT_NAME_HERE'; /* TODO: fill this in! */
+…
+```
+
+Start the example!
+
+```
+yarn start
+```
+
+## To Test
+
+```
+cd contract
+cargo test -- --nocapture
+```
+
+## To Explore
+
+- `contract/src/lib.rs` for the contract code
+- `src/index.html` for the front-end HTML
+- `src/main.js` for the JavaScript front-end code and how to integrate contracts
+- `src/test.js` for the JS tests for the contract
+
+'''
+'''--- REARME.md ---
+![CICD](https://github.com/inyourarms/near-voting-example/workflows/CICD/badge.svg)
+
+# A Fully Automated NEARCore Docker Deployment using GitHub Actions and Watchtower
+
+In this guide I will explain how to create a github actions workflow that automatically tests, builds, and deploys a Docker images that built from the latest source code (tags: "rc" and "beta") of [NEARCore](https://github.com/nearprotocol/nearcore) repository.
+
+## Getting started
+
+First of all, you need to familiarize yourself with [Github Actions](https://docs.github.com/en/actions) with which you can create any CI/CD workflows.
+Also Githab Actions has a good [API](https://developer.github.com/v3/actions/)
+
+To automate a set of tasks, you need to create workflows in your GitHub repository. GitHub looks for YAML files inside of the `.github/workflows` directory.
+Events like commits, the opening or closing of pull requests, schedules, or web-hooks trigger the start of a workflow. For a complete list of available events, refer to this [documentation](https://docs.github.com/en/actions/reference/events-that-trigger-workflows).
+
+In this guide we will use only a [schedule](https://docs.github.com/en/actions/reference/events-that-trigger-workflows#scheduled-events) event that allows to trigger a workflow at a scheduled time.
+
+Workflows are composed of jobs, which run concurrently by default. You can configure jobs to depend on the success of other jobs in the same workflow.
+Jobs contain a list of steps, which GitHub executes in sequence. A step can be a set of shell commands or an action, which is a pre-built, reusable step implemented either in TypeScript or inside a container. Some actions are provided by the GitHub team, while the open-source community maintains many more. [The GitHub Marketplace](https://github.com/marketplace?type=actions) keeps a catalog of known open-source actions.
+
+GitHub Actions is free for all open-source projects, and private repositories get up to [2000 minutes per month](https://github.com/features/actions#pricing-details)(33,33 hours). For smaller projects, this means being able to take full advantage of automation from the very beginning at no extra cost. You can even use the system for free forever if you use self-hosted runners.
+
+## CI/CD Workflow
+
+>The workflow will create a two docker images with tags: `dockerusername/nearcore:beta`(betanet) and `dockerusername/nearcore:rc`(testnet)
+
+>If you don't have a Docker ID. Go to the Docker Hub and [create an account](https://docs.docker.com/docker-hub/). 
+
+>Docker Hub is a hosted repository service provided by Docker for finding and sharing container images with your team.
+
+Let get started to dive deep into our CI/CD workflow.
+
+In the repository you will see our workflow `.github/workflows/cicd.yml`
+
+Our workflow will trigger by schedule event (trigger every 10 minutes):
+```
+on:
+  schedule:
+    # Run the workflow every 10 minutes
+    - cron: '*/10* * * *'
+```
+Global environment variables:
+```
+env:
+  DOCKER_BUILDKIT: 1 
+```
+In our workflow we we have one job:
+```
+jobs:
+  build:
+```
+Also runs on Ubuntu latest 
+```
+runs-on: ubuntu-latest
+```
+Lets create a [strategy matrix](https://docs.github.com/en/actions/reference/workflow-syntax-for-github-actions#jobsjob_idstrategymatrix) to build and deploy different releases for `testnet` and `betanet`.
+
+```
+strategy:
+  matrix:
+    release-name: ["rc", "beta"]
+```
+
+As mentioned abowe jobs contain a list of steps, which GitHub executes in sequence.
+
+Step 1: **Get Github Tag** where the script downloading and saving a github tag for a given release name ("rc" or "beta")
+```
+echo $(curl -s https://api.github.com/repos/nearprotocol/nearcore/releases | jq -c -r --arg RELEASE_NAME "$RELEASE_NAME" 'map(select(.tag_name | contains($RELEASE_NAME)))[0].tag_name') > github-tag.txt
+```
+Step 2: **Get Docker Hub Tags** where the script checks the latest tags of docker images that we have already at our [docker hub](https://hub.docker.com) repository if a github tag from the previuos step exists in the docker repo then the workflow will be cancelled if not then we have a new github tag and it's the case to build and publish a new docker image
+
+> `DOCKER_IMAGE_NAME` - [a public docker hub repository](https://docs.docker.com/docker-hub/repos/). (ex. `dockerusername/nearcore`)  
+>You have to create a secret github variable `DOCKER_IMAGE_NAME`. -> [Creating and storing encrypted secrets](https://docs.github.com/en/actions/configuring-and-managing-workflows/creating-and-storing-encrypted-secrets)
+```
+# if previous step is success
+if: ${{ success() }}
+        env:
+          DOCKER_IMAGE_NAME: ${{ secrets.DOCKER_IMAGE_NAME }}
+        run: |
+          ...
+```
+Step 3: **Publish GitHub Image Tag to Registry** where [elgohr/Publish-Docker-Github-Action@master](https://github.com/elgohr/Publish-Docker-Github-Action) is a pre-built action that publishes docker containers. It will build and publish a docker images with the latest github tags (ex. `nearcore:1.8.0-beta.2` or `nearcore:1.7.0-rc.5`).
+The logic of this step is to save the latest github tag to a docker hub repo as a docker image and then check the tags every time to build and publish only new releases of nearcore.
+
+>`DOCKER_USERNAME` - a Docker ID.
+
+>`DOCKER_PASSWORD` - a Docker ID password.
+
+>You have to create a secret github variables `DOCKER_USERNAME` and `DOCKER_PASSWORD`. -> [Creating and storing encrypted secrets](https://docs.github.com/en/actions/configuring-and-managing-workflows/creating-and-storing-encrypted-secrets)
+
+Step 4: **Install Rust** - an action which install Rust.
+
+Step 5: **Clone NEARCore** - an action which clone [nearcore](https://github.com/nearprotocol/nearcore) with a specific tag.
+
+Step 6: **Cargo Test** - execute tests of a nearcore packages.
+
+Step 7: **Publish Latest Docker Image to Registry** - will build and publish(concurrently) a docker images with `${{ matrix.release-name }}`(ex. `nearcore:beta` or `nearcore:rc`) tags.
+
+## NEARCore Docker
+
+#### Install Docker (if not installed)
+```
+sudo apt-get update
+sudo apt install docker.io
+```
+
+If you are using [nearup](https://github.com/near/nearup) just stop the node:
+
+```
+nearup stop
+```
+>In the future if you will not use docker, you can use nearup again without any problems. 
+
+After the first run of our workflow a new docker images(`dockerusername/nearcore:beta` and `dockerusername/nearcore:rc`) should be awailable and we can run the near node with the following command:
+```
+sudo docker run -dti \
+     --restart always \
+     --user 0 \
+     --volume $HOME/.near/betanet/:/srv/near \
+     --volume /tmp:/tmp \
+     --name nearcore \
+     --network=host \
+     -p 3030 \
+     -p 24567 dockerusername/nearcore:beta near --home /srv/near run
+```
+
+To watch the logs:
+```
+sudo docker logs nearcore -f
+```
+
+## Watchtower
+
+To automate updates of our docker images we can use a great open source tool [Watchtower](https://github.com/containrrr/watchtower).
+
+Watchtower monitors running containers and watches for changes to the images those containers were originally started from. When Watchtower detects that an image has changed, it automatically restarts the container using the new image.  
+
+>With watchtower you can update the running version of your containerized app simply by pushing a new image to the Docker Hub or your own image registry. Watchtower will pull down your new image, gracefully shut down your existing container and restart it with the same options that were used when it was deployed initially. 
+
+> With watchtower you can update nearcore, node exporter, near exporter,.... 
+
+Run the watchtower container on your node with the following command:
+```
+sudo docker run -d \
+    --name watchtower \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    containrrr/watchtower
+```
+Now, Watchtower will start monitoring `nearcore:beta` container. When the workflow push the a image to Docker Hub, Watchtower, will detect that a new image is available(about 5-6 minutes). It will gracefully stop the container and start the container using the new image.
+
+## Conclusion
+
+Hopefully this guide along with the workflow will make it easier for you to use Github Actions to build and deploy a new releases of [NEARCore](https://github.com/nearprotocol/nearcore).
+
+>To use this workflow just fork the repository and [set up secret variables](https://docs.github.com/en/actions/configuring-and-managing-workflows/creating-and-storing-encrypted-secrets): `DOCKER_IMAGE_NAME`, `DOCKER_USERNAME` and `DOCKER_PASSWORD`
+
+'''
+'''--- contract/Cargo.toml ---
+[package]
+name = "rust-voting"
+version = "0.1.0"
+authors = ["spdd"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.45"
+near-sdk = "0.6.0"
+borsh = "0.6.1"
+wee_alloc = "0.4.5"
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+
+[workspace]
+members = []
+
+'''
+'''--- contract/src/lib.rs ---
+use borsh::{BorshDeserialize, BorshSerialize};
+use near_sdk::{env, near_bindgen};
+
+use std::collections::HashMap;
+
+#[global_allocator]
+static ALLOC: wee_alloc::WeeAlloc = wee_alloc::WeeAlloc::INIT;
+
+#[near_bindgen]
+#[derive(Default, BorshDeserialize, BorshSerialize)]
+pub struct Voting {
+    votes_received: HashMap<String, i32>,
+}
+
+#[near_bindgen]
+impl Voting {
+    #[init]
+    pub fn new() -> Self {
+        Self {
+            votes_received: HashMap::new(),
+        }
+    }
+
+    pub fn add_candidate(&mut self, candidate: String) {
+        self.votes_received.insert(candidate, 0);
+    }
+
+    pub fn get_total_votes_for(self, name: String) -> Option::<i32> {
+        if !self.valid_candidate(&name) {
+            ()
+        }
+        self.votes_received.get(&name).cloned()
+    }
+
+    pub fn vote_for_candidate(&mut self, name: String) {
+        let counter = self.votes_received.entry(name).or_insert(0);
+        *counter += 1;
+    }
+
+    pub fn valid_candidate(&self, name: &String) -> bool {
+        for (candidate, votes) in self.votes_received.iter() {
+            if self.votes_received.contains_key(name) {
+                return true
+            }
+        }
+        false
+    }
+    
+    pub fn get_candidates(&self) -> HashMap<String, i32> {
+        self.votes_received.clone()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use near_bindgen::MockedBlockchain;
+    use near_bindgen::{testing_env, VMContext};
+
+    fn get_context(input: Vec<u8>, is_view: bool) -> VMContext {
+        VMContext {
+            current_account_id: "alice_near".to_string(),
+            signer_account_id: "bob_near".to_string(),
+            signer_account_pk: vec![0, 1, 2],
+            predecessor_account_id: "carol_near".to_string(),
+            input,
+            block_index: 0,
+            block_timestamp: 0,
+            account_balance: 0,
+            account_locked_balance: 0,
+            storage_usage: 0,
+            attached_deposit: 0,
+            prepaid_gas: 10u64.pow(18),
+            random_seed: vec![0, 1, 2],
+            is_view,
+            output_data_receivers: vec![],
+        }
+    }
+
+    #[test]
+    fn test_add_candidate() {
+        let context = get_context(vec![], false);
+        testing_env!(context);
+        let mut contract = Voting::new();
+        contract.add_candidate("Jeff".to_string());
+        assert_eq!(0, contract.get_total_votes_for("Jeff".to_string()).unwrap());
+    }
+
+    #[test]
+    fn test_get_total_votes_for() {
+        let context = get_context(vec![], true);
+        testing_env!(context);
+        let contract = Voting::new();
+        assert_eq!(None, contract.get_total_votes_for("Anna".to_string()));
+    }
+}
+'''
+'''--- neardev/dev-account.env ---
+CONTRACT_NAME=dev-1586706630629
+'''
+'''--- neardev/shared-test-staging/test.near.json ---
+{"account_id":"test.near","private_key":"ed25519:2wyRcSwSuHtRVmkMCGjPwnzZmQLeXLzLLyED1NDMt4BjnKgQL6tF85yBx6Jr26D2dUNeC716RBoTxntVHsegogYw"}
+
+'''
+'''--- neardev/shared-test/test.near.json ---
+{"account_id":"test.near","private_key":"ed25519:2wyRcSwSuHtRVmkMCGjPwnzZmQLeXLzLLyED1NDMt4BjnKgQL6tF85yBx6Jr26D2dUNeC716RBoTxntVHsegogYw"}
+
+'''
+'''--- package.json ---
+{
+  "name": "rust-voting",
+  "description": "Voting Rust Smart Contract\n\nThis project contains implementation of voting app backed by blockchain, written in Rust.",
+  "version": "0.0.1",
+  "scripts": {
+    "build": "cd contract && cargo build --target wasm32-unknown-unknown --release",
+    "postbuild": "cp contract/target/wasm32-unknown-unknown/release/rust_voting.wasm ./out/main.wasm",
+    "deploy:contract": "near deploy",
+    "deploy:pages": "gh-pages -d src",
+    "deploy": "yarn build && yarn deploy:contract && yarn deploy:pages",
+    "deploy:dev": "yarn build && near dev-deploy",
+    "dev": "yarn deploy:dev && yarn start:dev",
+    "prestart": "yarn build && yarn deploy:contract",
+    "start": "parcel src/index.html",
+    "start:dev": "env-cmd -f ./neardev/dev-account.env parcel src/index.html",
+    "test": "yarn build && jest && cd contract && cargo test -- --nocapture"
+  },
+  "devDependencies": {
+    "env-cmd": "^10.1.0",
+    "gh-pages": "~2.2.0",
+    "jest": "~25.2.0",
+    "jest-environment-node": "~25.2.3",
+    "near-shell": "~0.20.9",
+    "nodemon": "~2.0.2",
+    "parcel-bundler": "~1.12.4"
+  },
+  "jest": {
+    "testEnvironment": "near-shell/test_environment"
+  },
+  "dependencies": {
+    "near-api-js": "^0.23.2",
+    "regenerator-runtime": "^0.13.5"
+  }
+}
+
+'''
+'''--- src/config.js ---
+const CONTRACT_NAME = process.env.CONTRACT_NAME || 'sm7.testnet'; /* TODO: fill this in! */
+
+function getConfig(env) {
+    switch (env) {
+
+        case 'production':
+        case 'development':
+            return {
+                networkId: 'default',
+                nodeUrl: 'https://rpc.nearprotocol.com',
+                contractName: CONTRACT_NAME,
+                walletUrl: 'https://wallet.nearprotocol.com',
+                helperUrl: 'https://near-contract-helper.onrender.com',
+            };
+        case 'staging':
+            return {
+                networkId: 'staging',
+                nodeUrl: 'https://staging-rpc.nearprotocol.com/',
+                contractName: CONTRACT_NAME,
+                walletUrl: 'https://near-wallet-staging.onrender.com',
+                helperUrl: 'https://near-contract-helper-staging.onrender.com',
+            };
+        case 'local':
+            return {
+                networkId: 'local',
+                nodeUrl: 'http://localhost:3030',
+                keyPath: `${process.env.HOME}/.near/validator_key.json`,
+                walletUrl: 'http://localhost:4000/wallet',
+                contractName: CONTRACT_NAME,
+            };
+        case 'test':
+        case 'ci':
+            return {
+                networkId: 'shared-test',
+                nodeUrl: 'http://shared-test.nearprotocol.com:3030',
+                contractName: CONTRACT_NAME,
+                masterAccount: 'test.near',
+            };
+        case 'ci-staging':
+            return {
+                networkId: 'shared-test-staging',
+                nodeUrl: 'http://staging-shared-test.nearprotocol.com:3030',
+                contractName: CONTRACT_NAME,
+                masterAccount: 'test.near',
+            };
+        default:
+            throw Error(`Unconfigured environment '${env}'. Can be configured in src/config.js.`);
+    }
+}
+
+module.exports = getConfig;
+
+'''
+'''--- src/index.html ---
+<!DOCTYPE html>
+<html>
+<head>
+ <title>Hello World NEAR DApp</title>
+ <meta charset="utf-8">
+ <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.2.1/css/bootstrap.min.css" integrity="sha384-GJzZqFGwb1QTTN6wy59ffF1BuGJpLSa9DkKMp0DgiMDm4iYMj70gZWKYbI706tWS" crossorigin="anonymous">
+ <link href="https://fonts.googleapis.com/css?family=Arvo&display=swap" rel="stylesheet">
+ <link href='https://fonts.googleapis.com/css?family=Open Sans:400,700' rel='stylesheet' type='text/css'>
+ <link href='https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/css/bootstrap.min.css' rel='stylesheet' type='text/css'>
+</head>
+<body class="container">
+ <h1>A Simple Voting Application</h1>
+
+ <div class="sign-in" style="display: none;">
+  <p>You need to sign in to call contract methods:</p>
+  <button class="btn btn-primary" style="background-color: #0072CE;">Sign In</button>
+ </div>
+ <div class="after-sign-in" style="display: none;">
+  <div class="table-responsive">
+    <table class="table table-bordered">
+    <thead>
+      <tr>
+      <th>Candidate</th>
+      <th>Votes</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+      <td>Anna</td>
+      <td id="candidate1"></td>
+      </tr>
+      <tr>
+      <td>Jeff</td>
+      <td id="candidate2"></td>
+      </tr>
+      <tr>
+      <td>Jose</td>
+      <td id="candidate3"></td>
+      </tr>
+    </tbody>
+    </table>
+    </div>
+    <h2>Vote for Candidate</h2>
+    <div id="msg"></div>
+    <input type="text" name="vote" />
+    <a href="#" onclick="voteForCandidate()" style="background-color: #1faa00;" class="btn btn-primary">Vote</a>
+    <div class="sign-out">
+      <button class="btn btn-primary" style="background-color: #0072CE;">Sign Out</button>
+    </div>
+  </div>
+</body>
+<script src="https://cdn.jsdelivr.net/npm/js-cookie@2/src/js.cookie.min.js"></script>
+<script src="./main.js"></script>
+</html>
+
+'''
+'''--- src/loader.html ---
+<head>
+    <script>
+        window.paceOptions = {
+            elements: {
+                selectors: ['.never-appears']
+            }
+        };
+    </script>
+    <script src="https://cdn.jsdelivr.net/gh/HubSpot/pace@v0.5.3/pace.min.js"></script>
+    <link href="https://cdn.jsdelivr.net/gh/HubSpot/pace@v0.5.3/themes/black/pace-theme-center-radar.css" rel="stylesheet" />
+</head>
+'''
+'''--- src/main.js ---
+import "regenerator-runtime/runtime";
+import * as nearAPI from "near-api-js";
+import getConfig from "./config";
+
+let nearConfig = getConfig(process.env.NODE_ENV || "development");
+window.nearConfig = nearConfig;
+
+// Connects to NEAR and provides `near`, `walletAccount` and `contract` objects in `window` scope
+async function connect() {
+  // Initializing connection to the NEAR node.
+  window.near = await nearAPI.connect(Object.assign(nearConfig, { deps: { keyStore: new nearAPI.keyStores.BrowserLocalStorageKeyStore() }}));
+
+  // Needed to access wallet login
+  window.walletAccount = new nearAPI.WalletAccount(window.near);
+
+  // Initializing our contract APIs by contract name and configuration.
+  window.contract = await near.loadContract(nearConfig.contractName, {
+    viewMethods: ['get_total_votes_for', 'get_candidates', 'valid_candidate'],
+    changeMethods: ['add_candidate', 'vote_for_candidate'],
+    sender: window.walletAccount.getAccountId()
+  });
+}
+
+let candidates = {"Anna": "candidate1", "Jeff": "candidate2", "Jose": "candidate3"}
+
+window.voteForCandidate = function(candidate) {
+  let candidateName = document.querySelector('input[name="vote"]').value;
+  document.querySelector('#msg').innerText = "Vote has been submitted. Please wait...";
+  document.querySelector('input[name="vote"]').innerText = '';
+  contract.vote_for_candidate({ name: candidateName }).then(updateUI);
+}
+
+function updateUI() {
+  if (!window.walletAccount.getAccountId()) {
+    Array.from(document.querySelectorAll('.sign-in')).map(it => it.style = 'display: block;');
+  } else {
+    Array.from(document.querySelectorAll('.after-sign-in')).map(it => it.style = 'display: block;');
+
+    let candidateNames = Object.keys(candidates);
+    for (var i = 0; i < candidateNames.length; i++) {
+      let name = candidateNames[i];
+      contract.get_total_votes_for({ name: name }).then(count => {
+        document.querySelector('#' + candidates[name]).innerText = count == undefined ? 'calculating...' : count;
+        document.querySelector('#msg').innerText = "Please enter candidate name:";
+      });
+    }
+  }
+}
+
+// Log in user using NEAR Wallet on "Sign In" button click
+document.querySelector('.sign-in .btn').addEventListener('click', () => {
+  walletAccount.requestSignIn(nearConfig.contractName, 'NEAR Voting Example');
+});
+
+document.querySelector('.sign-out .btn').addEventListener('click', () => {
+  walletAccount.signOut();
+  // TODO: Move redirect to .signOut() ^^^
+  window.location.replace(window.location.origin + window.location.pathname);
+});
+
+window.nearInitPromise = connect()
+.then(updateUI)
+.catch(console.error);
+
+'''
+'''--- src/test-setup.js ---
+(function () {
+  let params = new URL(window.location).searchParams;
+  let keyStore = new nearlib.keyStores.InMemoryKeyStore();
+  nearConfig.contractName = params.get('contractName') || nearConfig.contractName;
+  keyStore.setKey(nearConfig.networkId, nearConfig.contractName, nearlib.KeyPair.fromString(params.get('privateKey')));
+  nearConfig.deps = { keyStore };
+})();
+
+'''
+'''--- src/test.js ---
+describe('Token', function () {
+  let near;
+  let contract;
+  let accountId;
+
+  jasmine.DEFAULT_TIMEOUT_INTERVAL = 10000;
+
+  beforeAll(async function () {
+    console.log('nearConfig', nearConfig);
+    near = await nearlib.connect(nearConfig);
+    accountId = nearConfig.contractName;
+    contract = await near.loadContract(nearConfig.contractName, {
+      viewMethods: ['get_total_votes_for', 'get_candidates', 'valid_candidate'],
+      changeMethods: ['vote_for_candidate', 'add_candidate'],
+      sender: accountId
+    });
+  });
+
+  describe('voting', function () {
+    // TODO:
+  });
+});
+
+'''

@@ -1,0 +1,1203 @@
+*GitHub Repository "namqdam/merkle-distributor"*
+
+'''--- .eslintrc.json ---
+{
+  "parser": "@typescript-eslint/parser",
+  "parserOptions": {
+    "ecmaVersion": 2015,
+    "sourceType": "module",
+    "project": "./tsconfig.eslint.json"
+  },
+  "env": {
+    "browser": true
+  },
+  "plugins": ["@typescript-eslint", "simple-import-sort", "prettier"],
+  "extends": ["plugin:@typescript-eslint/recommended", "plugin:prettier/recommended"],
+  "rules": {
+    "@typescript-eslint/ban-types": "off",
+    "@typescript-eslint/camelcase": "off",
+    "@typescript-eslint/explicit-function-return-type": "off",
+    "@typescript-eslint/explicit-member-accessibility": "off",
+    "@typescript-eslint/explicit-module-boundary-types": "off",
+    "@typescript-eslint/no-empty-function": "off",
+    "@typescript-eslint/no-use-before-define": "off",
+    "@typescript-eslint/no-var-requires": "off",
+    "simple-import-sort/imports": "error",
+    "simple-import-sort/exports": "error"
+  }
+}
+'''
+'''--- .vscode/settings.json ---
+{
+  "[javascript]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode",
+    "editor.formatOnSave": true
+  },
+  "[typescript]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode",
+    "editor.formatOnSave": true
+  },
+  "[jsonc]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "editor.codeActionsOnSave": {
+    "source.fixAll": true
+  },
+  "typescript.updateImportsOnFileMove.enabled": "always",
+  "typescript.preferences.importModuleSpecifier": "relative"
+}
+
+'''
+'''--- Cargo.toml ---
+[workspace]
+members = ["contracts/*"]
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+# Opt into extra safety checks on arithmetic operations https://stackoverflow.com/a/64136471/249801
+overflow-checks = true
+
+'''
+'''--- README.md ---
+Merkle Distributor
+===================
+
+[![Open in Gitpod](https://gitpod.io/button/open-in-gitpod.svg)](https://gitpod.io/#https://github.com/namqdam/merkle-distributor)
+
+A program for distributing tokens efficiently via uploading a [Merkle root](https://en.wikipedia.org/wiki/Merkle_tree).
+
+This program is largely based off of [Uniswap's Merkle Distributor](https://github.com/Uniswap/merkle-distributor).
+
+Prerequisites
+=============
+
+If you're using Gitpod, you can skip this step.
+
+* Make sure Rust is installed per the prerequisites in [`near-sdk-rs`](https://github.com/near/near-sdk-rs).
+* Make sure [near-cli](https://github.com/near/near-cli) is installed.
+
+Explore this contract
+=====================
+
+The source for this contract is in `contracts/merkle-distributor/lib.rs`.
+
+Building this contract
+======================
+
+Run the following, and we'll build our rust project up via cargo. This will generate our WASM binaries into our `target/` directory. This is the smart contract we'll be deploying onto the NEAR blockchain later.
+
+```bash
+cargo build --target wasm32-unknown-unknown --release
+```
+
+Testing this contract
+=====================
+
+We have some tests that you can run. For example, the following will run our simple tests to verify that our contract code is working.
+
+```bash
+cargo test -- --nocapture
+```
+
+Using this contract
+===================
+
+### Quickest deploy
+
+You can build and deploy this smart contract to a development account. [Dev Accounts](https://docs.near.org/docs/concepts/account#dev-accounts) are auto-generated accounts to assist in developing and testing smart contracts. Please see the [Standard deploy](#standard-deploy) section for creating a more personalized account to deploy to.
+
+```bash
+near dev-deploy --wasmFile target/wasm32-unknown-unknown/release/merkle_distributor.wasm
+```
+
+Behind the scenes, this is creating an account and deploying a contract to it. On the console, notice a message like:
+
+>Done deploying to dev-xxx
+
+In this instance, the account is `dev-xxx`. A file has been created containing a key pair to
+the account, located at `neardev/dev-account`. To make the next few steps easier, we're going to set an
+environment variable containing this development account id and use that when copy/pasting commands.
+Run this command to set the environment variable:
+
+```bash
+source neardev/dev-account.env
+export ACCOUNT_ID=aabbcc
+```
+
+You can tell if the environment variable is set correctly if your command line prints the account name after this command:
+
+```bash
+echo $CONTRACT_NAME
+echo $ACCOUNT_ID
+```
+
+The next command will initialize the contract using the `new` method:
+
+```bash
+near call $CONTRACT_NAME initialize '{"owner_id": "aaa", "token_id": "bbb", "merkle_root": "bbb"}' --accountId $CONTRACT_NAME
+```
+
+To claim:
+
+```bash
+near call $CONTRACT_NAME claim '{"index": 0, "amount": 100, "proof": ["xxx"]}' --accountId $ACCOUNT_ID
+```
+
+Notes
+=====
+
+* To generate merkle_tree, using command
+
+```bash
+yarn generate-merkle-root -i scripts/example.json -o merkle.json
+```
+
+* The output tree will be located in merkle.json
+* Using `merkleRoot` and `proof` for calling contract using near-cli
+
+'''
+'''--- contracts/merkle-distributor/Cargo.toml ---
+[package]
+name = "merkle-distributor"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+name = "merkle_distributor"
+path = "src/lib.rs"
+
+[dependencies]
+hex = "0.4"
+near-contract-standards = "4.0.0-pre.7"
+near-sdk = "4.0.0-pre.7"
+
+'''
+'''--- contracts/merkle-distributor/build.sh ---
+#!/bin/bash
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo build --target wasm32-unknown-unknown --release
+mkdir -p ../../res
+cp ../../target/wasm32-unknown-unknown/release/*.wasm ../../res/merkle_distributor.wasm
+'''
+'''--- contracts/merkle-distributor/src/constant.rs ---
+use near_sdk::Gas;
+
+pub const GAS_FOR_FT_TRANSFER: Gas = Gas(10_000_000_000_000);
+
+'''
+'''--- contracts/merkle-distributor/src/internal.rs ---
+use crate::*;
+
+impl MerkleDistributor {
+    pub(crate) fn assert_owner(&self) {
+        require!(
+            env::predecessor_account_id() == self.owner_id,
+            "Can only be called by the owner"
+        );
+    }
+
+    pub(crate) fn assert_paused(&self) {
+        require!(!self.paused, "Can only be called when not paused");
+    }
+}
+
+'''
+'''--- contracts/merkle-distributor/src/lib.rs ---
+use hex::FromHex;
+use near_sdk::{
+    borsh::{self, BorshDeserialize, BorshSerialize},
+    collections::UnorderedMap,
+    env::{self, sha256},
+    json_types::{U128, U64},
+    near_bindgen, require, AccountId, Balance, EpochHeight, PanicOnDefault,
+};
+
+mod constant;
+mod internal;
+mod merkle_proof;
+mod token;
+mod util;
+
+#[derive(BorshDeserialize, BorshSerialize, Debug, PartialEq)]
+pub struct Account {
+    pub claimed_amount: Balance,
+    pub claimed_epoch_height: EpochHeight,
+}
+
+impl Default for Account {
+    fn default() -> Self {
+        Self {
+            claimed_amount: 0,
+            claimed_epoch_height: 0,
+        }
+    }
+}
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct MerkleDistributor {
+    pub owner_id: AccountId,
+    pub token_id: AccountId,
+    pub balance: Balance,
+    pub merkle_root: Vec<u8>,
+    pub accounts: UnorderedMap<AccountId, Account>,
+    pub paused: bool,
+}
+
+#[near_bindgen]
+impl MerkleDistributor {
+    #[init]
+    pub fn initialize(owner_id: AccountId, token_id: AccountId, merkle_root: String) -> Self {
+        require!(!env::state_exists(), "Already initialized");
+        require!(
+            env::is_valid_account_id(owner_id.as_bytes()),
+            "The owner account ID is invalid"
+        );
+        Self {
+            owner_id,
+            token_id,
+            balance: 0,
+            merkle_root: <[u8; 32]>::from_hex(merkle_root).ok().unwrap().to_vec(),
+            accounts: UnorderedMap::new(b"c".to_vec()),
+            paused: false,
+        }
+    }
+
+    pub fn pause(&mut self) -> () {
+        self.assert_owner();
+        require!(!self.paused, "The contract is already paused");
+
+        self.paused = true;
+    }
+
+    pub fn resume(&mut self) -> () {
+        self.assert_owner();
+        require!(self.paused, "The contract is not paused");
+
+        self.paused = false;
+    }
+
+    pub fn get_balance(&self) -> Balance {
+        self.balance
+    }
+
+    pub fn get_claimed_amount(&self, account_id: AccountId) -> Balance {
+        let account = self.accounts.get(&account_id).unwrap_or_default();
+        account.claimed_amount
+    }
+
+    pub fn get_is_claimed(&self, account_id: AccountId) -> bool {
+        self.get_claimed_amount(account_id) > 0
+    }
+
+    fn set_claim(&mut self, amount: U128) -> () {
+        self.accounts.insert(
+            &env::predecessor_account_id(),
+            &Account {
+                claimed_amount: amount.into(),
+                claimed_epoch_height: env::epoch_height(),
+            },
+        );
+        self.balance -= u128::from(amount);
+    }
+
+    #[payable]
+    pub fn claim(&mut self, index: U64, amount: U128, proof: Vec<String>) -> () {
+        self.assert_paused();
+        require!(
+            !self.get_is_claimed(env::predecessor_account_id()),
+            "Already claimed"
+        );
+        require!(self.balance >= amount.into(), "Non-sufficient fund");
+
+        let mut _index = u64::from(index).to_le_bytes().to_vec();
+        let mut _account = env::predecessor_account_id().as_bytes().to_vec();
+        let mut _amount = u128::from(amount).to_le_bytes().to_vec();
+
+        _index.append(&mut _account);
+        _index.append(&mut _amount);
+
+        let _proof: Vec<[u8; 32]> = proof
+            .into_iter()
+            .map(|x| <[u8; 32]>::from_hex(x).ok().unwrap())
+            .collect();
+        let _root: [u8; 32] = self.merkle_root.clone().try_into().unwrap();
+        let _leaf: [u8; 32] = sha256(&_index).try_into().unwrap();
+
+        require!(
+            merkle_proof::verify(_proof, _root, _leaf),
+            "Failed to verify proof"
+        );
+
+        self.set_claim(amount);
+        self.withdraw_token(amount.into());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use near_sdk::{testing_env, VMContext};
+
+    struct Accounts {
+        current: AccountId,
+        owner: AccountId,
+        predecessor: AccountId,
+        token: AccountId,
+    }
+
+    struct Ctx {
+        accounts: Accounts,
+        vm: VMContext,
+    }
+
+    impl Ctx {
+        fn create_accounts() -> Accounts {
+            return Accounts {
+                current: "alice.testnet".parse().unwrap(),
+                owner: "robert.testnet".parse().unwrap(),
+                predecessor: "namqdam.testnet".parse().unwrap(),
+                token: "fungible_token.test".parse().unwrap(),
+            };
+        }
+
+        pub fn new(input: Vec<u8>) -> Self {
+            let accounts = Ctx::create_accounts();
+            let vm = VMContext {
+                current_account_id: accounts.current.to_string().parse().unwrap(),
+                signer_account_id: accounts.owner.to_string().parse().unwrap(),
+                signer_account_pk: vec![0, 1, 2],
+                predecessor_account_id: accounts.predecessor.to_string().parse().unwrap(),
+                input,
+                block_index: 0,
+                block_timestamp: 0,
+                account_balance: 0,
+                account_locked_balance: 0,
+                storage_usage: 0,
+                attached_deposit: 0,
+                prepaid_gas: 10u64.pow(18),
+                random_seed: vec![0, 1, 2],
+                view_config: std::option::Option::None,
+                output_data_receivers: vec![],
+                epoch_height: 19,
+            };
+            return Self {
+                accounts: accounts,
+                vm: vm,
+            };
+        }
+    }
+
+    #[test]
+    fn init_successful() {
+        let context = Ctx::new(vec![]);
+        testing_env!(context.vm);
+        let contract = MerkleDistributor::initialize(
+            env::signer_account_id(),
+            context.accounts.token,
+            "307c42c3e5465f5141e1cf37782792d9317c89a27b2562615d7a0f8b7f6d884f".to_string(),
+        );
+        assert_eq!(false, contract.get_is_claimed(context.accounts.predecessor));
+    }
+
+    #[test]
+    fn claim_successful() {
+        let mut context = Ctx::new(vec![]);
+        context.vm.attached_deposit = 1100;
+        testing_env!(context.vm);
+        let mut contract = MerkleDistributor::initialize(
+            env::signer_account_id(),
+            context.accounts.token,
+            "307c42c3e5465f5141e1cf37782792d9317c89a27b2562615d7a0f8b7f6d884f".to_string(),
+        );
+        contract.deposit_token(contract.token_id.clone(), 1100);
+        contract.claim(
+            U64(1),
+            U128(100),
+            vec![
+                "6a2d5b6181d157b4aa4bd835c3d3c178effa7beb791ce7a23e09d6f15e0a1d9e".to_string(),
+                "48069641146afc2b0d15170388a82430de18bb9df6936fc9cb0f19ed1af9d447".to_string(),
+                "2ac07b80700ffe561b0a3d6b9f977948b7b1be9338452ba63bdb50565cee8587".to_string(),
+                "c9d90c5c20104536d834097481f8fff6bb0a34ec7b724d13d62c6c9abbb3c31c".to_string(),
+            ],
+        );
+        assert_eq!(
+            100,
+            contract.get_claimed_amount(context.accounts.predecessor.clone())
+        );
+        assert_eq!(true, contract.get_is_claimed(context.accounts.predecessor));
+        assert_eq!(1000, contract.get_balance());
+    }
+
+    #[test]
+    #[should_panic(expected = "Failed to verify proof")]
+    fn claim_failed_because_input_wrong_amount() {
+        let mut context = Ctx::new(vec![]);
+        context.vm.attached_deposit = 1100;
+        testing_env!(context.vm);
+        let mut contract = MerkleDistributor::initialize(
+            env::signer_account_id(),
+            context.accounts.token,
+            "307c42c3e5465f5141e1cf37782792d9317c89a27b2562615d7a0f8b7f6d884f".to_string(),
+        );
+        contract.deposit_token(contract.token_id.clone(), 1100);
+        contract.claim(
+            U64(1),
+            U128(1000),
+            vec![
+                "6a2d5b6181d157b4aa4bd835c3d3c178effa7beb791ce7a23e09d6f15e0a1d9e".to_string(),
+                "48069641146afc2b0d15170388a82430de18bb9df6936fc9cb0f19ed1af9d447".to_string(),
+                "2ac07b80700ffe561b0a3d6b9f977948b7b1be9338452ba63bdb50565cee8587".to_string(),
+                "c9d90c5c20104536d834097481f8fff6bb0a34ec7b724d13d62c6c9abbb3c31c".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Already claimed")]
+    fn claim_failed_because_already_claimed() {
+        let mut context = Ctx::new(vec![]);
+        context.vm.attached_deposit = 1100;
+        testing_env!(context.vm);
+        let mut contract = MerkleDistributor::initialize(
+            env::signer_account_id(),
+            context.accounts.token,
+            "307c42c3e5465f5141e1cf37782792d9317c89a27b2562615d7a0f8b7f6d884f".to_string(),
+        );
+        contract.deposit_token(contract.token_id.clone(), 1100);
+        contract.claim(
+            U64(1),
+            U128(100),
+            vec![
+                "6a2d5b6181d157b4aa4bd835c3d3c178effa7beb791ce7a23e09d6f15e0a1d9e".to_string(),
+                "48069641146afc2b0d15170388a82430de18bb9df6936fc9cb0f19ed1af9d447".to_string(),
+                "2ac07b80700ffe561b0a3d6b9f977948b7b1be9338452ba63bdb50565cee8587".to_string(),
+                "c9d90c5c20104536d834097481f8fff6bb0a34ec7b724d13d62c6c9abbb3c31c".to_string(),
+            ],
+        );
+
+        contract.claim(
+            U64(1),
+            U128(100),
+            vec![
+                "6a2d5b6181d157b4aa4bd835c3d3c178effa7beb791ce7a23e09d6f15e0a1d9e".to_string(),
+                "48069641146afc2b0d15170388a82430de18bb9df6936fc9cb0f19ed1af9d447".to_string(),
+                "2ac07b80700ffe561b0a3d6b9f977948b7b1be9338452ba63bdb50565cee8587".to_string(),
+                "c9d90c5c20104536d834097481f8fff6bb0a34ec7b724d13d62c6c9abbb3c31c".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Can only be called when not paused")]
+    fn claim_failed_because_contract_is_paused() {
+        let mut context = Ctx::new(vec![]);
+        context.vm.attached_deposit = 1100;
+        testing_env!(context.vm);
+        let mut contract = MerkleDistributor::initialize(
+            env::predecessor_account_id(),
+            context.accounts.token,
+            "307c42c3e5465f5141e1cf37782792d9317c89a27b2562615d7a0f8b7f6d884f".to_string(),
+        );
+        contract.deposit_token(contract.token_id.clone(), 1100);
+        contract.pause();
+        contract.claim(
+            U64(1),
+            U128(100),
+            vec![
+                "6a2d5b6181d157b4aa4bd835c3d3c178effa7beb791ce7a23e09d6f15e0a1d9e".to_string(),
+                "48069641146afc2b0d15170388a82430de18bb9df6936fc9cb0f19ed1af9d447".to_string(),
+                "2ac07b80700ffe561b0a3d6b9f977948b7b1be9338452ba63bdb50565cee8587".to_string(),
+                "c9d90c5c20104536d834097481f8fff6bb0a34ec7b724d13d62c6c9abbb3c31c".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Can only be called by the owner")]
+    fn claim_failed_because_pause_contract_not_by_owner() {
+        let mut context = Ctx::new(vec![]);
+        context.vm.attached_deposit = 1100;
+        testing_env!(context.vm);
+        let mut contract = MerkleDistributor::initialize(
+            env::signer_account_id(),
+            context.accounts.token,
+            "307c42c3e5465f5141e1cf37782792d9317c89a27b2562615d7a0f8b7f6d884f".to_string(),
+        );
+        contract.pause();
+    }
+}
+
+'''
+'''--- contracts/merkle-distributor/src/merkle_proof.rs ---
+use near_sdk::env::sha256;
+
+pub fn verify(proof: Vec<[u8; 32]>, root: [u8; 32], leaf: [u8; 32]) -> bool {
+    let mut computed_hash = leaf;
+    for proof_element in proof.into_iter() {
+        if computed_hash <= proof_element {
+            // Hash(current computed hash + current element of the proof)
+            computed_hash = sha256(&[computed_hash, proof_element].concat())
+                .try_into()
+                .unwrap();
+        } else {
+            // Hash(current element of the proof + current computed hash)
+            computed_hash = sha256(&[proof_element, computed_hash].concat())
+                .try_into()
+                .unwrap();
+        }
+    }
+    // Check if the computed hash (root) is equal to the provided root
+    computed_hash == root
+}
+
+'''
+'''--- contracts/merkle-distributor/src/token.rs ---
+use near_contract_standards::fungible_token::{
+    core_impl::ext_fungible_token, receiver::FungibleTokenReceiver,
+};
+use near_sdk::{env, json_types::U128, near_bindgen, AccountId, PromiseOrValue};
+
+use crate::{constant::GAS_FOR_FT_TRANSFER, *};
+
+#[near_bindgen]
+impl FungibleTokenReceiver for MerkleDistributor {
+    // Callback on receiving tokens by this contract.
+    // Returns zero.
+    #[allow(unused_variables)]
+    #[payable]
+    fn ft_on_transfer(
+        &mut self,
+        sender_id: AccountId,
+        amount: U128,
+        msg: String,
+    ) -> PromiseOrValue<U128> {
+        let token_id = env::predecessor_account_id();
+        let sender_id = AccountId::from(sender_id);
+
+        self.deposit_token(token_id, amount.into());
+        return PromiseOrValue::Value(U128(0));
+    }
+}
+
+#[near_bindgen]
+impl MerkleDistributor {
+    // Record deposit of some number of tokens to this contract.
+    pub(crate) fn deposit_token(&mut self, token_id: AccountId, amount: Balance) {
+        require!(
+            token_id.to_string() == self.token_id.to_string(),
+            "Wrong token on deposit"
+        );
+        env_log!("Deposit {} of {} token", amount, self.token_id);
+        self.balance += amount
+    }
+
+    // Withdraws tokens
+    #[payable]
+    pub(crate) fn withdraw_token(&mut self, amount: Balance) {
+        let account_id = env::predecessor_account_id();
+
+        ext_fungible_token::ft_transfer(
+            account_id,
+            amount.into(),
+            Some("Withdraw token".to_string()),
+            self.token_id.clone(),
+            1, // required 1yNEAR for transfers
+            GAS_FOR_FT_TRANSFER,
+        );
+    }
+}
+
+'''
+'''--- contracts/merkle-distributor/src/util.rs ---
+#[macro_export]
+macro_rules! env_log {
+    ($($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        // io::_print(msg);
+        println!("{}", msg);
+        env::log_str(&msg)
+    }}
+}
+'''
+'''--- package.json ---
+{
+  "name": "merkle-distributor",
+  "version": "1.0.0",
+  "author": "Nam Dam <namqdam@gmail.com>",
+  "license": "GPL-3.0",
+  "scripts": {
+    "generate-merkle-root": "ts-node scripts/generate-merkle-root.ts",
+    "generate-merkle-root:example": "ts-node scripts/generate-merkle-root.ts --input scripts/example.json",
+    "test": "jest",
+    "test:deploy": "yarn dev:deploy && yarn hoist-credentials && yarn test",
+    "dev:deploy": "yarn build:contracts && rm -rf neardev && yarn patch:config",
+    "build:contracts": "cd contracts/merkle-distributor && ./build.sh && cd ../..",
+    "hoist-credentials": "mkdir -p ./neardev/testnet && ts-node ./utils/hoist-credentials.ts",
+    "patch:config": "ts-node ./utils/config.ts"
+  },
+  "devDependencies": {
+    "@types/jest": "27.4.0",
+    "@types/node": "14.17.3",
+    "@typescript-eslint/eslint-plugin": "5.12.0",
+    "@typescript-eslint/parser": "5.12.0",
+    "commander": "9.0.0",
+    "eslint": "8.9.0",
+    "eslint-config-prettier": "8.4.0",
+    "eslint-plugin-import": "2.25.4",
+    "eslint-plugin-prettier": "4.0.0",
+    "eslint-plugin-simple-import-sort": "7.0.0",
+    "jest": "27.5.1",
+    "nanoid": "3.3.1",
+    "near-api-js": "0.44.2",
+    "prettier": "2.5.1",
+    "ts-jest": "27.1.3",
+    "ts-node": "10.5.0",
+    "typescript": "4.5.5"
+  },
+  "dependencies": {
+    "bn.js": "5.2.0",
+    "merkletreejs": "0.2.27"
+  },
+  "jest": {
+    "preset": "ts-jest"
+  },
+  "engines": {
+    "node": ">=10.16.0 <=14.x.x",
+    "npm": "^6.0.0"
+  }
+}
+
+'''
+'''--- scripts/example.json ---
+[
+  { "address": "namqdam.testnet", "earnings": "100", "reasons": "" },
+  { "address": "dev-1643214487092-88798218258116", "earnings": "100", "reasons": "" },
+  { "address": "near-3", "earnings": "100", "reasons": "" },
+  { "address": "near-4", "earnings": "100", "reasons": "" },
+  { "address": "near-5", "earnings": "100", "reasons": "" },
+  { "address": "near-6", "earnings": "100", "reasons": "" },
+  { "address": "near-7", "earnings": "100", "reasons": "" },
+  { "address": "near-8", "earnings": "100", "reasons": "" },
+  { "address": "near-9", "earnings": "100", "reasons": "" },
+  { "address": "near-10", "earnings": "100", "reasons": "" },
+  { "address": "near-11", "earnings": "100", "reasons": "" }
+]
+
+'''
+'''--- scripts/generate-merkle-root.ts ---
+import { program } from 'commander';
+import fs from 'fs';
+import path from 'path';
+import { parseBalanceMap } from '../src/parse-balance-map';
+
+(function () {
+  program
+    .version('0.0.0')
+    .option('-o, --output <path>', 'ouput JSON file location for saving')
+    .requiredOption(
+      '-i, --input <path>',
+      'input JSON file location containing a map of account addresses to string balances'
+    );
+
+  program.parse(process.argv);
+
+  const inputPath = program.opts().i || program.opts().input;
+  if (!inputPath) return;
+
+  const json = JSON.parse(fs.readFileSync(path.resolve(inputPath), { encoding: 'utf8' }));
+
+  if (typeof json !== 'object') throw new Error('Invalid JSON');
+
+  const result = parseBalanceMap(json);
+  console.log(JSON.stringify(result));
+
+  const outputPath = program.opts().o || program.opts().output;
+  if (!outputPath) return;
+
+  fs.writeFileSync(path.resolve(outputPath), JSON.stringify(parseBalanceMap(json), null, 2));
+})();
+
+'''
+'''--- src/balance-tree.ts ---
+import MerkleTree from 'merkletreejs';
+import BN from 'bn.js';
+import crypto, { BinaryLike } from 'crypto';
+
+function sha256(data: BinaryLike) {
+  return crypto.createHash('sha256').update(data).digest();
+}
+
+export default class BalanceTree {
+  private readonly tree: MerkleTree;
+
+  constructor(balances: { account: string; amount: BN }[]) {
+    this.tree = new MerkleTree(
+      balances.map(({ account, amount }, index) => {
+        return BalanceTree.toNode(new BN(index), account, amount);
+      }),
+      sha256,
+      {
+        sort: true
+      }
+    );
+  }
+
+  public static verifyProof(index: BN, account: string, amount: BN, proof: Buffer[], root: Buffer): boolean {
+    let pair = BalanceTree.toNode(index, account, amount);
+    return MerkleTree.verify(proof, pair, root, sha256);
+  }
+
+  public static toNode(index: BN, account: string, amount: BN): Buffer {
+    let _index = new BN(index).toBuffer('le', 8);
+    let _account = Buffer.from(account, 'utf-8');
+    let _amount = new BN(amount).toBuffer('le', 16);
+
+    return sha256(Buffer.concat([_index, _account, _amount]));
+  }
+
+  public getHexRoot(): string {
+    return this.tree.getHexRoot();
+  }
+
+  public getProof(index: BN, account: string, amount: BN): string[] {
+    return this.tree.getHexProof(BalanceTree.toNode(index, account, amount));
+  }
+}
+
+'''
+'''--- src/parse-balance-map.ts ---
+import BalanceTree from './balance-tree';
+import BN from 'bn.js';
+
+export interface MerkleDistributorInfo {
+  merkleRoot: string;
+  tokenTotal: string;
+  claims: {
+    [account: string]: {
+      index: number;
+      amount: string;
+      proof: string[];
+      flags?: {
+        [flag: string]: boolean;
+      };
+    };
+  };
+}
+
+export type BalanceFormat = { address: string; earnings: string; reasons: string };
+
+export function parseBalanceMap(balances: BalanceFormat[]): MerkleDistributorInfo {
+  const dataByAddress = balances.reduce<{
+    [address: string]: { amount: BN; flags?: { [flag: string]: boolean } };
+  }>((memo, { address: account, earnings, reasons }) => {
+    if (memo[account]) throw new Error(`Duplicate address: ${account}`);
+    const parsedNum = new BN(earnings);
+    if (parsedNum.lte(new BN(0))) throw new Error(`Invalid amount for account: ${account}`);
+
+    const flags = {
+      // isSOCKS: reasons.includes('socks'),
+      // isLP: reasons.includes('lp'),
+      // isUser: reasons.includes('user'),
+    };
+
+    memo[account] = { amount: parsedNum, ...(reasons === '' ? {} : { flags }) };
+    return memo;
+  }, {});
+
+  const sortedAddresses = Object.keys(dataByAddress).sort();
+
+  // construct a tree
+  const tree = new BalanceTree(
+    sortedAddresses.map((address) => ({ account: address, amount: dataByAddress[address].amount }))
+  );
+
+  // generate claims
+  const claims = sortedAddresses.reduce<{
+    [address: string]: { amount: string; index: number; proof: string[]; flags?: { [flag: string]: boolean } };
+  }>((memo, address, index) => {
+    const { amount, flags } = dataByAddress[address];
+    memo[address] = {
+      index,
+      amount: amount.toString(),
+      proof: tree.getProof(new BN(index), address, amount).map((proof) => proof.substring(2)),
+      ...(flags ? { flags } : {})
+    };
+    return memo;
+  }, {});
+
+  const tokenTotal: BN = sortedAddresses.reduce<BN>((memo, key) => memo.add(dataByAddress[key].amount), new BN(0));
+
+  return {
+    merkleRoot: tree.getHexRoot().substring(2),
+    tokenTotal: tokenTotal.toString(),
+    claims
+  };
+}
+
+'''
+'''--- tests/config.ts ---
+const masterContractId = 'dev-1645354480430-48965257052981';
+
+export default {
+  networkId: 'testnet',
+  nodeUrl: 'https://rpc.testnet.near.org',
+  walletUrl: 'https://wallet.testnet.near.org',
+  helperUrl: 'https://helper.testnet.near.org',
+  masterContractId
+};
+
+'''
+'''--- tests/lib.test.ts ---
+import { BN } from 'bn.js';
+import { Account, Contract } from 'near-api-js';
+import { parseNearAmount } from 'near-api-js/lib/utils/format';
+
+import { BalanceFormat, MerkleDistributorInfo } from '../src/parse-balance-map';
+import testUtils from './test-utils';
+
+const GAS = new BN('200000000000000');
+
+jest.setTimeout(300_000);
+
+describe('Deploy contracts', () => {
+  let masterInfo: {
+    contract: Contract;
+    account: Account;
+    balances: BalanceFormat[];
+    merkle: MerkleDistributorInfo;
+  };
+
+  let ftInfo: {
+    contract: Contract;
+    account: Account;
+  };
+
+  beforeAll(async () => {
+    const { master, ft } = await testUtils.initContracts();
+    masterInfo = master;
+    ftInfo = ft;
+  });
+
+  test('Simple merkle', async () => {
+    const claim = masterInfo.merkle.claims[ftInfo.account.accountId];
+
+    await ftInfo.account.functionCall({
+      contractId: ftInfo.contract.contractId,
+      methodName: 'storage_deposit',
+      args: { account_id: masterInfo.contract.contractId },
+      gas: GAS,
+      attachedDeposit: new BN(parseNearAmount('0.1') ?? '0')
+    });
+
+    await ftInfo.account.functionCall({
+      contractId: ftInfo.contract.contractId,
+      methodName: 'ft_transfer_call',
+      args: {
+        receiver_id: masterInfo.contract.contractId,
+        amount: masterInfo.merkle.tokenTotal,
+        msg: 'deposit-for-claims'
+      },
+      gas: GAS,
+      attachedDeposit: new BN('1')
+    });
+
+    await ftInfo.account.functionCall({
+      contractId: masterInfo.contract.contractId,
+      methodName: 'claim',
+      args: { index: `${claim.index}`, amount: claim.amount, proof: claim.proof },
+      gas: GAS
+    });
+
+    const tokenBalance = await ftInfo.account.viewFunction(ftInfo.contract.contractId, 'ft_balance_of', {
+      account_id: ftInfo.account.accountId
+    });
+
+    const tokenClaimed = new BN(tokenBalance).add(new BN(masterInfo.merkle.tokenTotal)).sub(new BN('1000000000'));
+
+    const claimedAmount = await ftInfo.account.viewFunction(masterInfo.contract.contractId, 'get_claimed_amount', {
+      account_id: ftInfo.account.accountId
+    });
+
+    expect(new BN(claimedAmount).eq(new BN(claim.amount))).toEqual(true);
+    expect(new BN(claimedAmount).eq(tokenClaimed)).toEqual(true);
+  });
+});
+
+'''
+'''--- tests/near-utils.ts ---
+import fs from 'fs';
+import { Account, Contract, KeyPair, Near } from 'near-api-js';
+import { InMemoryKeyStore } from 'near-api-js/lib/key_stores';
+
+import config from './config';
+
+const { masterContractId, nodeUrl, networkId } = config;
+
+function prepare(networkId: string, contractId: string) {
+  const credPath = `./neardev/${networkId}/${contractId}.json`;
+  console.log('Loading Credentials:\n', credPath);
+
+  let credentials;
+  try {
+    credentials = JSON.parse(fs.readFileSync(credPath, { encoding: 'utf8' }));
+  } catch (e) {
+    console.warn(e);
+    /// attempt to load backup creds from local machine
+    credentials = JSON.parse(
+      fs.readFileSync(`${process.env.HOME}/.near-credentials/${networkId}/${contractId}.json`, { encoding: 'utf8' })
+    );
+  }
+  return credentials;
+}
+
+function init() {
+  const ftContractId = `ft.${masterContractId}`;
+
+  const keyStore = new InMemoryKeyStore();
+
+  const masterCredentials = prepare(networkId, masterContractId);
+  const ftCredentials = prepare(networkId, ftContractId);
+
+  keyStore.setKey(networkId, masterContractId, KeyPair.fromString(masterCredentials.private_key));
+  keyStore.setKey(networkId, ftContractId, KeyPair.fromString(ftCredentials.private_key));
+
+  const near = new Near({
+    networkId,
+    nodeUrl,
+    keyStore,
+    headers: {}
+  });
+
+  const masterAccount = new Account(near.connection, masterContractId);
+  const ftAccount = new Account(near.connection, ftContractId);
+
+  const masterContract = new Contract(masterAccount, masterAccount.accountId, {
+    changeMethods: ['initialize'],
+    viewMethods: []
+  });
+
+  const ftContract = new Contract(ftAccount, ftAccount.accountId, {
+    changeMethods: ['new_default_meta'],
+    viewMethods: []
+  });
+
+  return {
+    masterAccount,
+    ftAccount,
+    masterContract,
+    ftContract,
+    config,
+    near,
+    keyStore
+  };
+}
+
+export default init();
+
+'''
+'''--- tests/test-utils.ts ---
+import BN from 'bn.js';
+import { nanoid } from 'nanoid';
+
+import { BalanceFormat, parseBalanceMap } from '../src/parse-balance-map';
+import nearInfo from './near-utils';
+
+const { masterAccount, ftAccount, masterContract, ftContract, config, near, keyStore } = nearInfo;
+const GAS = new BN('200000000000000');
+
+function randomMerkle(contractId: string) {
+  const rndInt = Math.floor(Math.random() * 10) + 1;
+  const balances: BalanceFormat[] = [];
+
+  for (let index = 0; index < 10; index++) {
+    if (index === rndInt) {
+      balances.push({
+        address: contractId,
+        earnings: `${index * 1000}`,
+        reasons: ''
+      });
+    } else {
+      balances.push({
+        address: nanoid(10),
+        earnings: `${(index + 1) * 1000}`,
+        reasons: ''
+      });
+    }
+  }
+  return { balances, merkle: parseBalanceMap(balances) };
+}
+
+async function initContracts() {
+  const { balances, merkle } = randomMerkle(ftAccount.accountId);
+
+  /// try to call new on contract, swallow e if already initialized
+  try {
+    const args = {
+      owner_id: ftAccount.accountId,
+      total_supply: '1000000000'
+    };
+    await ftAccount.functionCall({
+      contractId: ftContract.contractId,
+      methodName: 'new_default_meta',
+      args,
+      gas: GAS
+    });
+  } catch (e: any) {
+    if (!/initialized/.test(e.toString())) {
+      throw e;
+    }
+  }
+
+  /// try to call new on contract, swallow e if already initialized
+  try {
+    const args = {
+      owner_id: masterAccount.accountId,
+      token_id: ftContract.contractId,
+      merkle_root: merkle.merkleRoot
+    };
+    await masterAccount.functionCall({
+      contractId: masterContract.contractId,
+      methodName: 'initialize',
+      args,
+      gas: GAS
+    });
+  } catch (e: any) {
+    if (!/initialized/.test(e.toString())) {
+      throw e;
+    }
+  }
+
+  return {
+    master: {
+      contract: masterContract,
+      account: masterAccount,
+      balances,
+      merkle
+    },
+    ft: {
+      contract: ftContract,
+      account: ftAccount
+    }
+  };
+}
+
+export default {
+  config,
+  near,
+  keyStore,
+  masterAccount,
+  ftAccount,
+  initContracts
+};
+
+'''
+'''--- tsconfig.eslint.json ---
+{
+  "extends": "./tsconfig.json",
+  "include": ["scripts", "src", "tests", "utils"],
+  "exclude": ["node_modules"]
+}
+'''
+'''--- tsconfig.json ---
+{
+  "compilerOptions": {
+    "target": "es5",
+    "module": "commonjs",
+    "strict": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true
+  }
+}
+'''
+'''--- utils/config.ts ---
+import { execSync } from 'child_process';
+import fs from 'fs';
+import https from 'https';
+import path from 'path';
+
+function downloadFT() {
+  return new Promise<void>((resolve, reject) => {
+    const ftPath =
+      'https://raw.githubusercontent.com/near/near-sdk-rs/master/examples/fungible-token/res/fungible_token.wasm';
+    const dest = path.resolve('res', 'fungible_token.wasm');
+
+    const file = fs.createWriteStream(dest);
+
+    https
+      .get(ftPath, (response) => {
+        response.pipe(file);
+        file.on('finish', () => {
+          file.close();
+          resolve();
+        });
+      })
+      .on('error', (err) => {
+        // Handle errors
+        fs.unlink(dest, () => {
+          reject(err.message);
+        });
+      });
+  });
+}
+
+function deploy() {
+  execSync('near dev-deploy --wasmFile res/merkle_distributor.wasm', { stdio: 'inherit' });
+  const contractId = fs.readFileSync('./neardev/dev-account').toString();
+  const ftContractId = `ft.${contractId}`;
+  execSync(`near create-account ${ftContractId} --initialBalance 10 --masterAccount ${contractId}`, {
+    stdio: 'inherit'
+  });
+  execSync(`near deploy --accountId ${ftContractId} --wasmFile res/fungible_token.wasm`, { stdio: 'inherit' });
+}
+
+function editConfig() {
+  const contractId = fs.readFileSync('./neardev/dev-account').toString();
+  const utilPath = './tests/config.ts';
+
+  let data = fs.readFileSync(utilPath, { encoding: 'utf-8' });
+  data = data.replace(/.*const masterContractId.*/gim, `const masterContractId = '${contractId}';`);
+
+  fs.writeFileSync(utilPath, data, { encoding: 'utf-8' });
+}
+
+(async function () {
+  await downloadFT();
+  deploy();
+  editConfig();
+})();
+
+'''
+'''--- utils/hoist-credentials.ts ---
+import fs from 'fs';
+
+import config from '../tests/config';
+
+const { networkId, masterContractId } = config;
+
+(function () {
+  fs.copyFile(
+    `${process.env.HOME}/.near-credentials/${networkId}/${masterContractId}.json`,
+    `./neardev/${networkId}/${masterContractId}.json`,
+    (err) => {
+      if (err) throw err;
+    }
+  );
+
+  fs.copyFile(
+    `${process.env.HOME}/.near-credentials/${networkId}/ft.${masterContractId}.json`,
+    `./neardev/${networkId}/ft.${masterContractId}.json`,
+    (err) => {
+      if (err) throw err;
+    }
+  );
+})();
+
+'''

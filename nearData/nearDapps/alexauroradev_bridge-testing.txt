@@ -1,0 +1,211 @@
+*GitHub Repository "alexauroradev/bridge-testing"*
+
+'''--- src/borshify-proof.js ---
+const bs58 = require('bs58')
+const Web3 = require('web3');
+const ethereumConfig = require("./json/ethereum-config.json");
+const web3 = new Web3(ethereumConfig.JsonRpc);
+
+function borshifyOutcomeProof (proof) {
+  const statusToBuffer = (status) => {
+    //console.log(status)
+    if ('SuccessValue' in status) {
+      const data = Buffer.from(status.SuccessValue, 'base64')
+      return Buffer.concat([
+        Buffer.from([2]),
+        web3.utils.toBN(data.length).toBuffer('le', 4),
+        data
+      ])
+    } else if ('SuccessReceiptId' in status) {
+      return Buffer.concat([
+        Buffer.from([3]),
+        bs58.decode(status.SuccessReceiptId)
+      ])
+    } else {
+      throw new Error('status not supported')
+    }
+  }
+  return Buffer.concat([
+    web3.utils.toBN(proof.outcome_proof.proof.length).toBuffer('le', 4),
+    Buffer.concat(
+      proof.outcome_proof.proof.map((p) =>
+        Buffer.concat([
+          bs58.decode(p.hash),
+          Buffer.from([p.direction === 'Right' ? 1 : 0])
+        ])
+      )
+    ),
+
+    bs58.decode(proof.outcome_proof.block_hash),
+
+    bs58.decode(proof.outcome_proof.id),
+
+    Buffer.concat([
+      web3.utils
+        .toBN(proof.outcome_proof.outcome.logs.length)
+        .toBuffer('le', 4),
+
+      web3.utils
+        .toBN(proof.outcome_proof.outcome.receipt_ids.length)
+        .toBuffer('le', 4),
+      Buffer.concat(
+        proof.outcome_proof.outcome.receipt_ids.map((r) => bs58.decode(r))
+      ),
+
+      web3.utils.toBN(proof.outcome_proof.outcome.gas_burnt).toBuffer('le', 8),
+      web3.utils
+        .toBN(proof.outcome_proof.outcome.tokens_burnt)
+        .toBuffer('le', 16),
+      web3.utils
+        .toBN(proof.outcome_proof.outcome.executor_id.length)
+        .toBuffer('le', 4),
+      Buffer.from(proof.outcome_proof.outcome.executor_id, 'utf8'),
+
+      statusToBuffer(proof.outcome_proof.outcome.status),
+
+      web3.utils.toBN(0).toBuffer('le', 4),
+
+      bs58.decode(proof.block_header_lite.prev_block_hash),
+      bs58.decode(proof.block_header_lite.inner_rest_hash),
+      web3.utils
+        .toBN(proof.block_header_lite.inner_lite.height)
+        .toBuffer('le', 8),
+      bs58.decode(proof.block_header_lite.inner_lite.epoch_id),
+      bs58.decode(proof.block_header_lite.inner_lite.next_epoch_id),
+      bs58.decode(proof.block_header_lite.inner_lite.prev_state_root),
+      bs58.decode(proof.block_header_lite.inner_lite.outcome_root),
+      // for backward compatible in tests with old dumps
+      web3.utils
+        .toBN(
+          proof.block_header_lite.inner_lite.timestamp_nanosec ||
+            proof.block_header_lite.inner_lite.timestamp
+        )
+        .toBuffer('le', 8),
+      bs58.decode(proof.block_header_lite.inner_lite.next_bp_hash),
+      bs58.decode(proof.block_header_lite.inner_lite.block_merkle_root),
+
+      web3.utils.toBN(proof.block_proof.length).toBuffer('le', 4),
+      Buffer.concat(
+        proof.block_proof.map((bp) =>
+          Buffer.concat([
+            bs58.decode(bp.hash),
+            Buffer.from([bp.direction === 'Right' ? 1 : 0])
+          ])
+        )
+      )
+    ])
+  ])
+}
+
+exports.borshifyOutcomeProof = borshifyOutcomeProof
+'''
+'''--- src/generate-proof.js ---
+const Tree = require('merkle-patricia-tree') ;
+const { encode } = require('eth-util-lite');
+const { Header, Proof, Receipt, Log } = require('eth-object'); 
+const { promisfy } = require('promisfy'); 
+const utils = require('ethereumjs-util'); 
+const { serialize: serializeBorsh } = require('near-api-js/lib/utils/serialize'); 
+const Web3 = require('web3');
+const ethereumConfig = require('./json/ethereum-config.json');
+const connectorAbi = require('./json/connector.json');
+
+const web3 = new Web3(ethereumConfig.JsonRpc);
+const ethTokenLocker = new web3.eth.Contract(connectorAbi, ethereumConfig.ConnectorAddress); //, {from: ethereumConfig.Address}
+
+class BorshProof {
+  constructor (proof) {
+    Object.assign(this, proof)
+  }
+};
+
+const proofBorshSchema = new Map([
+  [BorshProof, {
+    kind: 'struct',
+    fields: [
+      ['log_index', 'u64'],
+      ['log_entry_data', ['u8']],
+      ['receipt_index', 'u64'],
+      ['receipt_data', ['u8']],
+      ['header_data', ['u8']],
+      ['proof', [['u8']]]
+    ]
+  }]
+]);
+
+// Compute proof that Locked event was fired in Ethereum. This proof can then
+// be passed to the FungibleTokenFactory contract, which verifies the proof
+// against a Prover contract.
+async function findProof (lockTxHash) {
+  //console.log(lockTxHash);
+  const receipt = await web3.eth.getTransactionReceipt(lockTxHash);
+  const block = await web3.eth.getBlock(receipt.blockNumber);
+  const tree = await buildTree(block);
+  //console.log(block);
+  const proof = await extractProof(
+    block,
+    tree,
+    receipt.transactionIndex
+  );
+  //console.log(proof);
+
+  const [lockedEvent] = await ethTokenLocker.getPastEvents('Locked', {
+    filter: { transactionHash: lockTxHash },
+    fromBlock: receipt.blockNumber
+  });
+  //console.log(lockedEvent);
+  // `log.logIndex` does not necessarily match the log's order in the array of logs
+  const logIndexInArray = receipt.logs.findIndex(
+    l => l.logIndex === lockedEvent.logIndex
+  );
+  const log = receipt.logs[logIndexInArray];
+  //console.log(log);
+  const formattedProof = new BorshProof({
+    log_index: logIndexInArray,
+    log_entry_data: Array.from(Log.fromWeb3(log).serialize()),
+    receipt_index: proof.txIndex,
+    receipt_data: Array.from(Receipt.fromWeb3(receipt).serialize()),
+    header_data: Array.from(proof.header_rlp),
+    proof: Array.from(proof.receiptProof).map(utils.rlp.encode).map(b => Array.from(b))
+  });
+
+  return serializeBorsh(proofBorshSchema, formattedProof);
+}
+
+exports.findProof = findProof;
+
+async function buildTree (block) {
+  const blockReceipts = await Promise.all(
+    block.transactions.map(t => 
+      web3.eth.getTransactionReceipt(t))
+  );
+
+  // Build a Patricia Merkle Trie
+  const tree = new Tree();
+  await Promise.all(
+    blockReceipts.map(receipt => {
+      const path = encode(receipt.transactionIndex)
+      const serializedReceipt = Receipt.fromWeb3(receipt).serialize()
+      return promisfy(tree.put, tree)(path, serializedReceipt)
+    })
+  );
+
+  return tree;
+}
+
+async function extractProof (block, tree, transactionIndex) {
+  const [, , stack] = await promisfy(
+    tree.findPath,
+    tree
+  )(encode(transactionIndex));
+
+  const blockData = await web3.eth.getBlock(block.number);
+  // Correctly compose and encode the header.
+  const header = Header.fromWeb3(blockData);
+  return {
+    header_rlp: header.serialize(),
+    receiptProof: Proof.fromStack(stack),
+    txIndex: transactionIndex
+  };
+}
+'''

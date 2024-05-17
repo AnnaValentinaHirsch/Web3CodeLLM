@@ -1,0 +1,327 @@
+*GitHub Repository "kimchi9199/Blockchain-hw-day2"*
+
+'''--- Cargo.toml ---
+[package]
+name = "uit-ecommerce-payment-rs"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "4.0.0"
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+# Opt into extra safety checks on arithmetic operations https://stackoverflow.com/a/64136471/249801
+overflow-checks = true
+'''
+'''--- README.md ---
+# Blockchain-hw-day2
+'''
+'''--- build.sh ---
+#!/bin/bash
+set -e
+
+RUSTFLAGS='-C link-arg=-s' cargo build --target wasm32-unknown-unknown --release
+mkdir -p out
+cp target/wasm32-unknown-unknown/release/*.wasm out/contract.wasm
+'''
+'''--- src/ft_contract.rs ---
+use crate::*;
+
+pub trait FungibleTokenReceiver {
+    fn ft_on_transfer(&mut self, sender_id: AccountId, amount: U128, msg: String) -> PromiseOrValue<U128>;
+}
+
+#[ext_contract(ext_ft)]
+pub trait FungibleToken {
+    fn ft_transfer(&mut self, receiver_id: AccountId, amount: U128, memo: Option<String>) -> Promise;
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(crate="near_sdk::serde")]
+struct FTMessage {
+    order_id: OrderId,
+    order_amount: U128
+}
+
+#[near_bindgen]
+impl FungibleTokenReceiver for EcommerceContract {
+    fn ft_on_transfer(&mut self, sender_id: AccountId, amount: U128, msg: String) -> PromiseOrValue<U128> {
+        assert_eq!(env::predecessor_account_id(), self.ft_contract_id);
+        let FTMessage { order_id, order_amount } = near_sdk::serde_json::from_str(&msg).expect("ERROR_NOT_VALID_MESSAGE");
+
+        assert!(amount.0 >= order_amount.0);
+
+        // Kiem tra xem don hang da thanh toan chua
+        let order_optional = self.orders.get(&order_id);
+        match order_optional {
+            Some(order) => {
+                assert!(!order.is_completed)
+            }
+            None => {}
+        }
+
+        // Luu tru lai thong tin thanh toan cua user
+        let order: Order = Order { 
+            order_id: order_id.clone(), 
+            payer_id: sender_id, 
+            payment_method: PaymentMethod::FungibleToken,
+            amount: order_amount.0, 
+            received_amount: amount.0, 
+            is_completed: true, 
+            is_refund: false, 
+            created_at: env::block_timestamp()
+        };
+
+        self.orders.insert(&order_id, &order);
+
+        // Tra lai tien thua cho user
+        if amount.0 > order_amount.0 {
+            PromiseOrValue::Value(U128(amount.0 - order_amount.0))
+        } else {
+            PromiseOrValue::Value(U128(0))
+        }
+
+    }
+}
+'''
+'''--- src/lib.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::json_types::U128;
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{env, AccountId, near_bindgen, Balance, PanicOnDefault, BorshStorageKey, Promise, PromiseOrValue};
+use near_sdk::collections::{LookupMap};
+
+mod order;
+use order::*;
+
+pub type OrderId = String;
+
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+#[near_bindgen]
+struct EcommerceContract {
+    pub owner_id: AccountId,
+    pub orders: LookupMap<OrderId, Order>
+}
+
+#[derive(BorshDeserialize, BorshSerialize, BorshStorageKey)]
+enum StorageKey {
+    OrderKey
+}
+
+/**
+ * Storage account key/ value,  ["Vu Nguyen", "Vu nguyen 123", "Vu nguyen abc"] = names
+ * {key: value, number: 1, name: "Vu Nguyen"}
+ * {"names[0]": "Vu nguyen", "names[1]": "Vu nguyen 123", key: value, number: 1}
+ */
+/**
+ * Bài tập về nhà: Cho phép owner trả tiền lại cho user khi user muốn trả hàng
+ */
+
+#[near_bindgen]
+impl EcommerceContract {
+    #[init]
+    pub fn new(owner_id: AccountId) -> Self {
+        Self { 
+            owner_id, 
+            orders: LookupMap::new(StorageKey::OrderKey)
+        }
+    }
+
+    #[payable]
+    pub fn pay_order(&mut self, order_id: OrderId, order_amount: U128) -> PromiseOrValue<U128> {
+        // Lay thong tin so NEAR deposit cua user env::attached_deposit()
+        assert!(env::attached_deposit() >= order_amount.0, "ERROR_DEPOSIT_NOT_ENOUGH");
+
+        // Luu tru lai thong tin thanh toan cua user
+        let order: Order = Order { 
+            order_id: order_id.clone(), 
+            payer_id: env::signer_account_id(), 
+            amount: order_amount.0, 
+            received_amount: env::attached_deposit(), 
+            is_completed: true, 
+            is_refund: false, 
+            created_at: env::block_timestamp()
+        };
+
+        self.orders.insert(&order_id, &order);
+
+        // Tra lai tien thua cho user
+        if env::attached_deposit() > order_amount.0 {
+            Promise::new(env::signer_account_id()).transfer(env::attached_deposit() - order_amount.0);
+            PromiseOrValue::Value(U128(env::attached_deposit() - order_amount.0))
+        } else {
+            PromiseOrValue::Value(U128(0))
+        }
+    }
+
+    pub fn get_order(&self, order_id: OrderId) -> Order {
+        self.orders.get(&order_id).expect("NOT_FOUND_ORDER_ID")
+    }
+
+    // #[payable]
+    // pub fn refund(&mut self, order_id: OrderId, refund_money: U128) -> PromiseOrValue<U128> {
+    //     // let order =  self.orders.get.(&order_id).expect("NOT_FOUND_ORDER_ID");
+    //     // let refund_money = order.amount;
+    //     Promise::new(env::signer_account_id()).transfer(refund_money.0);
+    //     PromiseOrValue::Value(U128(refund_money.0))
+    // }
+
+    #[payable]
+    pub fn refund(&mut self, order_id: OrderId) -> PromiseOrValue<U128> {
+        let order =  self.orders.get(&order_id).expect("NOT_FOUND_ORDER_ID");
+        let refund_money: U128 = U128(order.amount);
+        Promise::new(env::signer_account_id()).transfer(refund_money.0);
+        PromiseOrValue::Value(U128(refund_money.0))
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use near_sdk::test_utils::{VMContextBuilder, accounts};
+    use near_sdk::{testing_env, MockedBlockchain};
+
+    fn get_context(is_view: bool) -> VMContextBuilder {
+        let mut builder = VMContextBuilder::new();
+        builder
+        .current_account_id(accounts(0))
+        .signer_account_id(accounts(0))
+        .predecessor_account_id(accounts(0))
+        .is_view(is_view);
+
+        builder
+    }
+
+    #[test]
+    fn test_pay_order() {
+        let mut context = get_context(false);
+        let alice: AccountId = accounts(0);
+
+        context.account_balance(1000)
+        .predecessor_account_id(alice.clone())
+        .attached_deposit(1000)
+        .signer_account_id(alice.clone());
+
+        testing_env!(context.build());
+
+        let mut contract = EcommerceContract::new(alice.clone());
+        let order_amount = U128(1000);
+        contract.pay_order("order_1".to_owned(), order_amount);
+
+        let order = contract.get_order("order_1".to_owned());
+
+        // Test
+        assert_eq!(order.order_id, "order_1".to_owned());
+        assert_eq!(order.amount, order_amount.0);
+        assert_eq!(order.payer_id, alice);
+        assert!(order.is_completed);
+    }
+
+    #[test]
+    #[should_panic(expected = "ERROR_DEPOSIT_NOT_ENOUGH")]
+    fn test_pay_order_with_lack_balance() {
+        let mut context = get_context(false);
+        let alice: AccountId = accounts(0);
+
+        context.account_balance(1000)
+        .predecessor_account_id(alice.clone())
+        .attached_deposit(1000)
+        .signer_account_id(alice.clone());
+
+        testing_env!(context.build());
+
+        let mut contract = EcommerceContract::new(alice.clone());
+        let order_amount = U128(2000);
+        contract.pay_order("order_1".to_owned(), order_amount);
+    }
+}
+'''
+'''--- src/order.rs ---
+use near_sdk::Timestamp;
+
+use crate::*;
+
+#[derive(BorshDeserialize, BorshSerialize, Deserialize, Serialize)]
+#[serde(crate= "near_sdk::serde")]
+pub struct Order {
+    pub order_id: OrderId,
+    pub payer_id: AccountId,
+    pub amount: Balance,
+    pub received_amount: Balance,
+    pub is_completed: bool,
+    pub is_refund: bool,
+    pub created_at: Timestamp
+}
+'''
+'''--- tests/integration_test.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::json_types::U128;
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{env, AccountId, near_bindgen, Balance, PanicOnDefault, BorshStorageKey, Promise, PromiseOrValue, ext_contract, PromiseResult, Gas};
+use near_sdk::collections::{LookupMap};
+use uit-ecommerce-contract::*;
+use near_units::parse_near;
+use serde_json::json;
+use workspaces::prelude::*;
+use workspaces::{network::Sandbox, sandbox, Account, Contract, Worker};
+const WASM_FILEPATH: &str = "../out/main.wasm";
+
+[tokio::main]
+async fn main() -> anyhow::Resutl<()> {
+    let sandbox = sandbox().await?;
+    let wasm = std::fs::read(WASM_FILEPATH)?;
+    let contract = sandbox.dev_deploy(&wasm).await?;
+
+    //create accounts
+    let owner = sandbox.root_account().unwrap();
+    let user = owner.create_subaccount(&sandbox, "user")
+                    . initial_balance(parse_near!("30 N"))
+                    .transact()
+                    .await?;
+                    .into_resutl()?;
+
+    //begin tests
+    test_fn_contracts()
+
+    Ok(())
+}
+
+#[test]
+async fn test_ft_contracts(
+    user: &Account,
+    contract: &Contract,
+    sandbox: &Worker<Sandbox>
+) -> anyhow::Result<()> {
+    let mut context = get_context(false);
+        let alice: AccountId = accounts(0);
+
+        context.account_balance(1000)
+        .predecessor_account_id(alice.clone())
+        .attached_deposit(1000)
+        .signer_account_id(alice.clone());
+
+        testing_env!(context.build());
+
+        let mut contract = EcommerceContract::new(alice.clone());
+        let order_amount = U128(1000);
+        contract.ft_on_transfer(alice, order_amount);
+
+        let order = contract.get_order("order_1".to_owned());
+
+        // Test
+        assert_eq!(order.order_id, "order_1".to_owned());
+        assert_eq!(order.amount, order_amount.0);
+        assert_eq!(order.payer_id, alice);
+        assert!(order.is_completed);
+    }
+'''

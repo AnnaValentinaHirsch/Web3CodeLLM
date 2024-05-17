@@ -1,0 +1,6206 @@
+*GitHub Repository "kuutamolabs/hyper-util"*
+
+'''--- .github/workflows/CI.yml ---
+name: CI
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+env:
+  RUST_BACKTRACE: 1
+
+jobs:
+  ci-pass:
+    name: CI is green
+    runs-on: ubuntu-latest
+    needs:
+      - style
+      - test
+      - msrv
+      - miri
+      - features
+      - doc
+    steps:
+      - run: exit 0
+
+  style:
+    name: Check Style
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - run: cargo fmt --all --check
+
+  test:
+    name: Test ${{ matrix.rust }} on ${{ matrix.os }}
+    needs: [style]
+    strategy:
+      matrix:
+        rust:
+          - stable
+          - beta
+          - nightly
+
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macOS-latest
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (${{ matrix.rust }})
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - run: cargo test
+
+  msrv:
+    name: Check MSRV (${{ matrix.rust }})
+    needs: [style]
+    strategy:
+      matrix:
+        rust:
+          - 1.63 # keep in sync with MSRV.md dev doc
+
+        os:
+          - ubuntu-latest
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (${{ matrix.rust }})
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - run: cargo check --features full
+
+  miri:
+    name: Test with Miri
+    needs: [style]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - name: Test
+        env:
+          # Can't enable tcp feature since Miri does not support the tokio runtime
+          MIRIFLAGS: "-Zmiri-disable-isolation"
+        run: cargo miri test
+
+  features:
+    name: features
+    needs: [style]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@cargo-hack
+
+      - run: cargo hack --no-dev-deps check --feature-powerset --depth 2
+
+  doc:
+    name: Build docs
+    needs: [style, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - run: cargo rustdoc -- --cfg docsrs -D broken-intra-doc-links
+
+'''
+'''--- Cargo.toml ---
+[package]
+name = "hyper-util"
+version = "0.0.0"
+description = "hyper utilities"
+readme = "README.md"
+homepage = "https://hyper.rs"
+documentation = "https://docs.rs/hyper-util"
+repository = "https://github.com/hyperium/hyper-util"
+license = "MIT"
+authors = ["Sean McArthur <sean@seanmonstar.com>"]
+keywords = ["http", "hyper", "hyperium"]
+categories = ["network-programming", "web-programming::http-client", "web-programming::http-server"]
+edition = "2018"
+
+publish = false # no accidents while in dev
+
+[dependencies]
+hyper = "=1.0.0-rc.4"
+futures-channel = "0.3"
+futures-util = { version = "0.3", default-features = false }
+http = "0.2"
+http-body = "1.0.0-rc.2"
+bytes = "1"
+pin-project-lite = "0.2.4"
+socket2 = "0.5"
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tokio = { version = "1", features = ["net", "rt", "time"] }
+tower-service = "0.3"
+tower = { version = "0.4", features = ["make", "util"] }
+
+[dev-dependencies]
+hyper = { version = "1.0.0-rc.3", features = ["full"] }
+bytes = "1"
+http-body-util = "0.1.0-rc.3"
+tokio = { version = "1", features = ["macros", "test-util"] }
+tokio-test = "0.4"
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]
+pnet_datalink = "0.34.0"
+
+[features]
+default = []
+
+# Shorthand to enable everything
+full = ["client", "server", "http1", "http2", "tcp", "auto", "runtime"]
+
+client = ["hyper/client"]
+server = ["hyper/server"]
+
+http1 = ["hyper/http1"]
+http2 = ["hyper/http2"]
+
+tcp = []
+auto = ["hyper/server", "http1", "http2"]
+runtime = []
+
+# internal features used in CI
+__internal_happy_eyeballs_tests = []
+
+[[example]]
+name = "client"
+required-features = ["client", "http1", "tcp", "runtime"]
+
+'''
+'''--- README.md ---
+# hyper-util
+
+A collection of utilities to be do common things with hyper.
+
+'''
+'''--- examples/client.rs ---
+use std::env;
+
+use http_body_util::Empty;
+use hyper::Request;
+use hyper_util::client::{connect::HttpConnector, legacy::Client};
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let url = match env::args().nth(1) {
+        Some(url) => url,
+        None => {
+            eprintln!("Usage: client <url>");
+            return Ok(());
+        }
+    };
+
+    // HTTPS requires picking a TLS implementation, so give a better
+    // warning if the user tries to request an 'https' URL.
+    let url = url.parse::<hyper::Uri>()?;
+    if url.scheme_str() != Some("http") {
+        eprintln!("This example only works with 'http' URLs.");
+        return Ok(());
+    }
+
+    let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(HttpConnector::new());
+
+    let req = Request::builder()
+        .uri(url)
+        .body(Empty::<bytes::Bytes>::new())?;
+
+    let resp = client.request(req).await?;
+
+    eprintln!("{:?} {:?}", resp.version(), resp.status());
+    eprintln!("{:#?}", resp.headers());
+
+    Ok(())
+}
+
+'''
+'''--- src/client/client.rs ---
+use hyper::{Request, Response};
+use tower::{Service, MakeService};
+
+use super::connect::Connect;
+use super::pool;
+
+pub struct Client<M> {
+    // Hi there. So, let's take a 0.14.x hyper::Client, and build up its layers
+    // here. We don't need to fully expose the layers to start with, but that
+    // is the end goal.
+    //
+    // Client = MakeSvcAsService<
+    //   SetHost<
+    //     Http1RequestTarget<
+    //       DelayedRelease<
+    //         ConnectingPool<C, P>
+    //       >
+    //     >
+    //   >
+    // >
+    make_svc: M,
+}
+
+// We might change this... :shrug:
+type PoolKey = hyper::Uri;
+
+struct ConnectingPool<C, P> {
+    connector: C,
+    pool: P,
+}
+
+struct PoolableSvc<S>(S);
+
+/// A marker to identify what version a pooled connection is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
+pub enum Ver {
+    Auto,
+    Http2,
+}
+
+// ===== impl Client =====
+
+impl<M, /*ReqBody, ResBody,*/ E> Client<M>
+where
+    M: MakeService<
+        hyper::Uri,
+        Request<()>,
+        Response = Response<()>,
+        Error = E,
+        MakeError = E,
+    >,
+    //M: Service<hyper::Uri, Error = E>,
+    //M::Response: Service<Request<ReqBody>, Response = Response<ResBody>>,
+{
+    pub async fn request(&mut self, req: Request<()>) -> Result<Response<()>, E> {
+        let mut svc = self.make_svc.make_service(req.uri().clone()).await?;
+        svc.call(req).await
+    }
+}
+
+impl<M, /*ReqBody, ResBody,*/ E> Client<M>
+where
+    M: MakeService<
+        hyper::Uri,
+        Request<()>,
+        Response = Response<()>,
+        Error = E,
+        MakeError = E,
+    >,
+    //M: Service<hyper::Uri, Error = E>,
+    //M::Response: Service<Request<ReqBody>, Response = Response<ResBody>>,
+{
+    
+}
+
+// ===== impl ConnectingPool =====
+
+impl<C, P> ConnectingPool<C, P>
+where
+    C: Connect,
+    C::_Svc: Unpin + Send + 'static,
+{
+    async fn connection_for(&self, target: PoolKey) -> Result<pool::Pooled<PoolableSvc<C::_Svc>, PoolKey>, ()> {
+        todo!()
+    }
+}
+
+impl<S> pool::Poolable for PoolableSvc<S>
+where
+    S: Unpin + Send + 'static,
+{
+    fn is_open(&self) -> bool {
+        /*
+        match self.tx {
+            PoolTx::Http1(ref tx) => tx.is_ready(),
+            #[cfg(feature = "http2")]
+            PoolTx::Http2(ref tx) => tx.is_ready(),
+        }
+        */
+        true
+    }
+
+    fn reserve(self) -> pool::Reservation<Self> {
+        /*
+        match self.tx {
+            PoolTx::Http1(tx) => Reservation::Unique(PoolClient {
+                conn_info: self.conn_info,
+                tx: PoolTx::Http1(tx),
+            }),
+            #[cfg(feature = "http2")]
+            PoolTx::Http2(tx) => {
+                let b = PoolClient {
+                    conn_info: self.conn_info.clone(),
+                    tx: PoolTx::Http2(tx.clone()),
+                };
+                let a = PoolClient {
+                    conn_info: self.conn_info,
+                    tx: PoolTx::Http2(tx),
+                };
+                Reservation::Shared(a, b)
+            }
+        }
+        */
+        pool::Reservation::Unique(self)
+    }
+
+    fn can_share(&self) -> bool {
+        false
+        //self.is_http2()
+    }
+}
+
+'''
+'''--- src/client/connect/dns.rs ---
+//! DNS Resolution used by the `HttpConnector`.
+//!
+//! This module contains:
+//!
+//! - A [`GaiResolver`](GaiResolver) that is the default resolver for the
+//!   `HttpConnector`.
+//! - The `Name` type used as an argument to custom resolvers.
+//!
+//! # Resolvers are `Service`s
+//!
+//! A resolver is just a
+//! `Service<Name, Response = impl Iterator<Item = SocketAddr>>`.
+//!
+//! A simple resolver that ignores the name and always returns a specific
+//! address:
+//!
+//! ```rust,ignore
+//! use std::{convert::Infallible, iter, net::SocketAddr};
+//!
+//! let resolver = tower::service_fn(|_name| async {
+//!     Ok::<_, Infallible>(iter::once(SocketAddr::from(([127, 0, 0, 1], 8080))))
+//! });
+//! ```
+use std::error::Error;
+use std::future::Future;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs};
+use std::pin::Pin;
+use std::str::FromStr;
+use std::task::{self, Poll};
+use std::{fmt, io, vec};
+
+use tokio::task::JoinHandle;
+use tower_service::Service;
+use tracing::debug;
+
+pub(super) use self::sealed::Resolve;
+
+/// A domain name to resolve into IP addresses.
+#[derive(Clone, Hash, Eq, PartialEq)]
+pub struct Name {
+    host: Box<str>,
+}
+
+/// A resolver using blocking `getaddrinfo` calls in a threadpool.
+#[derive(Clone)]
+pub struct GaiResolver {
+    _priv: (),
+}
+
+/// An iterator of IP addresses returned from `getaddrinfo`.
+pub struct GaiAddrs {
+    inner: SocketAddrs,
+}
+
+/// A future to resolve a name returned by `GaiResolver`.
+pub struct GaiFuture {
+    inner: JoinHandle<Result<SocketAddrs, io::Error>>,
+}
+
+impl Name {
+    pub(super) fn new(host: Box<str>) -> Name {
+        Name { host }
+    }
+
+    /// View the hostname as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.host
+    }
+}
+
+impl fmt::Debug for Name {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.host, f)
+    }
+}
+
+impl fmt::Display for Name {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.host, f)
+    }
+}
+
+impl FromStr for Name {
+    type Err = InvalidNameError;
+
+    fn from_str(host: &str) -> Result<Self, Self::Err> {
+        // Possibly add validation later
+        Ok(Name::new(host.into()))
+    }
+}
+
+/// Error indicating a given string was not a valid domain name.
+#[derive(Debug)]
+pub struct InvalidNameError(());
+
+impl fmt::Display for InvalidNameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Not a valid domain name")
+    }
+}
+
+impl Error for InvalidNameError {}
+
+impl GaiResolver {
+    /// Construct a new `GaiResolver`.
+    pub fn new() -> Self {
+        GaiResolver { _priv: () }
+    }
+}
+
+impl Service<Name> for GaiResolver {
+    type Response = GaiAddrs;
+    type Error = io::Error;
+    type Future = GaiFuture;
+
+    fn poll_ready(&mut self, _cx: &mut task::Context<'_>) -> Poll<Result<(), io::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, name: Name) -> Self::Future {
+        let blocking = tokio::task::spawn_blocking(move || {
+            debug!("resolving host={:?}", name.host);
+            (&*name.host, 0)
+                .to_socket_addrs()
+                .map(|i| SocketAddrs { iter: i })
+        });
+
+        GaiFuture { inner: blocking }
+    }
+}
+
+impl fmt::Debug for GaiResolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad("GaiResolver")
+    }
+}
+
+impl Future for GaiFuture {
+    type Output = Result<GaiAddrs, io::Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.inner).poll(cx).map(|res| match res {
+            Ok(Ok(addrs)) => Ok(GaiAddrs { inner: addrs }),
+            Ok(Err(err)) => Err(err),
+            Err(join_err) => {
+                if join_err.is_cancelled() {
+                    Err(io::Error::new(io::ErrorKind::Interrupted, join_err))
+                } else {
+                    panic!("gai background task failed: {:?}", join_err)
+                }
+            }
+        })
+    }
+}
+
+impl fmt::Debug for GaiFuture {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad("GaiFuture")
+    }
+}
+
+impl Drop for GaiFuture {
+    fn drop(&mut self) {
+        self.inner.abort();
+    }
+}
+
+impl Iterator for GaiAddrs {
+    type Item = SocketAddr;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+}
+
+impl fmt::Debug for GaiAddrs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad("GaiAddrs")
+    }
+}
+
+pub(super) struct SocketAddrs {
+    iter: vec::IntoIter<SocketAddr>,
+}
+
+impl SocketAddrs {
+    pub(super) fn new(addrs: Vec<SocketAddr>) -> Self {
+        SocketAddrs {
+            iter: addrs.into_iter(),
+        }
+    }
+
+    pub(super) fn try_parse(host: &str, port: u16) -> Option<SocketAddrs> {
+        if let Ok(addr) = host.parse::<Ipv4Addr>() {
+            let addr = SocketAddrV4::new(addr, port);
+            return Some(SocketAddrs {
+                iter: vec![SocketAddr::V4(addr)].into_iter(),
+            });
+        }
+        if let Ok(addr) = host.parse::<Ipv6Addr>() {
+            let addr = SocketAddrV6::new(addr, port, 0, 0);
+            return Some(SocketAddrs {
+                iter: vec![SocketAddr::V6(addr)].into_iter(),
+            });
+        }
+        None
+    }
+
+    #[inline]
+    fn filter(self, predicate: impl FnMut(&SocketAddr) -> bool) -> SocketAddrs {
+        SocketAddrs::new(self.iter.filter(predicate).collect())
+    }
+
+    pub(super) fn split_by_preference(
+        self,
+        local_addr_ipv4: Option<Ipv4Addr>,
+        local_addr_ipv6: Option<Ipv6Addr>,
+    ) -> (SocketAddrs, SocketAddrs) {
+        match (local_addr_ipv4, local_addr_ipv6) {
+            (Some(_), None) => (self.filter(SocketAddr::is_ipv4), SocketAddrs::new(vec![])),
+            (None, Some(_)) => (self.filter(SocketAddr::is_ipv6), SocketAddrs::new(vec![])),
+            _ => {
+                let preferring_v6 = self
+                    .iter
+                    .as_slice()
+                    .first()
+                    .map(SocketAddr::is_ipv6)
+                    .unwrap_or(false);
+
+                let (preferred, fallback) = self
+                    .iter
+                    .partition::<Vec<_>, _>(|addr| addr.is_ipv6() == preferring_v6);
+
+                (SocketAddrs::new(preferred), SocketAddrs::new(fallback))
+            }
+        }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.iter.as_slice().is_empty()
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.iter.as_slice().len()
+    }
+}
+
+impl Iterator for SocketAddrs {
+    type Item = SocketAddr;
+    #[inline]
+    fn next(&mut self) -> Option<SocketAddr> {
+        self.iter.next()
+    }
+}
+
+mod sealed {
+    use std::future::Future;
+    use std::task::{self, Poll};
+
+    use super::{Name, SocketAddr};
+    use tower_service::Service;
+
+    // "Trait alias" for `Service<Name, Response = Addrs>`
+    pub trait Resolve {
+        type Addrs: Iterator<Item = SocketAddr>;
+        type Error: Into<Box<dyn std::error::Error + Send + Sync>>;
+        type Future: Future<Output = Result<Self::Addrs, Self::Error>>;
+
+        fn poll_ready(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), Self::Error>>;
+        fn resolve(&mut self, name: Name) -> Self::Future;
+    }
+
+    impl<S> Resolve for S
+    where
+        S: Service<Name>,
+        S::Response: Iterator<Item = SocketAddr>,
+        S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        type Addrs = S::Response;
+        type Error = S::Error;
+        type Future = S::Future;
+
+        fn poll_ready(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Service::poll_ready(self, cx)
+        }
+
+        fn resolve(&mut self, name: Name) -> Self::Future {
+            Service::call(self, name)
+        }
+    }
+}
+
+pub(super) async fn resolve<R>(resolver: &mut R, name: Name) -> Result<R::Addrs, R::Error>
+where
+    R: Resolve,
+{
+    futures_util::future::poll_fn(|cx| resolver.poll_ready(cx)).await?;
+    resolver.resolve(name).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn test_ip_addrs_split_by_preference() {
+        let ip_v4 = Ipv4Addr::new(127, 0, 0, 1);
+        let ip_v6 = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1);
+        let v4_addr = (ip_v4, 80).into();
+        let v6_addr = (ip_v6, 80).into();
+
+        let (mut preferred, mut fallback) = SocketAddrs {
+            iter: vec![v4_addr, v6_addr].into_iter(),
+        }
+        .split_by_preference(None, None);
+        assert!(preferred.next().unwrap().is_ipv4());
+        assert!(fallback.next().unwrap().is_ipv6());
+
+        let (mut preferred, mut fallback) = SocketAddrs {
+            iter: vec![v6_addr, v4_addr].into_iter(),
+        }
+        .split_by_preference(None, None);
+        assert!(preferred.next().unwrap().is_ipv6());
+        assert!(fallback.next().unwrap().is_ipv4());
+
+        let (mut preferred, mut fallback) = SocketAddrs {
+            iter: vec![v4_addr, v6_addr].into_iter(),
+        }
+        .split_by_preference(Some(ip_v4), Some(ip_v6));
+        assert!(preferred.next().unwrap().is_ipv4());
+        assert!(fallback.next().unwrap().is_ipv6());
+
+        let (mut preferred, mut fallback) = SocketAddrs {
+            iter: vec![v6_addr, v4_addr].into_iter(),
+        }
+        .split_by_preference(Some(ip_v4), Some(ip_v6));
+        assert!(preferred.next().unwrap().is_ipv6());
+        assert!(fallback.next().unwrap().is_ipv4());
+
+        let (mut preferred, fallback) = SocketAddrs {
+            iter: vec![v4_addr, v6_addr].into_iter(),
+        }
+        .split_by_preference(Some(ip_v4), None);
+        assert!(preferred.next().unwrap().is_ipv4());
+        assert!(fallback.is_empty());
+
+        let (mut preferred, fallback) = SocketAddrs {
+            iter: vec![v4_addr, v6_addr].into_iter(),
+        }
+        .split_by_preference(None, Some(ip_v6));
+        assert!(preferred.next().unwrap().is_ipv6());
+        assert!(fallback.is_empty());
+    }
+
+    #[test]
+    fn test_name_from_str() {
+        const DOMAIN: &str = "test.example.com";
+        let name = Name::from_str(DOMAIN).expect("Should be a valid domain");
+        assert_eq!(name.as_str(), DOMAIN);
+        assert_eq!(name.to_string(), DOMAIN);
+    }
+}
+
+'''
+'''--- src/client/connect/http.rs ---
+use std::error::Error as StdError;
+use std::fmt;
+use std::future::Future;
+use std::io;
+use std::marker::PhantomData;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{self, Poll};
+use std::time::Duration;
+
+use futures_util::future::Either;
+use http::uri::{Scheme, Uri};
+use pin_project_lite::pin_project;
+use socket2::TcpKeepalive;
+use tokio::net::{TcpSocket, TcpStream};
+use tokio::time::Sleep;
+use tracing::{debug, trace, warn};
+
+use super::dns::{self, resolve, GaiResolver, Resolve};
+use super::{Connected, Connection};
+use crate::rt::TokioIo;
+
+/// A connector for the `http` scheme.
+///
+/// Performs DNS resolution in a thread pool, and then connects over TCP.
+///
+/// # Note
+///
+/// Sets the [`HttpInfo`](HttpInfo) value on responses, which includes
+/// transport information such as the remote socket address used.
+#[derive(Clone)]
+pub struct HttpConnector<R = GaiResolver> {
+    config: Arc<Config>,
+    resolver: R,
+}
+
+/// Extra information about the transport when an HttpConnector is used.
+///
+/// # Example
+///
+/// ```
+/// # fn doc(res: http::Response<()>) {
+/// use hyper_util::client::connect::HttpInfo;
+///
+/// // res = http::Response
+/// res
+///     .extensions()
+///     .get::<HttpInfo>()
+///     .map(|info| {
+///         println!("remote addr = {}", info.remote_addr());
+///     });
+/// # }
+/// ```
+///
+/// # Note
+///
+/// If a different connector is used besides [`HttpConnector`](HttpConnector),
+/// this value will not exist in the extensions. Consult that specific
+/// connector to see what "extra" information it might provide to responses.
+#[derive(Clone, Debug)]
+pub struct HttpInfo {
+    remote_addr: SocketAddr,
+    local_addr: SocketAddr,
+}
+
+#[derive(Clone)]
+struct Config {
+    connect_timeout: Option<Duration>,
+    enforce_http: bool,
+    happy_eyeballs_timeout: Option<Duration>,
+    tcp_keepalive_config: TcpKeepaliveConfig,
+    local_address_ipv4: Option<Ipv4Addr>,
+    local_address_ipv6: Option<Ipv6Addr>,
+    nodelay: bool,
+    reuse_address: bool,
+    send_buffer_size: Option<usize>,
+    recv_buffer_size: Option<usize>,
+    interface: Option<String>,
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+struct TcpKeepaliveConfig {
+    time: Option<Duration>,
+    interval: Option<Duration>,
+    retries: Option<u32>,
+}
+
+impl TcpKeepaliveConfig {
+    /// Converts into a `socket2::TcpKeealive` if there is any keep alive configuration.
+    fn into_tcpkeepalive(self) -> Option<TcpKeepalive> {
+        let mut dirty = false;
+        let mut ka = TcpKeepalive::new();
+        if let Some(time) = self.time {
+            ka = ka.with_time(time);
+            dirty = true
+        }
+        if let Some(interval) = self.interval {
+            ka = Self::ka_with_interval(ka, interval, &mut dirty)
+        };
+        if let Some(retries) = self.retries {
+            ka = Self::ka_with_retries(ka, retries, &mut dirty)
+        };
+        if dirty {
+            Some(ka)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(not(any(target_os = "openbsd", target_os = "redox", target_os = "solaris")))]
+    fn ka_with_interval(ka: TcpKeepalive, interval: Duration, dirty: &mut bool) -> TcpKeepalive {
+        *dirty = true;
+        ka.with_interval(interval)
+    }
+
+    #[cfg(any(target_os = "openbsd", target_os = "redox", target_os = "solaris"))]
+    fn ka_with_interval(ka: TcpKeepalive, _: Duration, _: &mut bool) -> TcpKeepalive {
+        ka // no-op as keepalive interval is not supported on this platform
+    }
+
+    #[cfg(not(any(
+        target_os = "openbsd",
+        target_os = "redox",
+        target_os = "solaris",
+        target_os = "windows"
+    )))]
+    fn ka_with_retries(ka: TcpKeepalive, retries: u32, dirty: &mut bool) -> TcpKeepalive {
+        *dirty = true;
+        ka.with_retries(retries)
+    }
+
+    #[cfg(any(
+        target_os = "openbsd",
+        target_os = "redox",
+        target_os = "solaris",
+        target_os = "windows"
+    ))]
+    fn ka_with_retries(ka: TcpKeepalive, _: u32, _: &mut bool) -> TcpKeepalive {
+        ka // no-op as keepalive retries is not supported on this platform
+    }
+}
+
+// ===== impl HttpConnector =====
+
+impl HttpConnector {
+    /// Construct a new HttpConnector.
+    pub fn new() -> HttpConnector {
+        HttpConnector::new_with_resolver(GaiResolver::new())
+    }
+}
+
+impl<R> HttpConnector<R> {
+    /// Construct a new HttpConnector.
+    ///
+    /// Takes a [`Resolver`](crate::client::connect::dns#resolvers-are-services) to handle DNS lookups.
+    pub fn new_with_resolver(resolver: R) -> HttpConnector<R> {
+        HttpConnector {
+            config: Arc::new(Config {
+                connect_timeout: None,
+                enforce_http: true,
+                happy_eyeballs_timeout: Some(Duration::from_millis(300)),
+                tcp_keepalive_config: TcpKeepaliveConfig::default(),
+                local_address_ipv4: None,
+                local_address_ipv6: None,
+                nodelay: false,
+                reuse_address: false,
+                send_buffer_size: None,
+                recv_buffer_size: None,
+                interface: None,
+            }),
+            resolver,
+        }
+    }
+
+    /// Option to enforce all `Uri`s have the `http` scheme.
+    ///
+    /// Enabled by default.
+    #[inline]
+    pub fn enforce_http(&mut self, is_enforced: bool) {
+        self.config_mut().enforce_http = is_enforced;
+    }
+
+    /// Set that all sockets have `SO_KEEPALIVE` set with the supplied duration
+    /// to remain idle before sending TCP keepalive probes.
+    ///
+    /// If `None`, keepalive is disabled.
+    ///
+    /// Default is `None`.
+    #[inline]
+    pub fn set_keepalive(&mut self, time: Option<Duration>) {
+        self.config_mut().tcp_keepalive_config.time = time;
+    }
+
+    /// Set the duration between two successive TCP keepalive retransmissions,
+    /// if acknowledgement to the previous keepalive transmission is not received.
+    #[inline]
+    pub fn set_keepalive_interval(&mut self, interval: Option<Duration>) {
+        self.config_mut().tcp_keepalive_config.interval = interval;
+    }
+
+    /// Set the number of retransmissions to be carried out before declaring that remote end is not available.
+    #[inline]
+    pub fn set_keepalive_retries(&mut self, retries: Option<u32>) {
+        self.config_mut().tcp_keepalive_config.retries = retries;
+    }
+
+    /// Set that all sockets have `SO_NODELAY` set to the supplied value `nodelay`.
+    ///
+    /// Default is `false`.
+    #[inline]
+    pub fn set_nodelay(&mut self, nodelay: bool) {
+        self.config_mut().nodelay = nodelay;
+    }
+
+    /// Sets the value of the SO_SNDBUF option on the socket.
+    #[inline]
+    pub fn set_send_buffer_size(&mut self, size: Option<usize>) {
+        self.config_mut().send_buffer_size = size;
+    }
+
+    /// Sets the value of the SO_RCVBUF option on the socket.
+    #[inline]
+    pub fn set_recv_buffer_size(&mut self, size: Option<usize>) {
+        self.config_mut().recv_buffer_size = size;
+    }
+
+    /// Set that all sockets are bound to the configured address before connection.
+    ///
+    /// If `None`, the sockets will not be bound.
+    ///
+    /// Default is `None`.
+    #[inline]
+    pub fn set_local_address(&mut self, addr: Option<IpAddr>) {
+        let (v4, v6) = match addr {
+            Some(IpAddr::V4(a)) => (Some(a), None),
+            Some(IpAddr::V6(a)) => (None, Some(a)),
+            _ => (None, None),
+        };
+
+        let cfg = self.config_mut();
+
+        cfg.local_address_ipv4 = v4;
+        cfg.local_address_ipv6 = v6;
+    }
+
+    /// Set that all sockets are bound to the configured IPv4 or IPv6 address (depending on host's
+    /// preferences) before connection.
+    #[inline]
+    pub fn set_local_addresses(&mut self, addr_ipv4: Ipv4Addr, addr_ipv6: Ipv6Addr) {
+        let cfg = self.config_mut();
+
+        cfg.local_address_ipv4 = Some(addr_ipv4);
+        cfg.local_address_ipv6 = Some(addr_ipv6);
+    }
+
+    /// Set the connect timeout.
+    ///
+    /// If a domain resolves to multiple IP addresses, the timeout will be
+    /// evenly divided across them.
+    ///
+    /// Default is `None`.
+    #[inline]
+    pub fn set_connect_timeout(&mut self, dur: Option<Duration>) {
+        self.config_mut().connect_timeout = dur;
+    }
+
+    /// Set timeout for [RFC 6555 (Happy Eyeballs)][RFC 6555] algorithm.
+    ///
+    /// If hostname resolves to both IPv4 and IPv6 addresses and connection
+    /// cannot be established using preferred address family before timeout
+    /// elapses, then connector will in parallel attempt connection using other
+    /// address family.
+    ///
+    /// If `None`, parallel connection attempts are disabled.
+    ///
+    /// Default is 300 milliseconds.
+    ///
+    /// [RFC 6555]: https://tools.ietf.org/html/rfc6555
+    #[inline]
+    pub fn set_happy_eyeballs_timeout(&mut self, dur: Option<Duration>) {
+        self.config_mut().happy_eyeballs_timeout = dur;
+    }
+
+    /// Set that all socket have `SO_REUSEADDR` set to the supplied value `reuse_address`.
+    ///
+    /// Default is `false`.
+    #[inline]
+    pub fn set_reuse_address(&mut self, reuse_address: bool) -> &mut Self {
+        self.config_mut().reuse_address = reuse_address;
+        self
+    }
+
+    /// Sets the value for the `SO_BINDTODEVICE` option on this socket.
+    ///
+    /// If a socket is bound to an interface, only packets received from that particular
+    /// interface are processed by the socket. Note that this only works for some socket
+    /// types, particularly AF_INET sockets.
+    ///
+    /// On Linux it can be used to specify a [VRF], but the binary needs
+    /// to either have `CAP_NET_RAW` or to be run as root.
+    ///
+    /// This function is only available on Android、Fuchsia and Linux.
+    ///
+    /// [VRF]: https://www.kernel.org/doc/Documentation/networking/vrf.txt
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    #[inline]
+    pub fn set_interface<S: Into<String>>(&mut self, interface: S) -> &mut Self {
+        self.config_mut().interface = Some(interface.into());
+        self
+    }
+
+    // private
+
+    fn config_mut(&mut self) -> &mut Config {
+        // If the are HttpConnector clones, this will clone the inner
+        // config. So mutating the config won't ever affect previous
+        // clones.
+        Arc::make_mut(&mut self.config)
+    }
+}
+
+static INVALID_NOT_HTTP: &str = "invalid URL, scheme is not http";
+static INVALID_MISSING_SCHEME: &str = "invalid URL, scheme is missing";
+static INVALID_MISSING_HOST: &str = "invalid URL, host is missing";
+
+// R: Debug required for now to allow adding it to debug output later...
+impl<R: fmt::Debug> fmt::Debug for HttpConnector<R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HttpConnector").finish()
+    }
+}
+
+impl<R> tower_service::Service<Uri> for HttpConnector<R>
+where
+    R: Resolve + Clone + Send + Sync + 'static,
+    R::Future: Send,
+{
+    type Response = TokioIo<TcpStream>;
+    type Error = ConnectError;
+    type Future = HttpConnecting<R>;
+
+    fn poll_ready(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        futures_util::ready!(self.resolver.poll_ready(cx)).map_err(ConnectError::dns)?;
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, dst: Uri) -> Self::Future {
+        let mut self_ = self.clone();
+        HttpConnecting {
+            fut: Box::pin(async move { self_.call_async(dst).await }),
+            _marker: PhantomData,
+        }
+    }
+}
+
+fn get_host_port<'u>(config: &Config, dst: &'u Uri) -> Result<(&'u str, u16), ConnectError> {
+    trace!(
+        "Http::connect; scheme={:?}, host={:?}, port={:?}",
+        dst.scheme(),
+        dst.host(),
+        dst.port(),
+    );
+
+    if config.enforce_http {
+        if dst.scheme() != Some(&Scheme::HTTP) {
+            return Err(ConnectError {
+                msg: INVALID_NOT_HTTP.into(),
+                cause: None,
+            });
+        }
+    } else if dst.scheme().is_none() {
+        return Err(ConnectError {
+            msg: INVALID_MISSING_SCHEME.into(),
+            cause: None,
+        });
+    }
+
+    let host = match dst.host() {
+        Some(s) => s,
+        None => {
+            return Err(ConnectError {
+                msg: INVALID_MISSING_HOST.into(),
+                cause: None,
+            })
+        }
+    };
+    let port = match dst.port() {
+        Some(port) => port.as_u16(),
+        None => {
+            if dst.scheme() == Some(&Scheme::HTTPS) {
+                443
+            } else {
+                80
+            }
+        }
+    };
+
+    Ok((host, port))
+}
+
+impl<R> HttpConnector<R>
+where
+    R: Resolve,
+{
+    async fn call_async(&mut self, dst: Uri) -> Result<TokioIo<TcpStream>, ConnectError> {
+        let config = &self.config;
+
+        let (host, port) = get_host_port(config, &dst)?;
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+
+        // If the host is already an IP addr (v4 or v6),
+        // skip resolving the dns and start connecting right away.
+        let addrs = if let Some(addrs) = dns::SocketAddrs::try_parse(host, port) {
+            addrs
+        } else {
+            let addrs = resolve(&mut self.resolver, dns::Name::new(host.into()))
+                .await
+                .map_err(ConnectError::dns)?;
+            let addrs = addrs
+                .map(|mut addr| {
+                    addr.set_port(port);
+                    addr
+                })
+                .collect();
+            dns::SocketAddrs::new(addrs)
+        };
+
+        let c = ConnectingTcp::new(addrs, config);
+
+        let sock = c.connect().await?;
+
+        if let Err(e) = sock.set_nodelay(config.nodelay) {
+            warn!("tcp set_nodelay error: {}", e);
+        }
+
+        Ok(TokioIo::new(sock))
+    }
+}
+
+impl Connection for TokioIo<TcpStream> {
+    fn connected(&self) -> Connected {
+        let connected = Connected::new();
+        if let (Ok(remote_addr), Ok(local_addr)) =
+            (self.inner().peer_addr(), self.inner().local_addr())
+        {
+            connected.extra(HttpInfo {
+                remote_addr,
+                local_addr,
+            })
+        } else {
+            connected
+        }
+    }
+}
+
+impl HttpInfo {
+    /// Get the remote address of the transport used.
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.remote_addr
+    }
+
+    /// Get the local address of the transport used.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+}
+
+pin_project! {
+    // Not publicly exported (so missing_docs doesn't trigger).
+    //
+    // We return this `Future` instead of the `Pin<Box<dyn Future>>` directly
+    // so that users don't rely on it fitting in a `Pin<Box<dyn Future>>` slot
+    // (and thus we can change the type in the future).
+    #[must_use = "futures do nothing unless polled"]
+    #[allow(missing_debug_implementations)]
+    pub struct HttpConnecting<R> {
+        #[pin]
+        fut: BoxConnecting,
+        _marker: PhantomData<R>,
+    }
+}
+
+type ConnectResult = Result<TokioIo<TcpStream>, ConnectError>;
+type BoxConnecting = Pin<Box<dyn Future<Output = ConnectResult> + Send>>;
+
+impl<R: Resolve> Future for HttpConnecting<R> {
+    type Output = ConnectResult;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
+        self.project().fut.poll(cx)
+    }
+}
+
+// Not publicly exported (so missing_docs doesn't trigger).
+pub struct ConnectError {
+    msg: Box<str>,
+    cause: Option<Box<dyn StdError + Send + Sync>>,
+}
+
+impl ConnectError {
+    fn new<S, E>(msg: S, cause: E) -> ConnectError
+    where
+        S: Into<Box<str>>,
+        E: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        ConnectError {
+            msg: msg.into(),
+            cause: Some(cause.into()),
+        }
+    }
+
+    fn dns<E>(cause: E) -> ConnectError
+    where
+        E: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        ConnectError::new("dns error", cause)
+    }
+
+    fn m<S, E>(msg: S) -> impl FnOnce(E) -> ConnectError
+    where
+        S: Into<Box<str>>,
+        E: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        move |cause| ConnectError::new(msg, cause)
+    }
+}
+
+impl fmt::Debug for ConnectError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(ref cause) = self.cause {
+            f.debug_tuple("ConnectError")
+                .field(&self.msg)
+                .field(cause)
+                .finish()
+        } else {
+            self.msg.fmt(f)
+        }
+    }
+}
+
+impl fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.msg)?;
+
+        if let Some(ref cause) = self.cause {
+            write!(f, ": {}", cause)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl StdError for ConnectError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        self.cause.as_ref().map(|e| &**e as _)
+    }
+}
+
+struct ConnectingTcp<'a> {
+    preferred: ConnectingTcpRemote,
+    fallback: Option<ConnectingTcpFallback>,
+    config: &'a Config,
+}
+
+impl<'a> ConnectingTcp<'a> {
+    fn new(remote_addrs: dns::SocketAddrs, config: &'a Config) -> Self {
+        if let Some(fallback_timeout) = config.happy_eyeballs_timeout {
+            let (preferred_addrs, fallback_addrs) = remote_addrs
+                .split_by_preference(config.local_address_ipv4, config.local_address_ipv6);
+            if fallback_addrs.is_empty() {
+                return ConnectingTcp {
+                    preferred: ConnectingTcpRemote::new(preferred_addrs, config.connect_timeout),
+                    fallback: None,
+                    config,
+                };
+            }
+
+            ConnectingTcp {
+                preferred: ConnectingTcpRemote::new(preferred_addrs, config.connect_timeout),
+                fallback: Some(ConnectingTcpFallback {
+                    delay: tokio::time::sleep(fallback_timeout),
+                    remote: ConnectingTcpRemote::new(fallback_addrs, config.connect_timeout),
+                }),
+                config,
+            }
+        } else {
+            ConnectingTcp {
+                preferred: ConnectingTcpRemote::new(remote_addrs, config.connect_timeout),
+                fallback: None,
+                config,
+            }
+        }
+    }
+}
+
+struct ConnectingTcpFallback {
+    delay: Sleep,
+    remote: ConnectingTcpRemote,
+}
+
+struct ConnectingTcpRemote {
+    addrs: dns::SocketAddrs,
+    connect_timeout: Option<Duration>,
+}
+
+impl ConnectingTcpRemote {
+    fn new(addrs: dns::SocketAddrs, connect_timeout: Option<Duration>) -> Self {
+        let connect_timeout = connect_timeout.map(|t| t / (addrs.len() as u32));
+
+        Self {
+            addrs,
+            connect_timeout,
+        }
+    }
+}
+
+impl ConnectingTcpRemote {
+    async fn connect(&mut self, config: &Config) -> Result<TcpStream, ConnectError> {
+        let mut err = None;
+        for addr in &mut self.addrs {
+            debug!("connecting to {}", addr);
+            match connect(&addr, config, self.connect_timeout)?.await {
+                Ok(tcp) => {
+                    debug!("connected to {}", addr);
+                    return Ok(tcp);
+                }
+                Err(e) => {
+                    trace!("connect error for {}: {:?}", addr, e);
+                    err = Some(e);
+                }
+            }
+        }
+
+        match err {
+            Some(e) => Err(e),
+            None => Err(ConnectError::new(
+                "tcp connect error",
+                std::io::Error::new(std::io::ErrorKind::NotConnected, "Network unreachable"),
+            )),
+        }
+    }
+}
+
+fn bind_local_address(
+    socket: &socket2::Socket,
+    dst_addr: &SocketAddr,
+    local_addr_ipv4: &Option<Ipv4Addr>,
+    local_addr_ipv6: &Option<Ipv6Addr>,
+) -> io::Result<()> {
+    match (*dst_addr, local_addr_ipv4, local_addr_ipv6) {
+        (SocketAddr::V4(_), Some(addr), _) => {
+            socket.bind(&SocketAddr::new((*addr).into(), 0).into())?;
+        }
+        (SocketAddr::V6(_), _, Some(addr)) => {
+            socket.bind(&SocketAddr::new((*addr).into(), 0).into())?;
+        }
+        _ => {
+            if cfg!(windows) {
+                // Windows requires a socket be bound before calling connect
+                let any: SocketAddr = match *dst_addr {
+                    SocketAddr::V4(_) => ([0, 0, 0, 0], 0).into(),
+                    SocketAddr::V6(_) => ([0, 0, 0, 0, 0, 0, 0, 0], 0).into(),
+                };
+                socket.bind(&any.into())?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn connect(
+    addr: &SocketAddr,
+    config: &Config,
+    connect_timeout: Option<Duration>,
+) -> Result<impl Future<Output = Result<TcpStream, ConnectError>>, ConnectError> {
+    // TODO(eliza): if Tokio's `TcpSocket` gains support for setting the
+    // keepalive timeout, it would be nice to use that instead of socket2,
+    // and avoid the unsafe `into_raw_fd`/`from_raw_fd` dance...
+    use socket2::{Domain, Protocol, Socket, Type};
+    use std::convert::TryInto;
+
+    let domain = Domain::for_address(*addr);
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+        .map_err(ConnectError::m("tcp open error"))?;
+
+    // When constructing a Tokio `TcpSocket` from a raw fd/socket, the user is
+    // responsible for ensuring O_NONBLOCK is set.
+    socket
+        .set_nonblocking(true)
+        .map_err(ConnectError::m("tcp set_nonblocking error"))?;
+
+    if let Some(tcp_keepalive) = &config.tcp_keepalive_config.into_tcpkeepalive() {
+        if let Err(e) = socket.set_tcp_keepalive(tcp_keepalive) {
+            warn!("tcp set_keepalive error: {}", e);
+        }
+    }
+
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    // That this only works for some socket types, particularly AF_INET sockets.
+    if let Some(interface) = &config.interface {
+        socket
+            .bind_device(Some(interface.as_bytes()))
+            .map_err(ConnectError::m("tcp bind interface error"))?;
+    }
+
+    bind_local_address(
+        &socket,
+        addr,
+        &config.local_address_ipv4,
+        &config.local_address_ipv6,
+    )
+    .map_err(ConnectError::m("tcp bind local error"))?;
+
+    #[cfg(unix)]
+    let socket = unsafe {
+        // Safety: `from_raw_fd` is only safe to call if ownership of the raw
+        // file descriptor is transferred. Since we call `into_raw_fd` on the
+        // socket2 socket, it gives up ownership of the fd and will not close
+        // it, so this is safe.
+        use std::os::unix::io::{FromRawFd, IntoRawFd};
+        TcpSocket::from_raw_fd(socket.into_raw_fd())
+    };
+    #[cfg(windows)]
+    let socket = unsafe {
+        // Safety: `from_raw_socket` is only safe to call if ownership of the raw
+        // Windows SOCKET is transferred. Since we call `into_raw_socket` on the
+        // socket2 socket, it gives up ownership of the SOCKET and will not close
+        // it, so this is safe.
+        use std::os::windows::io::{FromRawSocket, IntoRawSocket};
+        TcpSocket::from_raw_socket(socket.into_raw_socket())
+    };
+
+    if config.reuse_address {
+        if let Err(e) = socket.set_reuseaddr(true) {
+            warn!("tcp set_reuse_address error: {}", e);
+        }
+    }
+
+    if let Some(size) = config.send_buffer_size {
+        if let Err(e) = socket.set_send_buffer_size(size.try_into().unwrap_or(std::u32::MAX)) {
+            warn!("tcp set_buffer_size error: {}", e);
+        }
+    }
+
+    if let Some(size) = config.recv_buffer_size {
+        if let Err(e) = socket.set_recv_buffer_size(size.try_into().unwrap_or(std::u32::MAX)) {
+            warn!("tcp set_recv_buffer_size error: {}", e);
+        }
+    }
+
+    let connect = socket.connect(*addr);
+    Ok(async move {
+        match connect_timeout {
+            Some(dur) => match tokio::time::timeout(dur, connect).await {
+                Ok(Ok(s)) => Ok(s),
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(io::Error::new(io::ErrorKind::TimedOut, e)),
+            },
+            None => connect.await,
+        }
+        .map_err(ConnectError::m("tcp connect error"))
+    })
+}
+
+impl ConnectingTcp<'_> {
+    async fn connect(mut self) -> Result<TcpStream, ConnectError> {
+        match self.fallback {
+            None => self.preferred.connect(self.config).await,
+            Some(mut fallback) => {
+                let preferred_fut = self.preferred.connect(self.config);
+                futures_util::pin_mut!(preferred_fut);
+
+                let fallback_fut = fallback.remote.connect(self.config);
+                futures_util::pin_mut!(fallback_fut);
+
+                let fallback_delay = fallback.delay;
+                futures_util::pin_mut!(fallback_delay);
+
+                let (result, future) =
+                    match futures_util::future::select(preferred_fut, fallback_delay).await {
+                        Either::Left((result, _fallback_delay)) => {
+                            (result, Either::Right(fallback_fut))
+                        }
+                        Either::Right(((), preferred_fut)) => {
+                            // Delay is done, start polling both the preferred and the fallback
+                            futures_util::future::select(preferred_fut, fallback_fut)
+                                .await
+                                .factor_first()
+                        }
+                    };
+
+                if result.is_err() {
+                    // Fallback to the remaining future (could be preferred or fallback)
+                    // if we get an error
+                    future.await
+                } else {
+                    result
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use ::http::Uri;
+
+    use crate::client::connect::http::TcpKeepaliveConfig;
+
+    use super::super::sealed::{Connect, ConnectSvc};
+    use super::{Config, ConnectError, HttpConnector};
+
+    async fn connect<C>(
+        connector: C,
+        dst: Uri,
+    ) -> Result<<C::_Svc as ConnectSvc>::Connection, <C::_Svc as ConnectSvc>::Error>
+    where
+        C: Connect,
+    {
+        connector.connect(super::super::sealed::Internal, dst).await
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_errors_enforce_http() {
+        let dst = "https://example.domain/foo/bar?baz".parse().unwrap();
+        let connector = HttpConnector::new();
+
+        let err = connect(connector, dst).await.unwrap_err();
+        assert_eq!(&*err.msg, super::INVALID_NOT_HTTP);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn get_local_ips() -> (Option<std::net::Ipv4Addr>, Option<std::net::Ipv6Addr>) {
+        use std::net::{IpAddr, TcpListener};
+
+        let mut ip_v4 = None;
+        let mut ip_v6 = None;
+
+        let ips = pnet_datalink::interfaces()
+            .into_iter()
+            .flat_map(|i| i.ips.into_iter().map(|n| n.ip()));
+
+        for ip in ips {
+            match ip {
+                IpAddr::V4(ip) if TcpListener::bind((ip, 0)).is_ok() => ip_v4 = Some(ip),
+                IpAddr::V6(ip) if TcpListener::bind((ip, 0)).is_ok() => ip_v6 = Some(ip),
+                _ => (),
+            }
+
+            if ip_v4.is_some() && ip_v6.is_some() {
+                break;
+            }
+        }
+
+        (ip_v4, ip_v6)
+    }
+
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    fn default_interface() -> Option<String> {
+        pnet_datalink::interfaces()
+            .iter()
+            .find(|e| e.is_up() && !e.is_loopback() && !e.ips.is_empty())
+            .map(|e| e.name.clone())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_errors_missing_scheme() {
+        let dst = "example.domain".parse().unwrap();
+        let mut connector = HttpConnector::new();
+        connector.enforce_http(false);
+
+        let err = connect(connector, dst).await.unwrap_err();
+        assert_eq!(&*err.msg, super::INVALID_MISSING_SCHEME);
+    }
+
+    // NOTE: pnet crate that we use in this test doesn't compile on Windows
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn local_address() {
+        use std::net::{IpAddr, TcpListener};
+
+        let (bind_ip_v4, bind_ip_v6) = get_local_ips();
+        let server4 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = server4.local_addr().unwrap().port();
+        let server6 = TcpListener::bind(&format!("[::1]:{}", port)).unwrap();
+
+        let assert_client_ip = |dst: String, server: TcpListener, expected_ip: IpAddr| async move {
+            let mut connector = HttpConnector::new();
+
+            match (bind_ip_v4, bind_ip_v6) {
+                (Some(v4), Some(v6)) => connector.set_local_addresses(v4, v6),
+                (Some(v4), None) => connector.set_local_address(Some(v4.into())),
+                (None, Some(v6)) => connector.set_local_address(Some(v6.into())),
+                _ => unreachable!(),
+            }
+
+            connect(connector, dst.parse().unwrap()).await.unwrap();
+
+            let (_, client_addr) = server.accept().unwrap();
+
+            assert_eq!(client_addr.ip(), expected_ip);
+        };
+
+        if let Some(ip) = bind_ip_v4 {
+            assert_client_ip(format!("http://127.0.0.1:{}", port), server4, ip.into()).await;
+        }
+
+        if let Some(ip) = bind_ip_v6 {
+            assert_client_ip(format!("http://[::1]:{}", port), server6, ip.into()).await;
+        }
+    }
+
+    // NOTE: pnet crate that we use in this test doesn't compile on Windows
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    #[tokio::test]
+    #[ignore = "setting `SO_BINDTODEVICE` requires the `CAP_NET_RAW` capability (works when running as root)"]
+    async fn interface() {
+        use socket2::{Domain, Protocol, Socket, Type};
+        use std::net::TcpListener;
+
+        let interface: Option<String> = default_interface();
+
+        let server4 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = server4.local_addr().unwrap().port();
+
+        let server6 = TcpListener::bind(&format!("[::1]:{}", port)).unwrap();
+
+        let assert_interface_name =
+            |dst: String,
+             server: TcpListener,
+             bind_iface: Option<String>,
+             expected_interface: Option<String>| async move {
+                let mut connector = HttpConnector::new();
+                if let Some(iface) = bind_iface {
+                    connector.set_interface(iface);
+                }
+
+                connect(connector, dst.parse().unwrap()).await.unwrap();
+                let domain = Domain::for_address(server.local_addr().unwrap());
+                let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).unwrap();
+
+                assert_eq!(
+                    socket.device().unwrap().as_deref(),
+                    expected_interface.as_deref().map(|val| val.as_bytes())
+                );
+            };
+
+        assert_interface_name(
+            format!("http://127.0.0.1:{}", port),
+            server4,
+            interface.clone(),
+            interface.clone(),
+        )
+        .await;
+        assert_interface_name(
+            format!("http://[::1]:{}", port),
+            server6,
+            interface.clone(),
+            interface.clone(),
+        )
+        .await;
+    }
+
+    #[test]
+    #[cfg_attr(not(feature = "__internal_happy_eyeballs_tests"), ignore)]
+    fn client_happy_eyeballs() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener};
+        use std::time::{Duration, Instant};
+
+        use super::dns;
+        use super::ConnectingTcp;
+
+        let server4 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = server4.local_addr().unwrap();
+        let _server6 = TcpListener::bind(&format!("[::1]:{}", addr.port())).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let local_timeout = Duration::default();
+        let unreachable_v4_timeout = measure_connect(unreachable_ipv4_addr()).1;
+        let unreachable_v6_timeout = measure_connect(unreachable_ipv6_addr()).1;
+        let fallback_timeout = std::cmp::max(unreachable_v4_timeout, unreachable_v6_timeout)
+            + Duration::from_millis(250);
+
+        let scenarios = &[
+            // Fast primary, without fallback.
+            (&[local_ipv4_addr()][..], 4, local_timeout, false),
+            (&[local_ipv6_addr()][..], 6, local_timeout, false),
+            // Fast primary, with (unused) fallback.
+            (
+                &[local_ipv4_addr(), local_ipv6_addr()][..],
+                4,
+                local_timeout,
+                false,
+            ),
+            (
+                &[local_ipv6_addr(), local_ipv4_addr()][..],
+                6,
+                local_timeout,
+                false,
+            ),
+            // Unreachable + fast primary, without fallback.
+            (
+                &[unreachable_ipv4_addr(), local_ipv4_addr()][..],
+                4,
+                unreachable_v4_timeout,
+                false,
+            ),
+            (
+                &[unreachable_ipv6_addr(), local_ipv6_addr()][..],
+                6,
+                unreachable_v6_timeout,
+                false,
+            ),
+            // Unreachable + fast primary, with (unused) fallback.
+            (
+                &[
+                    unreachable_ipv4_addr(),
+                    local_ipv4_addr(),
+                    local_ipv6_addr(),
+                ][..],
+                4,
+                unreachable_v4_timeout,
+                false,
+            ),
+            (
+                &[
+                    unreachable_ipv6_addr(),
+                    local_ipv6_addr(),
+                    local_ipv4_addr(),
+                ][..],
+                6,
+                unreachable_v6_timeout,
+                true,
+            ),
+            // Slow primary, with (used) fallback.
+            (
+                &[slow_ipv4_addr(), local_ipv4_addr(), local_ipv6_addr()][..],
+                6,
+                fallback_timeout,
+                false,
+            ),
+            (
+                &[slow_ipv6_addr(), local_ipv6_addr(), local_ipv4_addr()][..],
+                4,
+                fallback_timeout,
+                true,
+            ),
+            // Slow primary, with (used) unreachable + fast fallback.
+            (
+                &[slow_ipv4_addr(), unreachable_ipv6_addr(), local_ipv6_addr()][..],
+                6,
+                fallback_timeout + unreachable_v6_timeout,
+                false,
+            ),
+            (
+                &[slow_ipv6_addr(), unreachable_ipv4_addr(), local_ipv4_addr()][..],
+                4,
+                fallback_timeout + unreachable_v4_timeout,
+                true,
+            ),
+        ];
+
+        // Scenarios for IPv6 -> IPv4 fallback require that host can access IPv6 network.
+        // Otherwise, connection to "slow" IPv6 address will error-out immediately.
+        let ipv6_accessible = measure_connect(slow_ipv6_addr()).0;
+
+        for &(hosts, family, timeout, needs_ipv6_access) in scenarios {
+            if needs_ipv6_access && !ipv6_accessible {
+                continue;
+            }
+
+            let (start, stream) = rt
+                .block_on(async move {
+                    let addrs = hosts
+                        .iter()
+                        .map(|host| (host.clone(), addr.port()).into())
+                        .collect();
+                    let cfg = Config {
+                        local_address_ipv4: None,
+                        local_address_ipv6: None,
+                        connect_timeout: None,
+                        tcp_keepalive_config: TcpKeepaliveConfig::default(),
+                        happy_eyeballs_timeout: Some(fallback_timeout),
+                        nodelay: false,
+                        reuse_address: false,
+                        enforce_http: false,
+                        send_buffer_size: None,
+                        recv_buffer_size: None,
+                        interface: None,
+                    };
+                    let connecting_tcp = ConnectingTcp::new(dns::SocketAddrs::new(addrs), &cfg);
+                    let start = Instant::now();
+                    Ok::<_, ConnectError>((start, ConnectingTcp::connect(connecting_tcp).await?))
+                })
+                .unwrap();
+            let res = if stream.peer_addr().unwrap().is_ipv4() {
+                4
+            } else {
+                6
+            };
+            let duration = start.elapsed();
+
+            // Allow actual duration to be +/- 150ms off.
+            let min_duration = if timeout >= Duration::from_millis(150) {
+                timeout - Duration::from_millis(150)
+            } else {
+                Duration::default()
+            };
+            let max_duration = timeout + Duration::from_millis(150);
+
+            assert_eq!(res, family);
+            assert!(duration >= min_duration);
+            assert!(duration <= max_duration);
+        }
+
+        fn local_ipv4_addr() -> IpAddr {
+            Ipv4Addr::new(127, 0, 0, 1).into()
+        }
+
+        fn local_ipv6_addr() -> IpAddr {
+            Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1).into()
+        }
+
+        fn unreachable_ipv4_addr() -> IpAddr {
+            Ipv4Addr::new(127, 0, 0, 2).into()
+        }
+
+        fn unreachable_ipv6_addr() -> IpAddr {
+            Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 2).into()
+        }
+
+        fn slow_ipv4_addr() -> IpAddr {
+            // RFC 6890 reserved IPv4 address.
+            Ipv4Addr::new(198, 18, 0, 25).into()
+        }
+
+        fn slow_ipv6_addr() -> IpAddr {
+            // RFC 6890 reserved IPv6 address.
+            Ipv6Addr::new(2001, 2, 0, 0, 0, 0, 0, 254).into()
+        }
+
+        fn measure_connect(addr: IpAddr) -> (bool, Duration) {
+            let start = Instant::now();
+            let result =
+                std::net::TcpStream::connect_timeout(&(addr, 80).into(), Duration::from_secs(1));
+
+            let reachable = result.is_ok() || result.unwrap_err().kind() == io::ErrorKind::TimedOut;
+            let duration = start.elapsed();
+            (reachable, duration)
+        }
+    }
+
+    use std::time::Duration;
+
+    #[test]
+    fn no_tcp_keepalive_config() {
+        assert!(TcpKeepaliveConfig::default().into_tcpkeepalive().is_none());
+    }
+
+    #[test]
+    fn tcp_keepalive_time_config() {
+        let mut kac = TcpKeepaliveConfig::default();
+        kac.time = Some(Duration::from_secs(60));
+        if let Some(tcp_keepalive) = kac.into_tcpkeepalive() {
+            assert!(format!("{tcp_keepalive:?}").contains("time: Some(60s)"));
+        } else {
+            panic!("test failed");
+        }
+    }
+
+    #[cfg(not(any(target_os = "openbsd", target_os = "redox", target_os = "solaris")))]
+    #[test]
+    fn tcp_keepalive_interval_config() {
+        let mut kac = TcpKeepaliveConfig::default();
+        kac.interval = Some(Duration::from_secs(1));
+        if let Some(tcp_keepalive) = kac.into_tcpkeepalive() {
+            assert!(format!("{tcp_keepalive:?}").contains("interval: Some(1s)"));
+        } else {
+            panic!("test failed");
+        }
+    }
+
+    #[cfg(not(any(
+        target_os = "openbsd",
+        target_os = "redox",
+        target_os = "solaris",
+        target_os = "windows"
+    )))]
+    #[test]
+    fn tcp_keepalive_retries_config() {
+        let mut kac = TcpKeepaliveConfig::default();
+        kac.retries = Some(3);
+        if let Some(tcp_keepalive) = kac.into_tcpkeepalive() {
+            assert!(format!("{tcp_keepalive:?}").contains("retries: Some(3)"));
+        } else {
+            panic!("test failed");
+        }
+    }
+}
+
+'''
+'''--- src/client/connect/mod.rs ---
+//! Connectors used by the `Client`.
+//!
+//! This module contains:
+//!
+//! - A default [`HttpConnector`][] that does DNS resolution and establishes
+//!   connections over TCP.
+//! - Types to build custom connectors.
+//!
+//! # Connectors
+//!
+//! A "connector" is a [`Service`][] that takes a [`Uri`][] destination, and
+//! its `Response` is some type implementing [`Read`][], [`Write`][],
+//! and [`Connection`][].
+//!
+//! ## Custom Connectors
+//!
+//! A simple connector that ignores the `Uri` destination and always returns
+//! a TCP connection to the same address could be written like this:
+//!
+//! ```rust,ignore
+//! let connector = tower::service_fn(|_dst| async {
+//!     tokio::net::TcpStream::connect("127.0.0.1:1337")
+//! })
+//! ```
+//!
+//! Or, fully written out:
+//!
+//! ```
+//! use std::{future::Future, net::SocketAddr, pin::Pin, task::{self, Poll}};
+//! use http::Uri;
+//! use tokio::net::TcpStream;
+//! use tower::Service;
+//!
+//! #[derive(Clone)]
+//! struct LocalConnector;
+//!
+//! impl Service<Uri> for LocalConnector {
+//!     type Response = TcpStream;
+//!     type Error = std::io::Error;
+//!     // We can't "name" an `async` generated future.
+//!     type Future = Pin<Box<
+//!         dyn Future<Output = Result<Self::Response, Self::Error>> + Send
+//!     >>;
+//!
+//!     fn poll_ready(&mut self, _: &mut task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+//!         // This connector is always ready, but others might not be.
+//!         Poll::Ready(Ok(()))
+//!     }
+//!
+//!     fn call(&mut self, _: Uri) -> Self::Future {
+//!         Box::pin(TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], 1337))))
+//!     }
+//! }
+//! ```
+//!
+//! It's worth noting that for `TcpStream`s, the [`HttpConnector`][] is a
+//! better starting place to extend from.
+//!
+//! [`HttpConnector`]: HttpConnector
+//! [`Service`]: tower::Service
+//! [`Uri`]: ::http::Uri
+//! [`Read`]: hyper::rt::Read
+//! [`Write`]: hyper::rt::Write
+//! [`Connection`]: Connection
+use std::fmt;
+
+use ::http::Extensions;
+
+pub use self::http::{HttpConnector, HttpInfo};
+
+pub mod dns;
+mod http;
+
+pub use self::sealed::Connect;
+
+/// Describes a type returned by a connector.
+pub trait Connection {
+    /// Return metadata describing the connection.
+    fn connected(&self) -> Connected;
+}
+
+/// Extra information about the connected transport.
+///
+/// This can be used to inform recipients about things like if ALPN
+/// was used, or if connected to an HTTP proxy.
+#[derive(Debug)]
+pub struct Connected {
+    pub(super) alpn: Alpn,
+    pub(super) is_proxied: bool,
+    pub(super) extra: Option<Extra>,
+}
+
+pub(super) struct Extra(Box<dyn ExtraInner>);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum Alpn {
+    H2,
+    None,
+}
+
+impl Connected {
+    /// Create new `Connected` type with empty metadata.
+    pub fn new() -> Connected {
+        Connected {
+            alpn: Alpn::None,
+            is_proxied: false,
+            extra: None,
+        }
+    }
+
+    /// Set whether the connected transport is to an HTTP proxy.
+    ///
+    /// This setting will affect if HTTP/1 requests written on the transport
+    /// will have the request-target in absolute-form or origin-form:
+    ///
+    /// - When `proxy(false)`:
+    ///
+    /// ```http
+    /// GET /guide HTTP/1.1
+    /// ```
+    ///
+    /// - When `proxy(true)`:
+    ///
+    /// ```http
+    /// GET http://hyper.rs/guide HTTP/1.1
+    /// ```
+    ///
+    /// Default is `false`.
+    pub fn proxy(mut self, is_proxied: bool) -> Connected {
+        self.is_proxied = is_proxied;
+        self
+    }
+
+    /// Determines if the connected transport is to an HTTP proxy.
+    pub fn is_proxied(&self) -> bool {
+        self.is_proxied
+    }
+
+    /// Set extra connection information to be set in the extensions of every `Response`.
+    pub fn extra<T: Clone + Send + Sync + 'static>(mut self, extra: T) -> Connected {
+        if let Some(prev) = self.extra {
+            self.extra = Some(Extra(Box::new(ExtraChain(prev.0, extra))));
+        } else {
+            self.extra = Some(Extra(Box::new(ExtraEnvelope(extra))));
+        }
+        self
+    }
+
+    /// Copies the extra connection information into an `Extensions` map.
+    pub fn get_extras(&self, extensions: &mut Extensions) {
+        if let Some(extra) = &self.extra {
+            extra.set(extensions);
+        }
+    }
+
+    /// Set that the connected transport negotiated HTTP/2 as its next protocol.
+    pub fn negotiated_h2(mut self) -> Connected {
+        self.alpn = Alpn::H2;
+        self
+    }
+
+    /// Determines if the connected transport negotiated HTTP/2 as its next protocol.
+    pub fn is_negotiated_h2(&self) -> bool {
+        self.alpn == Alpn::H2
+    }
+
+    // Don't public expose that `Connected` is `Clone`, unsure if we want to
+    // keep that contract...
+    #[cfg(feature = "http2")]
+    pub(super) fn clone(&self) -> Connected {
+        Connected {
+            alpn: self.alpn,
+            is_proxied: self.is_proxied,
+            extra: self.extra.clone(),
+        }
+    }
+}
+
+// ===== impl Extra =====
+
+impl Extra {
+    pub(super) fn set(&self, res: &mut Extensions) {
+        self.0.set(res);
+    }
+}
+
+impl Clone for Extra {
+    fn clone(&self) -> Extra {
+        Extra(self.0.clone_box())
+    }
+}
+
+impl fmt::Debug for Extra {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Extra").finish()
+    }
+}
+
+trait ExtraInner: Send + Sync {
+    fn clone_box(&self) -> Box<dyn ExtraInner>;
+    fn set(&self, res: &mut Extensions);
+}
+
+// This indirection allows the `Connected` to have a type-erased "extra" value,
+// while that type still knows its inner extra type. This allows the correct
+// TypeId to be used when inserting into `res.extensions_mut()`.
+#[derive(Clone)]
+struct ExtraEnvelope<T>(T);
+
+impl<T> ExtraInner for ExtraEnvelope<T>
+where
+    T: Clone + Send + Sync + 'static,
+{
+    fn clone_box(&self) -> Box<dyn ExtraInner> {
+        Box::new(self.clone())
+    }
+
+    fn set(&self, res: &mut Extensions) {
+        res.insert(self.0.clone());
+    }
+}
+
+struct ExtraChain<T>(Box<dyn ExtraInner>, T);
+
+impl<T: Clone> Clone for ExtraChain<T> {
+    fn clone(&self) -> Self {
+        ExtraChain(self.0.clone_box(), self.1.clone())
+    }
+}
+
+impl<T> ExtraInner for ExtraChain<T>
+where
+    T: Clone + Send + Sync + 'static,
+{
+    fn clone_box(&self) -> Box<dyn ExtraInner> {
+        Box::new(self.clone())
+    }
+
+    fn set(&self, res: &mut Extensions) {
+        self.0.set(res);
+        res.insert(self.1.clone());
+    }
+}
+
+pub(super) mod sealed {
+    use std::error::Error as StdError;
+    use std::future::Future;
+    use std::marker::Unpin;
+
+    use ::http::Uri;
+    use hyper::rt::{Read, Write};
+
+    use super::Connection;
+
+    /// Connect to a destination, returning an IO transport.
+    ///
+    /// A connector receives a [`Uri`](::http::Uri) and returns a `Future` of the
+    /// ready connection.
+    ///
+    /// # Trait Alias
+    ///
+    /// This is really just an *alias* for the `tower::Service` trait, with
+    /// additional bounds set for convenience *inside* hyper. You don't actually
+    /// implement this trait, but `tower::Service<Uri>` instead.
+    // The `Sized` bound is to prevent creating `dyn Connect`, since they cannot
+    // fit the `Connect` bounds because of the blanket impl for `Service`.
+    pub trait Connect: Sealed + Sized {
+        #[doc(hidden)]
+        type _Svc: ConnectSvc;
+        #[doc(hidden)]
+        fn connect(self, internal_only: Internal, dst: Uri) -> <Self::_Svc as ConnectSvc>::Future;
+    }
+
+    pub trait ConnectSvc {
+        type Connection: Read + Write + Connection + Unpin + Send + 'static;
+        type Error: Into<Box<dyn StdError + Send + Sync>>;
+        type Future: Future<Output = Result<Self::Connection, Self::Error>> + Unpin + Send + 'static;
+
+        fn connect(self, internal_only: Internal, dst: Uri) -> Self::Future;
+    }
+
+    impl<S, T> Connect for S
+    where
+        S: tower_service::Service<Uri, Response = T> + Send + 'static,
+        S::Error: Into<Box<dyn StdError + Send + Sync>>,
+        S::Future: Unpin + Send,
+        T: Read + Write + Connection + Unpin + Send + 'static,
+    {
+        type _Svc = S;
+
+        fn connect(self, _: Internal, dst: Uri) -> tower::util::Oneshot<S, Uri> {
+            tower::util::Oneshot::new(self, dst)
+        }
+    }
+
+    impl<S, T> ConnectSvc for S
+    where
+        S: tower_service::Service<Uri, Response = T> + Send + 'static,
+        S::Error: Into<Box<dyn StdError + Send + Sync>>,
+        S::Future: Unpin + Send,
+        T: Read + Write + Connection + Unpin + Send + 'static,
+    {
+        type Connection = T;
+        type Error = S::Error;
+        type Future = tower::util::Oneshot<S, Uri>;
+
+        fn connect(self, _: Internal, dst: Uri) -> Self::Future {
+            tower::util::Oneshot::new(self, dst)
+        }
+    }
+
+    impl<S, T> Sealed for S
+    where
+        S: tower_service::Service<Uri, Response = T> + Send,
+        S::Error: Into<Box<dyn StdError + Send + Sync>>,
+        S::Future: Unpin + Send,
+        T: Read + Write + Connection + Unpin + Send + 'static,
+    {
+    }
+
+    pub trait Sealed {}
+    #[allow(missing_debug_implementations)]
+    pub struct Internal;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Connected;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Ex1(usize);
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Ex2(&'static str);
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Ex3(&'static str);
+
+    #[test]
+    fn test_connected_extra() {
+        let c1 = Connected::new().extra(Ex1(41));
+
+        let mut ex = ::http::Extensions::new();
+
+        assert_eq!(ex.get::<Ex1>(), None);
+
+        c1.extra.as_ref().expect("c1 extra").set(&mut ex);
+
+        assert_eq!(ex.get::<Ex1>(), Some(&Ex1(41)));
+    }
+
+    #[test]
+    fn test_connected_extra_chain() {
+        // If a user composes connectors and at each stage, there's "extra"
+        // info to attach, it shouldn't override the previous extras.
+
+        let c1 = Connected::new()
+            .extra(Ex1(45))
+            .extra(Ex2("zoom"))
+            .extra(Ex3("pew pew"));
+
+        let mut ex1 = ::http::Extensions::new();
+
+        assert_eq!(ex1.get::<Ex1>(), None);
+        assert_eq!(ex1.get::<Ex2>(), None);
+        assert_eq!(ex1.get::<Ex3>(), None);
+
+        c1.extra.as_ref().expect("c1 extra").set(&mut ex1);
+
+        assert_eq!(ex1.get::<Ex1>(), Some(&Ex1(45)));
+        assert_eq!(ex1.get::<Ex2>(), Some(&Ex2("zoom")));
+        assert_eq!(ex1.get::<Ex3>(), Some(&Ex3("pew pew")));
+
+        // Just like extensions, inserting the same type overrides previous type.
+        let c2 = Connected::new()
+            .extra(Ex1(33))
+            .extra(Ex2("hiccup"))
+            .extra(Ex1(99));
+
+        let mut ex2 = ::http::Extensions::new();
+
+        c2.extra.as_ref().expect("c2 extra").set(&mut ex2);
+
+        assert_eq!(ex2.get::<Ex1>(), Some(&Ex1(99)));
+        assert_eq!(ex2.get::<Ex2>(), Some(&Ex2("hiccup")));
+    }
+}
+
+'''
+'''--- src/client/legacy.rs ---
+//! The legacy HTTP Client from 0.14.x
+//!
+//! This `Client` will eventually be deconstructed into more composable parts.
+//! For now, to enable people to use hyper 1.0 quicker, this `Client` exists
+//! in much the same way it did in hyper 0.14.
+
+use std::error::Error as StdError;
+use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{self, Poll};
+use std::time::Duration;
+
+use futures_util::future::{self, Either, FutureExt, TryFutureExt};
+use http::uri::Scheme;
+use hyper::header::{HeaderValue, HOST};
+use hyper::{body::Body, Method, Request, Response, Uri, Version};
+use tracing::{debug, trace, warn};
+
+#[cfg(feature = "tcp")]
+use super::connect::HttpConnector;
+use super::connect::{Alpn, Connect, Connected, Connection};
+use super::pool::{self, Ver};
+use crate::common::{lazy as hyper_lazy, Exec, Lazy, SyncWrapper};
+
+type BoxSendFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// A Client to make outgoing HTTP requests.
+///
+/// `Client` is cheap to clone and cloning is the recommended way to share a `Client`. The
+/// underlying connection pool will be reused.
+#[cfg_attr(docsrs, doc(cfg(any(feature = "http1", feature = "http2"))))]
+pub struct Client<C, B> {
+    config: Config,
+    connector: C,
+    exec: Exec,
+    #[cfg(feature = "http1")]
+    h1_builder: hyper::client::conn::http1::Builder,
+    #[cfg(feature = "http2")]
+    h2_builder: hyper::client::conn::http2::Builder<Exec>,
+    pool: pool::Pool<PoolClient<B>, PoolKey>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Config {
+    retry_canceled_requests: bool,
+    set_host: bool,
+    ver: Ver,
+}
+
+/// Client errors
+#[derive(Debug)]
+pub struct Error {
+    kind: ErrorKind,
+    source: Option<Box<dyn StdError + Send + Sync>>,
+}
+
+#[derive(Debug)]
+enum ErrorKind {
+    Canceled,
+    ChannelClosed,
+    Connect,
+    UserUnsupportedRequestMethod,
+    UserUnsupportedVersion,
+    UserAbsoluteUriRequired,
+    SendRequest,
+}
+
+macro_rules! e {
+    ($kind:ident) => {
+        Error {
+            kind: ErrorKind::$kind,
+            source: None,
+        }
+    };
+    ($kind:ident, $src:expr) => {
+        Error {
+            kind: ErrorKind::$kind,
+            source: Some($src.into()),
+        }
+    };
+}
+
+// We might change this... :shrug:
+type PoolKey = (http::uri::Scheme, http::uri::Authority);
+
+/// A `Future` that will resolve to an HTTP Response.
+///
+/// This is returned by `Client::request` (and `Client::get`).
+#[must_use = "futures do nothing unless polled"]
+pub struct ResponseFuture {
+    inner: SyncWrapper<
+        Pin<Box<dyn Future<Output = Result<Response<hyper::body::Incoming>, Error>> + Send>>,
+    >,
+}
+
+// ===== impl Client =====
+
+impl Client<(), ()> {
+    /// Create a builder to configure a new `Client`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # #[cfg(feature = "runtime")]
+    /// # fn run () {
+    /// use std::time::Duration;
+    /// use hyper::Client;
+    /// use hyper_util::rt::TokioExecutor;
+    ///
+    /// let client = Client::builder(TokioExecutor::new())
+    ///     .pool_idle_timeout(Duration::from_secs(30))
+    ///     .http2_only(true)
+    ///     .build_http();
+    /// # let infer: Client<_, ()> = client;
+    /// # drop(infer);
+    /// # }
+    /// # fn main() {}
+    /// ```
+    pub fn builder<E>(executor: E) -> Builder
+    where
+        E: hyper::rt::Executor<BoxSendFuture> + Send + Sync + Clone + 'static,
+    {
+        Builder::new(executor)
+    }
+}
+
+impl<C, B> Client<C, B>
+where
+    C: Connect + Clone + Send + Sync + 'static,
+    B: Body + Send + 'static + Unpin,
+    B::Data: Send,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
+    /// Send a `GET` request to the supplied `Uri`.
+    ///
+    /// # Note
+    ///
+    /// This requires that the `Body` type have a `Default` implementation.
+    /// It *should* return an "empty" version of itself, such that
+    /// `Body::is_end_stream` is `true`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # #[cfg(feature = "runtime")]
+    /// # fn run () {
+    /// use hyper::{Client, Uri};
+    ///
+    /// let client = Client::new();
+    ///
+    /// let future = client.get(Uri::from_static("http://httpbin.org/ip"));
+    /// # }
+    /// # fn main() {}
+    /// ```
+    pub fn get(&self, uri: Uri) -> ResponseFuture
+    where
+        B: Default,
+    {
+        let body = B::default();
+        if !body.is_end_stream() {
+            warn!("default Body used for get() does not return true for is_end_stream");
+        }
+
+        let mut req = Request::new(body);
+        *req.uri_mut() = uri;
+        self.request(req)
+    }
+
+    /// Send a constructed `Request` using this `Client`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # #[cfg(feature = "runtime")]
+    /// # fn run () {
+    /// use hyper::{Method, Client, Request};
+    /// use http_body_util::Full;
+    ///
+    /// let client = Client::new();
+    ///
+    /// let req = Request::builder()
+    ///     .method(Method::POST)
+    ///     .uri("http://httpbin.org/post")
+    ///     .body(Full::from("Hallo!"))
+    ///     .expect("request builder");
+    ///
+    /// let future = client.request(req);
+    /// # }
+    /// # fn main() {}
+    /// ```
+    pub fn request(&self, mut req: Request<B>) -> ResponseFuture {
+        let is_http_connect = req.method() == Method::CONNECT;
+        match req.version() {
+            Version::HTTP_11 => (),
+            Version::HTTP_10 => {
+                if is_http_connect {
+                    warn!("CONNECT is not allowed for HTTP/1.0");
+                    return ResponseFuture::new(future::err(e!(UserUnsupportedRequestMethod)));
+                }
+            }
+            Version::HTTP_2 => (),
+            // completely unsupported HTTP version (like HTTP/0.9)!
+            other => return ResponseFuture::error_version(other),
+        };
+
+        let pool_key = match extract_domain(req.uri_mut(), is_http_connect) {
+            Ok(s) => s,
+            Err(err) => {
+                return ResponseFuture::new(future::err(err));
+            }
+        };
+
+        ResponseFuture::new(self.clone().send_request(req, pool_key))
+    }
+
+    /*
+    async fn retryably_send_request(
+        self,
+        mut req: Request<B>,
+        pool_key: PoolKey,
+    ) -> Result<Response<hyper::body::Incoming>, Error> {
+        let uri = req.uri().clone();
+
+        loop {
+            req = match self.send_request(req, pool_key.clone()).await {
+                Ok(resp) => return Ok(resp),
+                Err(ClientError::Normal(err)) => return Err(err),
+                Err(ClientError::Canceled {
+                    connection_reused,
+                    mut req,
+                    reason,
+                }) => {
+                    if !self.config.retry_canceled_requests || !connection_reused {
+                        // if client disabled, don't retry
+                        // a fresh connection means we definitely can't retry
+                        return Err(reason);
+                    }
+
+                    trace!(
+                        "unstarted request canceled, trying again (reason={:?})",
+                        reason
+                    );
+                    *req.uri_mut() = uri.clone();
+                    req
+                }
+            }
+        }
+    }
+    */
+
+    async fn send_request(
+        self,
+        mut req: Request<B>,
+        pool_key: PoolKey,
+    ) -> Result<Response<hyper::body::Incoming>, Error> {
+        let mut pooled = self.connection_for(pool_key).await?;
+
+        if pooled.is_http1() {
+            if req.version() == Version::HTTP_2 {
+                warn!("Connection is HTTP/1, but request requires HTTP/2");
+                return Err(e!(UserUnsupportedVersion));
+            }
+
+            if self.config.set_host {
+                let uri = req.uri().clone();
+                req.headers_mut().entry(HOST).or_insert_with(|| {
+                    let hostname = uri.host().expect("authority implies host");
+                    if let Some(port) = get_non_default_port(&uri) {
+                        let s = format!("{}:{}", hostname, port);
+                        HeaderValue::from_str(&s)
+                    } else {
+                        HeaderValue::from_str(hostname)
+                    }
+                    .expect("uri host is valid header value")
+                });
+            }
+
+            // CONNECT always sends authority-form, so check it first...
+            if req.method() == Method::CONNECT {
+                authority_form(req.uri_mut());
+            } else if pooled.conn_info.is_proxied {
+                absolute_form(req.uri_mut());
+            } else {
+                origin_form(req.uri_mut());
+            }
+        } else if req.method() == Method::CONNECT {
+            authority_form(req.uri_mut());
+        }
+
+        let fut = pooled.send_request(req);
+        //.send_request_retryable(req)
+        //.map_err(ClientError::map_with_reused(pooled.is_reused()));
+
+        // If the Connector included 'extra' info, add to Response...
+        let extra_info = pooled.conn_info.extra.clone();
+        let fut = fut.map_ok(move |mut res| {
+            if let Some(extra) = extra_info {
+                extra.set(res.extensions_mut());
+            }
+            res
+        });
+
+        // As of futures@0.1.21, there is a race condition in the mpsc
+        // channel, such that sending when the receiver is closing can
+        // result in the message being stuck inside the queue. It won't
+        // ever notify until the Sender side is dropped.
+        //
+        // To counteract this, we must check if our senders 'want' channel
+        // has been closed after having tried to send. If so, error out...
+        if pooled.is_closed() {
+            return fut.await;
+        }
+
+        let res = fut.await?;
+
+        // If pooled is HTTP/2, we can toss this reference immediately.
+        //
+        // when pooled is dropped, it will try to insert back into the
+        // pool. To delay that, spawn a future that completes once the
+        // sender is ready again.
+        //
+        // This *should* only be once the related `Connection` has polled
+        // for a new request to start.
+        //
+        // It won't be ready if there is a body to stream.
+        if pooled.is_http2() || !pooled.is_pool_enabled() || pooled.is_ready() {
+            drop(pooled);
+        } else if !res.body().is_end_stream() {
+            //let (delayed_tx, delayed_rx) = oneshot::channel::<()>();
+            //res.body_mut().delayed_eof(delayed_rx);
+            let on_idle = future::poll_fn(move |cx| pooled.poll_ready(cx)).map(move |_| {
+                // At this point, `pooled` is dropped, and had a chance
+                // to insert into the pool (if conn was idle)
+                //drop(delayed_tx);
+            });
+
+            self.exec.execute(on_idle);
+        } else {
+            // There's no body to delay, but the connection isn't
+            // ready yet. Only re-insert when it's ready
+            let on_idle = future::poll_fn(move |cx| pooled.poll_ready(cx)).map(|_| ());
+
+            self.exec.execute(on_idle);
+        }
+
+        Ok(res)
+    }
+
+    async fn connection_for(
+        &self,
+        pool_key: PoolKey,
+    ) -> Result<pool::Pooled<PoolClient<B>, PoolKey>, Error> {
+        loop {
+            match self.one_connection_for(pool_key.clone()).await {
+                Ok(pooled) => return Ok(pooled),
+                Err(ClientConnectError::Normal(err)) => return Err(err),
+                Err(ClientConnectError::CheckoutIsClosed(reason)) => {
+                    if !self.config.retry_canceled_requests {
+                        return Err(e!(Connect, reason));
+                    }
+
+                    trace!(
+                        "unstarted request canceled, trying again (reason={:?})",
+                        reason,
+                    );
+                    continue;
+                }
+            };
+        }
+    }
+
+    async fn one_connection_for(
+        &self,
+        pool_key: PoolKey,
+    ) -> Result<pool::Pooled<PoolClient<B>, PoolKey>, ClientConnectError> {
+        // This actually races 2 different futures to try to get a ready
+        // connection the fastest, and to reduce connection churn.
+        //
+        // - If the pool has an idle connection waiting, that's used
+        //   immediately.
+        // - Otherwise, the Connector is asked to start connecting to
+        //   the destination Uri.
+        // - Meanwhile, the pool Checkout is watching to see if any other
+        //   request finishes and tries to insert an idle connection.
+        // - If a new connection is started, but the Checkout wins after
+        //   (an idle connection became available first), the started
+        //   connection future is spawned into the runtime to complete,
+        //   and then be inserted into the pool as an idle connection.
+        let checkout = self.pool.checkout(pool_key.clone());
+        let connect = self.connect_to(pool_key);
+        let is_ver_h2 = self.config.ver == Ver::Http2;
+
+        // The order of the `select` is depended on below...
+
+        match future::select(checkout, connect).await {
+            // Checkout won, connect future may have been started or not.
+            //
+            // If it has, let it finish and insert back into the pool,
+            // so as to not waste the socket...
+            Either::Left((Ok(checked_out), connecting)) => {
+                // This depends on the `select` above having the correct
+                // order, such that if the checkout future were ready
+                // immediately, the connect future will never have been
+                // started.
+                //
+                // If it *wasn't* ready yet, then the connect future will
+                // have been started...
+                if connecting.started() {
+                    let bg = connecting
+                        .map_err(|err| {
+                            trace!("background connect error: {}", err);
+                        })
+                        .map(|_pooled| {
+                            // dropping here should just place it in
+                            // the Pool for us...
+                        });
+                    // An execute error here isn't important, we're just trying
+                    // to prevent a waste of a socket...
+                    self.exec.execute(bg);
+                }
+                Ok(checked_out)
+            }
+            // Connect won, checkout can just be dropped.
+            Either::Right((Ok(connected), _checkout)) => Ok(connected),
+            // Either checkout or connect could get canceled:
+            //
+            // 1. Connect is canceled if this is HTTP/2 and there is
+            //    an outstanding HTTP/2 connecting task.
+            // 2. Checkout is canceled if the pool cannot deliver an
+            //    idle connection reliably.
+            //
+            // In both cases, we should just wait for the other future.
+            Either::Left((Err(err), connecting)) => {
+                if err.is_canceled() {
+                    connecting.await.map_err(ClientConnectError::Normal)
+                } else {
+                    Err(ClientConnectError::Normal(e!(Connect, err)))
+                }
+            }
+            Either::Right((Err(err), checkout)) => {
+                if err.is_canceled() {
+                    checkout.await.map_err(move |err| {
+                        if is_ver_h2 && err.is_canceled() {
+                            ClientConnectError::CheckoutIsClosed(err)
+                        } else {
+                            ClientConnectError::Normal(e!(Connect, err))
+                        }
+                    })
+                } else {
+                    Err(ClientConnectError::Normal(err))
+                }
+            }
+        }
+    }
+
+    #[cfg(any(feature = "http1", feature = "http2"))]
+    fn connect_to(
+        &self,
+        pool_key: PoolKey,
+    ) -> impl Lazy<Output = Result<pool::Pooled<PoolClient<B>, PoolKey>, Error>> + Send + Unpin
+    {
+        let executor = self.exec.clone();
+        let pool = self.pool.clone();
+        #[cfg(feature = "http1")]
+        let h1_builder = self.h1_builder.clone();
+        #[cfg(feature = "http2")]
+        let h2_builder = self.h2_builder.clone();
+        let ver = self.config.ver;
+        let is_ver_h2 = ver == Ver::Http2;
+        let connector = self.connector.clone();
+        let dst = domain_as_uri(pool_key.clone());
+        hyper_lazy(move || {
+            // Try to take a "connecting lock".
+            //
+            // If the pool_key is for HTTP/2, and there is already a
+            // connection being established, then this can't take a
+            // second lock. The "connect_to" future is Canceled.
+            let connecting = match pool.connecting(&pool_key, ver) {
+                Some(lock) => lock,
+                None => {
+                    let canceled = e!(Canceled);
+                    // TODO
+                    //crate::Error::new_canceled().with("HTTP/2 connection in progress");
+                    return Either::Right(future::err(canceled));
+                }
+            };
+            Either::Left(
+                connector
+                    .connect(super::connect::sealed::Internal, dst)
+                    .map_err(|src| e!(Connect, src))
+                    .and_then(move |io| {
+                        let connected = io.connected();
+                        // If ALPN is h2 and we aren't http2_only already,
+                        // then we need to convert our pool checkout into
+                        // a single HTTP2 one.
+                        let connecting = if connected.alpn == Alpn::H2 && !is_ver_h2 {
+                            match connecting.alpn_h2(&pool) {
+                                Some(lock) => {
+                                    trace!("ALPN negotiated h2, updating pool");
+                                    lock
+                                }
+                                None => {
+                                    // Another connection has already upgraded,
+                                    // the pool checkout should finish up for us.
+                                    let canceled = e!(Canceled, "ALPN upgraded to HTTP/2");
+                                    return Either::Right(future::err(canceled));
+                                }
+                            }
+                        } else {
+                            connecting
+                        };
+
+                        #[cfg_attr(not(feature = "http2"), allow(unused))]
+                        let is_h2 = is_ver_h2 || connected.alpn == Alpn::H2;
+
+                        Either::Left(Box::pin(async move {
+                            let tx = if is_h2 {
+                                #[cfg(feature = "http2")] {
+                                    let (mut tx, conn) =
+                                        h2_builder.handshake(io).await.map_err(Error::tx)?;
+
+                                    trace!(
+                                        "http2 handshake complete, spawning background dispatcher task"
+                                    );
+                                    executor.execute(
+                                        conn.map_err(|e| debug!("client connection error: {}", e))
+                                            .map(|_| ()),
+                                    );
+
+                                    // Wait for 'conn' to ready up before we
+                                    // declare this tx as usable
+                                    tx.ready().await.map_err(Error::tx)?;
+                                    PoolTx::Http2(tx)
+                                }
+                                #[cfg(not(feature = "http2"))]
+                                panic!("http2 feature is not enabled");
+                            } else {
+                                #[cfg(feature = "http1")] {
+                                    let (mut tx, conn) =
+                                        h1_builder.handshake(io).await.map_err(Error::tx)?;
+
+                                    trace!(
+                                        "http1 handshake complete, spawning background dispatcher task"
+                                    );
+                                    executor.execute(
+                                        conn.map_err(|e| debug!("client connection error: {}", e))
+                                            .map(|_| ()),
+                                    );
+
+                                    // Wait for 'conn' to ready up before we
+                                    // declare this tx as usable
+                                    tx.ready().await.map_err(Error::tx)?;
+                                    PoolTx::Http1(tx)
+                                }
+                                #[cfg(not(feature = "http1"))] {
+                                    panic!("http1 feature is not enabled");
+                                }
+                            };
+
+                            Ok(pool.pooled(
+                                connecting,
+                                PoolClient {
+                                    conn_info: connected,
+                                    tx,
+                                },
+                            ))
+                        }))
+                    }),
+            )
+        })
+    }
+}
+
+impl<C, B> tower_service::Service<Request<B>> for Client<C, B>
+where
+    C: Connect + Clone + Send + Sync + 'static,
+    B: Body + Send + 'static + Unpin,
+    B::Data: Send,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
+    type Response = Response<hyper::body::Incoming>;
+    type Error = Error;
+    type Future = ResponseFuture;
+
+    fn poll_ready(&mut self, _: &mut task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: Request<B>) -> Self::Future {
+        self.request(req)
+    }
+}
+
+impl<C, B> tower_service::Service<Request<B>> for &'_ Client<C, B>
+where
+    C: Connect + Clone + Send + Sync + 'static,
+    B: Body + Send + 'static + Unpin,
+    B::Data: Send,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
+    type Response = Response<hyper::body::Incoming>;
+    type Error = Error;
+    type Future = ResponseFuture;
+
+    fn poll_ready(&mut self, _: &mut task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: Request<B>) -> Self::Future {
+        self.request(req)
+    }
+}
+
+impl<C: Clone, B> Clone for Client<C, B> {
+    fn clone(&self) -> Client<C, B> {
+        Client {
+            config: self.config.clone(),
+            exec: self.exec.clone(),
+            #[cfg(feature = "http1")]
+            h1_builder: self.h1_builder.clone(),
+            #[cfg(feature = "http2")]
+            h2_builder: self.h2_builder.clone(),
+            connector: self.connector.clone(),
+            pool: self.pool.clone(),
+        }
+    }
+}
+
+impl<C, B> fmt::Debug for Client<C, B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Client").finish()
+    }
+}
+
+// ===== impl ResponseFuture =====
+
+impl ResponseFuture {
+    fn new<F>(value: F) -> Self
+    where
+        F: Future<Output = Result<Response<hyper::body::Incoming>, Error>> + Send + 'static,
+    {
+        Self {
+            inner: SyncWrapper::new(Box::pin(value)),
+        }
+    }
+
+    fn error_version(ver: Version) -> Self {
+        warn!("Request has unsupported version \"{:?}\"", ver);
+        ResponseFuture::new(Box::pin(future::err(e!(UserUnsupportedVersion))))
+    }
+}
+
+impl fmt::Debug for ResponseFuture {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad("Future<Response>")
+    }
+}
+
+impl Future for ResponseFuture {
+    type Output = Result<Response<hyper::body::Incoming>, Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
+        self.inner.get_mut().as_mut().poll(cx)
+    }
+}
+
+// ===== impl PoolClient =====
+
+// FIXME: allow() required due to `impl Trait` leaking types to this lint
+#[allow(missing_debug_implementations)]
+struct PoolClient<B> {
+    conn_info: Connected,
+    tx: PoolTx<B>,
+}
+
+enum PoolTx<B> {
+    #[cfg(feature = "http1")]
+    Http1(hyper::client::conn::http1::SendRequest<B>),
+    #[cfg(feature = "http2")]
+    Http2(hyper::client::conn::http2::SendRequest<B>),
+}
+
+impl<B> PoolClient<B> {
+    fn poll_ready(
+        &mut self,
+        #[allow(unused_variables)] cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), Error>> {
+        match self.tx {
+            #[cfg(feature = "http1")]
+            PoolTx::Http1(ref mut tx) => tx.poll_ready(cx).map_err(Error::closed),
+            #[cfg(feature = "http2")]
+            PoolTx::Http2(_) => Poll::Ready(Ok(())),
+        }
+    }
+
+    fn is_http1(&self) -> bool {
+        !self.is_http2()
+    }
+
+    fn is_http2(&self) -> bool {
+        match self.tx {
+            #[cfg(feature = "http1")]
+            PoolTx::Http1(_) => false,
+            #[cfg(feature = "http2")]
+            PoolTx::Http2(_) => true,
+        }
+    }
+
+    fn is_ready(&self) -> bool {
+        match self.tx {
+            #[cfg(feature = "http1")]
+            PoolTx::Http1(ref tx) => tx.is_ready(),
+            #[cfg(feature = "http2")]
+            PoolTx::Http2(ref tx) => tx.is_ready(),
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        match self.tx {
+            #[cfg(feature = "http1")]
+            PoolTx::Http1(ref tx) => tx.is_closed(),
+            #[cfg(feature = "http2")]
+            PoolTx::Http2(ref tx) => tx.is_closed(),
+        }
+    }
+}
+
+impl<B: Body + 'static> PoolClient<B> {
+    fn send_request(
+        &mut self,
+        req: Request<B>,
+    ) -> impl Future<Output = Result<Response<hyper::body::Incoming>, Error>>
+    where
+        B: Send,
+    {
+        #[cfg(all(feature = "http1", feature = "http2"))]
+        return match self.tx {
+            #[cfg(feature = "http1")]
+            PoolTx::Http1(ref mut tx) => Either::Left(tx.send_request(req)),
+            #[cfg(feature = "http2")]
+            PoolTx::Http2(ref mut tx) => Either::Right(tx.send_request(req)),
+        }
+        .map_err(Error::tx);
+
+        #[cfg(feature = "http1")]
+        #[cfg(not(feature = "http2"))]
+        return match self.tx {
+            #[cfg(feature = "http1")]
+            PoolTx::Http1(ref mut tx) => tx.send_request(req),
+        }
+        .map_err(Error::tx);
+
+        #[cfg(not(feature = "http1"))]
+        #[cfg(feature = "http2")]
+        return match self.tx {
+            #[cfg(feature = "http2")]
+            PoolTx::Http2(ref mut tx) => tx.send_request(req),
+        }
+        .map_err(Error::tx);
+    }
+    /*
+    //TODO: can we re-introduce this somehow? Or must people use tower::retry?
+    fn send_request_retryable(
+        &mut self,
+        req: Request<B>,
+    ) -> impl Future<Output = Result<Response<hyper::body::Incoming>, (Error, Option<Request<B>>)>>
+    where
+        B: Send,
+    {
+        match self.tx {
+            #[cfg(not(feature = "http2"))]
+            PoolTx::Http1(ref mut tx) => tx.send_request_retryable(req),
+            #[cfg(feature = "http1")]
+            PoolTx::Http1(ref mut tx) => Either::Left(tx.send_request_retryable(req)),
+            #[cfg(feature = "http2")]
+            PoolTx::Http2(ref mut tx) => Either::Right(tx.send_request_retryable(req)),
+        }
+    }
+    */
+}
+
+impl<B> pool::Poolable for PoolClient<B>
+where
+    B: Send + 'static,
+{
+    fn is_open(&self) -> bool {
+        self.is_ready()
+    }
+
+    fn reserve(self) -> pool::Reservation<Self> {
+        match self.tx {
+            #[cfg(feature = "http1")]
+            PoolTx::Http1(tx) => pool::Reservation::Unique(PoolClient {
+                conn_info: self.conn_info,
+                tx: PoolTx::Http1(tx),
+            }),
+            #[cfg(feature = "http2")]
+            PoolTx::Http2(tx) => {
+                let b = PoolClient {
+                    conn_info: self.conn_info.clone(),
+                    tx: PoolTx::Http2(tx.clone()),
+                };
+                let a = PoolClient {
+                    conn_info: self.conn_info,
+                    tx: PoolTx::Http2(tx),
+                };
+                pool::Reservation::Shared(a, b)
+            }
+        }
+    }
+
+    fn can_share(&self) -> bool {
+        self.is_http2()
+    }
+}
+
+enum ClientConnectError {
+    Normal(Error),
+    CheckoutIsClosed(pool::Error),
+}
+
+fn origin_form(uri: &mut Uri) {
+    let path = match uri.path_and_query() {
+        Some(path) if path.as_str() != "/" => {
+            let mut parts = ::http::uri::Parts::default();
+            parts.path_and_query = Some(path.clone());
+            Uri::from_parts(parts).expect("path is valid uri")
+        }
+        _none_or_just_slash => {
+            debug_assert!(Uri::default() == "/");
+            Uri::default()
+        }
+    };
+    *uri = path
+}
+
+fn absolute_form(uri: &mut Uri) {
+    debug_assert!(uri.scheme().is_some(), "absolute_form needs a scheme");
+    debug_assert!(
+        uri.authority().is_some(),
+        "absolute_form needs an authority"
+    );
+    // If the URI is to HTTPS, and the connector claimed to be a proxy,
+    // then it *should* have tunneled, and so we don't want to send
+    // absolute-form in that case.
+    if uri.scheme() == Some(&Scheme::HTTPS) {
+        origin_form(uri);
+    }
+}
+
+fn authority_form(uri: &mut Uri) {
+    if let Some(path) = uri.path_and_query() {
+        // `https://hyper.rs` would parse with `/` path, don't
+        // annoy people about that...
+        if path != "/" {
+            warn!("HTTP/1.1 CONNECT request stripping path: {:?}", path);
+        }
+    }
+    *uri = match uri.authority() {
+        Some(auth) => {
+            let mut parts = ::http::uri::Parts::default();
+            parts.authority = Some(auth.clone());
+            Uri::from_parts(parts).expect("authority is valid")
+        }
+        None => {
+            unreachable!("authority_form with relative uri");
+        }
+    };
+}
+
+fn extract_domain(uri: &mut Uri, is_http_connect: bool) -> Result<PoolKey, Error> {
+    let uri_clone = uri.clone();
+    match (uri_clone.scheme(), uri_clone.authority()) {
+        (Some(scheme), Some(auth)) => Ok((scheme.clone(), auth.clone())),
+        (None, Some(auth)) if is_http_connect => {
+            let scheme = match auth.port_u16() {
+                Some(443) => {
+                    set_scheme(uri, Scheme::HTTPS);
+                    Scheme::HTTPS
+                }
+                _ => {
+                    set_scheme(uri, Scheme::HTTP);
+                    Scheme::HTTP
+                }
+            };
+            Ok((scheme, auth.clone()))
+        }
+        _ => {
+            debug!("Client requires absolute-form URIs, received: {:?}", uri);
+            Err(e!(UserAbsoluteUriRequired))
+        }
+    }
+}
+
+fn domain_as_uri((scheme, auth): PoolKey) -> Uri {
+    http::uri::Builder::new()
+        .scheme(scheme)
+        .authority(auth)
+        .path_and_query("/")
+        .build()
+        .expect("domain is valid Uri")
+}
+
+fn set_scheme(uri: &mut Uri, scheme: Scheme) {
+    debug_assert!(
+        uri.scheme().is_none(),
+        "set_scheme expects no existing scheme"
+    );
+    let old = std::mem::replace(uri, Uri::default());
+    let mut parts: ::http::uri::Parts = old.into();
+    parts.scheme = Some(scheme);
+    parts.path_and_query = Some("/".parse().expect("slash is a valid path"));
+    *uri = Uri::from_parts(parts).expect("scheme is valid");
+}
+
+fn get_non_default_port(uri: &Uri) -> Option<http::uri::Port<&str>> {
+    match (uri.port().map(|p| p.as_u16()), is_schema_secure(uri)) {
+        (Some(443), true) => None,
+        (Some(80), false) => None,
+        _ => uri.port(),
+    }
+}
+
+fn is_schema_secure(uri: &Uri) -> bool {
+    uri.scheme_str()
+        .map(|scheme_str| matches!(scheme_str, "wss" | "https"))
+        .unwrap_or_default()
+}
+
+/// A builder to configure a new [`Client`](Client).
+///
+/// # Example
+///
+/// ```
+/// # #[cfg(feature = "runtime")]
+/// # fn run () {
+/// use std::time::Duration;
+/// use hyper::Client;
+/// use hyper_util::rt::TokioExecutor;
+///
+/// let client = Client::builder(TokioExecutor::new())
+///     .pool_idle_timeout(Duration::from_secs(30))
+///     .http2_only(true)
+///     .build_http();
+/// # let infer: Client<_, _> = client;
+/// # drop(infer);
+/// # }
+/// # fn main() {}
+/// ```
+#[cfg_attr(docsrs, doc(cfg(any(feature = "http1", feature = "http2"))))]
+#[derive(Clone)]
+pub struct Builder {
+    client_config: Config,
+    exec: Exec,
+    #[cfg(feature = "http1")]
+    h1_builder: hyper::client::conn::http1::Builder,
+    #[cfg(feature = "http2")]
+    h2_builder: hyper::client::conn::http2::Builder<Exec>,
+    pool_config: pool::Config,
+}
+
+impl Builder {
+    /// Construct a new Builder.
+    pub fn new<E>(executor: E) -> Self
+    where
+        E: hyper::rt::Executor<BoxSendFuture> + Send + Sync + Clone + 'static,
+    {
+        let exec = Exec::new(executor);
+        Self {
+            client_config: Config {
+                retry_canceled_requests: true,
+                set_host: true,
+                ver: Ver::Auto,
+            },
+            exec: exec.clone(),
+            #[cfg(feature = "http1")]
+            h1_builder: hyper::client::conn::http1::Builder::new(),
+            #[cfg(feature = "http2")]
+            h2_builder: hyper::client::conn::http2::Builder::new(exec),
+            pool_config: pool::Config {
+                idle_timeout: Some(Duration::from_secs(90)),
+                max_idle_per_host: std::usize::MAX,
+            },
+        }
+    }
+    /// Set an optional timeout for idle sockets being kept-alive.
+    ///
+    /// Pass `None` to disable timeout.
+    ///
+    /// Default is 90 seconds.
+    pub fn pool_idle_timeout<D>(&mut self, val: D) -> &mut Self
+    where
+        D: Into<Option<Duration>>,
+    {
+        self.pool_config.idle_timeout = val.into();
+        self
+    }
+
+    #[doc(hidden)]
+    #[deprecated(note = "renamed to `pool_max_idle_per_host`")]
+    pub fn max_idle_per_host(&mut self, max_idle: usize) -> &mut Self {
+        self.pool_config.max_idle_per_host = max_idle;
+        self
+    }
+
+    /// Sets the maximum idle connection per host allowed in the pool.
+    ///
+    /// Default is `usize::MAX` (no limit).
+    pub fn pool_max_idle_per_host(&mut self, max_idle: usize) -> &mut Self {
+        self.pool_config.max_idle_per_host = max_idle;
+        self
+    }
+
+    // HTTP/1 options
+
+    /// Sets the exact size of the read buffer to *always* use.
+    ///
+    /// Note that setting this option unsets the `http1_max_buf_size` option.
+    ///
+    /// Default is an adaptive read buffer.
+    #[cfg(feature = "http1")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http1")))]
+    pub fn http1_read_buf_exact_size(&mut self, sz: usize) -> &mut Self {
+        self.h1_builder.read_buf_exact_size(Some(sz));
+        self
+    }
+
+    /// Set the maximum buffer size for the connection.
+    ///
+    /// Default is ~400kb.
+    ///
+    /// Note that setting this option unsets the `http1_read_exact_buf_size` option.
+    ///
+    /// # Panics
+    ///
+    /// The minimum value allowed is 8192. This method panics if the passed `max` is less than the minimum.
+    #[cfg(feature = "http1")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http1")))]
+    pub fn http1_max_buf_size(&mut self, max: usize) -> &mut Self {
+        self.h1_builder.max_buf_size(max);
+        self
+    }
+
+    /// Set whether HTTP/1 connections will accept spaces between header names
+    /// and the colon that follow them in responses.
+    ///
+    /// Newline codepoints (`\r` and `\n`) will be transformed to spaces when
+    /// parsing.
+    ///
+    /// You probably don't need this, here is what [RFC 7230 Section 3.2.4.] has
+    /// to say about it:
+    ///
+    /// > No whitespace is allowed between the header field-name and colon. In
+    /// > the past, differences in the handling of such whitespace have led to
+    /// > security vulnerabilities in request routing and response handling. A
+    /// > server MUST reject any received request message that contains
+    /// > whitespace between a header field-name and colon with a response code
+    /// > of 400 (Bad Request). A proxy MUST remove any such whitespace from a
+    /// > response message before forwarding the message downstream.
+    ///
+    /// Note that this setting does not affect HTTP/2.
+    ///
+    /// Default is false.
+    ///
+    /// [RFC 7230 Section 3.2.4.]: https://tools.ietf.org/html/rfc7230#section-3.2.4
+    #[cfg(feature = "http1")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http1")))]
+    pub fn http1_allow_spaces_after_header_name_in_responses(&mut self, val: bool) -> &mut Self {
+        self.h1_builder
+            .allow_spaces_after_header_name_in_responses(val);
+        self
+    }
+
+    /// Set whether HTTP/1 connections will accept obsolete line folding for
+    /// header values.
+    ///
+    /// You probably don't need this, here is what [RFC 7230 Section 3.2.4.] has
+    /// to say about it:
+    ///
+    /// > A server that receives an obs-fold in a request message that is not
+    /// > within a message/http container MUST either reject the message by
+    /// > sending a 400 (Bad Request), preferably with a representation
+    /// > explaining that obsolete line folding is unacceptable, or replace
+    /// > each received obs-fold with one or more SP octets prior to
+    /// > interpreting the field value or forwarding the message downstream.
+    ///
+    /// > A proxy or gateway that receives an obs-fold in a response message
+    /// > that is not within a message/http container MUST either discard the
+    /// > message and replace it with a 502 (Bad Gateway) response, preferably
+    /// > with a representation explaining that unacceptable line folding was
+    /// > received, or replace each received obs-fold with one or more SP
+    /// > octets prior to interpreting the field value or forwarding the
+    /// > message downstream.
+    ///
+    /// > A user agent that receives an obs-fold in a response message that is
+    /// > not within a message/http container MUST replace each received
+    /// > obs-fold with one or more SP octets prior to interpreting the field
+    /// > value.
+    ///
+    /// Note that this setting does not affect HTTP/2.
+    ///
+    /// Default is false.
+    ///
+    /// [RFC 7230 Section 3.2.4.]: https://tools.ietf.org/html/rfc7230#section-3.2.4
+    #[cfg(feature = "http1")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http1")))]
+    pub fn http1_allow_obsolete_multiline_headers_in_responses(&mut self, val: bool) -> &mut Self {
+        self.h1_builder
+            .allow_obsolete_multiline_headers_in_responses(val);
+        self
+    }
+
+    /// Sets whether invalid header lines should be silently ignored in HTTP/1 responses.
+    ///
+    /// This mimicks the behaviour of major browsers. You probably don't want this.
+    /// You should only want this if you are implementing a proxy whose main
+    /// purpose is to sit in front of browsers whose users access arbitrary content
+    /// which may be malformed, and they expect everything that works without
+    /// the proxy to keep working with the proxy.
+    ///
+    /// This option will prevent Hyper's client from returning an error encountered
+    /// when parsing a header, except if the error was caused by the character NUL
+    /// (ASCII code 0), as Chrome specifically always reject those.
+    ///
+    /// The ignorable errors are:
+    /// * empty header names;
+    /// * characters that are not allowed in header names, except for `\0` and `\r`;
+    /// * when `allow_spaces_after_header_name_in_responses` is not enabled,
+    ///   spaces and tabs between the header name and the colon;
+    /// * missing colon between header name and colon;
+    /// * characters that are not allowed in header values except for `\0` and `\r`.
+    ///
+    /// If an ignorable error is encountered, the parser tries to find the next
+    /// line in the input to resume parsing the rest of the headers. An error
+    /// will be emitted nonetheless if it finds `\0` or a lone `\r` while
+    /// looking for the next line.
+    #[cfg(feature = "http1")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http1")))]
+    pub fn http1_ignore_invalid_headers_in_responses(&mut self, val: bool) -> &mut Builder {
+        self.h1_builder.ignore_invalid_headers_in_responses(val);
+        self
+    }
+
+    /// Set whether HTTP/1 connections should try to use vectored writes,
+    /// or always flatten into a single buffer.
+    ///
+    /// Note that setting this to false may mean more copies of body data,
+    /// but may also improve performance when an IO transport doesn't
+    /// support vectored writes well, such as most TLS implementations.
+    ///
+    /// Setting this to true will force hyper to use queued strategy
+    /// which may eliminate unnecessary cloning on some TLS backends
+    ///
+    /// Default is `auto`. In this mode hyper will try to guess which
+    /// mode to use
+    #[cfg(feature = "http1")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http1")))]
+    pub fn http1_writev(&mut self, enabled: bool) -> &mut Builder {
+        self.h1_builder.writev(enabled);
+        self
+    }
+
+    /// Set whether HTTP/1 connections will write header names as title case at
+    /// the socket level.
+    ///
+    /// Note that this setting does not affect HTTP/2.
+    ///
+    /// Default is false.
+    #[cfg(feature = "http1")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http1")))]
+    pub fn http1_title_case_headers(&mut self, val: bool) -> &mut Self {
+        self.h1_builder.title_case_headers(val);
+        self
+    }
+
+    /// Set whether to support preserving original header cases.
+    ///
+    /// Currently, this will record the original cases received, and store them
+    /// in a private extension on the `Response`. It will also look for and use
+    /// such an extension in any provided `Request`.
+    ///
+    /// Since the relevant extension is still private, there is no way to
+    /// interact with the original cases. The only effect this can have now is
+    /// to forward the cases in a proxy-like fashion.
+    ///
+    /// Note that this setting does not affect HTTP/2.
+    ///
+    /// Default is false.
+    #[cfg(feature = "http1")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http1")))]
+    pub fn http1_preserve_header_case(&mut self, val: bool) -> &mut Self {
+        self.h1_builder.preserve_header_case(val);
+        self
+    }
+
+    /// Set whether HTTP/0.9 responses should be tolerated.
+    ///
+    /// Default is false.
+    #[cfg(feature = "http1")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http1")))]
+    pub fn http09_responses(&mut self, val: bool) -> &mut Self {
+        self.h1_builder.http09_responses(val);
+        self
+    }
+
+    /// Set whether the connection **must** use HTTP/2.
+    ///
+    /// The destination must either allow HTTP2 Prior Knowledge, or the
+    /// `Connect` should be configured to do use ALPN to upgrade to `h2`
+    /// as part of the connection process. This will not make the `Client`
+    /// utilize ALPN by itself.
+    ///
+    /// Note that setting this to true prevents HTTP/1 from being allowed.
+    ///
+    /// Default is false.
+    #[cfg(feature = "http2")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
+    pub fn http2_only(&mut self, val: bool) -> &mut Self {
+        self.client_config.ver = if val { Ver::Http2 } else { Ver::Auto };
+        self
+    }
+
+    /// Sets the [`SETTINGS_INITIAL_WINDOW_SIZE`][spec] option for HTTP2
+    /// stream-level flow control.
+    ///
+    /// Passing `None` will do nothing.
+    ///
+    /// If not set, hyper will use a default.
+    ///
+    /// [spec]: https://http2.github.io/http2-spec/#SETTINGS_INITIAL_WINDOW_SIZE
+    #[cfg(feature = "http2")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
+    pub fn http2_initial_stream_window_size(&mut self, sz: impl Into<Option<u32>>) -> &mut Self {
+        self.h2_builder.initial_stream_window_size(sz.into());
+        self
+    }
+
+    /// Sets the max connection-level flow control for HTTP2
+    ///
+    /// Passing `None` will do nothing.
+    ///
+    /// If not set, hyper will use a default.
+    #[cfg(feature = "http2")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
+    pub fn http2_initial_connection_window_size(
+        &mut self,
+        sz: impl Into<Option<u32>>,
+    ) -> &mut Self {
+        self.h2_builder.initial_connection_window_size(sz.into());
+        self
+    }
+
+    /// Sets whether to use an adaptive flow control.
+    ///
+    /// Enabling this will override the limits set in
+    /// `http2_initial_stream_window_size` and
+    /// `http2_initial_connection_window_size`.
+    #[cfg(feature = "http2")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
+    pub fn http2_adaptive_window(&mut self, enabled: bool) -> &mut Self {
+        self.h2_builder.adaptive_window(enabled);
+        self
+    }
+
+    /// Sets the maximum frame size to use for HTTP2.
+    ///
+    /// Passing `None` will do nothing.
+    ///
+    /// If not set, hyper will use a default.
+    #[cfg(feature = "http2")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
+    pub fn http2_max_frame_size(&mut self, sz: impl Into<Option<u32>>) -> &mut Self {
+        self.h2_builder.max_frame_size(sz);
+        self
+    }
+
+    /// Sets an interval for HTTP2 Ping frames should be sent to keep a
+    /// connection alive.
+    ///
+    /// Pass `None` to disable HTTP2 keep-alive.
+    ///
+    /// Default is currently disabled.
+    ///
+    /// # Cargo Feature
+    ///
+    /// Requires the `runtime` cargo feature to be enabled.
+    #[cfg(feature = "runtime")]
+    #[cfg(feature = "http2")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
+    pub fn http2_keep_alive_interval(
+        &mut self,
+        interval: impl Into<Option<Duration>>,
+    ) -> &mut Self {
+        self.h2_builder.keep_alive_interval(interval);
+        self
+    }
+
+    /// Sets a timeout for receiving an acknowledgement of the keep-alive ping.
+    ///
+    /// If the ping is not acknowledged within the timeout, the connection will
+    /// be closed. Does nothing if `http2_keep_alive_interval` is disabled.
+    ///
+    /// Default is 20 seconds.
+    ///
+    /// # Cargo Feature
+    ///
+    /// Requires the `runtime` cargo feature to be enabled.
+    #[cfg(feature = "runtime")]
+    #[cfg(feature = "http2")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
+    pub fn http2_keep_alive_timeout(&mut self, timeout: Duration) -> &mut Self {
+        self.h2_builder.keep_alive_timeout(timeout);
+        self
+    }
+
+    /// Sets whether HTTP2 keep-alive should apply while the connection is idle.
+    ///
+    /// If disabled, keep-alive pings are only sent while there are open
+    /// request/responses streams. If enabled, pings are also sent when no
+    /// streams are active. Does nothing if `http2_keep_alive_interval` is
+    /// disabled.
+    ///
+    /// Default is `false`.
+    ///
+    /// # Cargo Feature
+    ///
+    /// Requires the `runtime` cargo feature to be enabled.
+    #[cfg(feature = "runtime")]
+    #[cfg(feature = "http2")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
+    pub fn http2_keep_alive_while_idle(&mut self, enabled: bool) -> &mut Self {
+        self.h2_builder.keep_alive_while_idle(enabled);
+        self
+    }
+
+    /// Sets the maximum number of HTTP2 concurrent locally reset streams.
+    ///
+    /// See the documentation of [`h2::client::Builder::max_concurrent_reset_streams`] for more
+    /// details.
+    ///
+    /// The default value is determined by the `h2` crate.
+    ///
+    /// [`h2::client::Builder::max_concurrent_reset_streams`]: https://docs.rs/h2/client/struct.Builder.html#method.max_concurrent_reset_streams
+    #[cfg(feature = "http2")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
+    pub fn http2_max_concurrent_reset_streams(&mut self, max: usize) -> &mut Self {
+        self.h2_builder.max_concurrent_reset_streams(max);
+        self
+    }
+
+    /// Set the maximum write buffer size for each HTTP/2 stream.
+    ///
+    /// Default is currently 1MB, but may change.
+    ///
+    /// # Panics
+    ///
+    /// The value must be no larger than `u32::MAX`.
+    #[cfg(feature = "http2")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
+    pub fn http2_max_send_buf_size(&mut self, max: usize) -> &mut Self {
+        self.h2_builder.max_send_buf_size(max);
+        self
+    }
+
+    /// Set whether to retry requests that get disrupted before ever starting
+    /// to write.
+    ///
+    /// This means a request that is queued, and gets given an idle, reused
+    /// connection, and then encounters an error immediately as the idle
+    /// connection was found to be unusable.
+    ///
+    /// When this is set to `false`, the related `ResponseFuture` would instead
+    /// resolve to an `Error::Cancel`.
+    ///
+    /// Default is `true`.
+    #[inline]
+    pub fn retry_canceled_requests(&mut self, val: bool) -> &mut Self {
+        self.client_config.retry_canceled_requests = val;
+        self
+    }
+
+    /// Set whether to automatically add the `Host` header to requests.
+    ///
+    /// If true, and a request does not include a `Host` header, one will be
+    /// added automatically, derived from the authority of the `Uri`.
+    ///
+    /// Default is `true`.
+    #[inline]
+    pub fn set_host(&mut self, val: bool) -> &mut Self {
+        self.client_config.set_host = val;
+        self
+    }
+
+    /// Builder a client with this configuration and the default `HttpConnector`.
+    #[cfg(feature = "tcp")]
+    pub fn build_http<B>(&self) -> Client<HttpConnector, B>
+    where
+        B: Body + Send,
+        B::Data: Send,
+    {
+        let mut connector = HttpConnector::new();
+        if self.pool_config.is_enabled() {
+            connector.set_keepalive(self.pool_config.idle_timeout);
+        }
+        self.build(connector)
+    }
+
+    /// Combine the configuration of this builder with a connector to create a `Client`.
+    pub fn build<C, B>(&self, connector: C) -> Client<C, B>
+    where
+        C: Connect + Clone,
+        B: Body + Send,
+        B::Data: Send,
+    {
+        Client {
+            config: self.client_config,
+            exec: self.exec.clone(),
+            #[cfg(feature = "http1")]
+            h1_builder: self.h1_builder.clone(),
+            #[cfg(feature = "http2")]
+            h2_builder: self.h2_builder.clone(),
+            connector,
+            pool: pool::Pool::new(self.pool_config, &self.exec),
+        }
+    }
+}
+
+impl fmt::Debug for Builder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Builder")
+            .field("client_config", &self.client_config)
+            //.field("conn_builder", &self.conn_builder)
+            .field("pool_config", &self.pool_config)
+            .finish()
+    }
+}
+
+// ==== impl Error ====
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "client error ({:?})", self.kind)
+    }
+}
+
+impl StdError for Error {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        self.source.as_ref().map(|e| &**e as _)
+    }
+}
+
+impl Error {
+    fn is_canceled(&self) -> bool {
+        matches!(self.kind, ErrorKind::Canceled)
+    }
+
+    fn tx(src: hyper::Error) -> Self {
+        e!(SendRequest, src)
+    }
+
+    fn closed(src: hyper::Error) -> Self {
+        e!(ChannelClosed, src)
+    }
+}
+
+'''
+'''--- src/client/mod.rs ---
+//! HTTP client utilities
+
+//mod client;
+pub mod connect;
+#[cfg(any(feature = "http1", feature = "http2"))]
+pub mod legacy;
+#[doc(hidden)]
+pub mod pool;
+
+'''
+'''--- src/client/pool.rs ---
+#![allow(dead_code)]
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::convert::Infallible;
+use std::error::Error as StdError;
+use std::fmt::{self, Debug};
+use std::future::Future;
+use std::hash::Hash;
+use std::marker::Unpin;
+use std::ops::{Deref, DerefMut};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, Weak};
+use std::task::{self, Poll};
+
+#[cfg(not(feature = "runtime"))]
+use std::time::{Duration, Instant};
+#[cfg(feature = "runtime")]
+use tokio::time::{Duration, Instant, Interval};
+
+use futures_channel::oneshot;
+use tracing::{debug, trace};
+
+use crate::common::{exec::Exec, ready};
+
+// FIXME: allow() required due to `impl Trait` leaking types to this lint
+#[allow(missing_debug_implementations)]
+pub struct Pool<T, K: Key> {
+    // If the pool is disabled, this is None.
+    inner: Option<Arc<Mutex<PoolInner<T, K>>>>,
+}
+
+// Before using a pooled connection, make sure the sender is not dead.
+//
+// This is a trait to allow the `client::pool::tests` to work for `i32`.
+//
+// See https://github.com/hyperium/hyper/issues/1429
+pub trait Poolable: Unpin + Send + Sized + 'static {
+    fn is_open(&self) -> bool;
+    /// Reserve this connection.
+    ///
+    /// Allows for HTTP/2 to return a shared reservation.
+    fn reserve(self) -> Reservation<Self>;
+    fn can_share(&self) -> bool;
+}
+
+pub trait Key: Eq + Hash + Clone + Debug + Unpin + Send + 'static {}
+
+impl<T> Key for T where T: Eq + Hash + Clone + Debug + Unpin + Send + 'static {}
+
+/// A marker to identify what version a pooled connection is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
+pub enum Ver {
+    Auto,
+    Http2,
+}
+
+/// When checking out a pooled connection, it might be that the connection
+/// only supports a single reservation, or it might be usable for many.
+///
+/// Specifically, HTTP/1 requires a unique reservation, but HTTP/2 can be
+/// used for multiple requests.
+// FIXME: allow() required due to `impl Trait` leaking types to this lint
+#[allow(missing_debug_implementations)]
+pub enum Reservation<T> {
+    /// This connection could be used multiple times, the first one will be
+    /// reinserted into the `idle` pool, and the second will be given to
+    /// the `Checkout`.
+    #[cfg(feature = "http2")]
+    Shared(T, T),
+    /// This connection requires unique access. It will be returned after
+    /// use is complete.
+    Unique(T),
+}
+
+/// Simple type alias in case the key type needs to be adjusted.
+// pub type Key = (http::uri::Scheme, http::uri::Authority); //Arc<String>;
+
+struct PoolInner<T, K: Eq + Hash> {
+    // A flag that a connection is being established, and the connection
+    // should be shared. This prevents making multiple HTTP/2 connections
+    // to the same host.
+    connecting: HashSet<K>,
+    // These are internal Conns sitting in the event loop in the KeepAlive
+    // state, waiting to receive a new Request to send on the socket.
+    idle: HashMap<K, Vec<Idle<T>>>,
+    max_idle_per_host: usize,
+    // These are outstanding Checkouts that are waiting for a socket to be
+    // able to send a Request one. This is used when "racing" for a new
+    // connection.
+    //
+    // The Client starts 2 tasks, 1 to connect a new socket, and 1 to wait
+    // for the Pool to receive an idle Conn. When a Conn becomes idle,
+    // this list is checked for any parked Checkouts, and tries to notify
+    // them that the Conn could be used instead of waiting for a brand new
+    // connection.
+    waiters: HashMap<K, VecDeque<oneshot::Sender<T>>>,
+    // A oneshot channel is used to allow the interval to be notified when
+    // the Pool completely drops. That way, the interval can cancel immediately.
+    #[cfg(feature = "runtime")]
+    idle_interval_ref: Option<oneshot::Sender<Infallible>>,
+    #[cfg(feature = "runtime")]
+    exec: Exec,
+    timeout: Option<Duration>,
+}
+
+// This is because `Weak::new()` *allocates* space for `T`, even if it
+// doesn't need it!
+struct WeakOpt<T>(Option<Weak<T>>);
+
+#[derive(Clone, Copy, Debug)]
+pub struct Config {
+    pub idle_timeout: Option<Duration>,
+    pub max_idle_per_host: usize,
+}
+
+impl Config {
+    pub fn is_enabled(&self) -> bool {
+        self.max_idle_per_host > 0
+    }
+}
+
+impl<T, K: Key> Pool<T, K> {
+    pub fn new(config: Config, __exec: &Exec) -> Pool<T, K> {
+        let inner = if config.is_enabled() {
+            Some(Arc::new(Mutex::new(PoolInner {
+                connecting: HashSet::new(),
+                idle: HashMap::new(),
+                #[cfg(feature = "runtime")]
+                idle_interval_ref: None,
+                max_idle_per_host: config.max_idle_per_host,
+                waiters: HashMap::new(),
+                #[cfg(feature = "runtime")]
+                exec: __exec.clone(),
+                timeout: config.idle_timeout,
+            })))
+        } else {
+            None
+        };
+
+        Pool { inner }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.inner.is_some()
+    }
+
+    #[cfg(test)]
+    pub(super) fn no_timer(&self) {
+        // Prevent an actual interval from being created for this pool...
+        #[cfg(feature = "runtime")]
+        {
+            let mut inner = self.inner.as_ref().unwrap().lock().unwrap();
+            assert!(inner.idle_interval_ref.is_none(), "timer already spawned");
+            let (tx, _) = oneshot::channel();
+            inner.idle_interval_ref = Some(tx);
+        }
+    }
+}
+
+impl<T: Poolable, K: Key> Pool<T, K> {
+    /// Returns a `Checkout` which is a future that resolves if an idle
+    /// connection becomes available.
+    pub fn checkout(&self, key: K) -> Checkout<T, K> {
+        Checkout {
+            key,
+            pool: self.clone(),
+            waiter: None,
+        }
+    }
+
+    /// Ensure that there is only ever 1 connecting task for HTTP/2
+    /// connections. This does nothing for HTTP/1.
+    pub fn connecting(&self, key: &K, ver: Ver) -> Option<Connecting<T, K>> {
+        if ver == Ver::Http2 {
+            if let Some(ref enabled) = self.inner {
+                let mut inner = enabled.lock().unwrap();
+                return if inner.connecting.insert(key.clone()) {
+                    let connecting = Connecting {
+                        key: key.clone(),
+                        pool: WeakOpt::downgrade(enabled),
+                    };
+                    Some(connecting)
+                } else {
+                    trace!("HTTP/2 connecting already in progress for {:?}", key);
+                    None
+                };
+            }
+        }
+
+        // else
+        Some(Connecting {
+            key: key.clone(),
+            // in HTTP/1's case, there is never a lock, so we don't
+            // need to do anything in Drop.
+            pool: WeakOpt::none(),
+        })
+    }
+
+    #[cfg(test)]
+    fn locked(&self) -> std::sync::MutexGuard<'_, PoolInner<T, K>> {
+        self.inner.as_ref().expect("enabled").lock().expect("lock")
+    }
+
+    /* Used in client/tests.rs...
+    #[cfg(feature = "runtime")]
+    #[cfg(test)]
+    pub(super) fn h1_key(&self, s: &str) -> Key {
+        Arc::new(s.to_string())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[cfg(test)]
+    pub(super) fn idle_count(&self, key: &Key) -> usize {
+        self
+            .locked()
+            .idle
+            .get(key)
+            .map(|list| list.len())
+            .unwrap_or(0)
+    }
+    */
+
+    pub fn pooled(
+        &self,
+        #[cfg_attr(not(feature = "http2"), allow(unused_mut))] mut connecting: Connecting<T, K>,
+        value: T,
+    ) -> Pooled<T, K> {
+        let (value, pool_ref) = if let Some(ref enabled) = self.inner {
+            match value.reserve() {
+                #[cfg(feature = "http2")]
+                Reservation::Shared(to_insert, to_return) => {
+                    let mut inner = enabled.lock().unwrap();
+                    inner.put(connecting.key.clone(), to_insert, enabled);
+                    // Do this here instead of Drop for Connecting because we
+                    // already have a lock, no need to lock the mutex twice.
+                    inner.connected(&connecting.key);
+                    // prevent the Drop of Connecting from repeating inner.connected()
+                    connecting.pool = WeakOpt::none();
+
+                    // Shared reservations don't need a reference to the pool,
+                    // since the pool always keeps a copy.
+                    (to_return, WeakOpt::none())
+                }
+                Reservation::Unique(value) => {
+                    // Unique reservations must take a reference to the pool
+                    // since they hope to reinsert once the reservation is
+                    // completed
+                    (value, WeakOpt::downgrade(enabled))
+                }
+            }
+        } else {
+            // If pool is not enabled, skip all the things...
+
+            // The Connecting should have had no pool ref
+            debug_assert!(connecting.pool.upgrade().is_none());
+
+            (value, WeakOpt::none())
+        };
+        Pooled {
+            key: connecting.key.clone(),
+            is_reused: false,
+            pool: pool_ref,
+            value: Some(value),
+        }
+    }
+
+    fn reuse(&self, key: &K, value: T) -> Pooled<T, K> {
+        debug!("reuse idle connection for {:?}", key);
+        // TODO: unhack this
+        // In Pool::pooled(), which is used for inserting brand new connections,
+        // there's some code that adjusts the pool reference taken depending
+        // on if the Reservation can be shared or is unique. By the time
+        // reuse() is called, the reservation has already been made, and
+        // we just have the final value, without knowledge of if this is
+        // unique or shared. So, the hack is to just assume Ver::Http2 means
+        // shared... :(
+        let mut pool_ref = WeakOpt::none();
+        if !value.can_share() {
+            if let Some(ref enabled) = self.inner {
+                pool_ref = WeakOpt::downgrade(enabled);
+            }
+        }
+
+        Pooled {
+            is_reused: true,
+            key: key.clone(),
+            pool: pool_ref,
+            value: Some(value),
+        }
+    }
+}
+
+/// Pop off this list, looking for a usable connection that hasn't expired.
+struct IdlePopper<'a, T, K> {
+    key: &'a K,
+    list: &'a mut Vec<Idle<T>>,
+}
+
+impl<'a, T: Poolable + 'a, K: Debug> IdlePopper<'a, T, K> {
+    fn pop(self, expiration: &Expiration) -> Option<Idle<T>> {
+        while let Some(entry) = self.list.pop() {
+            // If the connection has been closed, or is older than our idle
+            // timeout, simply drop it and keep looking...
+            if !entry.value.is_open() {
+                trace!("removing closed connection for {:?}", self.key);
+                continue;
+            }
+            // TODO: Actually, since the `idle` list is pushed to the end always,
+            // that would imply that if *this* entry is expired, then anything
+            // "earlier" in the list would *have* to be expired also... Right?
+            //
+            // In that case, we could just break out of the loop and drop the
+            // whole list...
+            if expiration.expires(entry.idle_at) {
+                trace!("removing expired connection for {:?}", self.key);
+                continue;
+            }
+
+            let value = match entry.value.reserve() {
+                #[cfg(feature = "http2")]
+                Reservation::Shared(to_reinsert, to_checkout) => {
+                    self.list.push(Idle {
+                        idle_at: Instant::now(),
+                        value: to_reinsert,
+                    });
+                    to_checkout
+                }
+                Reservation::Unique(unique) => unique,
+            };
+
+            return Some(Idle {
+                idle_at: entry.idle_at,
+                value,
+            });
+        }
+
+        None
+    }
+}
+
+impl<T: Poolable, K: Key> PoolInner<T, K> {
+    fn put(&mut self, key: K, value: T, __pool_ref: &Arc<Mutex<PoolInner<T, K>>>) {
+        if value.can_share() && self.idle.contains_key(&key) {
+            trace!("put; existing idle HTTP/2 connection for {:?}", key);
+            return;
+        }
+        trace!("put; add idle connection for {:?}", key);
+        let mut remove_waiters = false;
+        let mut value = Some(value);
+        if let Some(waiters) = self.waiters.get_mut(&key) {
+            while let Some(tx) = waiters.pop_front() {
+                if !tx.is_canceled() {
+                    let reserved = value.take().expect("value already sent");
+                    let reserved = match reserved.reserve() {
+                        #[cfg(feature = "http2")]
+                        Reservation::Shared(to_keep, to_send) => {
+                            value = Some(to_keep);
+                            to_send
+                        }
+                        Reservation::Unique(uniq) => uniq,
+                    };
+                    match tx.send(reserved) {
+                        Ok(()) => {
+                            if value.is_none() {
+                                break;
+                            } else {
+                                continue;
+                            }
+                        }
+                        Err(e) => {
+                            value = Some(e);
+                        }
+                    }
+                }
+
+                trace!("put; removing canceled waiter for {:?}", key);
+            }
+            remove_waiters = waiters.is_empty();
+        }
+        if remove_waiters {
+            self.waiters.remove(&key);
+        }
+
+        match value {
+            Some(value) => {
+                // borrow-check scope...
+                {
+                    let idle_list = self.idle.entry(key.clone()).or_insert_with(Vec::new);
+                    if self.max_idle_per_host <= idle_list.len() {
+                        trace!("max idle per host for {:?}, dropping connection", key);
+                        return;
+                    }
+
+                    debug!("pooling idle connection for {:?}", key);
+                    idle_list.push(Idle {
+                        value,
+                        idle_at: Instant::now(),
+                    });
+                }
+
+                #[cfg(feature = "runtime")]
+                {
+                    self.spawn_idle_interval(__pool_ref);
+                }
+            }
+            None => trace!("put; found waiter for {:?}", key),
+        }
+    }
+
+    /// A `Connecting` task is complete. Not necessarily successfully,
+    /// but the lock is going away, so clean up.
+    fn connected(&mut self, key: &K) {
+        let existed = self.connecting.remove(key);
+        debug_assert!(existed, "Connecting dropped, key not in pool.connecting");
+        // cancel any waiters. if there are any, it's because
+        // this Connecting task didn't complete successfully.
+        // those waiters would never receive a connection.
+        self.waiters.remove(key);
+    }
+
+    #[cfg(feature = "runtime")]
+    fn spawn_idle_interval(&mut self, pool_ref: &Arc<Mutex<PoolInner<T, K>>>) {
+        let (dur, rx) = {
+            if self.idle_interval_ref.is_some() {
+                return;
+            }
+
+            if let Some(dur) = self.timeout {
+                let (tx, rx) = oneshot::channel();
+                self.idle_interval_ref = Some(tx);
+                (dur, rx)
+            } else {
+                return;
+            }
+        };
+
+        let interval = IdleTask {
+            interval: tokio::time::interval(dur),
+            pool: WeakOpt::downgrade(pool_ref),
+            pool_drop_notifier: rx,
+        };
+
+        self.exec.execute(interval);
+    }
+}
+
+impl<T, K: Eq + Hash> PoolInner<T, K> {
+    /// Any `FutureResponse`s that were created will have made a `Checkout`,
+    /// and possibly inserted into the pool that it is waiting for an idle
+    /// connection. If a user ever dropped that future, we need to clean out
+    /// those parked senders.
+    fn clean_waiters(&mut self, key: &K) {
+        let mut remove_waiters = false;
+        if let Some(waiters) = self.waiters.get_mut(key) {
+            waiters.retain(|tx| !tx.is_canceled());
+            remove_waiters = waiters.is_empty();
+        }
+        if remove_waiters {
+            self.waiters.remove(key);
+        }
+    }
+}
+
+#[cfg(feature = "runtime")]
+impl<T: Poolable, K: Key> PoolInner<T, K> {
+    /// This should *only* be called by the IdleTask
+    fn clear_expired(&mut self) {
+        let dur = self.timeout.expect("interval assumes timeout");
+
+        let now = Instant::now();
+        //self.last_idle_check_at = now;
+
+        self.idle.retain(|key, values| {
+            values.retain(|entry| {
+                if !entry.value.is_open() {
+                    trace!("idle interval evicting closed for {:?}", key);
+                    return false;
+                }
+
+                // Avoid `Instant::sub` to avoid issues like rust-lang/rust#86470.
+                if now.saturating_duration_since(entry.idle_at) > dur {
+                    trace!("idle interval evicting expired for {:?}", key);
+                    return false;
+                }
+
+                // Otherwise, keep this value...
+                true
+            });
+
+            // returning false evicts this key/val
+            !values.is_empty()
+        });
+    }
+}
+
+impl<T, K: Key> Clone for Pool<T, K> {
+    fn clone(&self) -> Pool<T, K> {
+        Pool {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+/// A wrapped poolable value that tries to reinsert to the Pool on Drop.
+// Note: The bounds `T: Poolable` is needed for the Drop impl.
+pub struct Pooled<T: Poolable, K: Key> {
+    value: Option<T>,
+    is_reused: bool,
+    key: K,
+    pool: WeakOpt<Mutex<PoolInner<T, K>>>,
+}
+
+impl<T: Poolable, K: Key> Pooled<T, K> {
+    pub fn is_reused(&self) -> bool {
+        self.is_reused
+    }
+
+    pub fn is_pool_enabled(&self) -> bool {
+        self.pool.0.is_some()
+    }
+
+    fn as_ref(&self) -> &T {
+        self.value.as_ref().expect("not dropped")
+    }
+
+    fn as_mut(&mut self) -> &mut T {
+        self.value.as_mut().expect("not dropped")
+    }
+}
+
+impl<T: Poolable, K: Key> Deref for Pooled<T, K> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.as_ref()
+    }
+}
+
+impl<T: Poolable, K: Key> DerefMut for Pooled<T, K> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.as_mut()
+    }
+}
+
+impl<T: Poolable, K: Key> Drop for Pooled<T, K> {
+    fn drop(&mut self) {
+        if let Some(value) = self.value.take() {
+            if !value.is_open() {
+                // If we *already* know the connection is done here,
+                // it shouldn't be re-inserted back into the pool.
+                return;
+            }
+
+            if let Some(pool) = self.pool.upgrade() {
+                if let Ok(mut inner) = pool.lock() {
+                    inner.put(self.key.clone(), value, &pool);
+                }
+            } else if !value.can_share() {
+                trace!("pool dropped, dropping pooled ({:?})", self.key);
+            }
+            // Ver::Http2 is already in the Pool (or dead), so we wouldn't
+            // have an actual reference to the Pool.
+        }
+    }
+}
+
+impl<T: Poolable, K: Key> fmt::Debug for Pooled<T, K> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Pooled").field("key", &self.key).finish()
+    }
+}
+
+struct Idle<T> {
+    idle_at: Instant,
+    value: T,
+}
+
+// FIXME: allow() required due to `impl Trait` leaking types to this lint
+#[allow(missing_debug_implementations)]
+pub struct Checkout<T, K: Key> {
+    key: K,
+    pool: Pool<T, K>,
+    waiter: Option<oneshot::Receiver<T>>,
+}
+
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum Error {
+    PoolDisabled,
+    CheckoutNoLongerWanted,
+    CheckedOutClosedValue,
+}
+
+impl Error {
+    pub(super) fn is_canceled(&self) -> bool {
+        matches!(self, Error::CheckedOutClosedValue)
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Error::PoolDisabled => "pool is disabled",
+            Error::CheckedOutClosedValue => "checked out connection was closed",
+            Error::CheckoutNoLongerWanted => "request was canceled",
+        })
+    }
+}
+
+impl StdError for Error {}
+
+impl<T: Poolable, K: Key> Checkout<T, K> {
+    fn poll_waiter(
+        &mut self,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Option<Result<Pooled<T, K>, Error>>> {
+        if let Some(mut rx) = self.waiter.take() {
+            match Pin::new(&mut rx).poll(cx) {
+                Poll::Ready(Ok(value)) => {
+                    if value.is_open() {
+                        Poll::Ready(Some(Ok(self.pool.reuse(&self.key, value))))
+                    } else {
+                        Poll::Ready(Some(Err(Error::CheckedOutClosedValue)))
+                    }
+                }
+                Poll::Pending => {
+                    self.waiter = Some(rx);
+                    Poll::Pending
+                }
+                Poll::Ready(Err(_canceled)) => {
+                    Poll::Ready(Some(Err(Error::CheckoutNoLongerWanted)))
+                }
+            }
+        } else {
+            Poll::Ready(None)
+        }
+    }
+
+    fn checkout(&mut self, cx: &mut task::Context<'_>) -> Option<Pooled<T, K>> {
+        let entry = {
+            let mut inner = self.pool.inner.as_ref()?.lock().unwrap();
+            let expiration = Expiration::new(inner.timeout);
+            let maybe_entry = inner.idle.get_mut(&self.key).and_then(|list| {
+                trace!("take? {:?}: expiration = {:?}", self.key, expiration.0);
+                // A block to end the mutable borrow on list,
+                // so the map below can check is_empty()
+                {
+                    let popper = IdlePopper {
+                        key: &self.key,
+                        list,
+                    };
+                    popper.pop(&expiration)
+                }
+                .map(|e| (e, list.is_empty()))
+            });
+
+            let (entry, empty) = if let Some((e, empty)) = maybe_entry {
+                (Some(e), empty)
+            } else {
+                // No entry found means nuke the list for sure.
+                (None, true)
+            };
+            if empty {
+                //TODO: This could be done with the HashMap::entry API instead.
+                inner.idle.remove(&self.key);
+            }
+
+            if entry.is_none() && self.waiter.is_none() {
+                let (tx, mut rx) = oneshot::channel();
+                trace!("checkout waiting for idle connection: {:?}", self.key);
+                inner
+                    .waiters
+                    .entry(self.key.clone())
+                    .or_insert_with(VecDeque::new)
+                    .push_back(tx);
+
+                // register the waker with this oneshot
+                assert!(Pin::new(&mut rx).poll(cx).is_pending());
+                self.waiter = Some(rx);
+            }
+
+            entry
+        };
+
+        entry.map(|e| self.pool.reuse(&self.key, e.value))
+    }
+}
+
+impl<T: Poolable, K: Key> Future for Checkout<T, K> {
+    type Output = Result<Pooled<T, K>, Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
+        if let Some(pooled) = ready!(self.poll_waiter(cx)?) {
+            return Poll::Ready(Ok(pooled));
+        }
+
+        if let Some(pooled) = self.checkout(cx) {
+            Poll::Ready(Ok(pooled))
+        } else if !self.pool.is_enabled() {
+            Poll::Ready(Err(Error::PoolDisabled))
+        } else {
+            // There's a new waiter, already registered in self.checkout()
+            debug_assert!(self.waiter.is_some());
+            Poll::Pending
+        }
+    }
+}
+
+impl<T, K: Key> Drop for Checkout<T, K> {
+    fn drop(&mut self) {
+        if self.waiter.take().is_some() {
+            trace!("checkout dropped for {:?}", self.key);
+            if let Some(Ok(mut inner)) = self.pool.inner.as_ref().map(|i| i.lock()) {
+                inner.clean_waiters(&self.key);
+            }
+        }
+    }
+}
+
+// FIXME: allow() required due to `impl Trait` leaking types to this lint
+#[allow(missing_debug_implementations)]
+pub struct Connecting<T: Poolable, K: Key> {
+    key: K,
+    pool: WeakOpt<Mutex<PoolInner<T, K>>>,
+}
+
+impl<T: Poolable, K: Key> Connecting<T, K> {
+    pub fn alpn_h2(self, pool: &Pool<T, K>) -> Option<Self> {
+        debug_assert!(
+            self.pool.0.is_none(),
+            "Connecting::alpn_h2 but already Http2"
+        );
+
+        pool.connecting(&self.key, Ver::Http2)
+    }
+}
+
+impl<T: Poolable, K: Key> Drop for Connecting<T, K> {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool.upgrade() {
+            // No need to panic on drop, that could abort!
+            if let Ok(mut inner) = pool.lock() {
+                inner.connected(&self.key);
+            }
+        }
+    }
+}
+
+struct Expiration(Option<Duration>);
+
+impl Expiration {
+    fn new(dur: Option<Duration>) -> Expiration {
+        Expiration(dur)
+    }
+
+    fn expires(&self, instant: Instant) -> bool {
+        match self.0 {
+            // Avoid `Instant::elapsed` to avoid issues like rust-lang/rust#86470.
+            Some(timeout) => Instant::now().saturating_duration_since(instant) > timeout,
+            None => false,
+        }
+    }
+}
+
+#[cfg(feature = "runtime")]
+pin_project_lite::pin_project! {
+    struct IdleTask<T, K: Key> {
+        #[pin]
+        interval: Interval,
+        pool: WeakOpt<Mutex<PoolInner<T, K>>>,
+        // This allows the IdleTask to be notified as soon as the entire
+        // Pool is fully dropped, and shutdown. This channel is never sent on,
+        // but Err(Canceled) will be received when the Pool is dropped.
+        #[pin]
+        pool_drop_notifier: oneshot::Receiver<Infallible>,
+    }
+}
+
+#[cfg(feature = "runtime")]
+impl<T: Poolable + 'static, K: Key> Future for IdleTask<T, K> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
+        loop {
+            match this.pool_drop_notifier.as_mut().poll(cx) {
+                Poll::Ready(Ok(n)) => match n {},
+                Poll::Pending => (),
+                Poll::Ready(Err(_canceled)) => {
+                    trace!("pool closed, canceling idle interval");
+                    return Poll::Ready(());
+                }
+            }
+
+            ready!(this.interval.as_mut().poll_tick(cx));
+
+            if let Some(inner) = this.pool.upgrade() {
+                if let Ok(mut inner) = inner.lock() {
+                    trace!("idle interval checking for expired");
+                    inner.clear_expired();
+                    continue;
+                }
+            }
+            return Poll::Ready(());
+        }
+    }
+}
+
+impl<T> WeakOpt<T> {
+    fn none() -> Self {
+        WeakOpt(None)
+    }
+
+    fn downgrade(arc: &Arc<T>) -> Self {
+        WeakOpt(Some(Arc::downgrade(arc)))
+    }
+
+    fn upgrade(&self) -> Option<Arc<T>> {
+        self.0.as_ref().and_then(Weak::upgrade)
+    }
+}
+
+#[cfg(all(test, not(miri)))]
+mod tests {
+    use std::fmt::Debug;
+    use std::future::Future;
+    use std::hash::Hash;
+    use std::pin::Pin;
+    use std::task::{self, Poll};
+    use std::time::Duration;
+
+    use super::{Connecting, Key, Pool, Poolable, Reservation, WeakOpt};
+    use crate::common::exec::Exec;
+
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    struct KeyImpl(http::uri::Scheme, http::uri::Authority);
+
+    type KeyTuple = (http::uri::Scheme, http::uri::Authority);
+
+    /// Test unique reservations.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Uniq<T>(T);
+
+    impl<T: Send + 'static + Unpin> Poolable for Uniq<T> {
+        fn is_open(&self) -> bool {
+            true
+        }
+
+        fn reserve(self) -> Reservation<Self> {
+            Reservation::Unique(self)
+        }
+
+        fn can_share(&self) -> bool {
+            false
+        }
+    }
+
+    fn c<T: Poolable, K: Key>(key: K) -> Connecting<T, K> {
+        Connecting {
+            key,
+            pool: WeakOpt::none(),
+        }
+    }
+
+    fn host_key(s: &str) -> KeyImpl {
+        KeyImpl(http::uri::Scheme::HTTP, s.parse().expect("host key"))
+    }
+
+    fn pool_no_timer<T, K: Key>() -> Pool<T, K> {
+        pool_max_idle_no_timer(::std::usize::MAX)
+    }
+
+    fn pool_max_idle_no_timer<T, K: Key>(max_idle: usize) -> Pool<T, K> {
+        let pool = Pool::new(
+            super::Config {
+                idle_timeout: Some(Duration::from_millis(100)),
+                max_idle_per_host: max_idle,
+            },
+            &Exec::Default,
+        );
+        pool.no_timer();
+        pool
+    }
+
+    #[tokio::test]
+    async fn test_pool_checkout_smoke() {
+        let pool = pool_no_timer();
+        let key = host_key("foo");
+        let pooled = pool.pooled(c(key.clone()), Uniq(41));
+
+        drop(pooled);
+
+        match pool.checkout(key).await {
+            Ok(pooled) => assert_eq!(*pooled, Uniq(41)),
+            Err(_) => panic!("not ready"),
+        };
+    }
+
+    /// Helper to check if the future is ready after polling once.
+    struct PollOnce<'a, F>(&'a mut F);
+
+    impl<F, T, U> Future for PollOnce<'_, F>
+    where
+        F: Future<Output = Result<T, U>> + Unpin,
+    {
+        type Output = Option<()>;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
+            match Pin::new(&mut self.0).poll(cx) {
+                Poll::Ready(Ok(_)) => Poll::Ready(Some(())),
+                Poll::Ready(Err(_)) => Poll::Ready(Some(())),
+                Poll::Pending => Poll::Ready(None),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pool_checkout_returns_none_if_expired() {
+        let pool = pool_no_timer();
+        let key = host_key("foo");
+        let pooled = pool.pooled(c(key.clone()), Uniq(41));
+
+        drop(pooled);
+        tokio::time::sleep(pool.locked().timeout.unwrap()).await;
+        let mut checkout = pool.checkout(key);
+        let poll_once = PollOnce(&mut checkout);
+        let is_not_ready = poll_once.await.is_none();
+        assert!(is_not_ready);
+    }
+
+    #[cfg(feature = "runtime")]
+    #[tokio::test]
+    async fn test_pool_checkout_removes_expired() {
+        let pool = pool_no_timer();
+        let key = host_key("foo");
+
+        pool.pooled(c(key.clone()), Uniq(41));
+        pool.pooled(c(key.clone()), Uniq(5));
+        pool.pooled(c(key.clone()), Uniq(99));
+
+        assert_eq!(
+            pool.locked().idle.get(&key).map(|entries| entries.len()),
+            Some(3)
+        );
+        tokio::time::sleep(pool.locked().timeout.unwrap()).await;
+
+        let mut checkout = pool.checkout(key.clone());
+        let poll_once = PollOnce(&mut checkout);
+        // checkout.await should clean out the expired
+        poll_once.await;
+        assert!(pool.locked().idle.get(&key).is_none());
+    }
+
+    #[test]
+    fn test_pool_max_idle_per_host() {
+        let pool = pool_max_idle_no_timer(2);
+        let key = host_key("foo");
+
+        pool.pooled(c(key.clone()), Uniq(41));
+        pool.pooled(c(key.clone()), Uniq(5));
+        pool.pooled(c(key.clone()), Uniq(99));
+
+        // pooled and dropped 3, max_idle should only allow 2
+        assert_eq!(
+            pool.locked().idle.get(&key).map(|entries| entries.len()),
+            Some(2)
+        );
+    }
+
+    #[cfg(feature = "runtime")]
+    #[tokio::test]
+    async fn test_pool_timer_removes_expired() {
+        tokio::time::pause();
+
+        let pool = Pool::new(
+            super::Config {
+                idle_timeout: Some(Duration::from_millis(10)),
+                max_idle_per_host: std::usize::MAX,
+            },
+            &Exec::Default,
+        );
+
+        let key = host_key("foo");
+
+        pool.pooled(c(key.clone()), Uniq(41));
+        pool.pooled(c(key.clone()), Uniq(5));
+        pool.pooled(c(key.clone()), Uniq(99));
+
+        assert_eq!(
+            pool.locked().idle.get(&key).map(|entries| entries.len()),
+            Some(3)
+        );
+
+        // Let the timer tick passed the expiration...
+        tokio::time::advance(Duration::from_millis(30)).await;
+        // Yield so the Interval can reap...
+        tokio::task::yield_now().await;
+
+        assert!(pool.locked().idle.get(&key).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pool_checkout_task_unparked() {
+        use futures_util::future::join;
+        use futures_util::FutureExt;
+
+        let pool = pool_no_timer();
+        let key = host_key("foo");
+        let pooled = pool.pooled(c(key.clone()), Uniq(41));
+
+        let checkout = join(pool.checkout(key), async {
+            // the checkout future will park first,
+            // and then this lazy future will be polled, which will insert
+            // the pooled back into the pool
+            //
+            // this test makes sure that doing so will unpark the checkout
+            drop(pooled);
+        })
+        .map(|(entry, _)| entry);
+
+        assert_eq!(*checkout.await.unwrap(), Uniq(41));
+    }
+
+    #[tokio::test]
+    async fn test_pool_checkout_drop_cleans_up_waiters() {
+        let pool = pool_no_timer::<Uniq<i32>, KeyImpl>();
+        let key = host_key("foo");
+
+        let mut checkout1 = pool.checkout(key.clone());
+        let mut checkout2 = pool.checkout(key.clone());
+
+        let poll_once1 = PollOnce(&mut checkout1);
+        let poll_once2 = PollOnce(&mut checkout2);
+
+        // first poll needed to get into Pool's parked
+        poll_once1.await;
+        assert_eq!(pool.locked().waiters.get(&key).unwrap().len(), 1);
+        poll_once2.await;
+        assert_eq!(pool.locked().waiters.get(&key).unwrap().len(), 2);
+
+        // on drop, clean up Pool
+        drop(checkout1);
+        assert_eq!(pool.locked().waiters.get(&key).unwrap().len(), 1);
+
+        drop(checkout2);
+        assert!(pool.locked().waiters.get(&key).is_none());
+    }
+
+    #[derive(Debug)]
+    struct CanClose {
+        #[allow(unused)]
+        val: i32,
+        closed: bool,
+    }
+
+    impl Poolable for CanClose {
+        fn is_open(&self) -> bool {
+            !self.closed
+        }
+
+        fn reserve(self) -> Reservation<Self> {
+            Reservation::Unique(self)
+        }
+
+        fn can_share(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn pooled_drop_if_closed_doesnt_reinsert() {
+        let pool = pool_no_timer();
+        let key = host_key("foo");
+        pool.pooled(
+            c(key.clone()),
+            CanClose {
+                val: 57,
+                closed: true,
+            },
+        );
+
+        assert!(!pool.locked().idle.contains_key(&key));
+    }
+}
+
+'''
+'''--- src/client/service.rs ---
+struct ConnectingPool<C, P> {
+    connector: C,
+    pool: P,
+}
+
+struct PoolableSvc<S>(S);
+
+'''
+'''--- src/common/exec.rs ---
+#![allow(dead_code)]
+
+use hyper::rt::Executor;
+use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
+pub(crate) type BoxSendFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+// Either the user provides an executor for background tasks, or we use
+// `tokio::spawn`.
+#[derive(Clone)]
+pub enum Exec {
+    Default,
+    Executor(Arc<dyn Executor<BoxSendFuture> + Send + Sync>),
+}
+
+// ===== impl Exec =====
+
+impl Exec {
+    pub(crate) fn new<E>(inner: E) -> Self
+    where
+        E: Executor<BoxSendFuture> + Send + Sync + 'static,
+    {
+        Exec::Executor(Arc::new(inner))
+    }
+
+    pub(crate) fn execute<F>(&self, fut: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        match *self {
+            Exec::Default => {
+                #[cfg(feature = "tcp")]
+                {
+                    tokio::task::spawn(fut);
+                }
+                #[cfg(not(feature = "tcp"))]
+                {
+                    // If no runtime, we need an executor!
+                    panic!("executor must be set")
+                }
+            }
+            Exec::Executor(ref e) => {
+                e.execute(Box::pin(fut));
+            }
+        }
+    }
+}
+
+impl fmt::Debug for Exec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Exec").finish()
+    }
+}
+
+impl<F> hyper::rt::Executor<F> for Exec
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    fn execute(&self, fut: F) {
+        Exec::execute(self, fut);
+    }
+}
+
+'''
+'''--- src/common/lazy.rs ---
+use pin_project_lite::pin_project;
+
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{self, Poll};
+
+pub(crate) trait Started: Future {
+    fn started(&self) -> bool;
+}
+
+pub(crate) fn lazy<F, R>(func: F) -> Lazy<F, R>
+where
+    F: FnOnce() -> R,
+    R: Future + Unpin,
+{
+    Lazy {
+        inner: Inner::Init { func },
+    }
+}
+
+// FIXME: allow() required due to `impl Trait` leaking types to this lint
+pin_project! {
+    #[allow(missing_debug_implementations)]
+    pub(crate) struct Lazy<F, R> {
+        #[pin]
+        inner: Inner<F, R>,
+    }
+}
+
+pin_project! {
+    #[project = InnerProj]
+    #[project_replace = InnerProjReplace]
+    enum Inner<F, R> {
+        Init { func: F },
+        Fut { #[pin] fut: R },
+        Empty,
+    }
+}
+
+impl<F, R> Started for Lazy<F, R>
+where
+    F: FnOnce() -> R,
+    R: Future,
+{
+    fn started(&self) -> bool {
+        match self.inner {
+            Inner::Init { .. } => false,
+            Inner::Fut { .. } | Inner::Empty => true,
+        }
+    }
+}
+
+impl<F, R> Future for Lazy<F, R>
+where
+    F: FnOnce() -> R,
+    R: Future,
+{
+    type Output = R::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
+
+        if let InnerProj::Fut { fut } = this.inner.as_mut().project() {
+            return fut.poll(cx);
+        }
+
+        match this.inner.as_mut().project_replace(Inner::Empty) {
+            InnerProjReplace::Init { func } => {
+                this.inner.set(Inner::Fut { fut: func() });
+                if let InnerProj::Fut { fut } = this.inner.project() {
+                    return fut.poll(cx);
+                }
+                unreachable!()
+            }
+            _ => unreachable!("lazy state wrong"),
+        }
+    }
+}
+
+'''
+'''--- src/common/mod.rs ---
+#![allow(missing_docs)]
+
+macro_rules! ready {
+    ($e:expr) => {
+        match $e {
+            std::task::Poll::Ready(v) => v,
+            std::task::Poll::Pending => return std::task::Poll::Pending,
+        }
+    };
+}
+
+pub(crate) use ready;
+pub mod exec;
+#[cfg(feature = "client")]
+mod lazy;
+pub(crate) mod rewind;
+#[cfg(feature = "client")]
+mod sync;
+
+#[cfg(feature = "client")]
+pub(crate) use exec::Exec;
+
+#[cfg(feature = "client")]
+pub(crate) use lazy::{lazy, Started as Lazy};
+#[cfg(feature = "client")]
+pub(crate) use sync::SyncWrapper;
+
+'''
+'''--- src/common/never.rs ---
+//! An uninhabitable type meaning it can never happen.
+//!
+//! To be replaced with `!` once it is stable.
+
+use std::error::Error;
+use std::fmt;
+
+#[derive(Debug)]
+pub(crate) enum Never {}
+
+impl fmt::Display for Never {
+    fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {}
+    }
+}
+
+impl Error for Never {
+    fn description(&self) -> &str {
+        match *self {}
+    }
+}
+
+'''
+'''--- src/common/rewind.rs ---
+use std::marker::Unpin;
+use std::{cmp, io};
+
+use bytes::{Buf, Bytes};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+use std::{
+    pin::Pin,
+    task::{self, Poll},
+};
+
+/// Combine a buffer with an IO, rewinding reads to use the buffer.
+#[derive(Debug)]
+pub(crate) struct Rewind<T> {
+    pre: Option<Bytes>,
+    inner: T,
+}
+
+impl<T> Rewind<T> {
+    #[cfg(test)]
+    pub(crate) fn new(io: T) -> Self {
+        Rewind {
+            pre: None,
+            inner: io,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn new_buffered(io: T, buf: Bytes) -> Self {
+        Rewind {
+            pre: Some(buf),
+            inner: io,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rewind(&mut self, bs: Bytes) {
+        debug_assert!(self.pre.is_none());
+        self.pre = Some(bs);
+    }
+
+    // pub(crate) fn into_inner(self) -> (T, Bytes) {
+    //     (self.inner, self.pre.unwrap_or_else(Bytes::new))
+    // }
+
+    // pub(crate) fn get_mut(&mut self) -> &mut T {
+    //     &mut self.inner
+    // }
+}
+
+impl<T> AsyncRead for Rewind<T>
+where
+    T: AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if let Some(mut prefix) = self.pre.take() {
+            // If there are no remaining bytes, let the bytes get dropped.
+            if !prefix.is_empty() {
+                let copy_len = cmp::min(prefix.len(), buf.remaining());
+                // TODO: There should be a way to do following two lines cleaner...
+                buf.put_slice(&prefix[..copy_len]);
+                prefix.advance(copy_len);
+                // Put back what's left
+                if !prefix.is_empty() {
+                    self.pre = Some(prefix);
+                }
+
+                return Poll::Ready(Ok(()));
+            }
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<T> AsyncWrite for Rewind<T>
+where
+    T: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // FIXME: re-implement tests with `async/await`, this import should
+    // trigger a warning to remind us
+    use super::Rewind;
+    use bytes::Bytes;
+    use tokio::io::AsyncReadExt;
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn partial_rewind() {
+        let underlying = [104, 101, 108, 108, 111];
+
+        let mock = tokio_test::io::Builder::new().read(&underlying).build();
+
+        let mut stream = Rewind::new(mock);
+
+        // Read off some bytes, ensure we filled o1
+        let mut buf = [0; 2];
+        stream.read_exact(&mut buf).await.expect("read1");
+
+        // Rewind the stream so that it is as if we never read in the first place.
+        stream.rewind(Bytes::copy_from_slice(&buf[..]));
+
+        let mut buf = [0; 5];
+        stream.read_exact(&mut buf).await.expect("read1");
+
+        // At this point we should have read everything that was in the MockStream
+        assert_eq!(&buf, &underlying);
+    }
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn full_rewind() {
+        let underlying = [104, 101, 108, 108, 111];
+
+        let mock = tokio_test::io::Builder::new().read(&underlying).build();
+
+        let mut stream = Rewind::new(mock);
+
+        let mut buf = [0; 5];
+        stream.read_exact(&mut buf).await.expect("read1");
+
+        // Rewind the stream so that it is as if we never read in the first place.
+        stream.rewind(Bytes::copy_from_slice(&buf[..]));
+
+        let mut buf = [0; 5];
+        stream.read_exact(&mut buf).await.expect("read1");
+    }
+}
+
+'''
+'''--- src/common/sync.rs ---
+pub(crate) struct SyncWrapper<T>(T);
+
+impl<T> SyncWrapper<T> {
+    /// Creates a new SyncWrapper containing the given value.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use hyper::common::sync_wrapper::SyncWrapper;
+    ///
+    /// let wrapped = SyncWrapper::new(42);
+    /// ```
+    pub(crate) fn new(value: T) -> Self {
+        Self(value)
+    }
+
+    /// Acquires a reference to the protected value.
+    ///
+    /// This is safe because it requires an exclusive reference to the wrapper. Therefore this method
+    /// neither panics nor does it return an error. This is in contrast to [`Mutex::get_mut`] which
+    /// returns an error if another thread panicked while holding the lock. It is not recommended
+    /// to send an exclusive reference to a potentially damaged value to another thread for further
+    /// processing.
+    ///
+    /// [`Mutex::get_mut`]: https://doc.rust-lang.org/std/sync/struct.Mutex.html#method.get_mut
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use hyper::common::sync_wrapper::SyncWrapper;
+    ///
+    /// let mut wrapped = SyncWrapper::new(42);
+    /// let value = wrapped.get_mut();
+    /// *value = 0;
+    /// assert_eq!(*wrapped.get_mut(), 0);
+    /// ```
+    pub(crate) fn get_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+
+    /// Consumes this wrapper, returning the underlying data.
+    ///
+    /// This is safe because it requires ownership of the wrapper, aherefore this method will neither
+    /// panic nor does it return an error. This is in contrast to [`Mutex::into_inner`] which
+    /// returns an error if another thread panicked while holding the lock. It is not recommended
+    /// to send an exclusive reference to a potentially damaged value to another thread for further
+    /// processing.
+    ///
+    /// [`Mutex::into_inner`]: https://doc.rust-lang.org/std/sync/struct.Mutex.html#method.into_inner
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use hyper::common::sync_wrapper::SyncWrapper;
+    ///
+    /// let mut wrapped = SyncWrapper::new(42);
+    /// assert_eq!(wrapped.into_inner(), 42);
+    /// ```
+    #[allow(dead_code)]
+    pub(crate) fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+// this is safe because the only operations permitted on this data structure require exclusive
+// access or ownership
+unsafe impl<T: Send> Sync for SyncWrapper<T> {}
+
+'''
+'''--- src/error.rs ---
+/*
+use std::error::Error;
+
+pub(crate) fn find<'a, E: Error + 'static>(top: &'a (dyn Error + 'static)) -> Option<&'a E> {
+    let mut err = Some(top);
+    while let Some(src) = err {
+        if src.is::<E>() {
+            return src.downcast_ref();
+        }
+        err = src.source();
+    }
+    None
+}
+*/
+
+'''
+'''--- src/lib.rs ---
+#![deny(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_auto_cfg, doc_cfg))]
+
+//! hyper-util
+
+#[cfg(feature = "client")]
+pub mod client;
+mod common;
+pub mod rt;
+pub mod server;
+
+mod error;
+
+'''
+'''--- src/rt/mod.rs ---
+//! Runtime utilities
+
+/// Implementation of [`hyper::rt::Executor`] that utilises [`tokio::spawn`].
+pub mod tokio_executor;
+mod tokio_io;
+
+pub use tokio_executor::TokioExecutor;
+pub use tokio_io::TokioIo;
+
+'''
+'''--- src/rt/tokio_executor.rs ---
+use hyper::rt::Executor;
+use std::future::Future;
+
+/// Future executor that utilises `tokio` threads.
+#[non_exhaustive]
+#[derive(Default, Debug, Clone)]
+pub struct TokioExecutor {}
+
+impl<Fut> Executor<Fut> for TokioExecutor
+where
+    Fut: Future + Send + 'static,
+    Fut::Output: Send + 'static,
+{
+    fn execute(&self, fut: Fut) {
+        tokio::spawn(fut);
+    }
+}
+
+impl TokioExecutor {
+    /// Create new executor that relies on [`tokio::spawn`] to execute futures.
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::rt::tokio_executor::TokioExecutor;
+    use hyper::rt::Executor;
+    use tokio::sync::oneshot;
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn simple_execute() -> Result<(), Box<dyn std::error::Error>> {
+        let (tx, rx) = oneshot::channel();
+        let executor = TokioExecutor::new();
+        executor.execute(async move {
+            tx.send(()).unwrap();
+        });
+        rx.await.map_err(Into::into)
+    }
+}
+
+'''
+'''--- src/rt/tokio_io.rs ---
+#![allow(dead_code)]
+//! Tokio IO integration for hyper
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
+
+use pin_project_lite::pin_project;
+
+pin_project! {
+    /// A wrapping implementing hyper IO traits for a type that
+    /// implements Tokio's IO traits.
+    #[derive(Debug)]
+    pub struct TokioIo<T> {
+        #[pin]
+        inner: T,
+    }
+}
+
+impl<T> TokioIo<T> {
+    /// Wrap a type implementing Tokio's IO traits.
+    pub fn new(inner: T) -> Self {
+        Self { inner }
+    }
+
+    /// Borrow the inner type.
+    pub fn inner(&self) -> &T {
+        &self.inner
+    }
+
+    /// Consume this wrapper and get the inner type.
+    pub fn into_inner(self) -> T {
+        self.inner
+    }
+}
+
+impl<T> hyper::rt::Read for TokioIo<T>
+where
+    T: tokio::io::AsyncRead,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mut buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        let n = unsafe {
+            let mut tbuf = tokio::io::ReadBuf::uninit(buf.as_mut());
+            match tokio::io::AsyncRead::poll_read(self.project().inner, cx, &mut tbuf) {
+                Poll::Ready(Ok(())) => tbuf.filled().len(),
+                other => return other,
+            }
+        };
+
+        unsafe {
+            buf.advance(n);
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<T> hyper::rt::Write for TokioIo<T>
+where
+    T: tokio::io::AsyncWrite,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        tokio::io::AsyncWrite::poll_write(self.project().inner, cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+        tokio::io::AsyncWrite::poll_flush(self.project().inner, cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        tokio::io::AsyncWrite::poll_shutdown(self.project().inner, cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        tokio::io::AsyncWrite::is_write_vectored(&self.inner)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        tokio::io::AsyncWrite::poll_write_vectored(self.project().inner, cx, bufs)
+    }
+}
+
+impl<T> tokio::io::AsyncRead for TokioIo<T>
+where
+    T: hyper::rt::Read,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        tbuf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        //let init = tbuf.initialized().len();
+        let filled = tbuf.filled().len();
+        let sub_filled = unsafe {
+            let mut buf = hyper::rt::ReadBuf::uninit(tbuf.unfilled_mut());
+
+            match hyper::rt::Read::poll_read(self.project().inner, cx, buf.unfilled()) {
+                Poll::Ready(Ok(())) => buf.filled().len(),
+                other => return other,
+            }
+        };
+
+        let n_filled = filled + sub_filled;
+        // At least sub_filled bytes had to have been initialized.
+        let n_init = sub_filled;
+        unsafe {
+            tbuf.assume_init(n_init);
+            tbuf.set_filled(n_filled);
+        }
+
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<T> tokio::io::AsyncWrite for TokioIo<T>
+where
+    T: hyper::rt::Write,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        hyper::rt::Write::poll_write(self.project().inner, cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+        hyper::rt::Write::poll_flush(self.project().inner, cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        hyper::rt::Write::poll_shutdown(self.project().inner, cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        hyper::rt::Write::is_write_vectored(&self.inner)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        hyper::rt::Write::poll_write_vectored(self.project().inner, cx, bufs)
+    }
+}
+
+'''
+'''--- src/server/conn/auto.rs ---
+//! Http1 or Http2 connection.
+
+use futures_util::ready;
+use std::future::Future;
+use std::io::{Error as IoError, ErrorKind, Result as IoResult};
+use std::marker::PhantomPinned;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::{error::Error as StdError, marker::Unpin, time::Duration};
+
+use bytes::Bytes;
+use http::{Request, Response};
+use http_body::Body;
+use hyper::{
+    body::Incoming,
+    rt::{bounds::Http2ConnExec, Timer},
+    server::conn::{http1, http2},
+    service::Service,
+};
+use pin_project_lite::pin_project;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+use crate::{common::rewind::Rewind, rt::TokioIo};
+
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// Http1 or Http2 connection builder.
+pub struct Builder<E> {
+    http1: http1::Builder,
+    http2: http2::Builder<E>,
+}
+
+impl<E> Builder<E> {
+    /// Create a new auto connection builder.
+    ///
+    /// `executor` parameter should be a type that implements
+    /// [`Executor`](hyper::rt::Executor) trait.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use hyper_util::{
+    ///     rt::tokio_executor::TokioExecutor,
+    ///     server::conn::auto,
+    /// };
+    ///
+    /// auto::Builder::new(TokioExecutor::new());
+    /// ```
+    pub fn new(executor: E) -> Self {
+        Self {
+            http1: http1::Builder::new(),
+            http2: http2::Builder::new(executor),
+        }
+    }
+
+    /// Http1 configuration.
+    pub fn http1(&mut self) -> Http1Builder<'_, E> {
+        Http1Builder { inner: self }
+    }
+
+    /// Http2 configuration.
+    pub fn http2(&mut self) -> Http2Builder<'_, E> {
+        Http2Builder { inner: self }
+    }
+
+    /// Bind a connection together with a [`Service`].
+    pub async fn serve_connection<I, S, B>(&self, io: I, service: S) -> Result<()>
+    where
+        S: Service<Request<Incoming>, Response = Response<B>> + Send,
+        S::Future: 'static,
+        S::Error: Into<Box<dyn StdError + Send + Sync>>,
+        B: Body + Send + 'static,
+        B::Data: Send,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+        I: AsyncRead + AsyncWrite + Unpin + 'static,
+        E: Http2ConnExec<S::Future, B>,
+    {
+        let (version, io) = read_version(io).await?;
+        let io = TokioIo::new(io);
+        match version {
+            Version::H1 => self.http1.serve_connection(io, service).await?,
+            Version::H2 => self.http2.serve_connection(io, service).await?,
+        }
+
+        Ok(())
+    }
+
+    /// Bind a connection together with a [`Service`], with the ability to
+    /// handle HTTP upgrades. This requires that the IO object implements
+    /// `Send`.
+    pub async fn serve_connection_with_upgrades<I, S, B>(&self, io: I, service: S) -> Result<()>
+    where
+        S: Service<Request<Incoming>, Response = Response<B>> + Send,
+        S::Future: 'static,
+        S::Error: Into<Box<dyn StdError + Send + Sync>>,
+        B: Body + Send + 'static,
+        B::Data: Send,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+        I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        E: Http2ConnExec<S::Future, B>,
+    {
+        let (version, io) = read_version(io).await?;
+        let io = TokioIo::new(io);
+        match version {
+            Version::H1 => {
+                self.http1
+                    .serve_connection(io, service)
+                    .with_upgrades()
+                    .await?
+            }
+            Version::H2 => self.http2.serve_connection(io, service).await?,
+        }
+
+        Ok(())
+    }
+}
+#[derive(Copy, Clone)]
+enum Version {
+    H1,
+    H2,
+}
+async fn read_version<'a, A>(mut reader: A) -> IoResult<(Version, Rewind<A>)>
+where
+    A: AsyncRead + Unpin,
+{
+    let mut buf = [0; 24];
+    let (version, buf) = ReadVersion {
+        reader: &mut reader,
+        buf: ReadBuf::new(&mut buf),
+        version: Version::H1,
+        _pin: PhantomPinned,
+    }
+    .await?;
+    Ok((version, Rewind::new_buffered(reader, Bytes::from(buf))))
+}
+pin_project! {
+    struct ReadVersion<'a, A: ?Sized> {
+        reader: &'a mut A,
+        buf: ReadBuf<'a>,
+        version: Version,
+        // Make this future `!Unpin` for compatibility with async trait methods.
+        #[pin]
+        _pin: PhantomPinned,
+    }
+}
+
+impl<A> Future for ReadVersion<'_, A>
+where
+    A: AsyncRead + Unpin + ?Sized,
+{
+    type Output = IoResult<(Version, Vec<u8>)>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<(Version, Vec<u8>)>> {
+        let this = self.project();
+
+        while this.buf.remaining() != 0 {
+            if this.buf.filled() != &H2_PREFACE[0..this.buf.filled().len()] {
+                return Poll::Ready(Ok((*this.version, this.buf.filled().to_vec())));
+            }
+            // if our buffer is empty, then we need to read some data to continue.
+            let rem = this.buf.remaining();
+            ready!(Pin::new(&mut *this.reader).poll_read(cx, this.buf))?;
+            if this.buf.remaining() == rem {
+                return Err(IoError::new(ErrorKind::UnexpectedEof, "early eof")).into();
+            }
+        }
+        if this.buf.filled() == H2_PREFACE {
+            *this.version = Version::H2;
+        }
+        return Poll::Ready(Ok((*this.version, this.buf.filled().to_vec())));
+    }
+}
+
+/// Http1 part of builder.
+pub struct Http1Builder<'a, E> {
+    inner: &'a mut Builder<E>,
+}
+
+impl<E> Http1Builder<'_, E> {
+    /// Http2 configuration.
+    pub fn http2(&mut self) -> Http2Builder<'_, E> {
+        Http2Builder {
+            inner: &mut self.inner,
+        }
+    }
+
+    /// Set whether HTTP/1 connections should support half-closures.
+    ///
+    /// Clients can chose to shutdown their write-side while waiting
+    /// for the server to respond. Setting this to `true` will
+    /// prevent closing the connection immediately if `read`
+    /// detects an EOF in the middle of a request.
+    ///
+    /// Default is `false`.
+    pub fn half_close(&mut self, val: bool) -> &mut Self {
+        self.inner.http1.half_close(val);
+        self
+    }
+
+    /// Enables or disables HTTP/1 keep-alive.
+    ///
+    /// Default is true.
+    pub fn keep_alive(&mut self, val: bool) -> &mut Self {
+        self.inner.http1.keep_alive(val);
+        self
+    }
+
+    /// Set whether HTTP/1 connections will write header names as title case at
+    /// the socket level.
+    ///
+    /// Note that this setting does not affect HTTP/2.
+    ///
+    /// Default is false.
+    pub fn title_case_headers(&mut self, enabled: bool) -> &mut Self {
+        self.inner.http1.title_case_headers(enabled);
+        self
+    }
+
+    /// Set whether to support preserving original header cases.
+    ///
+    /// Currently, this will record the original cases received, and store them
+    /// in a private extension on the `Request`. It will also look for and use
+    /// such an extension in any provided `Response`.
+    ///
+    /// Since the relevant extension is still private, there is no way to
+    /// interact with the original cases. The only effect this can have now is
+    /// to forward the cases in a proxy-like fashion.
+    ///
+    /// Note that this setting does not affect HTTP/2.
+    ///
+    /// Default is false.
+    pub fn preserve_header_case(&mut self, enabled: bool) -> &mut Self {
+        self.inner.http1.preserve_header_case(enabled);
+        self
+    }
+
+    /// Set a timeout for reading client request headers. If a client does not
+    /// transmit the entire header within this time, the connection is closed.
+    ///
+    /// Default is None.
+    pub fn header_read_timeout(&mut self, read_timeout: Duration) -> &mut Self {
+        self.inner.http1.header_read_timeout(read_timeout);
+        self
+    }
+
+    /// Set whether HTTP/1 connections should try to use vectored writes,
+    /// or always flatten into a single buffer.
+    ///
+    /// Note that setting this to false may mean more copies of body data,
+    /// but may also improve performance when an IO transport doesn't
+    /// support vectored writes well, such as most TLS implementations.
+    ///
+    /// Setting this to true will force hyper to use queued strategy
+    /// which may eliminate unnecessary cloning on some TLS backends
+    ///
+    /// Default is `auto`. In this mode hyper will try to guess which
+    /// mode to use
+    pub fn writev(&mut self, val: bool) -> &mut Self {
+        self.inner.http1.writev(val);
+        self
+    }
+
+    /// Set the maximum buffer size for the connection.
+    ///
+    /// Default is ~400kb.
+    ///
+    /// # Panics
+    ///
+    /// The minimum value allowed is 8192. This method panics if the passed `max` is less than the minimum.
+    pub fn max_buf_size(&mut self, max: usize) -> &mut Self {
+        self.inner.http1.max_buf_size(max);
+        self
+    }
+
+    /// Aggregates flushes to better support pipelined responses.
+    ///
+    /// Experimental, may have bugs.
+    ///
+    /// Default is false.
+    pub fn pipeline_flush(&mut self, enabled: bool) -> &mut Self {
+        self.inner.http1.pipeline_flush(enabled);
+        self
+    }
+
+    /// Set the timer used in background tasks.
+    pub fn timer<M>(&mut self, timer: M) -> &mut Self
+    where
+        M: Timer + Send + Sync + 'static,
+    {
+        self.inner.http1.timer(timer);
+        self
+    }
+
+    /// Bind a connection together with a [`Service`].
+    pub async fn serve_connection<I, S, B>(&self, io: I, service: S) -> Result<()>
+    where
+        S: Service<Request<Incoming>, Response = Response<B>> + Send,
+        S::Future: Send + 'static,
+        S::Error: Into<Box<dyn StdError + Send + Sync>>,
+        B: Body + Send + 'static,
+        B::Data: Send,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+        I: AsyncRead + AsyncWrite + Unpin + 'static,
+        E: Http2ConnExec<S::Future, B>,
+    {
+        self.inner.serve_connection(io, service).await
+    }
+}
+
+/// Http2 part of builder.
+pub struct Http2Builder<'a, E> {
+    inner: &'a mut Builder<E>,
+}
+
+impl<E> Http2Builder<'_, E> {
+    /// Http1 configuration.
+    pub fn http1(&mut self) -> Http1Builder<'_, E> {
+        Http1Builder {
+            inner: &mut self.inner,
+        }
+    }
+
+    /// Sets the [`SETTINGS_INITIAL_WINDOW_SIZE`][spec] option for HTTP2
+    /// stream-level flow control.
+    ///
+    /// Passing `None` will do nothing.
+    ///
+    /// If not set, hyper will use a default.
+    ///
+    /// [spec]: https://http2.github.io/http2-spec/#SETTINGS_INITIAL_WINDOW_SIZE
+    pub fn initial_stream_window_size(&mut self, sz: impl Into<Option<u32>>) -> &mut Self {
+        self.inner.http2.initial_stream_window_size(sz);
+        self
+    }
+
+    /// Sets the max connection-level flow control for HTTP2.
+    ///
+    /// Passing `None` will do nothing.
+    ///
+    /// If not set, hyper will use a default.
+    pub fn initial_connection_window_size(&mut self, sz: impl Into<Option<u32>>) -> &mut Self {
+        self.inner.http2.initial_connection_window_size(sz);
+        self
+    }
+
+    /// Sets whether to use an adaptive flow control.
+    ///
+    /// Enabling this will override the limits set in
+    /// `http2_initial_stream_window_size` and
+    /// `http2_initial_connection_window_size`.
+    pub fn adaptive_window(&mut self, enabled: bool) -> &mut Self {
+        self.inner.http2.adaptive_window(enabled);
+        self
+    }
+
+    /// Sets the maximum frame size to use for HTTP2.
+    ///
+    /// Passing `None` will do nothing.
+    ///
+    /// If not set, hyper will use a default.
+    pub fn max_frame_size(&mut self, sz: impl Into<Option<u32>>) -> &mut Self {
+        self.inner.http2.max_frame_size(sz);
+        self
+    }
+
+    /// Sets the [`SETTINGS_MAX_CONCURRENT_STREAMS`][spec] option for HTTP2
+    /// connections.
+    ///
+    /// Default is no limit (`std::u32::MAX`). Passing `None` will do nothing.
+    ///
+    /// [spec]: https://http2.github.io/http2-spec/#SETTINGS_MAX_CONCURRENT_STREAMS
+    pub fn max_concurrent_streams(&mut self, max: impl Into<Option<u32>>) -> &mut Self {
+        self.inner.http2.max_concurrent_streams(max);
+        self
+    }
+
+    /// Sets an interval for HTTP2 Ping frames should be sent to keep a
+    /// connection alive.
+    ///
+    /// Pass `None` to disable HTTP2 keep-alive.
+    ///
+    /// Default is currently disabled.
+    ///
+    /// # Cargo Feature
+    ///
+    pub fn keep_alive_interval(&mut self, interval: impl Into<Option<Duration>>) -> &mut Self {
+        self.inner.http2.keep_alive_interval(interval);
+        self
+    }
+
+    /// Sets a timeout for receiving an acknowledgement of the keep-alive ping.
+    ///
+    /// If the ping is not acknowledged within the timeout, the connection will
+    /// be closed. Does nothing if `http2_keep_alive_interval` is disabled.
+    ///
+    /// Default is 20 seconds.
+    ///
+    /// # Cargo Feature
+    ///
+    pub fn keep_alive_timeout(&mut self, timeout: Duration) -> &mut Self {
+        self.inner.http2.keep_alive_timeout(timeout);
+        self
+    }
+
+    /// Set the maximum write buffer size for each HTTP/2 stream.
+    ///
+    /// Default is currently ~400KB, but may change.
+    ///
+    /// # Panics
+    ///
+    /// The value must be no larger than `u32::MAX`.
+    pub fn max_send_buf_size(&mut self, max: usize) -> &mut Self {
+        self.inner.http2.max_send_buf_size(max);
+        self
+    }
+
+    /// Enables the [extended CONNECT protocol].
+    ///
+    /// [extended CONNECT protocol]: https://datatracker.ietf.org/doc/html/rfc8441#section-4
+    pub fn enable_connect_protocol(&mut self) -> &mut Self {
+        self.inner.http2.enable_connect_protocol();
+        self
+    }
+
+    /// Sets the max size of received header frames.
+    ///
+    /// Default is currently ~16MB, but may change.
+    pub fn max_header_list_size(&mut self, max: u32) -> &mut Self {
+        self.inner.http2.max_header_list_size(max);
+        self
+    }
+
+    /// Set the timer used in background tasks.
+    pub fn timer<M>(&mut self, timer: M) -> &mut Self
+    where
+        M: Timer + Send + Sync + 'static,
+    {
+        self.inner.http2.timer(timer);
+        self
+    }
+
+    /// Bind a connection together with a [`Service`].
+    pub async fn serve_connection<I, S, B>(&self, io: I, service: S) -> Result<()>
+    where
+        S: Service<Request<Incoming>, Response = Response<B>> + Send,
+        S::Future: Send + 'static,
+        S::Error: Into<Box<dyn StdError + Send + Sync>>,
+        B: Body + Send + 'static,
+        B::Data: Send,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+        I: AsyncRead + AsyncWrite + Unpin + 'static,
+        E: Http2ConnExec<S::Future, B>,
+    {
+        self.inner.serve_connection(io, service).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        rt::{tokio_executor::TokioExecutor, TokioIo},
+        server::conn::auto,
+    };
+    use http::{Request, Response};
+    use http_body::Body;
+    use http_body_util::{BodyExt, Empty, Full};
+    use hyper::{body, body::Bytes, client, service::service_fn};
+    use std::{convert::Infallible, error::Error as StdError, net::SocketAddr};
+    use tokio::net::{TcpListener, TcpStream};
+
+    const BODY: &[u8] = b"Hello, world!";
+
+    #[test]
+    fn configuration() {
+        // One liner.
+        auto::Builder::new(TokioExecutor::new())
+            .http1()
+            .keep_alive(true)
+            .http2()
+            .keep_alive_interval(None);
+        //  .serve_connection(io, service);
+
+        // Using variable.
+        let mut builder = auto::Builder::new(TokioExecutor::new());
+
+        builder.http1().keep_alive(true);
+        builder.http2().keep_alive_interval(None);
+        // builder.serve_connection(io, service);
+    }
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn http1() {
+        let addr = start_server().await;
+        let mut sender = connect_h1(addr).await;
+
+        let response = sender
+            .send_request(Request::new(Empty::<Bytes>::new()))
+            .await
+            .unwrap();
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+
+        assert_eq!(body, BODY);
+    }
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn http2() {
+        let addr = start_server().await;
+        let mut sender = connect_h2(addr).await;
+
+        let response = sender
+            .send_request(Request::new(Empty::<Bytes>::new()))
+            .await
+            .unwrap();
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+
+        assert_eq!(body, BODY);
+    }
+
+    async fn connect_h1<B>(addr: SocketAddr) -> client::conn::http1::SendRequest<B>
+    where
+        B: Body + Send + 'static,
+        B::Data: Send,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        let stream = TokioIo::new(TcpStream::connect(addr).await.unwrap());
+        let (sender, connection) = client::conn::http1::handshake(stream).await.unwrap();
+
+        tokio::spawn(connection);
+
+        sender
+    }
+
+    async fn connect_h2<B>(addr: SocketAddr) -> client::conn::http2::SendRequest<B>
+    where
+        B: Body + Unpin + Send + 'static,
+        B::Data: Send,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        let stream = TokioIo::new(TcpStream::connect(addr).await.unwrap());
+        let (sender, connection) = client::conn::http2::Builder::new(TokioExecutor::new())
+            .handshake(stream)
+            .await
+            .unwrap();
+
+        tokio::spawn(connection);
+
+        sender
+    }
+
+    async fn start_server() -> SocketAddr {
+        let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
+        let listener = TcpListener::bind(addr).await.unwrap();
+
+        let local_addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                tokio::task::spawn(async move {
+                    let _ = auto::Builder::new(TokioExecutor::new())
+                        .serve_connection(stream, service_fn(hello))
+                        .await;
+                });
+            }
+        });
+
+        local_addr
+    }
+
+    async fn hello(_req: Request<body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+        Ok(Response::new(Full::new(Bytes::from(BODY))))
+    }
+}
+
+'''
+'''--- src/server/conn/mod.rs ---
+//! Connection utilities.
+
+#[cfg(feature = "auto")]
+pub mod auto;
+
+'''
+'''--- src/server/mod.rs ---
+//! Server utilities.
+
+pub mod conn;
+
+'''

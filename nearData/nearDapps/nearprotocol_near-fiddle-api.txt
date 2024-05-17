@@ -1,0 +1,652 @@
+*GitHub Repository "nearprotocol/near-fiddle-api"*
+
+'''--- .eslintrc.yml ---
+env:
+  es6: true
+  node: true
+  jest: true
+extends: 'eslint:recommended'
+parserOptions:
+  ecmaVersion: 2018
+rules:
+  indent:
+    - error
+    - 4
+  linebreak-style:
+    - error
+    - unix
+  quotes:
+    - error
+    - single
+  semi:
+    - error
+    - always
+  no-console: off
+  require-atomic-updates: off
+
+'''
+'''--- .gitlab-ci.yml ---
+image: node:latest
+
+services:
+  - postgres:latest
+
+variables:
+  POSTGRES_DB: fiddle_test
+  POSTGRES_USER: fiddle
+  POSTGRES_PASSWORD: fiddle
+  NODE_ENV: ci
+
+stages:
+  - test
+
+test_with_lab:
+  stage: test
+  script: yarn && yarn test
+
+lint:
+  stage: test
+  script: yarn && yarn lint
+
+'''
+'''--- .travis.yml ---
+language: node_js
+node_js:
+ - "lts/*"
+services:
+  - postgresql
+before_script:
+  - psql -c "create user fiddle with encrypted password 'fiddle';" -U postgres
+  - psql -c "create database fiddle_test;" -U postgres
+  - psql -c "grant all privileges on database fiddle_test to fiddle" -U postgres
+
+'''
+'''--- README.md ---
+# near-fiddle-api
+
+ ![Build Status](https://gitlab.com/near-protocol/near-fiddle-api/badges/staging/pipeline.svg)
+
+Micro-service to save/load fiddles for [NEAR Studio](https://github.com/NEARProtocol/NEARStudio).
+
+## Environment Variables
+This micro-service depends on the following environment variables:
+* `APP_URL` -- default `https://app.near.ai`;
+* `CONTRACT_HELPER_URL` -- default `https://studio.nearprotocol.com/contract-api`;
+* `NODE_URL` -- default `https://studio.nearprotocol.com/devnet`;
+* `WALLET_URL` -- default `https://wallet.nearprotocol.com`;
+
+The above variables define the URLs used by the web apps from withing the browser so they should always correspond to
+public IP or DNS name.
+
+* `NODE_ENV` -- default `production`;
+* `PORT` -- default `3000`;
+
+## Local Development
+### Requirements 
+
+1) Install latest Node.js LTS release.
+2) Install postgres 
+
+```
+brew install postgres
+```
+
+### Run database 
+
+```
+brew services start postgresql
+createuser fiddle -W  # It'll ask for password, enter "fiddle"
+createdb -O fiddle fiddle
+createdb -O fiddle fiddle_test
+```
+
+### Build and run the service 
+
+```
+npm install
+node app.js
+```
+
+'''
+'''--- app.js ---
+var Sugar = require('sugar');
+Sugar.extend();
+
+const Koa = require('koa');
+const app = new Koa();
+app.keys = [ process.env.FIDDLE_SECRET_KEY || 'verysecretkey'];
+
+const body = require('koa-json-body');
+const cors = require('@koa/cors');
+
+app.use(body({ limit: '3Mb', fallback: true }));
+if (process.NODE_ENV != 'production') {
+    app.use(cors({ credentials: true }));
+}
+
+const models = require('./models');
+const randomstring = require('randomstring');
+const path = require('path');
+const Router = require('koa-router');
+const router = new Router();
+
+const namespace = require('cls-hooked').createNamespace('near-fiddle-api');
+models.Sequelize.useCLS(namespace);
+
+// TODO: Extract and publish as separate module as koa-sequelize-transaction is broken
+const transactionMiddleware = (ctx, next) => {
+    return new Promise((resolve, reject) => {
+        namespace.run(() => {
+            models.sequelize.transaction().then(transaction => {
+                namespace.set('transaction', transaction);
+                next().then((result) => {
+                    transaction.commit();
+                    resolve(result);
+                }, (e) => {
+                    transaction.rollback();
+                    reject(e);
+                });
+            }, reject);
+        });
+    });
+};
+app.use(transactionMiddleware);
+
+const session = require('koa-generic-session');
+const SequelizeStore = require('koa-generic-session-sequelize');
+const sessionStore = new SequelizeStore(models.sequelize, {
+    maxAge: 90 * 24 * 60 * 60 * 1000 // 90 days in ms
+});
+
+app.use(session({ store: sessionStore }));
+
+const createFiddle = async (ctx, next) => {
+    ctx.fiddle = await models.Fiddle.create({
+        name: randomstring.generate({ readable: true, length: 9 , capitalization: 'lowercase' })
+    });
+    await next();
+};
+
+const withFiddle = async (ctx, next) => {
+    ctx.fiddle = await models.Fiddle.findOne({
+        where: { name: ctx.params.name },
+        include: [{
+            model: models.FiddleFile,
+            include: {
+                model: models.File
+            }
+        }],
+        order: [[models.FiddleFile, 'name']]
+    });
+    if (!ctx.fiddle) {
+        ctx.throw(404);
+    }
+    await next();
+};
+
+const updateFiddleFiles = async (ctx, next) => {
+    const filesInRequest = ctx.request.body.files;
+    await ctx.fiddle.addOrUpdateFilesFromRequest(filesInRequest);
+    await next();
+};
+
+const grantFiddleAccess = async (ctx, next) => {
+    ctx.session.ownedFiddles = ctx.session.ownedFiddles || [];
+    ctx.session.ownedFiddles = ctx.session.ownedFiddles.concat([ctx.fiddle.name]);
+    await next();
+};
+
+const checkFiddleAccess = async (ctx, next) => {
+    ctx.fiddleEditable = !!(ctx.session.ownedFiddles && ctx.session.ownedFiddles.find(ctx.fiddle.name));
+    await next();
+};
+
+router.post('/api/fiddle', createFiddle, updateFiddleFiles, grantFiddleAccess, async ctx => {
+    ctx.body = {
+        success: true,
+        message: 'Branch ' + ctx.fiddle.name + ' pushed',
+        id: ctx.fiddle.name
+    };
+    ctx.status = 201;
+});
+
+router.get('/api/fiddle/:name', withFiddle, checkFiddleAccess, async ctx => {
+    ctx.body = {
+        success: true,
+        message: 'Success',
+        editable: ctx.fiddleEditable,
+        id: ctx.fiddle.name,
+        files: ctx.fiddle.FiddleFiles.map(file => {
+            return {
+                name: file.name,
+                type: file.type,
+                data: file.File.getDataValue('data').toString('utf8')
+            };
+        })
+    };
+});
+
+router.patch('/api/fiddle/:name', withFiddle, checkFiddleAccess, updateFiddleFiles, async ctx => {
+    if (!ctx.fiddleEditable) {
+        ctx.throw(403);
+    }
+    ctx.status = 204;
+});
+
+const servePage = async ctx => {
+    let fiddle = await models.Fiddle.findOne({
+        where: { name: ctx.params.name }
+    });
+
+    const loadFile = filePath => models.FiddleFile.findOne({
+        where: { FiddleId: fiddle.id, name: filePath },
+        include: { model: models.File }
+    });
+
+    let filePath = `src/${ctx.params.path || 'index.html'}`;
+    let file = await loadFile(filePath);
+    if (!file) {
+        ctx.throw(404);
+    }
+
+    ctx.body = file.File.getDataValue('data').toString('utf8');
+    ctx.type = path.extname(filePath);
+
+    ctx.cookies.set('fiddleConfig', encodeURIComponent(JSON.stringify({
+        nearPages: true,
+        networkId: 'default',
+        contractName: ctx.query.contractName || `studio-${ctx.params.name}`,
+        appUrl: `${process.env.APP_URL || 'https://app.near.ai'}/${ctx.params.name}`,
+        baseUrl: process.env.CONTRACT_HELPER_URL || 'https://studio.nearprotocol.com/contract-api',
+        nodeUrl: process.env.NODE_URL || 'https://studio.nearprotocol.com/devnet',
+        walletUrl: process.env.WALLET_URL || 'https://wallet.nearprotocol.com'
+    })), { signed: false, httpOnly: false });
+};
+
+router.get('/app/:name', servePage);
+router.get('/app/:name/:path(.*)', servePage);
+
+app
+    .use(router.routes())
+    .use(router.allowedMethods());
+
+if (!module.parent) {
+    models.sequelize.sync().then(() => {
+        app.listen(process.env.PORT || 3000);
+    });
+} else {
+    module.exports = app;
+    app.sessionStore = sessionStore;
+}
+
+'''
+'''--- build_image.sh ---
+#!/usr/bin/env bash
+
+LOCAL_IMAGE_NAME="near-fiddle-api"
+docker build . -t ${LOCAL_IMAGE_NAME}
+
+echo -n "Publish image to hub (y/n)? "
+read answer
+
+if [ "$answer" != "${answer#[Yy]}" ] ;then
+    echo -n "Enter semver:"
+    read semver
+    IMAGE_NAME="nearprotocol/${LOCAL_IMAGE_NAME}:${semver}"
+    docker tag ${LOCAL_IMAGE_NAME} ${IMAGE_NAME}
+    docker push ${IMAGE_NAME}
+else
+    exit 0
+fi
+
+'''
+'''--- config/config.js ---
+module.exports = {
+    development: {
+        username: 'fiddle',
+        password: 'fiddle',
+        database: 'fiddle',
+        host: '127.0.0.1',
+        dialect: 'postgres',
+    },
+    test: {
+        username: 'fiddle',
+        password: 'fiddle',
+        database: 'fiddle_test',
+        host: '127.0.0.1',
+        dialect: 'postgres',
+    },
+    ci: {
+        username: 'fiddle',
+        password: 'fiddle',
+        database: 'fiddle_test',
+        host: 'postgres',
+        dialect: 'postgres',
+    },
+    production: {
+        username: process.env.FIDDLE_DB_USERNAME || 'fiddle',
+        password: process.env.FIDDLE_DB_PASSWORD || 'fiddle',
+        database: process.env.FIDDLE_DB_NAME || 'fiddle',
+        host: process.env.FIDDLE_DB_HOST || '127.0.0.1',
+        dialect: 'postgres',
+    },
+};
+'''
+'''--- models/fiddle.js ---
+'use strict';
+const crypto2 = require('crypto2');
+
+module.exports = (sequelize, DataTypes) => {
+    const Fiddle = sequelize.define('Fiddle', {
+        name: { type: DataTypes.STRING, unique: true },
+    }, {});
+    Fiddle.associate = function(models) {
+        Fiddle.hasMany(models.FiddleFile);
+        models.FiddleFile.belongsTo(Fiddle);
+    };
+    Fiddle.prototype.addOrUpdateFileFromRequest = async function (fileInRequest) {
+        const [file,] = await sequelize.models.File.findOrCreate({
+            where: {
+                hash: await crypto2.hash.sha256(fileInRequest.data)
+            },
+            defaults: {
+                data: fileInRequest.data
+            }
+        });
+        if (this.FiddleFiles) {
+            const fileToReplace = this.FiddleFiles.find(file => file.name === fileInRequest.name);
+            if (fileToReplace) {
+                await fileToReplace.destroy();
+            }
+        }
+        await sequelize.models.FiddleFile.create({
+            FiddleId: this.id,
+            FileId: file.id,
+            name: fileInRequest.name,
+            type: fileInRequest.type
+        });
+    };
+    Fiddle.prototype.addOrUpdateFilesFromRequest = async function(filesInRequest) {
+        if (Array.isArray(filesInRequest)) {
+            await Promise.all(
+                filesInRequest.map(
+                    this.addOrUpdateFileFromRequest.bind(this)));
+        }
+    };
+    return Fiddle;
+};
+'''
+'''--- models/fiddlefile.js ---
+'use strict';
+module.exports = (sequelize, DataTypes) => {
+    const FiddleFile = sequelize.define('FiddleFile', {
+        FiddleId: { type: DataTypes.INTEGER, primaryKey: true },
+        FileId: { type: DataTypes.INTEGER, primaryKey: true },
+        name: { type: DataTypes.STRING, primaryKey: true },
+        type: DataTypes.STRING
+    }, {});
+    FiddleFile.associate = function(models) {
+        FiddleFile.belongsTo(models.File);
+    };
+    return FiddleFile;
+};
+'''
+'''--- models/file.js ---
+'use strict';
+module.exports = (sequelize, DataTypes) => {
+    const File = sequelize.define('File', {
+        hash: { type: DataTypes.STRING, unique: true },
+        data: DataTypes.BLOB
+    }, {});
+    // eslint-disable-next-line no-unused-vars
+    File.associate = function(models) {
+        // associations can be defined here
+    };
+    return File;
+};
+'''
+'''--- models/index.js ---
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const Sequelize = require('sequelize');
+const basename = path.basename(__filename);
+const env = process.env.NODE_ENV || 'development';
+const config = require(__dirname + '/../config/config.js')[env];
+const db = {};
+
+let sequelize;
+if (config.use_env_variable) {
+    sequelize = new Sequelize(process.env[config.use_env_variable], config);
+} else {
+    sequelize = new Sequelize(config.database, config.username, config.password, config);
+}
+
+fs
+    .readdirSync(__dirname)
+    .filter(file => {
+        return (file.indexOf('.') !== 0) && (file !== basename) && (file.slice(-3) === '.js');
+    })
+    .forEach(file => {
+        const model = sequelize['import'](path.join(__dirname, file));
+        db[model.name] = model;
+    });
+
+Object.keys(db).forEach(modelName => {
+    if (db[modelName].associate) {
+        db[modelName].associate(db);
+    }
+});
+
+db.sequelize = sequelize;
+db.Sequelize = Sequelize;
+
+module.exports = db;
+
+'''
+'''--- package.json ---
+{
+  "name": "near-fiddle-api",
+  "version": "0.0.1",
+  "description": "Micro-service to save/load fiddles for NEAR Studio",
+  "main": "index.js",
+  "scripts": {
+    "start": "supervisor app",
+    "test": "jest test",
+    "lint": "eslint .",
+    "fix": "eslint . --fix"
+  },
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@koa/cors": "^3.0.0",
+    "cls-hooked": "^4.2.2",
+    "crypto2": "^2.0.0",
+    "koa": "^2.11.0",
+    "koa-generic-session": "^2.0.3",
+    "koa-generic-session-sequelize": "^2.2.0",
+    "koa-json-body": "^5.3.0",
+    "koa-router": "^7.4.0",
+    "koa-session": "^5.10.0",
+    "pg": "^7.17.0",
+    "pg-hstore": "^2.3.2",
+    "randomstring": "^1.1.5",
+    "sequelize": "^5.21.3",
+    "sugar": "^2.0.6",
+    "supervisor": "^0.12.0"
+  },
+  "devDependencies": {
+    "eslint": "^6.8.0",
+    "jest": "^24.9.0",
+    "supertest": "^4.0.2"
+  }
+}
+
+'''
+'''--- run_prod.sh ---
+#!/bin/sh
+NODE_ENV=production supervisor app
+
+'''
+'''--- scripts/init_postgres.sh ---
+#!/bin/bash
+set -e
+
+mkdir -p /srv/near/postgresql && \
+    chown -R postgres:postgres /srv/near/postgresql
+
+if [[ ! -d '/srv/near/postgresql/10/main' ]]; then
+su - postgres -c "
+    /usr/lib/postgresql/10/bin/initdb -D /srv/near/postgresql/10/main &&
+    /etc/init.d/postgresql start &&
+    psql -c \"CREATE USER fiddle password 'fiddle'\" &&
+    createdb -O fiddle fiddle"
+else
+    /etc/init.d/postgresql start
+fi
+
+'''
+'''--- scripts/run.sh ---
+#!/bin/bash
+set -e
+
+if [[ -z ${NODE_ENV} ]]
+then
+    export NODE_ENV=production
+fi
+
+cd /near-fiddle-api
+node app.js >> /var/log/fiddle.log 2>&1
+
+'''
+'''--- test/app.test.js ---
+const supertest = require('supertest');
+const app = require('../app');
+const models = require('../models');
+
+beforeAll(async () => {
+    await models.sequelize.sync({ force: true });
+    await app.sessionStore.Model.sync();
+    app.sessionStore.synced = true;
+});
+
+afterAll(async () => {
+    await models.sequelize.close();
+});
+
+const FILE1 = {
+    name: 'src/file1.txt',
+    type: 'text',
+    data: 'file contents'
+};
+
+const FILE2 = {
+    name: 'src/file2.txt',
+    type: 'text',
+    data: 'file contents'
+};
+
+const FILE2_UPDATED = {
+    name: 'src/file2.txt',
+    type: 'text',
+    data: 'file contents 3'
+};
+
+const FILE_INDEX = {
+    name: 'src/index.html',
+    type: 'text',
+    data: 'index contents'
+};
+
+let request = supertest(app.callback());
+
+test('Create Fiddle No Content', async () => {
+    const response = await request.post('/api/fiddle');
+    expect(response.status).toBe(201);
+    expect(response.body.success).toBeTruthy();
+    expect(response.body.id).toBeTruthy();
+    expect(response.body.id).toBe(response.body.id.toLowerCase());
+});
+
+test('Create & View Fiddle', async () => {
+    const createResponse = await request.post('/api/fiddle')
+        .send({ files: [FILE1, FILE2] });
+    expect(createResponse.status).toBe(201);
+
+    const response = await request.get('/api/fiddle/' + createResponse.body.id);
+    expect(response.status).toBe(200);
+    expect(response.body.success).toBeTruthy();
+    expect(response.body.id).toBeTruthy();
+    expect(response.body.files).toEqual([FILE1, FILE2]);
+});
+
+test('Create & View Fiddle Page', async () => {
+    const createResponse = await request.post('/api/fiddle')
+        .send({ files: [FILE1, FILE2] });
+    expect(createResponse.status).toBe(201);
+
+    const response = await request.get(`/app/${createResponse.body.id}/file1.txt`);
+    expect(response.status).toBe(200);
+    expect(response.type).toBe('text/plain');
+    expect(response.text).toEqual(FILE1.data);
+});
+
+test('Create & View Fiddle Page Index', async () => {
+    const createResponse = await request.post('/api/fiddle')
+        .send({ files: [FILE1, FILE2, FILE_INDEX] });
+    expect(createResponse.status).toBe(201);
+
+    const response = await request.get(`/app/${createResponse.body.id}`);
+    expect(response.status).toBe(200);
+    expect(response.type).toBe('text/html');
+    expect(response.text).toEqual(FILE_INDEX.data);
+});
+
+test('Create Fiddle & Add File', async () => {
+    // NOTE: request.agent creates client with cookie store
+    const agent = supertest.agent(app.callback());
+    const createResponse = await agent.post('/api/fiddle')
+        .send({ files: [FILE1] });
+    expect(createResponse.status).toBe(201);
+
+    const updateResponse = await agent.patch('/api/fiddle/' + createResponse.body.id)
+        .send({ files: [FILE2] });
+    expect(updateResponse.status).toBe(204);
+
+    const response = await agent.get('/api/fiddle/' + createResponse.body.id);
+    expect(response.status).toBe(200);
+    expect(response.body.success).toBeTruthy();
+    expect(response.body.id).toBeTruthy();
+    expect(response.body.files).toEqual([FILE1, FILE2]);
+});
+
+test('Create Fiddle & Update File', async () => {
+    // NOTE: request.agent creates client with cookie store
+    const agent = supertest.agent(app.callback());
+    const createResponse = await agent.post('/api/fiddle')
+        .send({ files: [FILE1, FILE2] });
+    expect(createResponse.status).toBe(201);
+
+    const updateResponse = await agent.patch('/api/fiddle/' + createResponse.body.id)
+        .send({ files: [FILE2_UPDATED] });
+    expect(updateResponse.status).toBe(204);
+
+    const response = await agent.get('/api/fiddle/' + createResponse.body.id);
+    expect(response.status).toBe(200);
+    expect(response.body.success).toBeTruthy();
+    expect(response.body.id).toBeTruthy();
+    expect(response.body.files).toEqual([FILE1, FILE2_UPDATED]);
+});
+
+test('Create Fiddle & Update File Unauthorized', async () => {
+    const createResponse = await request.post('/api/fiddle')
+        .send({ files: [FILE1, FILE2] });
+    expect(createResponse.status).toBe(201);
+
+    const updateResponse = await request.patch('/api/fiddle/' + createResponse.body.id)
+        .send({ files: [FILE2_UPDATED] });
+    expect(updateResponse.status).toBe(403);
+});
+
+'''

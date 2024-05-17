@@ -1,0 +1,1220 @@
+*GitHub Repository "MakC-Ukr/near-staking-data-extraction"*
+
+'''--- README.md ---
+# Near staking data extraction pipeline
+'''
+'''--- RELEVANT_VALIDATORS.json ---
+[
+    "figment.poolv1.near",
+    "bzam6yjpnfnxsdmjf6pw.poolv1.near",
+    "zavodil.poolv1.near",
+    "binancenode1.poolv1.near",
+    "yes_protocol1.poolv1.near",
+    "staking_yes_protocol1.poolv1.near",
+    "epic.poolv1.near",
+    "aurora.pool.near",
+    "stake1.poolv1.near",
+    "sweat_validator.poolv1.near",
+    "future_is_near.poolv1.near",
+    "rekt.poolv1.near",
+    "valisaurus-dex.poolv1.near",
+    "finoa.poolv1.near",
+    "kiln.poolv1.near",
+    "blockdaemon.poolv1.near",
+    "nearcrowd.poolv1.near",
+    "p2p-org.poolv1.near",
+    "pandora.poolv1.near",
+    "cryptium.poolv1.near",
+    "twinstake.poolv1.near",
+    "binancestaking.poolv1.near",
+    "bitcoinsuisse.poolv1.near",
+    "shardlabs.poolv1.near",
+    "sicmundus.poolv1.near",
+    "dariya.poolv1.near"
+]
+'''
+'''--- back_populate.py ---
+from helpers import *
+
+base_dir_path = os.path.dirname(os.path.realpath(__file__))
+data_dir_path = os.path.join(base_dir_path, 'data')
+blocks_csv_path = os.path.join(data_dir_path, 'blocks_recorded.csv')
+blocks_df = pd.read_csv(blocks_csv_path)
+
+historical_csv_path = os.path.join(data_dir_path, 'back_populated.csv')
+historical_df = pd.read_csv(historical_csv_path)
+
+# get all rows from blocks_df where epoch_id is not in historical_df 
+blocks_df = blocks_df[~blocks_df['epoch_id'].isin(historical_df['epoch_id'])]
+blocks_df.reset_index(drop=True, inplace=True)
+
+#delete rows from blocks_df which have duplicate epoch_id
+blocks_df = blocks_df.drop_duplicates(subset=['epoch_id'], keep='first')
+print(blocks_df)
+
+for i in tqdm(range(len(blocks_df)-1)):
+    BLOCK_FROM_RECORDED_BLOCKS_DF = int(blocks_df.iloc[i]['block_height'])
+    ANY_BLOCK_FROM_EPOCH = int(blocks_df.iloc[i+1]['block_height'])
+
+    t = time.time()
+    RELEVANT_VALIDATORS = json.load(open("RELEVANT_VALIDATORS.json"))
+
+    curr_block_details = get_block_details(ANY_BLOCK_FROM_EPOCH)
+    print(bcolors.OKBLUE, "Current block height:", curr_block_details['block_height'], bcolors.ENDC)
+    last_recorded_block = blocks_df[blocks_df['block_height'] == BLOCK_FROM_RECORDED_BLOCKS_DF].iloc[0]
+    new_row = {}
+    for key in last_recorded_block.keys():
+        new_row[key] = last_recorded_block[key]
+    del new_row['block_height']
+    
+    start_block = int(get_block_details(last_recorded_block['prev_epoch_last_block'])['block_height']) + 1
+    new_row['epoch_height'] = int((start_block-last_recorded_block['GENESIS_HEIGHT'])//43200)
+    new_row['start_block'] = start_block
+    new_row['end_block'] = start_block+43200
+    new_row['block_time_empirical'] = get_avg_block_time_for_epoch(start_block)
+    validators_info = get_ALL_validators_info(block_num=start_block+43200-1)
+
+    tries = 0
+    for i, addr in enumerate(RELEVANT_VALIDATORS):
+            if i < 18: 
+                continue
+            new_row[f'val_{i}_name'] =  addr
+        # try:
+            print(addr)
+            added_stake = int(get_recent_stake_txns_for_validator(addr, new_row['start_block'], new_row['end_block'])[1])
+            unstaked_amount = int(get_recent_UNSTAKE_txns_for_validator(addr, new_row['start_block'], new_row['end_block']))
+            rewards_v2 = int(get_rewards_v2(addr, new_row['start_block'], new_row['end_block']))
+
+            new_row[f'val_{i}_expected_blocks'] =  validators_info[addr]['expected_blocks']
+            new_row[f'val_{i}_produced_blocks'] =  validators_info[addr]['produced_blocks']
+            new_row[f'val_{i}_expected_chunks'] =  validators_info[addr]['expected_chunks']
+            new_row[f'val_{i}_produced_chunks'] =  validators_info[addr]['produced_chunks']
+            new_row[f'val_{i}_is_slashed'] =  int(validators_info[addr]['is_slashed'])
+            new_row[f'val_{i}_sum_stake'] =  int(validators_info[addr]['stake'])
+            new_row[f'val_{i}_added_stake'] = added_stake
+            new_row[f'val_{i}_unstaked_amount'] = unstaked_amount
+            new_row[f'val_{i}_commission'] = get_validator_commission(addr, new_row['end_block'])
+            new_row[f'val_{i}_total_rewards_v2'] = rewards_v2
+            # print(bcolors.OKGREEN, "New method", (float(chaçnge_in_stake[1]) - added_stake)/float(change_in_stake[0]-added_stake)*640*100, "% APY", bcolors.ENDC)
+            # print(new_row)
+            print()
+            time.sleep(0.2)
+            tries = 0
+        # except:
+        #     tries += 1
+        #     if tries > 5:
+        #         exit()
+        #     print(bcolors.FAIL, addr, " failed", bcolors.ENDC)
+        #     time.sleep(30)
+    historical_df = pd.concat( [historical_df, pd.DataFrame([new_row])], ignore_index=True)
+    historical_df.to_csv(historical_csv_path, index=False)
+
+    print(bcolors.OKGREEN, "Time taken:", time.time()-t, bcolors.ENDC)
+'''
+'''--- daily_bot.py ---
+from global_import import *
+import matplotlib.pyplot as plt
+import seaborn as sns
+from slack import WebClient
+from datetime import date
+
+TEST_SLACK_UPLOAD_TOKEN = os.getenv("TEST_SLACK_UPLOAD_TOKEN")
+TEST_SLACK_CHANNEL_ID = os.getenv("TEST_SLACK_CHANNEL_ID")
+
+def get_historical_dataframe():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    historical_df = pd.read_csv(f"{base_dir}/data/val_out.csv")
+    max_epoch_height = historical_df['Epoch Number'].max()
+    historical_df = historical_df[historical_df['Epoch Number'] > (max_epoch_height - 12)]
+    return historical_df
+
+def get_24hrs_rewards_and_stake():
+    df = get_historical_dataframe()
+    rewards = df[df['Validator Name'] == 'twinstake.poolv1.near'][-2:]['Actual Rewards'].sum()
+    stake = df[df['Validator Name'] == 'twinstake.poolv1.near']['Stake'].iloc[-1]
+    apy = df[df['Validator Name'] == 'twinstake.poolv1.near']['Realized APY'].iloc[-2:].mean()
+    return rewards, stake, apy
+
+def generate_chart():
+    df = get_historical_dataframe()
+    
+    charting_df = pd.DataFrame()
+    charting_df.index = df['Epoch Number'].unique()
+    charting_df['Twinstake APY'] = list(df[df['Validator Name'] == 'twinstake.poolv1.near']['Realized APY'])
+    charting_df.loc[charting_df['Twinstake APY'] > 15, 'Twinstake APY'] = np.nan
+
+    ls = [i for i in df[df['Block Producer'] == 1].groupby('Epoch Number')['Realized APY'].median() - df[df['Block Producer'] == 0].groupby('Epoch Number')['Realized APY'].median() if np.abs(i) > 0.02]
+    if len(ls) > 0:
+        charting_df['Blocks Producers APY (Median)'] = df[df['Block Producer'] == 1].groupby('Epoch Number')['Realized APY'].median()
+        charting_df['Chunk Producers APY (Median)'] = df[df['Block Producer'] == 0].groupby('Epoch Number')['Realized APY'].median()
+        
+    charting_df['Largest Stakers APY (Median)'] = df[df['Block Producer'] == 1].groupby('Epoch Number')['Realized APY'].median()
+    charting_df.loc[charting_df['Largest Stakers APY (Median)'] > 15, 'Largest Stakers APY (Median)'] = np.nan
+
+    # Plot the chart
+    plt.cla() # Clear the plot from previous chain charts (if any)
+    ax = sns.lineplot(data=charting_df, markers=True)
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=40, ha="right")
+    ax.set_ylabel('APY (%)')
+    ax.set_ylim([10,12])
+    ax.set_title(f"NEAR Staking APY (Last 12 Epochs)")
+
+    # Add the APY values to the chart
+    for ind, row in charting_df.iterrows():
+        ax.text(ind-0.5, row['Twinstake APY']+0.05, str(round(float(row['Twinstake APY']),2)))
+
+    # Plot the delta APY for TS vs Avg
+    delta_apy = abs(round(charting_df['Twinstake APY'] - charting_df['Largest Stakers APY (Median)'],2))
+    ax2 = ax.twinx()
+    ax2.plot(delta_apy, color='blue')
+    ax2.tick_params(axis='y', labelcolor='blue')
+    ax2.set_ylim([0.005,2])
+    ax2.set_ylabel('Absolute Difference in APY (TS vs Avg)')
+
+    # Save the chart to a file
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    chart_path = f"{base_dir}/data/chart.png"
+    ax.figure.savefig(chart_path, bbox_inches='tight')
+
+def send_chart_to_channel(_rewards, _stake, _apy):
+    slack_message = f'---------------------------------\n'
+    slack_message += f'*Historical performance of TwinStake validator on Near* \n'
+    slack_message += f'Rewards earned in last 2 epochs (~27 hours): {round(_rewards,2)} NEAR \n'
+    slack_message += f'AUD: {int(_stake)} NEAR \n'
+    slack_message += f'APY: {round(_apy, 2)} % \n'
+
+    client = WebClient(TEST_SLACK_UPLOAD_TOKEN)
+    chart_path = os.path.dirname(__file__) + '/data/chart.png'
+    img = open(chart_path, 'rb').read()
+
+    response = client.files_upload(
+        channels = TEST_SLACK_CHANNEL_ID,
+        initial_comment = slack_message,
+        filename = f"DailyChart-{date.today()}",
+        content = img
+    )
+    # For optimisation need to upload file, collect the permalink and then send the message embedding the image
+    print("Permalink:", response['file']['permalink'])
+
+def daily_bot_send_chart():
+    rewards, stake, apy = get_24hrs_rewards_and_stake()
+    generate_chart()
+    send_chart_to_channel(rewards, stake, apy)
+
+if __name__ == "__main__":
+    daily_bot_send_chart()
+'''
+'''--- global_import.py ---
+import random
+import time
+import numpy as np
+import os
+import requests
+import pandas as pd
+from dotenv import load_dotenv
+import json
+from tqdm import tqdm
+
+class bcolors:
+    WARNING = '\033[93m'
+    ENDC = '\033[0m'
+    OKBLUE = '\033[94m'
+    FAIL = '\033[91m'
+
+load_dotenv()
+RPC_URL = os.getenv("RPC_URL")
+RPC_URL_PUBLIC = os.getenv("RPC_URL_PUBLIC")
+RPC_URL_PUBLIC_ARCHIVAL = os.getenv("RPC_URL_PUBLIC_ARCHIVAL")
+NEAR_BLOCKS_API = 'https://api.nearblocks.io/v1/'
+
+class bcolors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
+headers = {'Content-Type': 'application/json'}
+'''
+'''--- google_sheet_updates/send_historical_file.py ---
+import os
+import pandas as pd
+from dotenv import load_dotenv
+import pygsheets
+import requests
+
+load_dotenv()
+
+def send_historical_file():
+    base_dir_path = os.path.dirname(os.path.realpath(__file__))
+    parent_dir_path = base_dir_path.split('/google_sheet_updates')[0] # This is the path to the parent directory of the google_drive_updates directory
+
+    # connect to google sheeet
+    client = pygsheets.authorize(service_file=f'{parent_dir_path}/service_credentials.json')
+    sheet = client.open_by_key(os.getenv('HISTORICAL_GDS_FILE_ID'))
+    wks = sheet.sheet1
+
+    # find out the last epoch updated on google sheets
+    cells = wks.get_all_values(include_tailing_empty_rows=False, include_tailing_empty=False, returnas='matrix')
+    last_epoch = int(cells[-1][0])
+    print(f'Last updated epoch on google sheets: {last_epoch}')
+
+    # compare the last epoch updated on google sheets with the last epoch updated on the historical_data/sc_avg file
+    file = f'{parent_dir_path}/data/near_historical_gds.csv'
+    historical_df = pd.read_csv(file)
+
+    # identify rows that are new and need to be added to the google sheets file
+    new_historical_df = historical_df[historical_df['epoch_height'] > last_epoch]
+    print(f'new rows: {len(new_historical_df)}')
+
+    # add new rows to google sheets file
+    insert_into_row = len(cells)
+    new_row = new_historical_df.values.tolist()
+    wks = wks.insert_rows(insert_into_row, number=len(new_row), values= new_row)
+
+if __name__ == '__main__':
+    send_historical_file()
+'''
+'''--- google_sheet_updates/send_val_file.py ---
+import os
+import pandas as pd
+from dotenv import load_dotenv
+import pygsheets
+import requests
+
+load_dotenv()
+
+def send_val_file():
+    base_dir_path = os.path.dirname(os.path.realpath(__file__))
+    parent_dir_path = base_dir_path.split('/google_sheet_updates')[0] # This is the path to the parent directory of the google_drive_updates directory
+
+    # connect to google sheeet
+    client = pygsheets.authorize(service_file=f'{parent_dir_path}/service_credentials.json')
+    sheet = client.open_by_key(os.getenv('NEAR_VALIDATION_FILE_ID'))
+    wks = sheet.sheet1
+
+    # find out the last epoch updated on google sheets
+    cells = wks.get_all_values(include_tailing_empty_rows=False, include_tailing_empty=False, returnas='matrix')
+    last_epoch = int(cells[-1][0])
+    print(f'Last updated epoch on google sheets: {last_epoch}')
+
+    # compare the last epoch updated on google sheets with the last epoch updated on the historical_data/sc_avg file
+    val_file = f'{parent_dir_path}/data/val_out.csv'
+    val_df = pd.read_csv(val_file)
+
+    # identify rows that are new and need to be added to the google sheets file
+    new_val_df = val_df[val_df['Epoch Number'] > last_epoch]
+    print(f'new rows: {len(new_val_df)}')
+
+    # add new rows to google sheets file
+    insert_into_row = len(cells)
+    new_row = new_val_df.values.tolist()
+    wks = wks.insert_rows(insert_into_row, number=len(new_row), values= new_row)
+
+if __name__ == '__main__':
+    send_val_file()
+'''
+'''--- google_sheet_updates/update_all.py ---
+from send_historical_file import send_historical_file
+from send_val_file import send_val_file
+
+if __name__ == '__main__':
+    send_historical_file()
+    send_val_file()
+'''
+'''--- helpers.py ---
+from global_import import *
+import base64 as b64
+from near_api.providers import JsonProvider
+from near_api.account import Account
+import near_api
+
+def get_validator_info(validator_id):
+    """Returns validator info for the given validator_id. Expected and produced block info is for the current running epoch"""
+    res_dict = {}
+    payload = json.dumps({"jsonrpc": "2.0","id": "dontcare","method": "validators","params": [None]})
+    curr_validators = requests.request("POST", RPC_URL_PUBLIC, headers=headers, data=payload).json()['result']['current_validators']
+    val_info = next(v for v in curr_validators if v["account_id"] == validator_id)
+    total_stake = sum([int(v['stake']) for v in curr_validators])
+    res_dict['stake'] = val_info['stake']
+    res_dict['num_expected_blocks'] = val_info['num_expected_blocks']
+    res_dict['num_expected_chunks'] = val_info['num_expected_chunks']
+    res_dict['num_produced_blocks'] = val_info['num_produced_blocks']
+    res_dict['num_produced_chunks'] = val_info['num_produced_chunks']
+    res_dict['total_stake'] = total_stake
+    return res_dict
+
+def get_transaction_by_hash(tx_hash, msg_sender):
+    """Returns the transaction from NEAR RPC API. The msg.sendr is required to query the relevant shard"""
+    payload = json.dumps({
+        "jsonrpc": "2.0", 
+        "id": "dontcare", 
+        "method": "EXPERIMENTAL_tx_status",
+        "params": [f"{tx_hash}", f"{msg_sender}"]
+    })
+    try:
+        response = requests.request("POST", RPC_URL_PUBLIC, headers=headers, data=payload).json()['result']
+    except:
+        response = requests.request("POST", RPC_URL_PUBLIC_ARCHIVAL, headers=headers, data=payload).json()['result']
+        print("Archival node was used")
+    return response
+
+# returns the epoch id for the current block if no block_height is supplied
+def get_epoch_id(block_height = -1):
+    payload = json.dumps({"jsonrpc": "2.0","id": "dontcare","method": "block","params": {"finality": "final"} if block_height == -1 else {"block_id": block_height}})
+    response = requests.request("POST", RPC_URL_PUBLIC, headers=headers, data=payload).json()['result']['header']
+    ep_id = response['epoch_id']
+    return ep_id
+
+def get_total_supply():
+    payload = json.dumps({"jsonrpc": "2.0","id": "dontcare","method": "block","params": {"finality": "final"}})
+    response = requests.request("POST", RPC_URL_PUBLIC, headers=headers, data=payload).json()['result']['header']
+    return response['total_supply']
+
+# If supplied with epoch start block, it will return the average block time for that epoch
+def get_avg_block_time_for_epoch(start_block):
+    end_block = start_block+43200
+    start_time = -100 # set to 100 in order to enter the while loop and stay there for 100 tries
+    end_time = -100
+    blocks_to_subtract = 0
+
+    while start_time < 0:
+        # the try-except block is added for cases when the specified block was not produced
+        try:
+            start_time+=1
+            payload = json.dumps({"jsonrpc": "2.0","id": "dontcare","method": "block","params": {"block_id": start_block}})
+            print(start_block)
+            try:
+                start_time = requests.request("POST", RPC_URL_PUBLIC, headers=headers, data=payload).json()['result']['header']['timestamp']
+            except:
+                start_time = requests.request("POST", RPC_URL_PUBLIC_ARCHIVAL, headers=headers, data=payload).json()['result']['header']['timestamp']
+                print("Archival node was used")
+        except:
+            start_block+=1
+            blocks_to_subtract+=1
+            print("unsuccesful request. retrying...")
+
+    while end_time < 0:
+        try:
+            end_time+=1            
+            payload = json.dumps({"jsonrpc": "2.0","id": "dontcare","method": "block","params": {"block_id": end_block}})
+            end_time = requests.request("POST", RPC_URL_PUBLIC, headers=headers, data=payload).json()['result']['header']['timestamp']
+        except:
+            end_block-=1
+            blocks_to_subtract+=1
+            print("unsuccesful request. retrying...")
+
+    numerator = end_time - start_time
+    denominator = (43200-blocks_to_subtract) * 1e9 # API returns timestamp in nanoseconds (10^-9)
+    avg_bl_time = numerator/denominator 
+    return avg_bl_time
+
+def get_all_validators_ids():
+    res_dict = {}
+    payload = json.dumps({"jsonrpc": "2.0","id": "dontcare","method": "validators","params": [None]})
+    curr_validators = requests.request("POST", RPC_URL_PUBLIC, headers=headers, data=payload).json()['result']['current_validators']
+    addresses = [v['account_id'] for v in curr_validators]
+    return addresses
+
+def get_active_validator_set():
+    payload = json.dumps({
+    "jsonrpc": "2.0",
+    "id": "dontcare",
+    "method": "status",
+    "params": []
+    })
+    response = requests.request("POST", RPC_URL_PUBLIC, headers=headers, data=payload).json()['result']['validators']
+    ls = []
+    for i in response:
+        ls.append(i['account_id'])
+    return ls
+
+def get_block_details(block_height = -1):
+    res_dict = {}
+    payload = json.dumps({"jsonrpc": "2.0","id": "dontcare","method": "block","params": {"finality": "final"} if block_height == -1 else {"block_id": block_height}})
+    try:
+        response = requests.request("POST", RPC_URL_PUBLIC, headers=headers, data=payload).json()['result']
+    except:
+        response = requests.request("POST", RPC_URL_PUBLIC_ARCHIVAL, headers=headers, data=payload).json()['result']
+        print("Archival node was used")
+    
+    res_dict['epoch_id'] = response['header']['epoch_id']
+    res_dict['total_supply'] = response['header']['total_supply']
+    res_dict['block_height'] = response['header']['height']
+    res_dict['timestamp'] = response['header']['timestamp']
+    res_dict['prev_epoch_last_block'] = response['header']['next_epoch_id'] # yes, weirdly enough next_epoch_id is actually the block height of the last block of the previous epoch
+    return res_dict
+
+def get_constant_vals():
+    res_dict = {}
+    payload = json.dumps({"jsonrpc": "2.0","id": "dontcare",
+        "method": "EXPERIMENTAL_protocol_config",
+        "params": {"finality": "final"}
+    })
+    response = requests.request("POST", RPC_URL_PUBLIC, headers=headers, data=payload).json()['result']
+    res_dict['EPOCH_LENGTH'] = response['epoch_length']
+    res_dict['EPOCHS_A_YEAR'] = response['num_blocks_per_year']/res_dict['EPOCH_LENGTH'] 
+    res_dict['BLOCK_TIME_TARGET'] = int(365*24*60*60/int(response['num_blocks_per_year']))
+    res_dict['ONLINE_THRESHOLD_MIN'] = float(response['online_min_threshold'][0]/response['online_min_threshold'][1])
+    res_dict['ONLINE_THRESHOLD_MAX'] = float(response['online_max_threshold'][0]/response['online_max_threshold'][1])
+    res_dict['BLOCK_PRODUCER_KICKOUT_THRESHOLD'] = int(response['block_producer_kickout_threshold'])
+    res_dict['CHUNK_PRODUCER_KICKOUT_THRESHOLD'] = int(response['block_producer_kickout_threshold'])
+    res_dict['GENESIS_HEIGHT'] = int(response['genesis_height'])
+    return res_dict
+
+def get_total_stake(block_num = -1):
+    res_dict = {}
+    if block_num == -1:
+        payload = json.dumps({"jsonrpc": "2.0","id": "dontcare","method": "validators","params": [None]}) # Ideally we should be able to get this for a past block as well (according to RPC docs). But the method fails for past blocks right now
+    else:
+        payload = json.dumps({"jsonrpc": "2.0","id": "dontcare","method": "validators", "params": [block_num]})
+    curr_validators = requests.request("POST", RPC_URL, headers=headers, data=payload).json()['result']['current_validators']
+    total_stake = sum([int(v['stake']) for v in curr_validators])
+    return total_stake
+
+def get_ALL_validators_info(block_num):
+    """returns produced vs expected blocks/chunks information for all the validators. The block number passed must be the last block in the epoch."""
+    res_dict = {}
+    payload = json.dumps({"jsonrpc": "2.0","id": "dontcare","method": "validators","params": [block_num]})
+    try:
+        curr_validators = requests.request("POST", RPC_URL_PUBLIC, headers=headers, data=payload).json()['result']['current_validators']
+    except:
+        curr_validators = requests.request("POST", RPC_URL_PUBLIC_ARCHIVAL, headers=headers, data=payload).json()['result']['current_validators']
+        print("Using archival node")
+    for v in curr_validators:
+        single_val = {}
+        single_val['produced_blocks'] = v['num_produced_blocks']
+        single_val['expected_blocks'] = v['num_expected_blocks']
+        single_val['produced_chunks'] = v['num_produced_chunks']
+        single_val['expected_chunks'] = v['num_expected_chunks']
+        single_val['stake'] = v['stake']
+        single_val['is_slashed'] = v['is_slashed']
+        res_dict[v['account_id']] = single_val
+    return res_dict
+
+def get_acc_info_for_block(account_id, block_height):
+    payload = json.dumps({
+    "jsonrpc": "2.0",
+    "id": "dontcare",
+    "method": "query",
+    "params": {
+        "request_type": "view_account",
+        "block_id": block_height,
+        "account_id": str(account_id)
+    }})
+    response = requests.request("POST", RPC_URL_PUBLIC, headers=headers, data=payload).json()['result']
+    return response
+
+# param validator - account_id of the validator
+# param block_id - (epoch_id OR block_height) at which we want to get the list of accounts
+def get_validator_accounts(validator, block_id):
+    near_provider = JsonProvider(RPC_URL_PUBLIC)    
+    accounts = []
+    from_index = 0
+    has_more_accounts = True
+    while has_more_accounts:
+        TEXT = f'{{"from_index": {from_index},"limit": 500}}'
+        base64 = b64.b64encode(bytes(TEXT,encoding='utf8')).decode('utf-8')
+        r = near_provider.json_rpc("query", {
+            "request_type": "call_function", 
+            "block_id": block_id,
+            "account_id": validator,
+            "method_name": "get_accounts",
+            "args_base64": base64
+        }, timeout=60)
+        lst = r.get('result')
+        current_accounts = json.loads(''.join(chr(v) for v in lst))
+        if len(current_accounts) == 0:
+            has_more_accounts = False
+        accounts += current_accounts
+        from_index += 500
+    return accounts
+
+# param start_block and end_block can also be epoch IDs (I guess)
+def get_rewards_for_epoch(validator, start_block, end_block):
+    near_provider = JsonProvider(RPC_URL_PUBLIC_ARCHIVAL)    
+    accounts_info = get_validator_accounts(validator, end_block)    
+    previous_epoch_accounts_info = get_validator_accounts(validator,start_block)
+
+    total_staked_in_beginning = 0
+    total_unstaked = 0
+    total_rewards = 0
+
+    for ind, account in enumerate(accounts_info):
+        current_account_id = account['account_id']
+        previous_epoch_account = list(filter(lambda p_account: p_account['account_id'] == current_account_id, previous_epoch_accounts_info))
+
+        if len(previous_epoch_account) == 0:
+            rew = float(account['staked_balance'])
+        else:
+            total_staked_in_beginning += int(previous_epoch_account[0]["staked_balance"])
+            total_unstaked += int(previous_epoch_account[0]["unstaked_balance"])
+            rew = int(account["staked_balance"]) - int(previous_epoch_account[0]["staked_balance"])
+            if rew < 0:
+                rew = 0        
+        total_rewards += rew
+
+    # TODO: can delete the dataframe part later
+    df_ls = []
+    for account in accounts_info:
+        current_delegator = {}
+        current_account_id = account['account_id']
+
+        previous_epoch_account = list(filter(lambda p_account: p_account['account_id'] == current_account_id, previous_epoch_accounts_info))
+        if len(previous_epoch_account) == 0:
+            rewards = float(account['staked_balance'])
+            previous_stake_balance = 0
+        else:
+            rewards = int(account["staked_balance"]) - int(previous_epoch_account[0]["staked_balance"])
+            previous_stake_balance = int(previous_epoch_account[0]["staked_balance"])
+        
+        if rewards < 0:
+            rewards = 0
+
+        current_delegator["delegator"] = current_account_id
+        current_delegator["validator"] = validator
+        current_delegator["balance_staked"] = int(account["staked_balance"]) / 10**24
+        current_delegator["balance_unstaked"] = int(account["unstaked_balance"]) / 10**24
+        current_delegator["rewards"] = rewards / 10**24   
+        
+        if float(current_delegator["balance_staked"]) > 0:
+            current_delegator['rew/stk'] = float(current_delegator["rewards"]) / float(current_delegator["balance_staked"])
+        else:
+            current_delegator['rew/stk'] = 0
+
+        df_ls.append(current_delegator)
+    
+    df = pd.DataFrame(df_ls)
+    median_diff_in_stake = df['rew/stk'].median()
+    return int(total_staked_in_beginning), int(total_rewards), median_diff_in_stake
+
+# def v2_get_rewards_for_epoch(addr, start_block, end_block):
+#     epoch_before = get_ALL_validators_info(start_block-1)  
+#     epoch_curr = get_ALL_validators_info(end_block-1)
+
+#     for i in epoch_before.keys():
+#         if i == addr:
+#             sum1 = int(epoch_before[i]['stake'])//1e24
+
+#     for i in epoch_curr.keys():
+#         if i == addr:
+#             sum2 = int(epoch_curr[i]['stake'])//1e24
+
+#     return int(sum1), int(sum2-sum1)
+
+# Powered by Nearblocks.io APIs - (leave this comment in your code)
+def get_recent_stake_txns_for_validator(validator_addr, start_block, end_block):
+    headers = {'accept': '*/*'}
+    page_no = 1
+
+    stake_transactions = []
+    fetch_more_txns = True
+    added_stake_amount = 0
+
+    while(fetch_more_txns):
+        print(bcolors.OKCYAN, "Fetching deposit_and_stake Txns from Near Blocks", bcolors.ENDC)
+
+        if page_no > 5:
+            print(bcolors.FAIL, "Too many pages, something is wrong", bcolors.ENDC)
+            break
+
+        fetch_more_txns = False
+        params = {'page': str(page_no), 'per_page': '25', 'order': 'desc', 'method': 'deposit_and_stake'}
+        url = f'{NEAR_BLOCKS_API}/account/{validator_addr}/txns'
+        response = requests.get(url, params=params, headers=headers).json()
+
+        for txn in response['txns']:
+            for action in txn['actions']:
+                if action['method'] == "deposit_and_stake" and txn['block']['block_height'] > start_block and txn['block']['block_height'] < end_block:
+                    stake_transactions.append(txn)
+                    added_stake_amount += txn['actions_agg']['deposit']
+
+        # fetch more transactions from API if the last transaction is more recent than the start_block
+        if response['txns'][-1]['block']['block_height'] > start_block:
+            fetch_more_txns = True
+            page_no += 1
+            time.sleep(10)
+
+    return stake_transactions, added_stake_amount
+
+def get_recent_STAKE_txns_for_validator(validator_addr, start_block, end_block):
+    headers = {'accept': '*/*'}
+    page_no = 1
+
+    stake_transactions = []
+    fetch_more_txns = True
+    added_stake_amount = 0
+
+    while(fetch_more_txns):
+        print(bcolors.OKCYAN, "Fetching deposit_and_stake Txns from Near Blocks", bcolors.ENDC)
+
+        if page_no > 15:
+            print(bcolors.FAIL, "Too many pages, something is wrong", bcolors.ENDC)
+            break
+
+        fetch_more_txns = False
+        params = {'page': str(page_no), 'per_page': '25', 'order': 'desc', 'method': 'deposit_and_stake'}
+        url = f'{NEAR_BLOCKS_API}/account/{validator_addr}/txns'
+        response = requests.get(url, params=params, headers=headers).json()
+
+        for txn in response['txns']:
+            for action in txn['actions']:
+                if action['method'] == "deposit_and_stake" and txn['block']['block_height'] > start_block and txn['block']['block_height'] < end_block:
+                    added_stake_amount += txn['actions_agg']['deposit']
+                    stake_transactions.append({
+                        "hash": txn['transaction_hash'],
+                        "sender": txn['predecessor_account_id'],
+                        "receipt_id" : txn['receipt_id']
+                    })
+
+        # fetch more transactions from API if the last transaction is more recent than the start_block
+        if response['txns'][-1]['block']['block_height'] > start_block:
+            fetch_more_txns = True
+            page_no += 1
+            time.sleep(10)  
+
+    print(stake_transactions)
+
+    total_staked_amount = 0
+    
+    for nearblocks_tx in stake_transactions:
+        found_at_least_one_log = False
+        transaction = get_transaction_by_hash(nearblocks_tx['hash'], nearblocks_tx['sender'])
+        # try:
+        for receipt_outcome in transaction['receipts_outcome']:
+            if receipt_outcome['id'] == nearblocks_tx['receipt_id']:
+                all_logs = receipt_outcome['outcome']['logs'] # Of type "someone.near deposited 120000. New"
+                for unstaking_sentence_log in all_logs:
+                    words = unstaking_sentence_log.split(" ")
+                    if words[0] == f"@{nearblocks_tx['sender']}" and words[1] == "deposited":
+                        amt = unstaking_sentence_log.split(" ")[2] # "120000."
+                        amt = amt[:-1] # => removing the dot "120000"
+                        total_staked_amount += int(amt)
+                        found_at_least_one_log = True
+                        break
+
+        assert found_at_least_one_log == True
+        # except:
+        #     print(bcolors.FAIL, f"Error while fetching transaction from JSON RPC. Tx Hash : {nearblocks_tx['hash']}, sender: {nearblocks_tx['sender']}", bcolors.ENDC)
+
+        time.sleep(2)
+
+    return total_staked_amount
+
+def get_recent_UNSTAKE_txns_for_validator(validator_addr, start_block, end_block):
+    headers = {'accept': '*/*'}
+    
+    unstake_transactions = []
+    total_unstaked_amount = 0
+    
+    fetch_more_txns = True
+    page_no = 1
+    while(fetch_more_txns):
+        print(bcolors.OKCYAN, "Fetching unstake Txns from Near Blocks", bcolors.ENDC)
+        if page_no > 5:
+            print(bcolors.FAIL, "Too many pages, something is wrong", bcolors.ENDC)
+            break
+
+        fetch_more_txns = False
+        params = {'page': str(page_no), 'per_page': '25', 'order': 'desc', 'method': 'unstake'}
+        url = f'{NEAR_BLOCKS_API}/account/{validator_addr}/txns'
+        response = requests.get(url, params=params, headers=headers).json()
+
+        for txn in response['txns']:
+            for action in txn['actions']:
+                if action['method'] == "unstake" and txn['block']['block_height'] > start_block and txn['block']['block_height'] < end_block:
+                    unstake_transactions.append({
+                        "hash": txn['transaction_hash'],
+                        "sender": txn['predecessor_account_id'],
+                        "receipt_id" : txn['receipt_id']
+                    })
+        
+        if len(response['txns']) > 0 and response['txns'][-1]['block']['block_height'] > start_block:
+            fetch_more_txns = True
+            page_no += 1
+            time.sleep(10)
+
+    fetch_more_txns = True
+    page_no = 1
+    while(fetch_more_txns):
+        print(bcolors.OKCYAN, "Fetching unstake_all Txns from Near Blocks", bcolors.ENDC)
+        if page_no > 5:
+            print(bcolors.FAIL, "Too many pages, something is wrong", bcolors.ENDC)
+            break
+
+        fetch_more_txns = False
+        params = {'page': str(page_no), 'per_page': '25', 'order': 'desc', 'method': 'unstake_all'}
+        url = f'{NEAR_BLOCKS_API}/account/{validator_addr}/txns'
+        response = requests.get(url, params=params, headers=headers).json()
+
+        for txn in response['txns']:
+            for action in txn['actions']:
+                if action['method'] == "unstake_all" and txn['block']['block_height'] > start_block and txn['block']['block_height'] < end_block:
+                    unstake_transactions.append({
+                        "hash": txn['transaction_hash'],
+                        "sender": txn['predecessor_account_id'],
+                        "receipt_id" : txn['receipt_id']
+                    })
+        
+        if fetch_more_txns:
+            time.sleep(15)
+    
+    print(unstake_transactions)
+
+    # for each of the transactions fetch from JSON RPC the information about amount unstaked
+    for nearblocks_tx in unstake_transactions:
+        found_at_least_one_log = False
+        transaction = get_transaction_by_hash(nearblocks_tx['hash'], nearblocks_tx['sender'])
+        try:
+            for receipt_outcome in transaction['receipts_outcome']:
+                if receipt_outcome['id'] == nearblocks_tx['receipt_id']:
+                    all_logs = receipt_outcome['outcome']['logs'] # Of type "someone.near unstaking 120000. Spent XX staking shares. Total YY unstaked balance and ZZ staking shares"
+                    for unstaking_sentence_log in all_logs:
+                        words = unstaking_sentence_log.split(" ")
+                        if words[0] == f"@{nearblocks_tx['sender']}" and words[1] == "unstaking":
+                            amt = unstaking_sentence_log.split(" ")[2] # "120000."
+                            amt = amt[:-1] # => removing the dot "120000"
+                            total_unstaked_amount += int(amt)
+                            found_at_least_one_log = True
+                            break
+
+            assert found_at_least_one_log == True
+        except:
+            print(bcolors.FAIL, f"Error while fetching transaction from JSON RPC. Tx Hash : {nearblocks_tx['hash']}, sender: {nearblocks_tx['sender']}", bcolors.ENDC)
+
+        time.sleep(2)
+
+    return total_unstaked_amount
+
+def get_rewards_v2(addr, first_block, last_block):
+    epoch_before = get_ALL_validators_info(first_block-1)  
+    epoch_curr = get_ALL_validators_info(last_block-1)
+    
+    sum1 = 0
+    sum2 = 0
+
+    for i in epoch_before.keys():
+        if i == addr:
+            sum1 = int(epoch_before[i]['stake'])
+    for i in epoch_curr.keys():
+        if i == addr:
+            sum2 = int(epoch_curr[i]['stake'])
+    return int(sum2-sum1)
+
+def get_validator_commission(validator, block_num):
+    """Returns validator commisisons (in %). Block_num passed should be some recent block number"""
+    near_provider = JsonProvider(RPC_URL_PUBLIC)
+    TEXT = f'{{}}'
+    base64 = b64.b64encode(bytes(TEXT,encoding='utf8')).decode('utf-8')
+    r = near_provider.json_rpc("query", {
+        "request_type": "call_function", 
+        "block_id": block_num,
+        "account_id": validator,
+        "method_name": "get_reward_fee_fraction",
+        "args_base64": base64
+    }, timeout=60)
+    lst = r.get('result')
+    commission = json.loads(''.join(chr(v) for v in lst))
+    return commission['numerator']
+
+if __name__ == '__main__':
+    print("Hello world")
+'''
+'''--- historical_script.py ---
+from helpers import *
+from validate import validate_historical_file, create_historical_gds
+
+t = time.time()
+base_dir_path = os.path.dirname(os.path.realpath(__file__))
+RELEVANT_VALIDATORS = json.load(open(f"{base_dir_path}/RELEVANT_VALIDATORS.json"))
+data_dir_path = os.path.join(base_dir_path, 'data')
+historical_csv_path = os.path.join(data_dir_path, 'near_historical.csv')
+blocks_csv_path = os.path.join(data_dir_path, 'blocks_recorded.csv')
+
+historical_df = pd.read_csv(historical_csv_path)
+blocks_df = pd.read_csv(blocks_csv_path)
+
+# Update blocks_recorded csv
+curr_block_details = get_block_details()
+print(bcolors.OKBLUE, "Current block height:", curr_block_details['block_height'], bcolors.ENDC)
+
+# if last block's epoch ID in blocks_recorded.csv is not the same as current block's epoch ID, then need to add new epoch to historical.csv
+if len(blocks_df) > 0 and curr_block_details['epoch_id'] != blocks_df.iloc[-1]['epoch_id']:
+    print(bcolors.OKGREEN, "New epoch detected. Updating historical.csv", bcolors.ENDC)
+    last_recorded_block = blocks_df.iloc[-1]
+    new_row = {}
+
+    start_block = int(get_block_details(last_recorded_block['prev_epoch_last_block'])['block_height']) + 1
+    new_row['epoch_height'] = int((start_block-last_recorded_block['GENESIS_HEIGHT'])//43200)
+    new_row['start_block'] = start_block
+    new_row['end_block'] = start_block+43200
+    new_row['block_time_empirical'] = get_avg_block_time_for_epoch(start_block)
+    validators_info = get_ALL_validators_info(block_num=start_block+43200-1)
+
+    # Retrieve all relevant values from the last block in blocks_recorded.csv
+    for key in last_recorded_block.keys():
+        new_row[key] = last_recorded_block[key]
+    del new_row['block_height']
+
+    tries = 0
+    for i, addr in enumerate(RELEVANT_VALIDATORS):
+        new_row[f'val_{i}_name'] =  addr
+        
+        try:
+            print(addr)
+            change_in_stake = get_rewards_for_epoch(addr,new_row['start_block'], new_row['end_block'])
+            added_stake = int(get_recent_stake_txns_for_validator(addr, new_row['start_block'], new_row['end_block'])[1])
+            unstaked_amount = int(get_recent_UNSTAKE_txns_for_validator(addr, new_row['start_block'], new_row['end_block']))
+            rewards_v2 = int(get_rewards_v2(addr, new_row['start_block'], new_row['end_block']))
+
+            new_row[f'val_{i}_expected_blocks'] =  validators_info[addr]['expected_blocks']
+            new_row[f'val_{i}_produced_blocks'] =  validators_info[addr]['produced_blocks']
+            new_row[f'val_{i}_expected_chunks'] =  validators_info[addr]['expected_chunks']
+            new_row[f'val_{i}_produced_chunks'] =  validators_info[addr]['produced_chunks']
+            new_row[f'val_{i}_is_slashed'] =  int(validators_info[addr]['is_slashed'])
+            new_row[f'val_{i}_sum_stake'] =  int(validators_info[addr]['stake'])
+            new_row[f'val_{i}_active_stake'] =  int(change_in_stake[0])
+            new_row[f'val_{i}_added_stake'] = added_stake
+            new_row[f'val_{i}_unstaked_amount'] = unstaked_amount
+            new_row[f'val_{i}_stake_diff'] = int(change_in_stake[1])
+            new_row[f'val_{i}_total_rewards'] = int(change_in_stake[1])-added_stake
+            new_row[f'val_{i}_median_rew/stk'] = float(change_in_stake[2])
+            new_row[f'val_{i}_commission'] = get_validator_commission(addr, new_row['end_block'])
+            new_row[f'val_{i}_total_rewards_v2'] = rewards_v2
+
+            # print(bcolors.OKGREEN, "New method", (float(chaçnge_in_stake[1]) - added_stake)/float(change_in_stake[0]-added_stake)*640*100, "% APY", bcolors.ENDC)
+            print(new_row)
+            print()
+            time.sleep(0.2)
+            tries = 0
+        except:
+            tries += 1
+            if tries > 5:
+                exit()
+            time.sleep(60)
+            print(bcolors.FAIL, addr, " failed", bcolors.ENDC)
+    historical_df = pd.concat( [historical_df, pd.DataFrame([new_row])], ignore_index=True)
+    historical_df.to_csv(historical_csv_path, index=False)
+
+    validate_historical_file()
+    create_historical_gds()
+
+# No new epoch detected. Record latest block in blocks_recorded.csv
+new_row = {}
+constant_vals = get_constant_vals()
+for key in constant_vals:
+    new_row[key] = constant_vals[key]
+for key in curr_block_details:
+    new_row[key] = curr_block_details[key]
+new_row['total_staked'] = get_total_stake()
+blocks_df = pd.concat( [blocks_df, pd.DataFrame([new_row])], ignore_index=True)
+blocks_df.to_csv(blocks_csv_path, index=False)
+
+print(bcolors.OKGREEN, "Time taken:", time.time()-t, bcolors.ENDC)
+'''
+'''--- requirements.txt ---
+aiobotocore==2.4.1
+aiohttp==3.8.3
+aioitertools==0.11.0
+aiosignal==1.3.1
+aiosqlite==0.17.0
+appnope==0.1.3
+asttokens==2.2.1
+async-timeout==4.0.2
+asyncio==3.4.3
+attrs==22.1.0
+backcall==0.2.0
+base58==2.1.1
+bitarray==2.6.0
+botocore==1.27.59
+cachetools==5.2.0
+certifi==2022.9.24
+charset-normalizer==2.1.1
+click==8.1.3
+comm==0.1.2
+cytoolz==0.12.0
+dataclasses==0.6
+dataclasses-json==0.5.7
+debugpy==1.6.4
+decorator==5.1.1
+durable-rules==2.0.28
+ed25519==1.5
+entrypoints==0.4
+eth-abi==2.2.0
+eth-account==0.5.9
+eth-hash==0.5.1
+eth-keyfile==0.5.1
+eth-keys==0.3.4
+eth-rlp==0.2.1
+eth-typing==2.3.0
+eth-utils==1.9.5
+exceptiongroup==1.0.4
+executing==1.2.0
+forta-agent==0.1.5
+frozenlist==1.3.3
+google-api-core==2.11.0
+google-api-python-client==2.68.0
+google-auth==2.15.0
+google-auth-httplib2==0.1.0
+google-auth-oauthlib==0.7.1
+googleapis-common-protos==1.57.0
+greenlet==2.0.1
+hexbytes==0.3.0
+httplib2==0.21.0
+idna==3.4
+iniconfig==1.1.1
+install==1.3.5
+ipfshttpclient==0.7.0
+ipykernel==6.19.2
+ipython==8.7.0
+jedi==0.18.2
+jmespath==1.0.1
+joblib==1.2.0
+jsonc-parser==1.1.5
+jsonschema==3.2.0
+jupyter_client==7.4.8
+jupyter_core==5.1.0
+lru-dict==1.1.8
+marshmallow==3.19.0
+marshmallow-enum==1.5.1
+matplotlib-inline==0.1.6
+multiaddr==0.0.9
+multidict==6.0.2
+mypy-extensions==0.4.3
+near-api-py==0.1.0
+near-lake-framework==0.0.7
+nest-asyncio==1.5.6
+netaddr==0.8.0
+nltk==3.7
+numpy==1.23.5
+oauth2client==4.1.3
+oauthlib==3.2.2
+packaging==21.3
+pandas==1.5.1
+parsimonious==0.8.1
+parso==0.8.3
+pexpect==4.8.0
+pickleshare==0.7.5
+platformdirs==2.6.0
+pluggy==1.0.0
+prompt-toolkit==3.0.36
+protobuf==3.20.3
+psutil==5.9.4
+ptyprocess==0.7.0
+pure-eval==0.2.2
+py==1.11.0
+pyasn1==0.4.8
+pyasn1-modules==0.2.8
+pycryptodome==3.15.0
+Pygments==2.13.0
+pyparsing==3.0.9
+pyrsistent==0.19.2
+pyswip==0.2.10
+pytest==6.2.5
+pytest-env==0.6.2
+python-dateutil==2.8.2
+python-dotenv==0.21.0
+pytz==2022.6
+pyzmq==24.0.1
+regex==2022.10.31
+requests==2.28.1
+requests-oauthlib==1.3.1
+rlp==2.0.1
+rsa==4.9
+semantic-version==2.10.0
+six==1.16.0
+SQLAlchemy==1.4.44
+stack-data==0.6.2
+toml==0.10.2
+tomli==2.0.1
+toolz==0.12.0
+tornado==6.2
+tqdm==4.64.1
+traitlets==5.7.0
+typing-inspect==0.8.0
+typing_extensions==4.4.0
+uritemplate==4.1.1
+urllib3==1.26.12
+varint==1.0.2
+vyper==0.3.7
+wcwidth==0.2.5
+web3==5.23.0
+websockets==9.1
+wrapt==1.14.1
+yarl==1.8.1
+
+'''
+'''--- validate.py ---
+import math
+import os
+import numpy as np
+import pandas as pd
+import time
+import datetime
+
+No_Validators = 26
+
+def validate_historical_file():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    path = f"{base_dir}/data/near_historical.csv"
+    df_historical= pd.read_csv(path)
+
+    df_historical = df_historical[df_historical['epoch_height'] >= 1660]
+    df_historical.reset_index(drop=True, inplace=True)
+
+    df_output = pd.DataFrame(columns = ['Epoch Number', 'Validator Name', 'Stake', 'Block Producer', 'blocks_prod_ratio', 'chunks_prod_ratio','UptimePCT', 'Uptime', 'Actual Rewards', 'Expected Rewards', 'Realized APY', 'Expected APY', 'Absolute Difference in Rewards', 'Absolute Difference in APY', '% Difference in Rewards', 'Rewards Method Used'],
+                            index = range(No_Validators))
+    df_outputHist = pd.DataFrame(columns = ['Epoch Number', 'Validator Name', 'Stake', 'Block Producer', 'blocks_prod_ratio', 'chunks_prod_ratio','UptimePCT', 'Uptime', 'Actual Rewards', 'Expected Rewards', 'Realized APY', 'Expected APY',
+                                            'Absolute Difference in Rewards', 'Absolute Difference in APY', '% Difference in Rewards'])
+
+    for row in range (2, len(df_historical)):
+    # Constants from Network
+        totalStake                          = float(df_historical['total_staked'][row-2])*1E-24
+        totalSupply                         = float(df_historical['total_supply'][row-2])*1E-24
+        Block_time_empirical                = float(df_historical['block_time_empirical'][row-2]) 
+        ONLINE_THRESHOLD_MIN                = float(df_historical['ONLINE_THRESHOLD_MIN'][row])
+        ONLINE_THRESHOLD_MAX                = float(df_historical['ONLINE_THRESHOLD_MAX'][row])   
+        TREASURY_PCT                        = 0.1
+        EPOCHS_PER_YEAR                     = float(df_historical['EPOCHS_A_YEAR'][row])
+        EPOCH_LENGTH                        = float(df_historical['EPOCH_LENGTH'][row])
+        REWARD_PCT_PER_YEAR                 = 0.05
+        BLOCK_PRODUCER_KICKOUT_THRESHOLD    = float(df_historical['BLOCK_PRODUCER_KICKOUT_THRESHOLD'][row])
+        CHUNK_PRODUCER_KICKOUT_THRESHOLD    = float(df_historical['CHUNK_PRODUCER_KICKOUT_THRESHOLD'][row])
+        E_blockTime                         = float(df_historical['BLOCK_TIME_TARGET'][row])
+
+    # Parameters to be varied by validator
+        for i in range(No_Validators):
+            df_output['Validator Name'][i]                   = df_historical[f'val_{i}_name'][row]
+            df_output['Epoch Number'][i]                     = df_historical['epoch_height'][row]   
+            df_output['Stake'][i]                            = float(df_historical[f'val_{i}_sum_stake'][row-2])*1E-24
+
+            num_produced_blocks                = float(df_historical[f'val_{i}_produced_blocks'][row-2])
+            num_expected_blocks                = float(df_historical[f'val_{i}_expected_blocks'][row-2])
+            num_produced_chunks                = float(df_historical[f'val_{i}_produced_chunks'][row-2])
+            num_expected_chunks                = float(df_historical[f'val_{i}_expected_chunks'][row-2])
+
+            if num_expected_blocks == 0 and num_expected_chunks == 0:
+                df_output['Block Producer'][i] = None
+                uptime_Pct_v = 0
+                blocks_prod_ratio = 0
+                chunks_prod_ratio = 0
+            elif num_expected_blocks == 0:
+                df_output['Block Producer'][i] = 0
+                if num_produced_chunks/num_expected_chunks < CHUNK_PRODUCER_KICKOUT_THRESHOLD/100:
+                    uptime_Pct_v = 0
+                    blocks_prod_ratio = 0
+                    chunks_prod_ratio = num_produced_chunks/num_expected_chunks
+                else:  
+                    uptime_Pct_v = num_produced_chunks/num_expected_chunks
+                    blocks_prod_ratio = 0
+                    chunks_prod_ratio = num_produced_chunks/num_expected_chunks
+            elif num_produced_blocks/num_expected_blocks < BLOCK_PRODUCER_KICKOUT_THRESHOLD/100 or num_produced_chunks/num_expected_chunks < CHUNK_PRODUCER_KICKOUT_THRESHOLD/100:
+                df_output['Block Producer'][i] = 1
+                uptime_Pct_v = 0
+                blocks_prod_ratio = num_produced_blocks/num_expected_blocks
+                chunks_prod_ratio = num_produced_chunks/num_expected_chunks
+            else:
+                df_output['Block Producer'][i] = 1
+                uptime_Pct_v = (num_produced_blocks/num_expected_blocks + num_produced_chunks/num_expected_chunks)/2
+                blocks_prod_ratio = num_produced_blocks/num_expected_blocks
+                chunks_prod_ratio = num_produced_chunks/num_expected_chunks
+
+            df_output['blocks_prod_ratio'][i] = blocks_prod_ratio
+            df_output['chunks_prod_ratio'][i] = chunks_prod_ratio
+            df_output['UptimePCT'][i]         = uptime_Pct_v
+
+            uptime_v                          = min(1,max(0,(uptime_Pct_v-ONLINE_THRESHOLD_MIN) / (ONLINE_THRESHOLD_MAX-ONLINE_THRESHOLD_MIN)))
+            df_output['Uptime'][i]            = uptime_v
+
+            E_epochReward           = totalSupply * ( REWARD_PCT_PER_YEAR/EPOCHS_PER_YEAR) *Block_time_empirical/E_blockTime
+            E_totalValidatorReward  = (1-TREASURY_PCT)*E_epochReward
+            E_validator             = uptime_v * E_totalValidatorReward * df_output['Stake'][i]/totalStake
+
+            E_APY                      = (1+E_validator/df_output['Stake'][i])**(EPOCHS_PER_YEAR*E_blockTime/Block_time_empirical)-1 # POOR MODEL; SHOULD LOOP THROUGH YEAR
+                
+            unstaked_amount           = float(df_historical[f'val_{i}_unstaked_amount'][row-2])
+            added_stake               = float(df_historical[f'val_{i}_added_stake'][row-2])
+            stake_diff                = float(df_historical[f'val_{i}_total_rewards_v2'][row])
+            actual_rewards            = (stake_diff - ( added_stake - unstaked_amount))/1e24
+
+            Realized_APY              = (1+actual_rewards/df_output['Stake'][i])**(EPOCHS_PER_YEAR*E_blockTime/Block_time_empirical)-1 
+            method_used_for_rewards   = 2
+
+            df_output['Actual Rewards'][i]   = actual_rewards 
+            df_output['Expected Rewards'][i] = E_validator
+
+            if float(df_output['Actual Rewards'][i]) != 0:
+                pct_diff = (E_validator - float(df_output['Actual Rewards'][i])) / float(df_output['Actual Rewards'][i]) *100
+                df_output['% Difference in Rewards'][i] = round(pct_diff, 2)
+            else:
+                df_output['% Difference in Rewards'][i] = 'NaN'
+
+            df_output['Expected APY'][i]                   = E_APY*100
+            df_output['Realized APY'][i]                   = Realized_APY*100    
+            df_output['Absolute Difference in Rewards'][i] = E_validator - float(df_output['Actual Rewards'][i])
+            df_output['Absolute Difference in APY'][i]     = (df_output['Expected APY'][i]  -   df_output['Realized APY'][i])
+            df_output['Rewards Method Used'][i]            = method_used_for_rewards
+        df_outputHist = df_outputHist.append(df_output, ignore_index = True)
+        df_outputHist = df_outputHist.loc[(df_outputHist["Validator Name"] != ' ') & (df_outputHist["Stake"] > 0)] 
+
+    df_outputHist.to_csv(f"{base_dir}/data/val_out.csv", index = False)
+
+def create_historical_gds():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    path = f"{base_dir}/data/near_historical.csv"
+    df_historical= pd.read_csv(path)
+
+    df_historical = df_historical[df_historical['epoch_height'] >= 1660]
+    df_historical.reset_index(drop=True, inplace=True)
+    normal_cols = list(df_historical.columns[:16])
+
+    df_ls = []
+    for ind, row in df_historical.iterrows():
+        for val_index in range(No_Validators):
+            new_row = {}
+            for col in normal_cols:
+                new_row[col] = row[col]
+                new_row['Validator Address'] = row[f'val_{val_index}_name']
+
+                new_row['Expected Blocks'] = row[f'val_{val_index}_expected_blocks']
+                new_row['Produced Blocks'] = row[f'val_{val_index}_produced_blocks']
+                new_row['Expected Chunks'] = row[f'val_{val_index}_expected_chunks']
+                new_row['Produced Chunks'] = row[f'val_{val_index}_produced_chunks']
+                new_row['Is Slashed'] = row[f'val_{val_index}_is_slashed']
+                if new_row['Is Slashed'] == 1:
+                    print("SLASHED")
+            
+                try:
+                    new_row['Total Stake'] = int(row[f'val_{val_index}_sum_stake'])//1e24
+                except:
+                    new_row['Total Stake'] = 0
+                
+                try:
+                    new_row['Stake Added in Epoch'] = int(row[f'val_{val_index}_added_stake'])//1e24
+                except:
+                    new_row['Stake Added in Epoch'] = 0
+            
+                try:
+                    new_row['Stake Removed in Epoch'] = int(row[f'val_{val_index}_unstaked_amount'])//1e24
+                except:
+                    new_row['Stake Removed in Epoch'] = 0
+                
+                new_row['Commission'] = row[f'val_{val_index}_commission']
+            df_ls.append(new_row)
+
+    path = f"{base_dir}/data/near_historical_gds.csv"
+
+    # Added by Dave. Is the stake condition ok?
+    near_historical_gds = pd.DataFrame(df_ls)
+    near_historical_gds = near_historical_gds.loc[(near_historical_gds["Validator Address"] != ' ') & (near_historical_gds["Total Stake"] > 0)] 
+
+    pd.DataFrame(near_historical_gds).to_csv(path, index=False)
+
+if __name__ == "__main__":
+    validate_historical_file()
+    create_historical_gds()
+'''

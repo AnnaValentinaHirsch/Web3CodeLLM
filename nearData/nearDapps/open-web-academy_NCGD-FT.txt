@@ -1,0 +1,993 @@
+*GitHub Repository "open-web-academy/NCGD-FT"*
+
+'''--- Cargo.toml ---
+[package]
+name = "example-token"
+version = "0.1.0"
+edition = "2018"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde = { version = "*", features = ["derive"] }
+serde_json = "*"
+near-sdk = { git = "https://github.com/near/near-sdk-rs" } 
+near-contract-standards = { git = "https://github.com/near/near-sdk-rs" }
+uint = { version = "0.9.0", default-features = false }
+
+[dev-dependencies]
+near-primitives = { git = "https://github.com/nearprotocol/nearcore.git" }
+
+'''
+'''--- README.md ---
+### Example-Token
+
+ID=dev-1653521107679-88908214949697
+
+Inicializar contrato
+
+    near call $ID init_contract '{"owner_id": "yairnava.testnet"}' --accountId $ID
+
+Obtener propietario del contrato
+    
+    near view $ID get_owner_id
+
+Cambiar propietario del contrato
+
+    near call $ID set_owner_id '{"owner_id": "yairnh.testnet"}' --accountId yairnava.testnet
+
+Obtener lista de mineros
+    
+    near view $ID get_minters
+
+Agregar minero
+
+    near call $ID add_minter '{"account_id": "yairnh.testnet"}' --accountId yairnava.testnet
+
+Remover minero
+
+    near call $ID remove_minter '{"account_id": "yairnh.testnet"}' --accountId yairnava.testnet
+
+Minar FT Token
+
+    near call $ID mint '{"account_id": "yairnava.testnet", "amount" : "100000000000000000000000000000000"}' --accountId yairnava.testnet
+
+Obtener balance total de STRW-Token
+    
+    near view $ID ft_total_supply
+
+Obtener balance de una cuenta de STRW-Token
+
+    near view $ID ft_balance_of '{"account_id": "yairnava.testnet"}'
+
+Mostrar STRW-Token en Wallet
+
+    near call $ID ft_transfer '{"receiver_id": "yairnava.testnet", "amount":"0", "memo":""}' --accountId yairnava.testnet
+'''
+'''--- build.sh ---
+#!/bin/bash
+set -e
+cd "`dirname $0`"
+source flags.sh
+cargo build --all --target wasm32-unknown-unknown --release
+
+if [ ! -d res/ ];
+then
+mkdir res
+fi
+
+cp target/wasm32-unknown-unknown/release/example_token.wasm ./res/
+
+echo "¿Quieres desplegar el contrato de example tokens?"
+select yn in "Si" "No"; do
+    case $yn in
+        Si ) near dev-deploy --wasmFile res/example_token.wasm; break;;
+        No ) exit;;
+    esac
+done
+'''
+'''--- flags.sh ---
+#!/bin/bash
+
+if [ -z "$KEEP_NAMES" ]; then
+  export RUSTFLAGS='-C link-arg=-s'
+else
+  export RUSTFLAGS=''
+fi
+'''
+'''--- src/internal.rs ---
+use near_sdk::json_types::{ValidAccountId, U128};
+use near_sdk::{AccountId, Balance, PromiseResult};
+
+use crate::*;
+
+const ONE_NEAR: Balance = 1_000_000_000_000_000_000_000_000;
+pub const MIN_TRANSFER_UNIT: u128 = 1000; // to make sibyl attacks more expensive in terms of tokens
+const DATA_IMAGE_SVG_NEAR_ICON: &str = "";
+
+pub fn default_ft_metadata() -> FungibleTokenMetadata {
+    FungibleTokenMetadata {
+        spec: FT_METADATA_SPEC.to_string(),
+        name: "Example Token".to_string(),
+        symbol: "ET".to_string(),
+        icon: Some(DATA_IMAGE_SVG_NEAR_ICON.to_string()),
+        reference: Some("https://metapool.app".into()),
+        reference_hash: None,
+        decimals: 24,
+    }
+}
+
+impl MetaToken {
+    pub fn assert_owner_calling(&self) {
+        assert!(
+            env::predecessor_account_id() == self.owner_id,
+            "can only be called by the owner"
+        );
+    }
+
+    pub fn assert_minter(&self, account_id: String) {
+        assert!(self.minters.contains(&account_id), "not a minter");
+    }
+
+    //get stored metadata or default
+    pub fn internal_get_ft_metadata(&self) -> FungibleTokenMetadata {
+        self.metadata.get().unwrap_or(default_ft_metadata())
+    }
+
+    pub fn internal_unwrap_balance_of(&self, account_id: &AccountId) -> Balance {
+        self.accounts.get(&account_id).unwrap_or(0)
+    }
+
+    pub fn mint_into(&mut self, account_id: &AccountId, amount: Balance) {
+        let balance = self.internal_unwrap_balance_of(account_id);
+        self.internal_update_account(&account_id, balance + amount);
+        self.total_supply += amount;
+    }
+
+    pub fn internal_burn(&mut self, account_id: &AccountId, amount: u128) {
+        let balance = self.internal_unwrap_balance_of(account_id);
+        assert!(balance >= amount);
+        self.internal_update_account(&account_id, balance - amount);
+        assert!(self.total_supply >= amount);
+        self.total_supply -= amount;
+    }
+
+    pub fn internal_transfer(
+        &mut self,
+        sender_id: &AccountId,
+        receiver_id: &AccountId,
+        amount: Balance,
+        memo: Option<String>,
+    ) {
+        assert_ne!(
+            sender_id, receiver_id,
+            "Sender and receiver should be different"
+        );
+
+        if self.locked_until_nano > 0 && env::block_timestamp() < self.locked_until_nano {
+            panic!(
+                "transfers are locked until unix timestamp {}",
+                self.locked_until_nano / NANOSECONDS
+            );
+        }
+
+        let sender_balance = self.internal_unwrap_balance_of(sender_id);
+        assert!(
+            amount == sender_balance || amount > ONE_NEAR / MIN_TRANSFER_UNIT,
+            "The amount should be at least 1/{}",
+            MIN_TRANSFER_UNIT
+        );
+
+        // remove from sender
+        let sender_balance = self.internal_unwrap_balance_of(sender_id);
+        assert!(
+            amount <= sender_balance,
+            "The account doesn't have enough balance {}",
+            sender_balance
+        );
+        let balance_left = sender_balance - amount;
+        self.internal_update_account(&sender_id, balance_left);
+
+        // check vesting
+        if self.vested_count > 0 {
+            match self.vested.get(&sender_id) {
+                Some(vesting) => {
+                    //compute locked
+                    let locked = vesting.compute_amount_locked();
+                    if locked == 0 {
+                        //vesting is complete. remove vesting lock
+                        self.vested.remove(&sender_id);
+                        self.vested_count -= 1;
+                    } else if balance_left < locked {
+                        panic!("Vested account, balance can not go lower than {}", locked);
+                    }
+                }
+                None => {}
+            }
+        }
+
+        // add to receiver
+        let receiver_balance = self.internal_unwrap_balance_of(receiver_id);
+        self.internal_update_account(&receiver_id, receiver_balance + amount);
+
+        log!("Transfer {} from {} to {}", amount, sender_id, receiver_id);
+        if let Some(memo) = memo {
+            log!("Memo: {}", memo);
+        }
+    }
+
+    /// Inner method to save the given account for a given account ID.
+    pub fn internal_update_account(&mut self, account_id: &AccountId, balance: u128) {
+        self.accounts.insert(account_id, &balance); //insert_or_update
+    }
+
+    // TODO rename
+    pub fn int_ft_resolve_transfer(
+        &mut self,
+        sender_id: &AccountId,
+        receiver_id: ValidAccountId,
+        amount: U128,
+    ) -> (u128, u128) {
+        let sender_id: AccountId = sender_id.into();
+        let receiver_id: AccountId = receiver_id.into();
+        let amount: Balance = amount.into();
+
+        // Get the unused amount from the `ft_on_transfer` call result.
+        let unused_amount = match env::promise_result(0) {
+            PromiseResult::NotReady => unreachable!(),
+            PromiseResult::Successful(value) => {
+                if let Ok(unused_amount) = near_sdk::serde_json::from_slice::<U128>(&value) {
+                    std::cmp::min(amount, unused_amount.0)
+                } else {
+                    amount
+                }
+            }
+            PromiseResult::Failed => amount,
+        };
+
+        if unused_amount > 0 {
+            let receiver_balance = self.accounts.get(&receiver_id).unwrap_or(0);
+            if receiver_balance > 0 {
+                let refund_amount = std::cmp::min(receiver_balance, unused_amount);
+                self.accounts
+                    .insert(&receiver_id, &(receiver_balance - refund_amount));
+
+                if let Some(sender_balance) = self.accounts.get(&sender_id) {
+                    self.accounts
+                        .insert(&sender_id, &(sender_balance + refund_amount));
+                    log!(
+                        "Refund {} from {} to {}",
+                        refund_amount,
+                        receiver_id,
+                        sender_id
+                    );
+                    return (amount - refund_amount, 0);
+                } else {
+                    // Sender's account was deleted, so we need to burn tokens.
+                    self.total_supply -= refund_amount;
+                    log!("The account of the sender was deleted");
+                    return (amount, refund_amount);
+                }
+            }
+        }
+        (amount, 0)
+    }
+}
+
+'''
+'''--- src/lib.rs ---
+use near_sdk::collections::LookupMap;
+use near_contract_standards::fungible_token::{
+    core::FungibleTokenCore,
+    metadata::{FungibleTokenMetadata, FungibleTokenMetadataProvider, FT_METADATA_SPEC},
+    resolver::FungibleTokenResolver,
+};
+
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::LazyOption;
+use near_sdk::json_types::{ValidAccountId, U128};
+use near_sdk::{
+    assert_one_yocto, env, ext_contract, log, near_bindgen, AccountId, Balance, Gas,
+    Promise, PanicOnDefault, PromiseOrValue, serde_json::json
+};
+use std::str;
+
+//-- Sputnik DAO remote upgrade requires BLOCKCHAIN_INTERFACE low-level access
+#[cfg(target_arch = "wasm32")]
+use near_sdk::env::BLOCKCHAIN_INTERFACE;
+
+const TGAS: Gas = 1_000_000_000_000;
+const GAS_FOR_RESOLVE_TRANSFER: Gas = 5 * TGAS;
+const GAS_FOR_FT_TRANSFER_CALL: Gas = 25 * TGAS;
+const NO_DEPOSIT: Balance = 0;
+
+// nanoseconds in a second
+const NANOSECONDS: u64 = 1_000_000_000;
+
+type U128String = U128;
+
+near_sdk::setup_alloc!();
+
+mod internal;
+mod migrations;
+mod storage_nep_145;
+mod util;
+mod vesting;
+
+use util::*;
+use vesting::{VestingRecord, VestingRecordJSON};
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct MetaToken {
+    metadata: LazyOption<FungibleTokenMetadata>,
+
+    pub accounts: LookupMap<AccountId, Balance>,
+
+    pub owner_id: AccountId,
+
+    pub minters: Vec<AccountId>,
+
+    pub total_supply: Balance,
+
+    /// transfers are locked until this moment
+    pub locked_until_nano: TimestampNano,
+
+    pub vested: LookupMap<AccountId, VestingRecord>,
+    pub vested_count: u32
+}
+
+#[near_bindgen]
+impl MetaToken {
+    /// Initializes the contract with the given total supply owned by the given `owner_id`.
+    #[init]
+    pub fn init_contract(owner_id: AccountId) -> Self {
+        //validate default metadata
+        // internal::default_ft_metadata().assert_valid();
+        Self {
+            owner_id: owner_id.clone(),
+            metadata: LazyOption::new(b"m".to_vec(), None),
+            accounts: LookupMap::new(b"a".to_vec()),
+            minters: vec![owner_id],
+            total_supply: 0,
+            locked_until_nano: 0,
+            vested: LookupMap::new(b"v".to_vec()),
+            vested_count: 0
+        }
+    }
+
+    // Obtener dueño del contrato
+    pub fn get_owner_id(&self) -> AccountId {
+        return self.owner_id.clone();
+    }
+    
+    // Cambiar dueño del contrato
+    pub fn set_owner_id(&mut self, owner_id: AccountId) {
+        self.assert_owner_calling();
+        assert!(env::is_valid_account_id(owner_id.as_bytes()));
+        self.owner_id = owner_id.into();
+    }
+    
+    pub fn set_locked_until(&mut self, unix_timestamp: u32) {
+        self.assert_owner_calling();
+        self.locked_until_nano = unix_timestamp as u64 * NANOSECONDS;
+    }
+
+    // Minar tokens
+    pub fn mint(&mut self, account_id: &AccountId, amount: U128String) {
+        self.assert_minter(env::predecessor_account_id());
+        self.mint_into(account_id, amount.0);
+    }
+
+    // Agregar nuevo minero
+    pub fn add_minter(&mut self, account_id: AccountId) -> String {
+        self.assert_owner_calling();
+        if let Some(_) = self.minters.iter().position(|x| *x == account_id) {
+            //found
+            panic!("already in the list");
+        }
+        self.minters.push(account_id);
+        "Minero agregado".to_string()
+    }
+
+    // Remover minero
+    pub fn remove_minter(&mut self, account_id: &AccountId) -> String {
+        self.assert_owner_calling();
+        if let Some(inx) = self.minters.iter().position(|x| x == account_id) {
+            //found
+            let _removed = self.minters.swap_remove(inx);
+        } else {
+            panic!("not a minter")
+        }
+        "Minero removido".to_string()
+    }
+
+    // Consultar lista de mineros
+    pub fn get_minters(self) -> Vec<AccountId> {
+        self.minters
+    }
+
+    /// sets metadata_reference
+    #[payable]
+    pub fn set_metadata_reference(&mut self, reference: String, reference_hash: String) {
+        assert_one_yocto();
+        self.assert_owner_calling();
+        let mut m = self.internal_get_ft_metadata();
+        m.reference = Some(reference);
+        m.reference_hash = Some(reference_hash.as_bytes().to_vec().into());
+        m.assert_valid();
+        self.metadata.set(&m);
+    }
+
+    //-----------
+    //-- Vesting functions in the contract
+    //-----------
+    /// Get the amount of tokens that are locked in this account due to lockup or vesting.
+    pub fn get_locked_amount(&self, account: AccountId) -> U128String {
+        match self.vested.get(&account) {
+            Some(vesting) => vesting.compute_amount_locked().into(),
+            None => 0.into(),
+        }
+    }
+
+    /// Get vesting information
+    pub fn get_vesting_info(&self, account_id: AccountId) -> VestingRecordJSON {
+        match self.vested.get(&account_id) {
+            Some(vesting) => {
+                log!("{}", &account_id);
+                return VestingRecordJSON {
+                    amount: vesting.amount.into(),
+                    locked: vesting.compute_amount_locked().into(),
+                    locked_until_timestamp: (vesting.locked_until_timestamp_nano / NANOSECONDS)
+                        as u32,
+                    linear_start_timestamp: (vesting.linear_start_timestamp_nano / NANOSECONDS)
+                        as u32,
+                    linear_end_timestamp: (vesting.linear_end_timestamp_nano / NANOSECONDS) as u32,
+                }
+            }
+            _ => panic!("no vesting for account {}", account_id),
+        };
+    }
+
+    //minters can mint with vesting/locked periods
+    #[payable]
+    pub fn mint_vested(
+        &mut self,
+        account_id: &AccountId,
+        amount: U128String,
+        locked_until_timestamp: u64,
+        linear_start_timestamp: u64,
+        linear_end_timestamp: u64,
+    ) {
+        self.mint(account_id, amount);
+        let record = VestingRecord::new(
+            amount.into(),
+            locked_until_timestamp as u64 * NANOSECONDS,
+            linear_start_timestamp as u64 * NANOSECONDS,
+            linear_end_timestamp as u64 * NANOSECONDS,
+        );
+        match self.vested.insert(&account_id, &record) {
+            Some(previous) => {
+                if previous.compute_amount_locked()>0 {
+                    panic!("account already vested with locked amount")
+                }
+            },
+            None => self.vested_count += 1,
+        }
+    }
+
+    #[payable]
+    /// terminate vesting before is over
+    /// burn the tokens
+    pub fn terminate_vesting(&mut self, account_id: &AccountId) {
+        assert_one_yocto();
+        self.assert_owner_calling();
+        match self.vested.get(&account_id) {
+            Some(vesting) => {
+                let locked_amount = vesting.compute_amount_locked();
+                if locked_amount == 0 {
+                    panic!("locked_amount is zero")
+                }
+                self.internal_burn(account_id, locked_amount);
+                self.vested.remove(&account_id);
+                self.vested_count -= 1;
+                log!(
+                    "{} vesting terminated, {} burned",
+                    account_id,
+                    locked_amount
+                );
+            }
+            None => panic!("account not vested"),
+        }
+    }
+
+    /// return how many vested accounts are still active
+    pub fn vested_accounts_count(&self) -> u32 {
+        self.vested_count
+    }
+
+    //---------------------------------------------------------------------------
+    /// Sputnik DAO remote-upgrade receiver
+    /// can be called by a remote-upgrade proposal
+    ///
+    #[cfg(target_arch = "wasm32")]
+    pub fn upgrade(self) {
+        assert!(env::predecessor_account_id() == self.owner_id);
+        //input is code:<Vec<u8> on REGISTER 0
+        //log!("bytes.length {}", code.unwrap().len());
+        const GAS_FOR_UPGRADE: u64 = 10 * TGAS; //gas occupied by this fn
+        const BLOCKCHAIN_INTERFACE_NOT_SET_ERR: &str = "Blockchain interface not set.";
+        //after upgrade we call *pub fn migrate()* on the NEW CODE
+        let current_id = env::current_account_id().into_bytes();
+        let migrate_method_name = "migrate".as_bytes().to_vec();
+        let attached_gas = env::prepaid_gas() - env::used_gas() - GAS_FOR_UPGRADE;
+        unsafe {
+            BLOCKCHAIN_INTERFACE.with(|b| {
+                // Load input (new contract code) into register 0
+                b.borrow()
+                    .as_ref()
+                    .expect(BLOCKCHAIN_INTERFACE_NOT_SET_ERR)
+                    .input(0);
+
+                //prepare self-call promise
+                let promise_id = b
+                    .borrow()
+                    .as_ref()
+                    .expect(BLOCKCHAIN_INTERFACE_NOT_SET_ERR)
+                    .promise_batch_create(current_id.len() as _, current_id.as_ptr() as _);
+
+                //1st action, deploy/upgrade code (takes code from register 0)
+                b.borrow()
+                    .as_ref()
+                    .expect(BLOCKCHAIN_INTERFACE_NOT_SET_ERR)
+                    .promise_batch_action_deploy_contract(promise_id, u64::MAX as _, 0);
+
+                //2nd action, schedule a call to "migrate()".
+                //Will execute on the **new code**
+                b.borrow()
+                    .as_ref()
+                    .expect(BLOCKCHAIN_INTERFACE_NOT_SET_ERR)
+                    .promise_batch_action_function_call(
+                        promise_id,
+                        migrate_method_name.len() as _,
+                        migrate_method_name.as_ptr() as _,
+                        0 as _,
+                        0 as _,
+                        0 as _,
+                        attached_gas,
+                    );
+            });
+        }
+    }
+}
+
+//----------------------------------------------
+// ft metadata standard
+// Q: Is ignoring storage costs the only reason for the re-implementation?
+// A: making the user manage storage costs adds too much friction to account creation
+// it's better to impede sybil attacks by other means
+#[near_bindgen]
+impl FungibleTokenCore for MetaToken {
+    fn ft_transfer(&mut self, receiver_id: ValidAccountId, amount: U128, memo: Option<String>) {
+        let sender_id = env::predecessor_account_id();
+        let amount: Balance = amount.into();
+        self.internal_transfer(&sender_id, receiver_id.as_ref(), amount, memo);
+    }
+
+    #[payable]
+    fn ft_transfer_call(
+        &mut self,
+        receiver_id: ValidAccountId,
+        amount: U128,
+        memo: Option<String>,
+        msg: String,
+    ) -> PromiseOrValue<U128> {
+        assert_one_yocto();
+        let sender_id = env::predecessor_account_id();
+        let amount: Balance = amount.into();
+        self.internal_transfer(&sender_id, receiver_id.as_ref(), amount, memo);
+        // Initiating receiver's call and the callback
+        // ext_fungible_token_receiver::ft_on_transfer(
+        ext_ft_receiver::ft_on_transfer(
+            sender_id.clone(),
+            amount.into(),
+            msg,
+            receiver_id.as_ref(),
+            NO_DEPOSIT,
+            env::prepaid_gas() - GAS_FOR_FT_TRANSFER_CALL - GAS_FOR_RESOLVE_TRANSFER, // assign rest of gas to callback
+        )
+        .then(ext_self::ft_resolve_transfer(
+            sender_id,
+            receiver_id.into(),
+            amount.into(),
+            &env::current_account_id(),
+            NO_DEPOSIT,
+            GAS_FOR_RESOLVE_TRANSFER,
+        ))
+        .into()
+    }
+
+    fn ft_total_supply(&self) -> U128 {
+        self.total_supply.into()
+    }
+
+    fn ft_balance_of(&self, account_id: ValidAccountId) -> U128 {
+        self.accounts.get(account_id.as_ref()).unwrap_or(0).into()
+    }
+}
+
+#[near_bindgen]
+impl FungibleTokenResolver for MetaToken {
+    /// Returns the amount of burned tokens in a corner case when the sender
+    /// has deleted (unregistered) their account while the `ft_transfer_call` was still in flight.
+    /// Returns (Used token amount, Burned token amount)
+    #[private]
+    fn ft_resolve_transfer(
+        &mut self,
+        sender_id: ValidAccountId,
+        receiver_id: ValidAccountId,
+        amount: U128,
+    ) -> U128 {
+        let sender_id: AccountId = sender_id.into();
+        let (used_amount, burned_amount) =
+            self.int_ft_resolve_transfer(&sender_id, receiver_id, amount);
+        if burned_amount > 0 {
+            log!("{} tokens burned", burned_amount);
+        }
+        return used_amount.into();
+    }
+}
+
+#[near_bindgen]
+impl FungibleTokenMetadataProvider for MetaToken {
+    fn ft_metadata(&self) -> FungibleTokenMetadata {
+        self.internal_get_ft_metadata()
+    }
+}
+
+#[ext_contract(ext_ft_receiver)]
+pub trait FungibleTokenReceiver {
+    fn ft_on_transfer(
+        &mut self,
+        sender_id: AccountId,
+        amount: U128,
+        msg: String,
+    ) -> PromiseOrValue<U128>;
+}
+
+#[ext_contract(ext_self)]
+trait FungibleTokenResolver {
+    fn ft_resolve_transfer(
+        &mut self,
+        sender_id: AccountId,
+        receiver_id: AccountId,
+        amount: U128,
+    ) -> U128;
+}
+
+'''
+'''--- src/migrations.rs ---
+//-----------------------------
+//-----------------------------
+//contract main state migration
+//-----------------------------
+
+use near_contract_standards::fungible_token::metadata::FungibleTokenMetadata;
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::LazyOption;
+use near_sdk::collections::LookupMap;
+use near_sdk::{env, near_bindgen, AccountId, Balance};
+
+//---------------------------------------------------
+//  PREVIOUS Main Contract State for state migrations
+//---------------------------------------------------
+// uncomment when state migration is required on upgrade
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct PrevContractStateStruct {
+    metadata: LazyOption<FungibleTokenMetadata>,
+    pub accounts: LookupMap<AccountId, Balance>,
+    pub owner_id: AccountId,
+    pub minters: Vec<AccountId>,
+    pub total_supply: Balance,
+}
+
+use crate::MetaToken;
+use crate::MetaTokenContract;
+
+#[near_bindgen]
+impl MetaToken {
+    //-----------------
+    //-- migration called after code upgrade
+    ///  For next version upgrades, change this function.
+    //-- executed after upgrade to NEW CODE
+    //-----------------
+    /// This fn WILL be called by this contract from `pub fn upgrade` (started from DAO)
+    /// Originally a **NOOP implementation. KEEP IT if you haven't changed contract state.**
+    /// If you have changed state, you need to implement migration from old state (keep the old struct with different name to deserialize it first).
+    ///
+    #[init(ignore_state)] //do not auto-load state before this function
+    pub fn migrate() -> Self {
+        // read state with OLD struct
+        // uncomment when state migration is required on upgrade
+        //let old: migrations::MetaPoolPrevStateStruct = env::state_read().expect("Old state doesn't exist");
+        let old: PrevContractStateStruct = env::state_read().expect("Old state doesn't exist");
+
+        // can only be called by this same contract (it's called from fn upgrade())
+        assert_eq!(
+            &env::predecessor_account_id(),
+            &env::current_account_id(),
+            "Can only be called by this contract"
+        );
+
+        // uncomment when state migration is required on upgrade
+        // NOOP mode, returns this struct that gets stored as contract state
+        //return old;
+
+        // uncomment when state migration is required on upgrade
+        //
+        // Create the new contract state using the data from the old contract state.
+        // returns this struct that gets stored as contract state
+        return Self {
+            metadata: old.metadata,
+            accounts: old.accounts,
+            owner_id: old.owner_id,
+            minters: old.minters,
+            total_supply: old.total_supply,
+            // new fields
+            locked_until_nano: 0,
+            vested: LookupMap::new(b"v".to_vec()),
+            vested_count: 0
+        };
+    }
+}
+
+'''
+'''--- src/storage_nep_145.rs ---
+use crate::*;
+use near_contract_standards::storage_management::{
+    StorageBalance, StorageBalanceBounds, StorageManagement,
+};
+use near_sdk::json_types::{ValidAccountId, U128};
+use near_sdk::{assert_one_yocto, env, log, near_bindgen, AccountId, Balance, Promise};
+
+// The storage size in bytes for one account + some room, just in order to compute required account storage-rent in yoctoNEARS 
+// 3 [1-letter-prefix]+2colons + 64 (acc id) + 16 bytes of u128 (balance) 
+pub const ACCOUNT_STORAGE_BYTES: u128 = 3 + 64 + 16;
+/// 1e19 yoctos per byte, 0.00001 NEAR per byte, so 100 bytes => 0.001 NEAR, 100Kib => 1 NEAR
+/// kept STORAGE_PRICE_PER_BYTE as constant, so people deposit & can retrieve the same amount of NEAR. We cannot depend on env::storage_byte_cost(), we need a constant.
+/// if we use env::storage_byte_cost() instead and the result changes in the future, people will be withdrawing a different amount than they deposited
+pub const STORAGE_PRICE_PER_BYTE: Balance = 10_000_000_000_000_000_000;
+pub const STORAGE_COST : u128 = ACCOUNT_STORAGE_BYTES * STORAGE_PRICE_PER_BYTE;
+
+// We implement the NEP-145 standard. However user can't make additional deposits.
+// User registers an account by attaching `storage_deposit()` of NEAR. Deposits above
+// that amount will be refunded.
+#[near_bindgen]
+impl StorageManagement for MetaToken {
+    /// Registers an account and records the deposit.
+    /// `registration_only` doesn't affect the implementation for vanilla fungible token.
+    #[allow(unused_variables)]
+    #[payable]
+    fn storage_deposit(
+        &mut self,
+        account_id: Option<ValidAccountId>,
+        registration_only: Option<bool>,
+    ) -> StorageBalance {
+        let amount: Balance = env::attached_deposit();
+        let account_id: AccountId = if let Some(a) = account_id {
+            a.into()
+        } else {
+            env::predecessor_account_id()
+        };
+        // check if it is already registered
+        let exists = self.accounts.get(&account_id).is_some();
+        if exists {
+            log!("The account is already registered, refunding the deposit");
+            if amount > 0 {
+                Promise::new(env::predecessor_account_id()).transfer(amount);
+            }
+        } else {
+            let cost = STORAGE_COST;
+            assert!(
+                amount >= cost,
+                "attached deposit: {},  required: {}",
+                amount,
+                cost
+            );
+            self.accounts.insert(&account_id, &0); // register account
+            let refund = amount - cost;
+            if refund > 0 {
+                Promise::new(env::predecessor_account_id()).transfer(refund);
+            }
+        }
+        return storage_balance();
+    }
+
+    // While storage_withdraw normally allows the caller to retrieve `available` balance, the basic
+    // Fungible Token implementation sets storage_balance_bounds.min == storage_balance_bounds.max,
+    // which means available balance will always be 0. So this implementation:
+    // * panics if `amount > 0`
+    // * never transfers Ⓝ to caller
+    // * returns a `storage_balance` struct if `amount` is 0
+    #[payable]
+    fn storage_withdraw(&mut self, amount: Option<U128>) -> StorageBalance {
+        assert_one_yocto();
+        let predecessor_account_id = env::predecessor_account_id();
+        if self.accounts.contains_key(&predecessor_account_id) {
+            match amount {
+                Some(amount) if amount.0 > 0 => {
+                    env::panic(
+                        "The amount is greater than the available storage balance".as_bytes(),
+                    );
+                }
+                _ => storage_balance(),
+            }
+        } else {
+            env::panic(
+                format!("The account {} is not registered", &predecessor_account_id).as_bytes(),
+            );
+        }
+    }
+
+    // Returns `true` iff the account was successfully unregistered.
+    // Returns `false` iff account was not registered before.
+    #[payable]
+    fn storage_unregister(&mut self, force: Option<bool>) -> bool {
+        assert_one_yocto();
+        let account_id = env::predecessor_account_id();
+        let force = force.unwrap_or(false);
+        if let Some(balance) = self.accounts.get(&account_id) {
+            if balance == 0 || force {
+                self.accounts.remove(&account_id);
+                if balance != 0 {
+                    self.total_supply -= balance;
+                    // we add 1 because the function requires 1 yocto payment
+                    Promise::new(account_id.clone()).transfer(STORAGE_COST + 1);
+                }
+                return true;
+            } else {
+                env::panic(
+                    "Can't unregister the account with the positive balance without force"
+                        .as_bytes(),
+                )
+            }
+        } else {
+            log!("The account {} is not registered", &account_id);
+            return false;
+        }
+    }
+
+    fn storage_balance_bounds(&self) -> StorageBalanceBounds {
+        let d = U128::from(STORAGE_COST);
+        StorageBalanceBounds {
+            min: d,
+            max: Some(d),
+        }
+    }
+
+    fn storage_balance_of(&self, account_id: ValidAccountId) -> Option<StorageBalance> {
+        if self.accounts.contains_key(account_id.as_ref()) {
+            Some(storage_balance())
+        } else {
+            None
+        }
+    }
+}
+
+// all accounts have the same cost
+fn storage_balance() -> StorageBalance {
+    StorageBalance {
+        total: U128::from(STORAGE_COST),
+        available: 0.into(),
+    }
+}
+
+'''
+'''--- src/util.rs ---
+use near_sdk::json_types::{U128};
+use uint::construct_uint;
+
+pub type U128String = U128;
+
+/// Raw type for timestamp in nanoseconds
+pub type TimestampNano = u64;
+
+construct_uint! {
+    /// 256-bit unsigned integer.
+    pub struct U256(4);
+}
+
+/// returns amount * numerator/denominator
+pub fn fraction_of(amount: u128, numerator: u128, denominator: u128) -> u128 {
+    return (U256::from(amount) * U256::from(numerator) / U256::from(denominator)).as_u128();
+}
+
+'''
+'''--- src/vesting.rs ---
+use near_sdk::{
+    borsh::{self, BorshDeserialize, BorshSerialize},
+    env,
+    serde::{Deserialize, Serialize},
+};
+
+use crate::util::*;
+
+/// Contains information about vesting schedule.
+#[derive(BorshDeserialize, BorshSerialize, Deserialize, Serialize)]
+#[cfg_attr(feature = "test", derive(Clone, Debug))]
+pub struct VestingRecord {
+    /// amount locked in  the vesting schedule.
+    /// before transferring, vesting is checked and
+    /// if we're before linear_start_timestamp or locked_until_timestamp, locked_amount = amount
+    /// else if we're past the linear_end_timestamp, vesting is removed
+    /// else we're past the linear_start_timestamp and before linear_end_timestamp, a linear locked_amount is computed
+    pub amount: u128,
+    /// Absolute timestamp until the amount is locked in full. This field allows special linear release schedules
+    /// for example 50% at a certain date (locked_until_timestamp+1) and a linear release after that, can be arranged
+    /// by making locked_until_timestamp to sit between linear_start_timestamp and linear_end_timestamp
+    pub locked_until_timestamp_nano: TimestampNano,
+    /// The timestamp in nanosecond when linear release starts
+    pub linear_start_timestamp_nano: TimestampNano,
+    /// The remaining tokens will be released linearly until linear_end_timestamp.
+    pub linear_end_timestamp_nano: TimestampNano,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct VestingRecordJSON {
+    pub amount: U128String,
+    pub locked: U128String,
+    pub locked_until_timestamp: u32,
+    pub linear_start_timestamp: u32,
+    pub linear_end_timestamp: u32,
+}
+
+impl VestingRecord {
+    pub fn new(
+        amount: u128,
+        locked_until_timestamp_nano: TimestampNano,
+        linear_start_timestamp_nano: TimestampNano,
+        linear_end_timestamp_nano: TimestampNano,
+    ) -> Self {
+        assert!(amount > 0, "vesting amount must be > 0");
+        assert!(
+            linear_start_timestamp_nano <= linear_end_timestamp_nano,
+            "vesting: start > end"
+        );
+        assert!(
+            locked_until_timestamp_nano < linear_end_timestamp_nano,
+            "vesting: locked_until_timestamp {} >= end {}",locked_until_timestamp_nano , linear_end_timestamp_nano
+        );
+        Self {
+            amount,
+            locked_until_timestamp_nano,
+            linear_start_timestamp_nano,
+            linear_end_timestamp_nano,
+        }
+    }
+
+    /// Get the amount of tokens that are locked in this account due to vesting or release schedule.
+    pub fn compute_amount_locked(&self) -> u128 {
+        let block_timestamp = env::block_timestamp();
+
+        return if block_timestamp < self.linear_start_timestamp_nano || block_timestamp < self.locked_until_timestamp_nano {
+            // Before the start or before the locked_until date, all is locked
+            self.amount
+        } else if block_timestamp >= self.linear_end_timestamp_nano {
+            // After linear_end_timestamp none is locked
+            0
+        } else {
+            // compute time-left cannot overflow since block_timestamp < linear_end_timestamp
+            let time_left = self.linear_end_timestamp_nano - block_timestamp;
+            // The total time is positive. Checked at the contract initialization.
+            let total_time = self.linear_end_timestamp_nano - self.linear_start_timestamp_nano;
+            // locked amount is linearly reduced until time_left = 0 (linear_end_timestamp)
+            fraction_of(self.amount, time_left as u128, total_time as u128)
+        };
+    }
+}
+
+'''

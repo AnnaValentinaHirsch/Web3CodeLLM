@@ -1,0 +1,2909 @@
+*GitHub Repository "hskang9/aurora-cli-rs"*
+
+'''--- Cargo.toml ---
+[package]
+name = "aurora-cli-rs"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+aurora-engine = { git = "https://github.com/aurora-is-near/aurora-engine.git", tag = "2.7.0", features = ["std"] }
+aurora-engine-precompiles = { git = "https://github.com/aurora-is-near/aurora-engine.git", tag = "2.7.0", features = ["std"] }
+aurora-engine-sdk = { git = "https://github.com/aurora-is-near/aurora-engine.git", tag = "2.7.0", features = ["std"] }
+aurora-engine-transactions = { git = "https://github.com/aurora-is-near/aurora-engine.git", tag = "2.7.0", features = ["std"] }
+aurora-engine-types = { git = "https://github.com/aurora-is-near/aurora-engine.git", tag = "2.7.0", features = ["std", "serde"] }
+base64 = "0.13.0"
+borsh = "0.9.3"
+bs58 = "0.4.0"
+clap = { version = "3.1.6", features = ["derive"] }
+ethabi = "17.1"
+hex = "0.4.3"
+libsecp256k1 = "0.7.0"
+near-crypto = "0.12.0"
+near-jsonrpc-client = "0.3.0"
+near-jsonrpc-primitives = "0.12.0"
+near-primitives = "0.12.0"
+reqwest = { version = "0.11", features = ["json"] }
+rlp = "0.5.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+rand = "0.7"
+
+'''
+'''--- README.md ---
+<p>&nbsp;</p>
+<p align="center">
+<img src="https://raw.githubusercontent.com/hskang9/aurora-cli-rs/main/img/aurora-cli-logo.png" width=500>
+</p>
+
+<p align="center">
+<strong>An instant, zero-config Aurora engine operator</strong>
+</p>
+
+<br/>
+
+## What is Engine?
+
+[Aurora](https://doc.aurora.dev/getting-started/aurora-engine/) is an Ethereum Virtual Machine (EVM) project built on the NEAR Protocol, that provides a solution for developers to deploy their apps on an Ethereum-compatible, high-throughput, scalable and future-safe platform, with low transaction costs for their users. Engine is the Aurora's implementation for it.
+
+## What is Aurora CLI?
+Aurora CLI is a command line interface to bootstrap Aurora engine with rapid speed built with rust.
+
+Aurora CLI comes preconfiguration with opinionated, sensible defaults for standard testing environments. If other projects mention testing on Aurora, they are referring to the settings defined in this repo.
+
+**Aurora CLI has the following advantages over api:**
+
+- :pencil: **Easily modifiable EVM states through terminal**
+- :handshake: **Quick to interact for rapid iterations**
+
+See also prior version [aurora-cli](https://github.com/aurora-is-near/aurora-cli).
+
+## Prerequisites
+- :crab: Rust
+
+## Quickstart
+
+- 📦 Install `aurora-cli-rs` and start interacting with it: 
+    *`cargo install --git https://github.com/aurora-is-near/aurora-cli-rs.git`* 
+- 🔍 Check out what each command is for in the official Aurora [docs](https://doc.aurora.dev/tools/aurora-cli)
+- ✋ Have questions? Ask them at the official Aurora [forum](https://forum.aurora.dev/)
+
+'''
+'''--- default-config.json ---
+{
+    "network": "mainnet",
+    "engine_account_id": "aurora",
+    "aurora_api_key": null,
+    "near_key_path": null,
+    "evm_secret_key": null
+}
+
+'''
+'''--- src/cli/aurora.rs ---
+use crate::{
+    client::{AuroraClient, ClientError},
+    config::Config,
+    utils,
+};
+use aurora_engine_types::{
+    types::{Address, Wei},
+    U256,
+};
+use clap::Subcommand;
+
+#[derive(Subcommand)]
+pub enum Command {
+    Read {
+        #[clap(subcommand)]
+        subcommand: ReadCommand,
+    },
+    Write {
+        #[clap(subcommand)]
+        subcommand: WriteCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ReadCommand {
+    GetResult { tx_hash_hex: String },
+}
+
+#[derive(Subcommand)]
+pub enum WriteCommand {
+    Deploy {
+        input_data_hex: String,
+    },
+    Transfer {
+        #[clap(short, long)]
+        target_addr_hex: String,
+        #[clap(short, long)]
+        amount: String,
+    },
+    Call {
+        #[clap(short, long)]
+        target_addr_hex: String,
+        #[clap(short, long)]
+        amount: Option<String>,
+        #[clap(short, long)]
+        input_data_hex: String,
+    },
+}
+
+pub async fn execute_command<T: AsRef<str>>(
+    command: Command,
+    client: &AuroraClient<T>,
+    config: &Config,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        // Command::Benchmark
+        Command::Read { subcommand } => match subcommand {
+            ReadCommand::GetResult { tx_hash_hex } => {
+                let tx_hash =
+                    aurora_engine_types::H256::from_slice(&hex::decode(tx_hash_hex).unwrap());
+                let outcome = client.get_transaction_outcome(tx_hash).await?;
+                println!("{:?}", outcome);
+            }
+        },
+        Command::Write { subcommand } => match subcommand {
+            WriteCommand::Deploy { input_data_hex } => {
+                let source_private_key_hex = config.get_evm_secret_key();
+                let sk_bytes = utils::hex_to_arr32(source_private_key_hex)?;
+                let sk = libsecp256k1::SecretKey::parse(&sk_bytes).unwrap();
+                let input = hex::decode(input_data_hex)?;
+                send_transaction(client, &sk, None, Wei::zero(), input).await?;
+            }
+            WriteCommand::Transfer {
+                target_addr_hex,
+                amount,
+            } => {
+                let source_private_key_hex = config.get_evm_secret_key();
+                let sk_bytes = utils::hex_to_arr32(source_private_key_hex)?;
+                let sk = libsecp256k1::SecretKey::parse(&sk_bytes).unwrap();
+                let target = Address::decode(&target_addr_hex).unwrap();
+                let amount = Wei::new(U256::from_dec_str(&amount).unwrap());
+                send_transaction(client, &sk, Some(target), amount, Vec::new()).await?;
+            }
+            WriteCommand::Call {
+                target_addr_hex,
+                amount,
+                input_data_hex,
+            } => {
+                let source_private_key_hex = config.get_evm_secret_key();
+                let sk_bytes = utils::hex_to_arr32(source_private_key_hex)?;
+                let sk = libsecp256k1::SecretKey::parse(&sk_bytes).unwrap();
+                let target = Address::decode(&target_addr_hex).unwrap();
+                let amount = amount
+                    .as_ref()
+                    .map(|a| Wei::new(U256::from_dec_str(a).unwrap()))
+                    .unwrap_or_else(Wei::zero);
+                let input = hex::decode(input_data_hex)?;
+                send_transaction(client, &sk, Some(target), amount, input).await?;
+            }
+        },
+    }
+    Ok(())
+}
+
+async fn send_transaction<T: AsRef<str>>(
+    client: &AuroraClient<T>,
+    sk: &libsecp256k1::SecretKey,
+    to: Option<Address>,
+    amount: Wei,
+    input: Vec<u8>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source = utils::address_from_secret_key(sk);
+    println!("FROM {:?}", source);
+
+    let nonce = client.get_nonce(source).await?;
+    let chain_id = client.get_chain_id().await?;
+    let tx_hash = client
+        .eth_transaction(to, amount, sk, chain_id, nonce, input)
+        .await
+        .unwrap();
+
+    // Wait for the RPC to pick up the transaction
+    loop {
+        match client.get_transaction_outcome(tx_hash).await {
+            Ok(result) => {
+                println!("{:?}", result);
+                break;
+            }
+            Err(ClientError::AuroraTransactionNotFound(_)) => {
+                continue;
+            }
+            Err(other) => return Err(Box::new(other) as Box<dyn std::error::Error>),
+        }
+    }
+
+    Ok(())
+}
+
+'''
+'''--- src/cli/erc20.rs ---
+use aurora_engine_types::{types::Address, U256};
+use clap::Subcommand;
+
+const APPROVE_SELECTOR: &[u8] = &[0x09, 0x5e, 0xa7, 0xb3];
+const BALANCE_OF_SELECTOR: &[u8] = &[0x70, 0xa0, 0x82, 0x31];
+const TOTAL_SUPPLY_SELECTOR: &[u8] = &[0x18, 0x16, 0x0d, 0xdd];
+const TRANSFER_SELECTOR: &[u8] = &[0xa9, 0x05, 0x9c, 0xbb];
+const ALLOWANCE_SELECTOR: &[u8] = &[0xdd, 0x62, 0xed, 0x3e];
+const TRANSFER_FROM_SELECTOR: &[u8] = &[0x23, 0xb8, 0x72, 0xdd];
+
+#[derive(Subcommand)]
+pub enum Erc20 {
+    TotalSupply,
+    BalanceOf {
+        address_hex: String,
+    },
+    Transfer {
+        #[clap(short, long)]
+        to_address_hex: String,
+        #[clap(short, long)]
+        amount: String,
+    },
+    Allowance {
+        #[clap(short, long)]
+        owner_address_hex: String,
+        #[clap(short, long)]
+        spender_address_hex: String,
+    },
+    Approve {
+        #[clap(short, long)]
+        spender_address_hex: String,
+        #[clap(short, long)]
+        amount: String,
+    },
+    TransferFrom {
+        #[clap(short, long)]
+        from_address_hex: String,
+        #[clap(short, long)]
+        to_address_hex: String,
+        #[clap(short, long)]
+        amount: String,
+    },
+}
+
+impl Erc20 {
+    pub fn abi_encode(self) -> Result<Vec<u8>, ParseError> {
+        match self {
+            Self::TotalSupply => Ok(TOTAL_SUPPLY_SELECTOR.to_vec()),
+            Self::Transfer {
+                to_address_hex,
+                amount,
+            } => {
+                let to = Address::decode(&to_address_hex).map_err(wrap_error)?;
+                let amount = U256::from_str_radix(&amount, 10).map_err(wrap_error)?;
+                let input = [
+                    TRANSFER_SELECTOR,
+                    &ethabi::encode(&[
+                        ethabi::Token::Address(to.raw()),
+                        ethabi::Token::Uint(amount),
+                    ]),
+                ]
+                .concat();
+                Ok(input)
+            }
+            Self::Allowance {
+                owner_address_hex,
+                spender_address_hex,
+            } => {
+                let spender = Address::decode(&spender_address_hex).map_err(wrap_error)?;
+                let owner = Address::decode(&owner_address_hex).map_err(wrap_error)?;
+                let input = [
+                    ALLOWANCE_SELECTOR,
+                    &ethabi::encode(&[
+                        ethabi::Token::Address(owner.raw()),
+                        ethabi::Token::Address(spender.raw()),
+                    ]),
+                ]
+                .concat();
+                Ok(input)
+            }
+            Self::Approve {
+                spender_address_hex,
+                amount,
+            } => {
+                let spender = Address::decode(&spender_address_hex).map_err(wrap_error)?;
+                let amount = U256::from_str_radix(&amount, 10).map_err(wrap_error)?;
+                let input = [
+                    APPROVE_SELECTOR,
+                    &ethabi::encode(&[
+                        ethabi::Token::Address(spender.raw()),
+                        ethabi::Token::Uint(amount),
+                    ]),
+                ]
+                .concat();
+                Ok(input)
+            }
+            Self::BalanceOf { address_hex } => {
+                let address = Address::decode(&address_hex).map_err(wrap_error)?;
+                let input = [
+                    BALANCE_OF_SELECTOR,
+                    &ethabi::encode(&[ethabi::Token::Address(address.raw())]),
+                ]
+                .concat();
+                Ok(input)
+            }
+            Self::TransferFrom {
+                to_address_hex,
+                amount,
+                from_address_hex,
+            } => {
+                let from = Address::decode(&from_address_hex).map_err(wrap_error)?;
+                let to = Address::decode(&to_address_hex).map_err(wrap_error)?;
+                let amount = U256::from_str_radix(&amount, 10).map_err(wrap_error)?;
+                let input = [
+                    TRANSFER_FROM_SELECTOR,
+                    &ethabi::encode(&[
+                        ethabi::Token::Address(from.raw()),
+                        ethabi::Token::Address(to.raw()),
+                        ethabi::Token::Uint(amount),
+                    ]),
+                ]
+                .concat();
+                Ok(input)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseError(String);
+
+pub fn wrap_error<E: std::fmt::Debug>(e: E) -> ParseError {
+    ParseError(format!("{:?}", e))
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("erc20::ParseError({})", self.0))
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+#[cfg(test)]
+mod tests {
+    use aurora_engine_types::{H160, U256};
+    use rand::Rng;
+
+    #[test]
+    fn test_total_supply_encoding() {
+        #[allow(deprecated)]
+        let total_supply_function = ethabi::Function {
+            name: "totalSupply".into(),
+            inputs: vec![],
+            outputs: vec![ethabi::Param {
+                name: "".into(),
+                kind: ethabi::ParamType::Uint(256),
+                internal_type: None,
+            }],
+            constant: None,
+            state_mutability: ethabi::StateMutability::View,
+        };
+        let expected_tx_data = total_supply_function.encode_input(&[]).unwrap();
+
+        assert_eq!(
+            super::Erc20::TotalSupply.abi_encode().unwrap(),
+            expected_tx_data
+        );
+    }
+
+    #[test]
+    fn test_balance_of_encoding() {
+        let mut rng = rand::thread_rng();
+        let address: [u8; 20] = rng.gen();
+
+        let address = H160(address);
+
+        #[allow(deprecated)]
+        let balance_of_function = ethabi::Function {
+            name: "balanceOf".into(),
+            inputs: vec![ethabi::Param {
+                name: "account".into(),
+                kind: ethabi::ParamType::Address,
+                internal_type: None,
+            }],
+            outputs: vec![ethabi::Param {
+                name: "".into(),
+                kind: ethabi::ParamType::Uint(256),
+                internal_type: None,
+            }],
+            constant: None,
+            state_mutability: ethabi::StateMutability::View,
+        };
+        let expected_tx_data = balance_of_function
+            .encode_input(&[ethabi::Token::Address(address)])
+            .unwrap();
+
+        assert_eq!(
+            super::Erc20::BalanceOf {
+                address_hex: hex::encode(address.as_bytes())
+            }
+            .abi_encode()
+            .unwrap(),
+            expected_tx_data
+        );
+    }
+
+    #[test]
+    fn test_transfer_encoding() {
+        let mut rng = rand::thread_rng();
+        let address: [u8; 20] = rng.gen();
+        let amount: [u8; 32] = rng.gen();
+
+        let address = H160(address);
+        let amount = U256::from_big_endian(&amount);
+
+        #[allow(deprecated)]
+        let transfer_function = ethabi::Function {
+            name: "transfer".into(),
+            inputs: vec![
+                ethabi::Param {
+                    name: "to".into(),
+                    kind: ethabi::ParamType::Address,
+                    internal_type: None,
+                },
+                ethabi::Param {
+                    name: "amount".into(),
+                    kind: ethabi::ParamType::Uint(256),
+                    internal_type: None,
+                },
+            ],
+            outputs: vec![ethabi::Param {
+                name: "".into(),
+                kind: ethabi::ParamType::Bool,
+                internal_type: None,
+            }],
+            constant: None,
+            state_mutability: ethabi::StateMutability::NonPayable,
+        };
+        let expected_tx_data = transfer_function
+            .encode_input(&[ethabi::Token::Address(address), ethabi::Token::Uint(amount)])
+            .unwrap();
+
+        assert_eq!(
+            super::Erc20::Transfer {
+                to_address_hex: hex::encode(address.as_bytes()),
+                amount: amount.to_string()
+            }
+            .abi_encode()
+            .unwrap(),
+            expected_tx_data
+        );
+    }
+
+    #[test]
+    fn test_allowance_encoding() {
+        let mut rng = rand::thread_rng();
+        let owner: [u8; 20] = rng.gen();
+        let spender: [u8; 20] = rng.gen();
+
+        let owner = H160(owner);
+        let spender = H160(spender);
+
+        #[allow(deprecated)]
+        let allowance_function = ethabi::Function {
+            name: "allowance".into(),
+            inputs: vec![
+                ethabi::Param {
+                    name: "owner".into(),
+                    kind: ethabi::ParamType::Address,
+                    internal_type: None,
+                },
+                ethabi::Param {
+                    name: "spender".into(),
+                    kind: ethabi::ParamType::Address,
+                    internal_type: None,
+                },
+            ],
+            outputs: vec![ethabi::Param {
+                name: "".into(),
+                kind: ethabi::ParamType::Uint(256),
+                internal_type: None,
+            }],
+            constant: None,
+            state_mutability: ethabi::StateMutability::View,
+        };
+        let expected_tx_data = allowance_function
+            .encode_input(&[
+                ethabi::Token::Address(owner),
+                ethabi::Token::Address(spender),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            super::Erc20::Allowance {
+                owner_address_hex: hex::encode(owner.as_bytes()),
+                spender_address_hex: hex::encode(spender.as_bytes()),
+            }
+            .abi_encode()
+            .unwrap(),
+            expected_tx_data
+        );
+    }
+
+    #[test]
+    fn test_approve_encoding() {
+        let mut rng = rand::thread_rng();
+        let address: [u8; 20] = rng.gen();
+        let amount: [u8; 32] = rng.gen();
+
+        let address = H160(address);
+        let amount = U256::from_big_endian(&amount);
+
+        #[allow(deprecated)]
+        let approve_function = ethabi::Function {
+            name: "approve".into(),
+            inputs: vec![
+                ethabi::Param {
+                    name: "spender".into(),
+                    kind: ethabi::ParamType::Address,
+                    internal_type: None,
+                },
+                ethabi::Param {
+                    name: "amount".into(),
+                    kind: ethabi::ParamType::Uint(256),
+                    internal_type: None,
+                },
+            ],
+            outputs: vec![ethabi::Param {
+                name: "".into(),
+                kind: ethabi::ParamType::Bool,
+                internal_type: None,
+            }],
+            constant: None,
+            state_mutability: ethabi::StateMutability::NonPayable,
+        };
+        let expected_tx_data = approve_function
+            .encode_input(&[ethabi::Token::Address(address), ethabi::Token::Uint(amount)])
+            .unwrap();
+
+        assert_eq!(
+            super::Erc20::Approve {
+                spender_address_hex: hex::encode(address.as_bytes()),
+                amount: amount.to_string()
+            }
+            .abi_encode()
+            .unwrap(),
+            expected_tx_data
+        );
+    }
+
+    #[test]
+    fn test_transfer_from_encoding() {
+        let mut rng = rand::thread_rng();
+        let from: [u8; 20] = rng.gen();
+        let to: [u8; 20] = rng.gen();
+        let amount: [u8; 32] = rng.gen();
+
+        let from = H160(from);
+        let to = H160(to);
+        let amount = U256::from_big_endian(&amount);
+
+        #[allow(deprecated)]
+        let transfer_from_function = ethabi::Function {
+            name: "transferFrom".into(),
+            inputs: vec![
+                ethabi::Param {
+                    name: "from".into(),
+                    kind: ethabi::ParamType::Address,
+                    internal_type: None,
+                },
+                ethabi::Param {
+                    name: "to".into(),
+                    kind: ethabi::ParamType::Address,
+                    internal_type: None,
+                },
+                ethabi::Param {
+                    name: "amount".into(),
+                    kind: ethabi::ParamType::Uint(256),
+                    internal_type: None,
+                },
+            ],
+            outputs: vec![ethabi::Param {
+                name: "".into(),
+                kind: ethabi::ParamType::Bool,
+                internal_type: None,
+            }],
+            constant: None,
+            state_mutability: ethabi::StateMutability::NonPayable,
+        };
+        let expected_tx_data = transfer_from_function
+            .encode_input(&[
+                ethabi::Token::Address(from),
+                ethabi::Token::Address(to),
+                ethabi::Token::Uint(amount),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            super::Erc20::TransferFrom {
+                from_address_hex: hex::encode(from.as_bytes()),
+                to_address_hex: hex::encode(to.as_bytes()),
+                amount: amount.to_string()
+            }
+            .abi_encode()
+            .unwrap(),
+            expected_tx_data
+        );
+    }
+}
+
+'''
+'''--- src/cli/mod.rs ---
+use clap::{Parser, Subcommand};
+
+pub mod aurora;
+pub mod erc20;
+pub mod near;
+pub mod process_tx_data;
+pub mod solidity;
+
+#[derive(Parser)]
+pub struct Cli {
+    #[clap(short, long)]
+    pub config_path: Option<String>,
+    #[clap(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Subcommand)]
+pub enum Command {
+    Aurora {
+        #[clap(subcommand)]
+        subcommand: aurora::Command,
+    },
+    Near {
+        #[clap(subcommand)]
+        subcommand: near::Command,
+    },
+    ProcessTxData {
+        #[clap(subcommand)]
+        action: process_tx_data::ProcessTxAction,
+        input_files_list_path: String,
+    },
+}
+'''
+'''--- src/cli/near.rs ---
+use std::str::FromStr;
+
+use crate::{
+    client::AuroraClient,
+    config::Config,
+    utils,
+};
+use aurora_engine::parameters::{DeployErc20TokenArgs, GetStorageAtArgs, PauseEthConnectorCallArgs};
+use aurora_engine_types::{
+    parameters::{CrossContractCallArgs, PromiseArgs, PromiseCreateArgs},
+    types::{Address, NearGas, Wei, Yocto},
+    U256, account_id::AccountId,
+};
+use borsh::BorshSerialize;
+use clap::Subcommand;
+
+#[derive(Subcommand)]
+pub enum Command {
+    Read {
+        #[clap(subcommand)]
+        subcommand: ReadCommand,
+    },
+    Write {
+        #[clap(subcommand)]
+        subcommand: WriteCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ReadCommand {
+    GetReceiptResult {
+        receipt_id_b58: String,
+    },
+    EngineCall {
+        #[clap(short, long)]
+        sender_addr_hex: Option<String>,
+        #[clap(short, long)]
+        target_addr_hex: String,
+        #[clap(short, long)]
+        amount: Option<String>,
+        #[clap(short, long)]
+        input_data_hex: String,
+    },
+    EngineXccDryRun {
+        #[clap(short, long)]
+        sender_address_hex: String,
+        #[clap(short, long)]
+        target_near_account: String,
+        #[clap(short, long)]
+        method_name: String,
+        #[clap(short, long)]
+        json_args: Option<String>,
+        #[clap(long)]
+        json_args_stdin: Option<bool>,
+        #[clap(short, long)]
+        deposit_yocto: Option<String>,
+        #[clap(short, long)]
+        attached_gas: Option<String>,
+    },
+    EngineErc20 {
+        #[clap(short, long)]
+        sender_addr_hex: Option<String>,
+        #[clap(short, long)]
+        target_addr_hex: String,
+        #[clap(short, long)]
+        amount: Option<String>,
+        #[clap(subcommand)]
+        erc20: crate::cli::erc20::Erc20,
+    },
+    Solidity {
+        #[clap(short, long)]
+        sender_addr_hex: Option<String>,
+        #[clap(short, long)]
+        target_addr_hex: String,
+        #[clap(short, long)]
+        amount: Option<String>,
+        #[clap(subcommand)]
+        contract_call: crate::cli::solidity::Solidity,
+    },
+    // get nep141_from_erc20
+    GetBridgedNep141 {
+        erc_20_address_hex: String,
+    },
+    GetAuroraErc20 {
+        nep_141_account: String,
+    },
+    GetEngineBridgeProver,
+    // get_chain_id
+    GetChainId,
+    // get_upgrade_index
+    GetUpgradeIndex,
+    // get_block_hash
+    GetBlockHash {
+        block_number: String,
+    },
+    // get_code
+    GetCode {
+        address_hex: String,
+    },
+    // get_balance
+    GetBalance {
+        address_hex: String,
+    },
+    // get_nonce
+    GetNonce {
+        address_hex: String,
+    },
+    // get_storage_at
+    GetStorageAt {
+        address_hex: String,
+        key_hex: String,
+    },
+    // get_paused_flags
+    GetPausedFlags,
+}
+
+#[derive(Subcommand)]
+pub enum WriteCommand {
+    EngineXcc {
+        #[clap(short, long)]
+        target_near_account: String,
+        #[clap(short, long)]
+        method_name: String,
+        #[clap(short, long)]
+        json_args: Option<String>,
+        #[clap(long)]
+        json_args_stdin: Option<bool>,
+        #[clap(short, long)]
+        deposit_yocto: Option<String>,
+        #[clap(short, long)]
+        attached_gas: Option<String>,
+    },
+    EngineCall {
+        #[clap(short, long)]
+        target_addr_hex: String,
+        #[clap(short, long)]
+        amount: Option<String>,
+        #[clap(short, long)]
+        input_data_hex: String,
+    },
+    Solidity {
+        #[clap(short, long)]
+        target_addr_hex: String,
+        #[clap(short, long)]
+        amount: Option<String>,
+        #[clap(subcommand)]
+        contract_call: crate::cli::solidity::Solidity,
+    },
+    EngineErc20 {
+        #[clap(short, long)]
+        target_addr_hex: String,
+        #[clap(short, long)]
+        amount: Option<String>,
+        #[clap(subcommand)]
+        erc20: crate::cli::erc20::Erc20,
+    },
+    FactoryUpdate {
+        wasm_bytes_path: String,
+    },
+    // deploy_code
+    DeployCode {
+        code_byte_hex: String,
+    },
+    // register_relayer
+    RegisterRelayer {
+        relayer_eth_address_hex: String,
+    },
+    // deploy_erc20_token
+    DeployERC20Token {
+        nep141: String,
+    },
+    // deposit
+    Deposit {
+        raw_proof: String,
+    },    // storage_deposit
+    // set_paused_flags
+    SetPausedFlags {
+        paused_mask: String,
+    },
+
+}
+
+pub async fn execute_command<T: AsRef<str>>(
+    command: Command,
+    client: &AuroraClient<T>,
+    config: &Config,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        Command::Read { subcommand } => match subcommand {
+            ReadCommand::GetReceiptResult { receipt_id_b58 } => {
+                let tx_hash = bs58::decode(receipt_id_b58.as_str()).into_vec().unwrap();
+                let outcome = client
+                    .get_near_receipt_outcome(tx_hash.as_slice().try_into().unwrap())
+                    .await?;
+                println!("{:?}", outcome);
+            }
+            ReadCommand::EngineCall {
+                sender_addr_hex,
+                target_addr_hex,
+                amount,
+                input_data_hex,
+            } => {
+                let (sender, target, amount) =
+                    parse_read_call_args(sender_addr_hex, target_addr_hex, amount);
+                let input = hex::decode(input_data_hex)?;
+                let result = client
+                    .view_contract_call(sender, target, amount, input)
+                    .await
+                    .unwrap();
+                println!("{:?}", result);
+            }
+            ReadCommand::EngineErc20 {
+                erc20,
+                target_addr_hex,
+                amount,
+                sender_addr_hex,
+            } => {
+                let (sender, target, amount) =
+                    parse_read_call_args(sender_addr_hex, target_addr_hex, amount);
+                let input = erc20.abi_encode()?;
+                let result = client
+                    .view_contract_call(sender, target, amount, input)
+                    .await
+                    .unwrap();
+                println!("{:?}", result);
+            }
+            ReadCommand::Solidity {
+                contract_call,
+                target_addr_hex,
+                amount,
+                sender_addr_hex,
+            } => {
+                let (sender, target, amount) =
+                    parse_read_call_args(sender_addr_hex, target_addr_hex, amount);
+                let input = contract_call.abi_encode()?;
+                let result = client
+                    .view_contract_call(sender, target, amount, input)
+                    .await
+                    .unwrap();
+                println!("{:?}", result);
+            }
+            ReadCommand::EngineXccDryRun {
+                target_near_account,
+                sender_address_hex,
+                method_name,
+                json_args,
+                json_args_stdin,
+                deposit_yocto,
+                attached_gas,
+            } => {
+                let promise = PromiseArgs::Create(parse_xcc_args(
+                    target_near_account,
+                    method_name,
+                    json_args,
+                    json_args_stdin,
+                    deposit_yocto,
+                    attached_gas,
+                ));
+                let precompile_args = CrossContractCallArgs::Eager(promise);
+                let sender = Address::decode(&sender_address_hex).unwrap();
+                let result = client
+                    .view_contract_call(
+                        sender,
+                        aurora_engine_precompiles::xcc::cross_contract_call::ADDRESS,
+                        Wei::zero(),
+                        precompile_args.try_to_vec().unwrap(),
+                    )
+                    .await?;
+                println!("{:?}", result);
+            }
+            ReadCommand::GetBridgedNep141 { erc_20_address_hex } => {
+                let erc20 = Address::decode(&erc_20_address_hex).unwrap();
+                match client.get_nep141_from_erc20(erc20).await {
+                    Ok(nep_141_account) => println!("{}", nep_141_account),
+                    Err(e) => {
+                        let error_msg = format!("{:?}", e);
+                        if error_msg.contains("ERC20_NOT_FOUND") {
+                            println!("No NEP-141 account associated with {}", erc_20_address_hex);
+                        } else {
+                            panic!("{}", error_msg);
+                        }
+                    }
+                };
+            }
+            ReadCommand::GetAuroraErc20 { nep_141_account } => {
+                println!("{:?}", client.get_erc20_from_nep141(&nep_141_account).await?);
+            }
+            ReadCommand::GetEngineBridgeProver => {
+                println!("{:?}", client.get_bridge_prover().await?);
+            }
+            ReadCommand::GetChainId => {
+                let chain_id = {
+                    let result = client.near_view_call("get_chain_id".into(), vec![]).await?;
+                    U256::from_big_endian(&result.result).low_u64()
+                };
+                println!("{:?}", chain_id);
+            }
+            ReadCommand::GetUpgradeIndex => {
+                let upgrade_index = {
+                    let result = client
+                        .near_view_call("get_upgrade_index".into(), vec![])
+                        .await?;
+                    U256::from_big_endian(&result.result).low_u64()
+                };
+                println!("{:?}", upgrade_index);
+            }
+            ReadCommand::GetBlockHash {
+                block_number
+            } => {
+                let height_serialized: u128 =  block_number.parse::<u128>().unwrap();
+                let block_hash = {
+                    let result = client
+                        .near_view_call("get_block_hash".into(), height_serialized.to_le_bytes().to_vec())
+                        .await?.result;
+                    result
+                };
+                println!("{:?}", hex::encode(block_hash));
+            }
+            ReadCommand::GetCode { address_hex } => {
+                let code = client
+                    .near_view_call("get_code".into(), address_hex.as_bytes().to_vec())
+                    .await?
+                    .result;
+                println!("{:?}", code);
+            }
+            ReadCommand::GetBalance { address_hex } => {
+                let balance = {
+                    let result = client
+                        .near_view_call("get_balance".into(), address_hex.as_bytes().to_vec())
+                        .await?;
+                    U256::from_big_endian(&result.result).low_u64()
+                };
+                println!("{:?}", balance);
+            }
+            ReadCommand::GetNonce { address_hex } => {
+                let nonce = {
+                    let result = client
+                        .near_view_call("get_nonce".into(), address_hex.as_bytes().to_vec())
+                        .await?;
+                    U256::from_big_endian(&result.result).low_u64()
+                };
+                println!("{:?}", nonce);
+            }
+            ReadCommand::GetStorageAt {
+                address_hex,
+                key_hex,
+            } => {
+                let mut buffer: Vec<u8> = Vec::new();
+                let key_bytes32: [u8;32] = hex::decode(key_hex).unwrap().try_into().unwrap();
+                let input = GetStorageAtArgs {
+                    address: Address::decode(&address_hex).unwrap(),
+                    key: key_bytes32,
+                };
+                input.serialize(&mut buffer)?;
+                let storage = {
+                    let result = client
+                        .near_view_call("get_storage_at".into(), buffer)
+                        .await?;
+                    hex::encode(result.result)
+                };
+                println!("{:?}", storage);
+            }
+            ReadCommand::GetPausedFlags => {
+                let paused_flags = client
+                    .near_view_call("get_paused_flags".into(), vec![])
+                    .await?
+                    .result;
+                println!("{:?}", paused_flags);
+            } 
+        },
+        Command::Write { subcommand } => match subcommand {
+            WriteCommand::EngineXcc {
+                target_near_account,
+                method_name,
+                json_args,
+                json_args_stdin,
+                deposit_yocto,
+                attached_gas,
+            } => {
+                let source_private_key_hex = config.get_evm_secret_key();
+                let sk_bytes = utils::hex_to_arr32(source_private_key_hex)?;
+                let sk = libsecp256k1::SecretKey::parse(&sk_bytes).unwrap();
+                let promise = PromiseArgs::Create(parse_xcc_args(
+                    target_near_account,
+                    method_name,
+                    json_args,
+                    json_args_stdin,
+                    deposit_yocto,
+                    attached_gas,
+                ));
+                let precompile_args = CrossContractCallArgs::Eager(promise);
+                let result = send_as_near_transaction(
+                    client,
+                    &sk,
+                    Some(aurora_engine_precompiles::xcc::cross_contract_call::ADDRESS),
+                    Wei::zero(),
+                    precompile_args.try_to_vec().unwrap(),
+                )
+                .await?;
+                println!("{:?}", result);
+            }
+            WriteCommand::EngineCall {
+                target_addr_hex,
+                amount,
+                input_data_hex,
+            } => {
+                let (sk, target, amount) = parse_write_call_args(config, target_addr_hex, amount);
+                let input = hex::decode(input_data_hex)?;
+                let result =
+                    send_as_near_transaction(client, &sk, Some(target), amount, input).await?;
+                println!("{:?}", result);
+            }
+            WriteCommand::EngineErc20 {
+                erc20,
+                target_addr_hex,
+                amount,
+            } => {
+                let (sk, target, amount) = parse_write_call_args(config, target_addr_hex, amount);
+                let input = erc20.abi_encode()?;
+                let result =
+                    send_as_near_transaction(client, &sk, Some(target), amount, input).await?;
+                println!("{:?}", result);
+            }
+            WriteCommand::Solidity {
+                contract_call,
+                target_addr_hex,
+                amount,
+            } => {
+                let (sk, target, amount) = parse_write_call_args(config, target_addr_hex, amount);
+                let input = contract_call.abi_encode()?;
+                let result =
+                    send_as_near_transaction(client, &sk, Some(target), amount, input).await?;
+                println!("{:?}", result);
+            }
+            WriteCommand::FactoryUpdate { wasm_bytes_path } => {
+                let args = std::fs::read(wasm_bytes_path).unwrap();
+                let tx_outcome = client
+                    .near_contract_call("factory_update".into(), args)
+                    .await
+                    .unwrap();
+                println!("{:?}", tx_outcome);
+            }
+            WriteCommand::DeployCode { code_byte_hex } => {
+                let input = hex::decode(code_byte_hex)?;
+                let tx_outcome = client
+                    .near_contract_call("deploy_code".into(), input)
+                    .await?;
+                println!("{:?}", tx_outcome);
+            }
+            WriteCommand::RegisterRelayer {
+                relayer_eth_address_hex,
+            } => {
+                let relayer = hex::decode(relayer_eth_address_hex)?;
+                let tx_outcome = client
+                    .near_contract_call("register_relayer".into(), relayer)
+                    .await?;
+                println!("{:?}", tx_outcome);
+            }
+            WriteCommand::DeployERC20Token { nep141 } => {
+                let mut buffer: Vec<u8> = Vec::new();
+                let nep141: AccountId = nep141.parse().unwrap();
+                let input = DeployErc20TokenArgs {
+                    nep141
+                };
+                input.serialize(&mut buffer)?;
+                let tx_outcome = client
+                    .near_contract_call("deploy_erc20_token".into(), buffer)
+                    .await?;
+                println!("{:?}", tx_outcome);
+            }
+            WriteCommand::Deposit { raw_proof } => {
+                let tx_outcome = client
+                    .near_contract_call("deposit".into(), raw_proof.as_bytes().to_vec())
+                    .await?;
+                println!("{:?}", tx_outcome);
+            },
+            WriteCommand::SetPausedFlags { paused_mask } => {
+                let mut buffer: Vec<u8> = Vec::new();
+                let input = PauseEthConnectorCallArgs {
+                    paused_mask: u8::from_str(&paused_mask).unwrap(),
+                };
+                input.serialize(&mut buffer)?;
+                let tx_outcome = client
+                    .near_contract_call("set_paused_flags".into(), buffer)
+                    .await?;
+                println!("{:?}", tx_outcome);
+            },
+        },
+    };
+    Ok(())
+}
+
+fn parse_read_call_args(
+    sender_addr_hex: Option<String>,
+    target_addr_hex: String,
+    amount: Option<String>,
+) -> (Address, Address, Wei) {
+    let target = Address::decode(&target_addr_hex).unwrap();
+    let sender = sender_addr_hex
+        .map(|x| Address::decode(&x).unwrap())
+        .unwrap_or_default();
+    let amount = amount
+        .as_ref()
+        .map(|a| Wei::new(U256::from_dec_str(a).unwrap()))
+        .unwrap_or_else(Wei::zero);
+
+    (sender, target, amount)
+}
+
+fn parse_write_call_args(
+    config: &Config,
+    target_addr_hex: String,
+    amount: Option<String>,
+) -> (libsecp256k1::SecretKey, Address, Wei) {
+    let source_private_key_hex = config.get_evm_secret_key();
+    let sk_bytes = utils::hex_to_arr32(source_private_key_hex).unwrap();
+    let sk = libsecp256k1::SecretKey::parse(&sk_bytes).unwrap();
+    let target = Address::decode(&target_addr_hex).unwrap();
+    let amount = amount
+        .as_ref()
+        .map(|a| Wei::new(U256::from_dec_str(a).unwrap()))
+        .unwrap_or_else(Wei::zero);
+    (sk, target, amount)
+}
+
+fn parse_xcc_args(
+    target_near_account: String,
+    method_name: String,
+    json_args: Option<String>,
+    json_args_stdin: Option<bool>,
+    deposit_yocto: Option<String>,
+    attached_gas: Option<String>,
+) -> PromiseCreateArgs {
+    let near_args = match json_args {
+        Some(args) => args.into_bytes(),
+        None => match json_args_stdin {
+            Some(true) => {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).unwrap();
+                buf.into_bytes()
+            }
+            None | Some(false) => Vec::new(),
+        },
+    };
+    let attached_balance = match deposit_yocto {
+        Some(x) => Yocto::new(x.parse().unwrap()),
+        None => Yocto::new(0),
+    };
+    let attached_gas = match attached_gas {
+        Some(gas) => NearGas::new(gas.parse().unwrap()),
+        None => NearGas::new(30_000_000_000_000),
+    };
+    PromiseCreateArgs {
+        target_account_id: target_near_account.parse().unwrap(),
+        method: method_name,
+        args: near_args,
+        attached_balance,
+        attached_gas,
+    }
+}
+
+async fn send_as_near_transaction<T: AsRef<str>>(
+    client: &AuroraClient<T>,
+    sk: &libsecp256k1::SecretKey,
+    to: Option<Address>,
+    amount: Wei,
+    input: Vec<u8>,
+) -> Result<near_primitives::views::FinalExecutionOutcomeView, Box<dyn std::error::Error>> {
+    let sender_address = utils::address_from_secret_key(sk);
+    let nonce = {
+        let result = client
+            .near_view_call("get_nonce".into(), sender_address.as_bytes().to_vec())
+            .await?;
+        U256::from_big_endian(&result.result)
+    };
+    let tx = aurora_engine_transactions::legacy::TransactionLegacy {
+        nonce,
+        gas_price: U256::zero(),
+        gas_limit: U256::from(u64::MAX),
+        to,
+        value: amount,
+        data: input,
+    };
+    let chain_id = {
+        let result = client
+            .near_view_call("get_chain_id".into(), sender_address.as_bytes().to_vec())
+            .await?;
+        U256::from_big_endian(&result.result).low_u64()
+    };
+    let signed_tx = aurora_engine_transactions::EthTransactionKind::Legacy(
+        utils::sign_transaction(tx, chain_id, sk),
+    );
+    let result = client
+        .near_contract_call("submit".into(), (&signed_tx).into())
+        .await?;
+    Ok(result)
+}
+
+'''
+'''--- src/cli/process_tx_data.rs ---
+use crate::transaction_reader::{self, aggregator, filter};
+use aurora_engine_types::types::Address;
+use clap::Subcommand;
+use std::sync::Arc;
+
+#[derive(Subcommand)]
+pub enum ProcessTxAction {
+    NearGasVsEvmGas,
+    AverageGasProfile {
+        min_near_gas: Option<u128>,
+    },
+    GasDistribution,
+    OutcomeDistribution,
+    FilterTo {
+        target_addr_hex: String,
+    },
+    FilterGasRange {
+        #[clap(long)]
+        min_near: Option<u128>,
+        #[clap(long)]
+        min_evm: Option<u64>,
+        #[clap(long)]
+        max_near: Option<u128>,
+        #[clap(long)]
+        max_evm: Option<u64>,
+    },
+    FromToGasUsed,
+}
+
+pub async fn execute_command(action: ProcessTxAction, input_files_list_path: String) {
+    let paths_contents = tokio::fs::read_to_string(input_files_list_path)
+        .await
+        .unwrap();
+    let paths: Vec<String> = paths_contents
+        .split('\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| line.to_owned())
+        .collect();
+
+    match action {
+        ProcessTxAction::AverageGasProfile { min_near_gas } => {
+            let f1 = filter::MatchFlatStatus(transaction_reader::FlatTxStatus::Succeeded);
+            match min_near_gas {
+                None => {
+                    let f = Arc::new(f1);
+                    transaction_reader::process_data::<aggregator::AverageGasProfile, _>(paths, &f)
+                        .await
+                }
+                Some(min_gas) => {
+                    let f2 = filter::MinNearGasUsed(min_gas);
+                    let f = Arc::new(filter::And::new(f1, f2));
+                    transaction_reader::process_data::<aggregator::AverageGasProfile, _>(paths, &f)
+                        .await
+                }
+            }
+        }
+        ProcessTxAction::FilterTo { target_addr_hex } => {
+            let to = Address::decode(&target_addr_hex).unwrap();
+            let f = Arc::new(filter::EthTxTo(to));
+            transaction_reader::process_data::<aggregator::Echo, _>(paths, &f).await
+        }
+        ProcessTxAction::GasDistribution => {
+            let f1 = filter::MatchFlatStatus(transaction_reader::FlatTxStatus::Succeeded);
+            let f2 = filter::MatchFlatStatus(transaction_reader::FlatTxStatus::GasLimit);
+            let f = Arc::new(filter::Or::new(f1, f2));
+            transaction_reader::process_data::<aggregator::GroupByGas, _>(paths, &f).await
+        }
+        ProcessTxAction::NearGasVsEvmGas => {
+            let f = Arc::new(filter::StatusExecuted);
+            transaction_reader::process_data::<aggregator::GasComparison, _>(paths, &f).await
+        }
+        ProcessTxAction::OutcomeDistribution => {
+            let f = Arc::new(filter::NoFilter);
+            transaction_reader::process_data::<aggregator::GroupByFlatStatus, _>(paths, &f).await
+        }
+        ProcessTxAction::FilterGasRange {
+            min_near,
+            min_evm,
+            max_near,
+            max_evm,
+        } => {
+            let f = Arc::new(filter::GeneralGasFilter {
+                min_near,
+                min_evm,
+                max_near,
+                max_evm,
+            });
+            transaction_reader::process_data::<aggregator::Echo, _>(paths, &f).await
+        }
+        ProcessTxAction::FromToGasUsed => {
+            let f = Arc::new(filter::NoFilter);
+            transaction_reader::process_data::<aggregator::FromToGasUsage, _>(paths, &f).await
+        }
+    }
+}
+
+'''
+'''--- src/cli/solidity.rs ---
+use crate::cli::erc20::{wrap_error, ParseError};
+use aurora_engine_types::{types::Address, U256};
+use clap::Subcommand;
+
+#[derive(Subcommand)]
+pub enum Solidity {
+    UnaryCall {
+        #[clap(short, long)]
+        abi_path: String,
+        #[clap(short, long)]
+        method_name: String,
+        #[clap(short, long)]
+        arg: Option<String>,
+        #[clap(short, long)]
+        stdin_arg: Option<bool>,
+    },
+    /// Allows invoking a solidity functions by passing in a JSON object.
+    /// The names of the fields are the argument names of the function, and
+    /// the values are strings that can be parsed into the correct types.
+    CallArgsByName {
+        #[clap(short, long)]
+        abi_path: String,
+        #[clap(short, long)]
+        method_name: String,
+        #[clap(short, long)]
+        arg: Option<String>,
+        #[clap(short, long)]
+        stdin_arg: Option<bool>,
+    },
+}
+
+impl Solidity {
+    pub fn abi_encode(self) -> Result<Vec<u8>, ParseError> {
+        match self {
+            Self::UnaryCall {
+                abi_path,
+                method_name,
+                arg,
+                stdin_arg,
+            } => {
+                let abi = read_abi(abi_path)?;
+                let function = abi.function(&method_name).map_err(wrap_error)?;
+                if function.inputs.len() != 1 {
+                    return Err(wrap_error("Function must take only one argument"));
+                }
+                let arg_type = &function.inputs.first().unwrap().kind;
+                let arg = read_arg(arg, stdin_arg);
+                let bytes = function
+                    .encode_input(&[parse_arg(arg.trim(), arg_type)?])
+                    .map_err(wrap_error)?;
+                Ok(bytes.to_vec())
+            }
+            Self::CallArgsByName {
+                abi_path,
+                method_name,
+                arg,
+                stdin_arg,
+            } => {
+                let abi = read_abi(abi_path)?;
+                let function = abi.function(&method_name).map_err(wrap_error)?;
+                let arg: serde_json::Value =
+                    serde_json::from_str(&read_arg(arg, stdin_arg)).map_err(wrap_error)?;
+                let vars_map = arg
+                    .as_object()
+                    .ok_or_else(|| wrap_error("Expected JSON object"))?;
+                let mut tokens = Vec::with_capacity(function.inputs.len());
+                for input in function.inputs.iter() {
+                    let arg = vars_map
+                        .get(&input.name)
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| wrap_error("Missing variable"))?;
+                    let token = parse_arg(arg, &input.kind)?;
+                    tokens.push(token);
+                }
+                let bytes = function.encode_input(&tokens).map_err(wrap_error)?;
+                Ok(bytes.to_vec())
+            }
+        }
+    }
+}
+
+fn read_abi(abi_path: String) -> Result<ethabi::Contract, ParseError> {
+    let reader = std::fs::File::open(abi_path).map_err(wrap_error)?;
+    ethabi::Contract::load(reader).map_err(wrap_error)
+}
+
+fn read_arg(arg: Option<String>, stdin_arg: Option<bool>) -> String {
+    match arg {
+        Some(arg) => arg,
+        None => match stdin_arg {
+            Some(true) => {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).unwrap();
+                buf
+            }
+            None | Some(false) => String::new(),
+        },
+    }
+}
+
+fn parse_arg(arg: &str, kind: &ethabi::ParamType) -> Result<ethabi::Token, ParseError> {
+    match kind {
+        ethabi::ParamType::Address => {
+            let addr = Address::decode(arg).map_err(wrap_error)?;
+            Ok(ethabi::Token::Address(addr.raw()))
+        }
+        ethabi::ParamType::Bytes => {
+            let bytes = hex::decode(arg).map_err(wrap_error)?;
+            Ok(ethabi::Token::Bytes(bytes))
+        }
+        ethabi::ParamType::Int(_) => {
+            let value = U256::from_dec_str(arg).map_err(wrap_error)?;
+            Ok(ethabi::Token::Int(value))
+        }
+        ethabi::ParamType::Uint(_) => {
+            let value = U256::from_dec_str(arg).map_err(wrap_error)?;
+            Ok(ethabi::Token::Uint(value))
+        }
+        ethabi::ParamType::Bool => match arg.to_lowercase().as_str() {
+            "true" => Ok(ethabi::Token::Bool(true)),
+            "false" => Ok(ethabi::Token::Bool(false)),
+            _ => Err(wrap_error("Expected true or false")),
+        },
+        ethabi::ParamType::String => Ok(ethabi::Token::String(arg.into())),
+        ethabi::ParamType::Array(arr_kind) => {
+            let value: serde_json::Value = serde_json::from_str(arg).map_err(wrap_error)?;
+            parse_array(value, arr_kind).map(ethabi::Token::Array)
+        }
+        ethabi::ParamType::FixedBytes(size) => {
+            let bytes = hex::decode(&arg).map_err(wrap_error)?;
+            if &bytes.len() != size {
+                return Err(wrap_error("Incorrect FixedBytes length"));
+            }
+            Ok(ethabi::Token::FixedBytes(bytes))
+        }
+        ethabi::ParamType::FixedArray(arr_kind, size) => {
+            let value: serde_json::Value = serde_json::from_str(arg).map_err(wrap_error)?;
+            let tokens = parse_array(value, arr_kind)?;
+            if &tokens.len() != size {
+                return Err(wrap_error("Incorrect FixedArray length"));
+            }
+            Ok(ethabi::Token::FixedArray(tokens))
+        }
+        ethabi::ParamType::Tuple(tuple_kinds) => {
+            let value: serde_json::Value = serde_json::from_str(arg).map_err(wrap_error)?;
+            let values = match value {
+                serde_json::Value::Array(values) => values,
+                _ => {
+                    return Err(wrap_error("Expected Array"));
+                }
+            };
+            if values.len() != tuple_kinds.len() {
+                return Err(wrap_error("Incorrect number of args for tuple size"));
+            }
+            let mut tokens = Vec::with_capacity(values.len());
+            for (v, kind) in values.iter().zip(tuple_kinds.iter()) {
+                let token = parse_arg(&serde_json::to_string(v).unwrap(), kind)?;
+                tokens.push(token);
+            }
+            Ok(ethabi::Token::Tuple(tokens))
+        }
+    }
+}
+
+fn parse_array(
+    value: serde_json::Value,
+    arr_kind: &ethabi::ParamType,
+) -> Result<Vec<ethabi::Token>, ParseError> {
+    match value {
+        serde_json::Value::Array(values) => {
+            let mut tokens = Vec::with_capacity(values.len());
+            for v in values {
+                let token = parse_arg(&serde_json::to_string(&v).unwrap(), arr_kind)?;
+                tokens.push(token);
+            }
+            Ok(tokens)
+        }
+        _ => Err(wrap_error("Expected Array")),
+    }
+}
+
+'''
+'''--- src/client.rs ---
+use crate::eth_method::EthMethod;
+use aurora_engine::parameters::{SubmitResult, TransactionStatus};
+use aurora_engine_transactions::{legacy::TransactionLegacy, EthTransactionKind};
+use aurora_engine_types::{
+    types::{Address, Wei},
+    H256, U256,
+};
+use borsh::{BorshDeserialize, BorshSerialize};
+use libsecp256k1::SecretKey;
+use near_jsonrpc_client::AsUrl;
+use near_primitives::views;
+use serde::{Deserialize, Serialize};
+
+const NEAR_TRANSACTION_KEY: &str = "nearTransactionHash";
+
+type NearQueryError =
+    near_jsonrpc_client::errors::JsonRpcError<near_jsonrpc_primitives::types::query::RpcQueryError>;
+type NearCallError = near_jsonrpc_client::errors::JsonRpcError<
+    near_jsonrpc_client::methods::broadcast_tx_commit::RpcTransactionError,
+>;
+
+pub struct AuroraClient<T> {
+    inner: reqwest::Client,
+    aurora_rpc: T,
+    near_client: near_jsonrpc_client::JsonRpcClient,
+    engine_account_id: String,
+    signer_key_path: Option<String>,
+}
+
+impl<T: AsRef<str>> AuroraClient<T> {
+    pub fn new<U: AsUrl>(
+        aurora_rpc: T,
+        near_rpc: U,
+        engine_account_id: String,
+        signer_key_path: Option<String>,
+    ) -> Self {
+        let inner = reqwest::Client::new();
+        let near_client = near_jsonrpc_client::JsonRpcClient::connect(near_rpc);
+        Self {
+            inner,
+            aurora_rpc,
+            near_client,
+            engine_account_id,
+            signer_key_path,
+        }
+    }
+
+    pub async fn request<'a, 'b, U: Serialize>(
+        &self,
+        request: &Web3JsonRequest<'a, 'b, U>,
+    ) -> Result<Web3JsonResponse<serde_json::Value>, ClientError> {
+        let resp = self
+            .inner
+            .post(self.aurora_rpc.as_ref())
+            .json(request)
+            .send()
+            .await?;
+        // TODO: parse information from headers too (eg x-request-id)
+        // println!("{:?}", resp.headers());
+        let full = resp.bytes().await?;
+        serde_json::from_slice(&full).map_err(|_| {
+            let text = match String::from_utf8_lossy(&full) {
+                std::borrow::Cow::Owned(s) => s,
+                std::borrow::Cow::Borrowed(s) => s.to_owned(),
+            };
+            ClientError::InvalidJson(text)
+        })
+    }
+
+    pub async fn get_nonce(&self, address: Address) -> Result<U256, ClientError> {
+        let method = EthMethod::GetTransactionCount(address);
+        let request = Web3JsonRequest::from_method(1, &method);
+        let response = self.request(&request).await?;
+
+        if let Some(e) = response.error {
+            return Err(e.into());
+        }
+
+        let value = response.result.as_ref().and_then(|v| v.as_str()).unwrap();
+        Ok(U256::from_str_radix(value, 16).unwrap())
+    }
+
+    pub async fn get_chain_id(&self) -> Result<u64, ClientError> {
+        let method = EthMethod::GetChainId;
+        let request = Web3JsonRequest::from_method(1, &method);
+        let response = self.request(&request).await?;
+
+        if let Some(e) = response.error {
+            return Err(e.into());
+        }
+
+        let value = response.result.as_ref().and_then(|v| v.as_str()).unwrap();
+        Ok(value.parse().unwrap())
+    }
+
+    pub async fn eth_transaction(
+        &self,
+        target: Option<Address>,
+        amount: Wei,
+        signer: &SecretKey,
+        chain_id: u64,
+        nonce: U256,
+        data: Vec<u8>,
+    ) -> Result<H256, ClientError> {
+        let tx = TransactionLegacy {
+            nonce,
+            gas_price: U256::zero(),
+            gas_limit: U256::from(u64::MAX),
+            to: target,
+            value: amount,
+            data,
+        };
+        let signed_tx =
+            EthTransactionKind::Legacy(crate::utils::sign_transaction(tx, chain_id, signer));
+        let method = EthMethod::SendRawTransaction(Box::new(signed_tx));
+        let request = Web3JsonRequest::from_method(1, &method);
+        let response = self.request(&request).await?;
+
+        if let Some(e) = response.error {
+            return Err(e.into());
+        }
+
+        let tx_hash = response.result.as_ref().and_then(|v| v.as_str()).unwrap();
+        let tx_hash_bytes = tx_hash
+            .strip_prefix("0x")
+            .and_then(|x| hex::decode(x).ok())
+            .unwrap();
+        Ok(H256::from_slice(&tx_hash_bytes))
+    }
+
+    pub async fn get_transaction_outcome(
+        &self,
+        tx_hash: H256,
+    ) -> Result<TransactionOutcome, ClientError> {
+        let method = EthMethod::GetTransactionReceipt(tx_hash);
+        let request = Web3JsonRequest::from_method(1, &method);
+        let response = self.request(&request).await?;
+
+        if let Some(e) = response.error {
+            return Err(e.into());
+        }
+
+        let response_value = response
+            .result
+            .as_ref()
+            .ok_or(ClientError::AuroraTransactionNotFound(tx_hash))?;
+        let near_tx_value = response_value
+            .as_object()
+            .ok_or_else(|| ClientError::NotJsonObject(response_value.clone()))?
+            .get(NEAR_TRANSACTION_KEY)
+            .ok_or_else(|| ClientError::ResponseKeyNotFound(String::from(NEAR_TRANSACTION_KEY)))?;
+        let near_tx_str = near_tx_value
+            .as_str()
+            .ok_or_else(|| ClientError::NotJsonString(near_tx_value.clone()))?;
+        // println!("{}", near_tx_str);
+        let near_rx_hex = near_tx_str.strip_prefix("0x").unwrap_or(near_tx_str);
+        let near_receipt_id = hex::decode(near_rx_hex)?;
+
+        self.get_near_receipt_outcome(near_receipt_id.as_slice().try_into().unwrap())
+            .await
+    }
+
+    pub async fn get_near_receipt_outcome(
+        &self,
+        near_receipt_id: near_primitives::hash::CryptoHash,
+    ) -> Result<TransactionOutcome, ClientError> {
+        let mut receipt_id = near_receipt_id;
+        let receiver_id: near_primitives::types::AccountId =
+            self.engine_account_id.parse().unwrap();
+        loop {
+            let block_hash = {
+                let request = near_jsonrpc_client::methods::block::RpcBlockRequest {
+                    block_reference: near_primitives::types::Finality::Final.into(),
+                };
+                let response = self.near_client.call(request).await.unwrap();
+                response.header.hash
+            };
+            let request = near_jsonrpc_client::methods::light_client_proof::RpcLightClientExecutionProofRequest {
+                id: near_primitives::types::TransactionOrReceiptId::Receipt { receipt_id, receiver_id: receiver_id.clone() },
+                light_client_head: block_hash,
+            };
+            let response = self.near_client.call(request).await.unwrap();
+            match response.outcome_proof.outcome.status {
+                near_primitives::views::ExecutionStatusView::SuccessValue(result) => {
+                    let result_bytes = base64::decode(result).unwrap();
+                    let result = SubmitResult::try_from_slice(&result_bytes).unwrap();
+                    return Ok(TransactionOutcome::Result(result));
+                }
+                near_primitives::views::ExecutionStatusView::Failure(e) => {
+                    return Ok(TransactionOutcome::Failure(e))
+                }
+                near_primitives::views::ExecutionStatusView::SuccessReceiptId(id) => {
+                    println!("Intermediate receipt_id: {:?}", id);
+                    receipt_id = id;
+                }
+                near_primitives::views::ExecutionStatusView::Unknown => {
+                    panic!("Unknown receipt_id: {:?}", near_receipt_id)
+                }
+            }
+        }
+    }
+
+    pub async fn get_nep141_from_erc20(&self, erc20: Address) -> Result<String, ClientError> {
+        let result = self
+            .near_view_call("get_nep141_from_erc20".into(), erc20.as_bytes().to_vec())
+            .await?;
+        Ok(String::from_utf8_lossy(&result.result).into_owned())
+    }
+
+    pub async fn get_erc20_from_nep141(&self, nep141: &str) -> Result<Address, ClientError> {
+        let args = aurora_engine::parameters::GetErc20FromNep141CallArgs {
+            nep141: nep141.parse().unwrap(),
+        };
+        let result = self
+            .near_view_call("get_erc20_from_nep141".into(), args.try_to_vec().unwrap())
+            .await?;
+        Ok(Address::try_from_slice(&result.result).unwrap())
+    }
+
+    pub async fn get_bridge_prover(&self) -> Result<String, ClientError> {
+        let result = self
+            .near_view_call("get_bridge_prover".into(), Vec::new())
+            .await?;
+        Ok(String::from_utf8_lossy(&result.result).into_owned())
+    }
+
+    pub async fn view_contract_call(
+        &self,
+        sender: Address,
+        target: Address,
+        amount: Wei,
+        input: Vec<u8>,
+    ) -> Result<TransactionStatus, ClientError> {
+        let args = aurora_engine::parameters::ViewCallArgs {
+            sender,
+            address: target,
+            amount: amount.to_bytes(),
+            input,
+        };
+        let result = self
+            .near_view_call("view".into(), args.try_to_vec().unwrap())
+            .await?;
+        let status = TransactionStatus::try_from_slice(&result.result).unwrap();
+        Ok(status)
+    }
+
+    pub async fn near_view_call(
+        &self,
+        method_name: String,
+        args: Vec<u8>,
+    ) -> Result<views::CallResult, ClientError> {
+        let request = near_jsonrpc_primitives::types::query::RpcQueryRequest {
+            block_reference: near_primitives::types::Finality::Final.into(),
+            request: near_primitives::views::QueryRequest::CallFunction {
+                account_id: self.engine_account_id.parse().unwrap(),
+                method_name,
+                args: args.into(),
+            },
+        };
+        let response = self.near_client.call(request).await?;
+
+        match response.kind {
+            near_jsonrpc_primitives::types::query::QueryResponseKind::CallResult(result) => {
+                Ok(result)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    pub async fn near_contract_call(
+        &self,
+        method_name: String,
+        args: Vec<u8>,
+    ) -> Result<views::FinalExecutionOutcomeView, ClientError> {
+        let path = self
+            .signer_key_path
+            .as_ref()
+            .map(std::path::Path::new)
+            .expect("Signer path must be provided to use this functionality");
+        let signer = crate::utils::read_key_file(path).unwrap();
+        let request = near_jsonrpc_primitives::types::query::RpcQueryRequest {
+            block_reference: near_primitives::types::Finality::Final.into(),
+            request: near_primitives::views::QueryRequest::ViewAccessKey {
+                account_id: signer.account_id.clone(),
+                public_key: signer.public_key.clone(),
+            },
+        };
+        let response = self.near_client.call(request).await?;
+        let block_hash = response.block_hash;
+        let nonce = match response.kind {
+            near_jsonrpc_primitives::types::query::QueryResponseKind::AccessKey(k) => k.nonce + 1,
+            _ => unreachable!(),
+        };
+        let request =
+            near_jsonrpc_client::methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest {
+                signed_transaction: near_primitives::transaction::SignedTransaction::call(
+                    nonce,
+                    signer.account_id.clone(),
+                    self.engine_account_id.parse().unwrap(),
+                    &signer,
+                    0,
+                    method_name,
+                    args,
+                    300_000_000_000_000,
+                    block_hash,
+                ),
+            };
+        let response = self.near_client.call(request).await?;
+
+        Ok(response)
+    }
+}
+
+#[derive(Debug)]
+pub enum TransactionOutcome {
+    Result(SubmitResult),
+    Failure(near_primitives::errors::TxExecutionError),
+}
+
+#[derive(Debug, Serialize)]
+pub struct Web3JsonRequest<'method, 'version, T> {
+    jsonrpc: &'version str,
+    method: &'method str,
+    id: u32,
+    params: T,
+}
+
+impl<'a> Web3JsonRequest<'a, 'static, Vec<String>> {
+    pub fn from_method(id: u32, method: &'a EthMethod) -> Self {
+        Self {
+            jsonrpc: "2.0",
+            method: method.name(),
+            id,
+            params: method.create_params(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct Web3JsonResponse<T> {
+    jsonrpc: String,
+    id: u32,
+    result: Option<T>,
+    error: Option<Web3JsonResponseError>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct Web3JsonResponseError {
+    code: i64,
+    data: serde_json::Value,
+    message: String,
+}
+
+#[derive(Debug)]
+pub enum ClientError {
+    AuroraTransactionNotFound(H256),
+    InvalidHex(hex::FromHexError),
+    InvalidJson(String),
+    ResponseKeyNotFound(String),
+    NotJsonObject(serde_json::Value),
+    NotJsonString(serde_json::Value),
+    Rpc(Web3JsonResponseError),
+    NearRpc(NearQueryError),
+    NearContractCall(NearCallError),
+    Reqwest(reqwest::Error),
+}
+
+impl From<hex::FromHexError> for ClientError {
+    fn from(e: hex::FromHexError) -> Self {
+        Self::InvalidHex(e)
+    }
+}
+
+impl From<reqwest::Error> for ClientError {
+    fn from(e: reqwest::Error) -> Self {
+        Self::Reqwest(e)
+    }
+}
+
+impl From<Web3JsonResponseError> for ClientError {
+    fn from(e: Web3JsonResponseError) -> Self {
+        Self::Rpc(e)
+    }
+}
+
+impl From<NearQueryError> for ClientError {
+    fn from(e: NearQueryError) -> Self {
+        Self::NearRpc(e)
+    }
+}
+
+impl From<NearCallError> for ClientError {
+    fn from(e: NearCallError) -> Self {
+        Self::NearContractCall(e)
+    }
+}
+
+impl std::fmt::Display for ClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("ClientError({})", self))
+    }
+}
+
+impl std::error::Error for ClientError {}
+
+'''
+'''--- src/config.rs ---
+use std::path::Path;
+use std::{fs, io};
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Config {
+    pub network: Network,
+    pub engine_account_id: String,
+    pub aurora_api_key: Option<String>,
+    pub near_key_path: Option<String>,
+    pub evm_secret_key: Option<String>,
+}
+
+impl Config {
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, io::Error> {
+        let reader = fs::File::open(path)?;
+        let config = serde_json::from_reader(reader)?;
+        Ok(config)
+    }
+
+    pub fn get_evm_secret_key(&self) -> &str {
+        self.evm_secret_key
+            .as_deref()
+            .expect("evm_secret_key must be given in config to use this feature")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Network {
+    Mainnet,
+    Testnet,
+}
+
+'''
+'''--- src/eth_method.rs ---
+use aurora_engine_transactions::EthTransactionKind;
+use aurora_engine_types::{types::Address, H256};
+
+pub enum EthMethod {
+    GetChainId,
+    GetTransactionCount(Address),
+    GetTransactionReceipt(H256),
+    SendRawTransaction(Box<EthTransactionKind>),
+}
+
+impl EthMethod {
+    pub fn name(&self) -> &'static str {
+        match &self {
+            Self::GetChainId => "net_version",
+            Self::GetTransactionCount(_) => "eth_getTransactionCount",
+            Self::GetTransactionReceipt(_) => "eth_getTransactionReceipt",
+            Self::SendRawTransaction(_) => "eth_sendRawTransaction",
+        }
+    }
+
+    pub fn create_params(&self) -> Vec<String> {
+        match &self {
+            Self::GetChainId => Vec::new(),
+            Self::GetTransactionCount(address) => {
+                vec![format!("0x{}", address.encode())]
+            }
+            Self::GetTransactionReceipt(tx_hash) => {
+                vec![format!("0x{}", hex::encode(tx_hash))]
+            }
+            Self::SendRawTransaction(tx) => {
+                let tx_bytes: Vec<u8> = tx.as_ref().into();
+                vec![format!("0x{}", hex::encode(tx_bytes))]
+            }
+        }
+    }
+}
+
+'''
+'''--- src/main.rs ---
+mod cli;
+mod client;
+mod config;
+mod eth_method;
+mod transaction_reader;
+mod utils;
+
+const AURORA_MAINNET_ENDPOINT: &str = "https://mainnet.aurora.dev/";
+const NEAR_MAINNET_ENDPOINT: &str = "https://archival-rpc.mainnet.near.org/";
+const AURORA_TESTNET_ENDPOINT: &str = "https://testnet.aurora.dev/";
+const NEAR_TESTNET_ENDPOINT: &str = "https://archival-rpc.testnet.near.org/";
+
+use clap::Parser;
+use cli::{Cli, Command};
+use client::AuroraClient;
+use config::Network;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Cli::parse();
+    let config_path = args.config_path.as_deref().unwrap_or("default-config.json");
+    let config = config::Config::from_file(config_path)?;
+    let network = config.network;
+
+    let api_key = config.aurora_api_key.as_deref().unwrap_or_default();
+    let (aurora_endpoint, near_endpoint) = match network {
+        Network::Mainnet => (AURORA_MAINNET_ENDPOINT, NEAR_MAINNET_ENDPOINT),
+        Network::Testnet => (AURORA_TESTNET_ENDPOINT, NEAR_TESTNET_ENDPOINT),
+    };
+    let client = AuroraClient::new(
+        format!("{}{}", aurora_endpoint, api_key),
+        near_endpoint,
+        config.engine_account_id.clone(),
+        config.near_key_path.clone(),
+    );
+
+    match args.command {
+        Command::Aurora { subcommand } => {
+            cli::aurora::execute_command(subcommand, &client, &config).await?
+        }
+        Command::Near { subcommand } => {
+            cli::near::execute_command(subcommand, &client, &config).await?
+        }
+        Command::ProcessTxData {
+            action,
+            input_files_list_path,
+        } => cli::process_tx_data::execute_command(action, input_files_list_path).await,
+    }
+
+    Ok(())
+}
+
+'''
+'''--- src/transaction_reader/aggregator.rs ---
+use crate::transaction_reader::{FlatTxStatus, ParsedTx, TxStatus};
+use aurora_engine_types::types::Address;
+use std::collections::HashMap;
+use tokio::sync::mpsc;
+
+pub trait Aggregator: Sized {
+    type Input;
+
+    fn create() -> (mpsc::UnboundedSender<Self::Input>, Self);
+    fn start(self) -> tokio::task::JoinHandle<Self>;
+    fn pre_process(tx: &ParsedTx) -> Self::Input;
+    fn finish(self);
+}
+
+type FromToGasUsageEntry = (Address, Option<Address>, u128, u64, u128);
+pub struct FromToGasUsage {
+    entries: Vec<FromToGasUsageEntry>,
+    receive_channel: mpsc::UnboundedReceiver<Option<FromToGasUsageEntry>>,
+}
+impl Aggregator for FromToGasUsage {
+    type Input = Option<FromToGasUsageEntry>;
+
+    fn create() -> (mpsc::UnboundedSender<Self::Input>, Self) {
+        let (send_channel, receive_channel) = mpsc::unbounded_channel();
+
+        (
+            send_channel,
+            Self {
+                entries: Vec::new(),
+                receive_channel,
+            },
+        )
+    }
+
+    fn start(mut self) -> tokio::task::JoinHandle<Self> {
+        tokio::task::spawn(async move {
+            while let Some(maybe_entry) = self.receive_channel.recv().await {
+                if let Some(entry) = maybe_entry {
+                    self.entries.push(entry);
+                }
+            }
+
+            self
+        })
+    }
+
+    fn pre_process(tx: &ParsedTx) -> Self::Input {
+        let eth_tx = tx.data.eth_tx.as_ref()?;
+        let norm_tx: aurora_engine_transactions::NormalizedEthTransaction =
+            eth_tx.clone().try_into().ok()?;
+        let from = norm_tx.address;
+        let to = norm_tx.to;
+        let gas_limit = norm_tx.gas_limit.low_u64();
+        let gas_price = norm_tx.max_fee_per_gas.low_u128();
+        let gas_used = tx.data.gas_profile.get("TOTAL").copied()?;
+        Some((from, to, gas_used, gas_limit, gas_price))
+    }
+
+    fn finish(self) {
+        for (from, to, gas_used, gas_limit, gas_price) in self.entries {
+            let to_str = to.map(|t| t.encode()).unwrap_or_default();
+            println!(
+                "{},{},{:?},{:?},{:?}",
+                from.encode(),
+                to_str,
+                gas_used,
+                gas_limit,
+                gas_price
+            );
+        }
+    }
+}
+
+pub struct GroupByFlatStatus {
+    counts: HashMap<FlatTxStatus, usize>,
+    receive_channel: mpsc::UnboundedReceiver<FlatTxStatus>,
+}
+impl Aggregator for GroupByFlatStatus {
+    type Input = FlatTxStatus;
+
+    fn create() -> (mpsc::UnboundedSender<Self::Input>, Self) {
+        let (send_channel, receive_channel) = mpsc::unbounded_channel();
+        let counts: HashMap<FlatTxStatus, usize> = {
+            let init_data = [
+                (FlatTxStatus::Succeeded, 0usize),
+                (FlatTxStatus::Reverted, 0),
+                (FlatTxStatus::GasLimit, 0),
+                (FlatTxStatus::IncorrectNonce, 0),
+                (FlatTxStatus::Other, 0),
+            ];
+            init_data.into_iter().collect()
+        };
+
+        (
+            send_channel,
+            Self {
+                receive_channel,
+                counts,
+            },
+        )
+    }
+
+    fn start(mut self) -> tokio::task::JoinHandle<Self> {
+        tokio::task::spawn(async move {
+            while let Some(status) = self.receive_channel.recv().await {
+                *self.counts.get_mut(&status).unwrap() += 1;
+            }
+
+            self
+        })
+    }
+
+    fn pre_process(tx: &ParsedTx) -> Self::Input {
+        tx.data.status.flatten()
+    }
+
+    fn finish(self) {
+        let mut counts: Vec<(FlatTxStatus, usize)> = self.counts.into_iter().collect();
+        counts.sort_unstable_by(|(_, v1), (_, v2)| v2.cmp(v1));
+        for (status, count) in counts {
+            println!("{:?} {}", status, count);
+        }
+    }
+}
+
+pub struct GroupByGas {
+    counts: HashMap<u128, usize>,
+    receive_channel: mpsc::UnboundedReceiver<u128>,
+}
+impl GroupByGas {
+    const BUCKET_SIZE: u128 = 10_000_000_000_000;
+}
+impl Aggregator for GroupByGas {
+    type Input = u128;
+
+    fn create() -> (mpsc::UnboundedSender<Self::Input>, Self) {
+        let (send_channel, receive_channel) = mpsc::unbounded_channel();
+        let mut counts = HashMap::new();
+
+        for i in 0..31 {
+            counts.insert(i * Self::BUCKET_SIZE, 0);
+        }
+
+        (
+            send_channel,
+            Self {
+                receive_channel,
+                counts,
+            },
+        )
+    }
+
+    fn start(mut self) -> tokio::task::JoinHandle<Self> {
+        tokio::task::spawn(async move {
+            while let Some(gas) = self.receive_channel.recv().await {
+                let bucket = (gas / Self::BUCKET_SIZE) * Self::BUCKET_SIZE;
+                *self.counts.get_mut(&bucket).unwrap() += 1;
+            }
+
+            self
+        })
+    }
+
+    fn pre_process(tx: &ParsedTx) -> Self::Input {
+        tx.data
+            .gas_profile
+            .get("TOTAL")
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn finish(self) {
+        for i in 0..31 {
+            let bucket = i * Self::BUCKET_SIZE;
+            let count = self.counts.get(&bucket).unwrap();
+            println!("{} {}", bucket / 1_000_000_000_000, count);
+        }
+    }
+}
+
+pub struct Echo {
+    receive_channel: mpsc::UnboundedReceiver<String>,
+}
+impl Aggregator for Echo {
+    type Input = String;
+
+    fn create() -> (mpsc::UnboundedSender<Self::Input>, Self) {
+        let (send_channel, receive_channel) = mpsc::unbounded_channel();
+
+        (send_channel, Self { receive_channel })
+    }
+
+    fn start(mut self) -> tokio::task::JoinHandle<Self> {
+        tokio::task::spawn(async move {
+            while let Some(s) = self.receive_channel.recv().await {
+                println!("{}", s);
+            }
+
+            self
+        })
+    }
+
+    fn pre_process(tx: &ParsedTx) -> Self::Input {
+        tx.path.clone()
+    }
+
+    fn finish(self) {}
+}
+
+pub struct AverageGasProfile {
+    total_profile: HashMap<String, u128>,
+    count: u128,
+    receive_channel: mpsc::UnboundedReceiver<HashMap<String, u128>>,
+}
+impl Aggregator for AverageGasProfile {
+    type Input = HashMap<String, u128>;
+
+    fn create() -> (mpsc::UnboundedSender<Self::Input>, Self) {
+        let (send_channel, receive_channel) = mpsc::unbounded_channel();
+        let total_profile: HashMap<String, u128> = HashMap::new();
+        let count: u128 = 0;
+        let me = Self {
+            receive_channel,
+            total_profile,
+            count,
+        };
+        (send_channel, me)
+    }
+
+    fn start(mut self) -> tokio::task::JoinHandle<Self> {
+        tokio::task::spawn(async move {
+            while let Some(gas) = self.receive_channel.recv().await {
+                self.count += 1;
+                for (k, v) in gas {
+                    *self.total_profile.entry(k).or_insert(0) += v;
+                }
+            }
+
+            self
+        })
+    }
+
+    fn pre_process(tx: &ParsedTx) -> Self::Input {
+        tx.data.gas_profile.clone()
+    }
+
+    fn finish(self) {
+        let mut average_profile: Vec<(String, u128)> = self
+            .total_profile
+            .into_iter()
+            .map(|(k, v)| (k, v / self.count))
+            .collect();
+        average_profile.sort_unstable_by(|(_, v1), (_, v2)| v2.cmp(v1));
+
+        for (k, v) in average_profile {
+            println!("{} {}", k, v);
+        }
+    }
+}
+
+pub struct GasComparison {
+    data_points: Vec<(u64, u128)>,
+    receive_channel: mpsc::UnboundedReceiver<(u64, u128)>,
+}
+impl Aggregator for GasComparison {
+    type Input = (u64, u128);
+
+    fn create() -> (mpsc::UnboundedSender<Self::Input>, Self) {
+        let (send_channel, receive_channel) = mpsc::unbounded_channel();
+        let data_points = Vec::new();
+        let me = Self {
+            data_points,
+            receive_channel,
+        };
+        (send_channel, me)
+    }
+
+    fn start(mut self) -> tokio::task::JoinHandle<Self> {
+        tokio::task::spawn(async move {
+            while let Some(data_point) = self.receive_channel.recv().await {
+                self.data_points.push(data_point);
+            }
+
+            self
+        })
+    }
+
+    fn pre_process(tx: &ParsedTx) -> Self::Input {
+        let evm_gas = match &tx.data.status {
+            TxStatus::Executed(submit_result) => submit_result.gas_used,
+            _ => 0,
+        };
+        let near_gas = tx
+            .data
+            .gas_profile
+            .get("TOTAL")
+            .copied()
+            .unwrap_or_default();
+        (evm_gas, near_gas)
+    }
+
+    fn finish(self) {
+        for (x, y) in self.data_points {
+            println!("{} {}", x, y);
+        }
+    }
+}
+
+pub struct Pair<A1: Aggregator, A2: Aggregator> {
+    a1: Option<A1>,
+    a2: Option<A2>,
+    receive_channel: mpsc::UnboundedReceiver<(A1::Input, A2::Input)>,
+}
+impl<A1, A2> Aggregator for Pair<A1, A2>
+where
+    A1: Aggregator + Send + 'static,
+    A2: Aggregator + Send + 'static,
+    A1::Input: Send + std::fmt::Debug + 'static,
+    A2::Input: Send + std::fmt::Debug + 'static,
+{
+    type Input = (A1::Input, A2::Input);
+
+    fn create() -> (mpsc::UnboundedSender<Self::Input>, Self) {
+        let (send_channel, receive_channel) = mpsc::unbounded_channel();
+        let pair = Self {
+            a1: None,
+            a2: None,
+            receive_channel,
+        };
+        (send_channel, pair)
+    }
+
+    fn start(mut self) -> tokio::task::JoinHandle<Self> {
+        let (a1_channel, a1) = A1::create();
+        let (a2_channel, a2) = A2::create();
+        tokio::task::spawn(async move {
+            let a1_task = a1.start();
+            let a2_task = a2.start();
+
+            while let Some((a1_input, a2_input)) = self.receive_channel.recv().await {
+                a1_channel.send(a1_input).unwrap();
+                a2_channel.send(a2_input).unwrap();
+            }
+            drop(a1_channel);
+            drop(a2_channel);
+
+            let a1 = a1_task.await.unwrap();
+            let a2 = a2_task.await.unwrap();
+
+            Self {
+                a1: Some(a1),
+                a2: Some(a2),
+                receive_channel: self.receive_channel,
+            }
+        })
+    }
+
+    fn pre_process(tx: &ParsedTx) -> Self::Input {
+        (A1::pre_process(tx), A2::pre_process(tx))
+    }
+
+    fn finish(self) {
+        self.a1
+            .map(|a1| a1.finish())
+            .unwrap_or_else(|| println!("WARN Pair finished with no A1 instance"));
+        self.a2
+            .map(|a2| a2.finish())
+            .unwrap_or_else(|| println!("WARN Pair finished with no A2 instance"));
+    }
+}
+
+'''
+'''--- src/transaction_reader/filter.rs ---
+use crate::transaction_reader::{FlatTxStatus, TxData, TxStatus};
+use aurora_engine_transactions::EthTransactionKind;
+use aurora_engine_types::types::Address;
+
+pub trait Filter {
+    fn pass(&self, data: &TxData) -> bool;
+}
+
+pub struct NoFilter;
+impl Filter for NoFilter {
+    fn pass(&self, _data: &TxData) -> bool {
+        true
+    }
+}
+
+pub struct StatusExecuted;
+impl Filter for StatusExecuted {
+    fn pass(&self, data: &TxData) -> bool {
+        matches!(data.status, TxStatus::Executed(_))
+    }
+}
+
+pub struct MatchFlatStatus(pub FlatTxStatus);
+impl Filter for MatchFlatStatus {
+    fn pass(&self, data: &TxData) -> bool {
+        data.status.flatten() == self.0
+    }
+}
+
+pub struct MinNearGasUsed(pub u128);
+impl Filter for MinNearGasUsed {
+    fn pass(&self, data: &TxData) -> bool {
+        match data.gas_profile.get("TOTAL") {
+            None => false,
+            Some(total) => total >= &self.0,
+        }
+    }
+}
+
+pub struct MaxNearGasUsed(pub u128);
+impl Filter for MaxNearGasUsed {
+    fn pass(&self, data: &TxData) -> bool {
+        match data.gas_profile.get("TOTAL") {
+            None => false,
+            Some(total) => total <= &self.0,
+        }
+    }
+}
+
+pub struct MinEvmGasUsed(pub u64);
+impl Filter for MinEvmGasUsed {
+    fn pass(&self, data: &TxData) -> bool {
+        match &data.status {
+            TxStatus::Executed(submit_result) => submit_result.gas_used >= self.0,
+            _ => false,
+        }
+    }
+}
+
+pub struct MaxEvmGasUsed(pub u64);
+impl Filter for MaxEvmGasUsed {
+    fn pass(&self, data: &TxData) -> bool {
+        match &data.status {
+            TxStatus::Executed(submit_result) => submit_result.gas_used <= self.0,
+            _ => false,
+        }
+    }
+}
+
+pub struct GeneralGasFilter {
+    pub min_near: Option<u128>,
+    pub min_evm: Option<u64>,
+    pub max_near: Option<u128>,
+    pub max_evm: Option<u64>,
+}
+
+impl Filter for GeneralGasFilter {
+    fn pass(&self, data: &TxData) -> bool {
+        let near_gas_used = match data.gas_profile.get("TOTAL") {
+            None => return false,
+            Some(total) => total,
+        };
+        let evm_gas_used = match &data.status {
+            TxStatus::Executed(submit_result) => &submit_result.gas_used,
+            _ => return false,
+        };
+
+        self.min_near
+            .as_ref()
+            .map(|g| near_gas_used >= g)
+            .unwrap_or(true)
+            && self
+                .min_evm
+                .as_ref()
+                .map(|g| evm_gas_used >= g)
+                .unwrap_or(true)
+            && self
+                .max_near
+                .as_ref()
+                .map(|g| near_gas_used <= g)
+                .unwrap_or(true)
+            && self
+                .max_evm
+                .as_ref()
+                .map(|g| evm_gas_used <= g)
+                .unwrap_or(true)
+    }
+}
+
+pub struct EthTxTo(pub Address);
+impl Filter for EthTxTo {
+    fn pass(&self, data: &TxData) -> bool {
+        data.eth_tx
+            .as_ref()
+            .and_then(|eth_tx| match eth_tx {
+                EthTransactionKind::Legacy(tx) => tx.transaction.to.as_ref(),
+                EthTransactionKind::Eip2930(t) => t.transaction.to.as_ref(),
+                EthTransactionKind::Eip1559(t) => t.transaction.to.as_ref(),
+            })
+            .map(|a| a == &self.0)
+            .unwrap_or(false)
+    }
+}
+
+pub struct And<F1, F2> {
+    f1: F1,
+    f2: F2,
+}
+impl<F1, F2> And<F1, F2> {
+    pub fn new(f1: F1, f2: F2) -> Self {
+        Self { f1, f2 }
+    }
+}
+impl<F1: Filter, F2: Filter> Filter for And<F1, F2> {
+    fn pass(&self, data: &TxData) -> bool {
+        self.f1.pass(data) && self.f2.pass(data)
+    }
+}
+
+pub struct Or<F1, F2> {
+    f1: F1,
+    f2: F2,
+}
+impl<F1, F2> Or<F1, F2> {
+    pub fn new(f1: F1, f2: F2) -> Self {
+        Self { f1, f2 }
+    }
+}
+impl<F1: Filter, F2: Filter> Filter for Or<F1, F2> {
+    fn pass(&self, data: &TxData) -> bool {
+        self.f1.pass(data) || self.f2.pass(data)
+    }
+}
+
+'''
+'''--- src/transaction_reader/mod.rs ---
+//! Helpful functions for analyzing JSON data obtained from NEAR (e.g. via `tx` JSON RPC method).
+//! `paths: Vec<String>` gives the list of (absolute) paths for all the files to include in the analysis.
+
+use aurora_engine::parameters::SubmitResult;
+use aurora_engine_transactions::EthTransactionKind;
+use borsh::BorshDeserialize;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::fs;
+
+pub mod aggregator;
+pub mod filter;
+
+use aggregator::Aggregator;
+use filter::Filter;
+
+pub struct ParsedTx {
+    path: String,
+    data: TxData,
+}
+
+pub struct TxData {
+    status: TxStatus,
+    gas_profile: HashMap<String, u128>,
+    eth_tx: Option<EthTransactionKind>,
+}
+
+impl TxData {
+    pub fn from_value(value: &serde_json::Value) -> Option<Self> {
+        let status = get_tx_status(value)?;
+        let gas_profile = get_gas_profile(value)?;
+        let eth_tx = get_eth_tx(value);
+
+        Some(Self {
+            status,
+            gas_profile,
+            eth_tx,
+        })
+    }
+}
+
+pub async fn process_data<A, F>(paths: Vec<String>, filter: &Arc<F>)
+where
+    A: Aggregator,
+    A::Input: std::fmt::Debug + Send + 'static,
+    F: Filter + Send + Sync + 'static,
+{
+    let (send_channel, aggregator) = A::create();
+
+    let read_tasks: Vec<tokio::task::JoinHandle<_>> = paths
+        .into_iter()
+        .map(|path| {
+            let local_channel = send_channel.clone();
+            let local_filter = Arc::clone(filter);
+            tokio::task::spawn(async move {
+                let value = read_file(path.as_str()).await;
+                match TxData::from_value(&value) {
+                    None => println!("ERROR failed to read tx data for {}", path.as_str()),
+                    Some(data) => {
+                        if local_filter.pass(&data) {
+                            let tx = ParsedTx { path, data };
+                            let input = A::pre_process(&tx);
+                            local_channel.send(input).unwrap();
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+    drop(send_channel);
+    let agg_task = aggregator.start();
+
+    for t in read_tasks {
+        t.await.unwrap_or_else(|e| println!("ERROR {:?}", e));
+    }
+
+    let aggregator = agg_task.await.unwrap();
+    aggregator.finish();
+}
+
+async fn read_file(path: &str) -> serde_json::Value {
+    let bytes = match fs::read(path).await {
+        Ok(b) => b,
+        Err(e) => panic!("ERROR on file {}: {:?}", path, e),
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(x) => x,
+        Err(e) => panic!("ERROR on file {}: {:?}", path, e),
+    }
+}
+
+fn get_gas_profile(value: &serde_json::Value) -> Option<HashMap<String, u128>> {
+    let mut profile_map = HashMap::new();
+    let total = get_gas_burnt(value)?;
+    let result = value.as_object()?.get("result")?;
+    let outcomes = result.as_object()?.get("receipts_outcome")?.as_array()?;
+    let outcome = outcomes
+        .iter()
+        .filter_map(|v| {
+            let outcome = v.as_object()?.get("outcome")?.as_object()?;
+            let g = outcome.get("gas_burnt")?.as_u64()?;
+            if (g as u128) == total {
+                Some(outcome)
+            } else {
+                None
+            }
+        })
+        .next()?;
+    let profile = get_recursive(outcome.get("metadata")?, &["gas_profile"])?.as_array()?;
+    for entry in profile.iter() {
+        let entry = entry.as_object()?;
+        let name = entry.get("cost")?.as_str()?;
+        let amount = entry.get("gas_used")?.as_str()?;
+        profile_map.insert(name.to_owned(), amount.parse().unwrap());
+    }
+    let profile_total: u128 = profile_map.values().sum();
+    profile_map.insert("OTHER".into(), total - profile_total);
+    profile_map.insert("TOTAL".into(), total);
+    Some(profile_map)
+}
+
+fn get_eth_tx(value: &serde_json::Value) -> Option<EthTransactionKind> {
+    let result = value.as_object()?.get("result")?;
+    let transaction = result.as_object()?.get("transaction")?;
+    let actions = transaction.as_object()?.get("actions")?;
+    for action in actions.as_array()? {
+        if let Some(fn_call) = action.as_object().and_then(|a| a.get("FunctionCall")) {
+            let args = fn_call.as_object()?.get("args")?.as_str()?;
+            let bytes = base64::decode(args).ok()?;
+            return bytes.as_slice().try_into().ok();
+        }
+    }
+    None
+}
+
+fn get_tx_status(value: &serde_json::Value) -> Option<TxStatus> {
+    let result = value.as_object()?.get("result")?;
+    let status = result.as_object()?.get("status")?.as_object()?;
+    match status.get("Failure") {
+        Some(failed_status) => {
+            let message = get_recursive(
+                failed_status,
+                &["ActionError", "kind", "FunctionCallError", "ExecutionError"],
+            )?
+            .as_str()?;
+            if message.contains("ERR_INCORRECT_NONCE") {
+                Some(TxStatus::IncorrectNonce)
+            } else if message.contains("Exceeded the maximum amount of gas") {
+                Some(TxStatus::GasLimit)
+            } else {
+                Some(TxStatus::Other(message.to_owned()))
+            }
+        }
+        None => {
+            let success_b64 = status.get("SuccessValue")?.as_str()?;
+            let success_bytes = base64::decode(success_b64).ok()?;
+            let result = SubmitResult::try_from_slice(success_bytes.as_slice()).ok()?;
+            Some(TxStatus::Executed(result))
+        }
+    }
+}
+
+fn get_gas_burnt(value: &serde_json::Value) -> Option<u128> {
+    let result = value.as_object()?.get("result")?;
+    let outcomes = result.as_object()?.get("receipts_outcome")?.as_array()?;
+    let max_burnt = outcomes
+        .iter()
+        .filter_map(|v| {
+            let g = get_recursive(v, &["outcome", "gas_burnt"])?;
+            g.as_u64()
+        })
+        .max()?;
+    Some(max_burnt as u128)
+}
+
+fn get_recursive<'a, 'b>(
+    v: &'a serde_json::Value,
+    path: &'b [&str],
+) -> Option<&'a serde_json::Value> {
+    if path.is_empty() {
+        return Some(v);
+    }
+
+    let field = v.as_object()?.get(path[0])?;
+    get_recursive(field, &path[1..])
+}
+
+#[derive(Debug)]
+enum TxStatus {
+    Executed(SubmitResult),
+    GasLimit,
+    IncorrectNonce,
+    Other(String),
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub enum FlatTxStatus {
+    Succeeded,
+    Reverted,
+    GasLimit,
+    IncorrectNonce,
+    Other,
+}
+
+impl TxStatus {
+    fn flatten(&self) -> FlatTxStatus {
+        match self {
+            Self::Executed(result) => match result.status {
+                aurora_engine::parameters::TransactionStatus::Succeed(_) => FlatTxStatus::Succeeded,
+                _ => FlatTxStatus::Reverted,
+            },
+            Self::GasLimit => FlatTxStatus::GasLimit,
+            Self::IncorrectNonce => FlatTxStatus::IncorrectNonce,
+            Self::Other(_) => FlatTxStatus::Other,
+        }
+    }
+}
+
+'''
+'''--- src/utils.rs ---
+use aurora_engine_transactions::legacy::{LegacyEthSignedTransaction, TransactionLegacy};
+use aurora_engine_types::{types::Address, U256};
+use libsecp256k1::{Message, PublicKey, SecretKey};
+use near_crypto::InMemorySigner;
+use rlp::RlpStream;
+use std::{io, path::Path};
+
+pub(crate) fn hex_to_arr32(h: &str) -> Result<[u8; 32], hex::FromHexError> {
+    let mut output = [0u8; 32];
+    hex::decode_to_slice(h, &mut output)?;
+    Ok(output)
+}
+
+pub(crate) fn address_from_secret_key(sk: &SecretKey) -> Address {
+    let pk = PublicKey::from_secret_key(sk);
+    let hash = aurora_engine_sdk::keccak(&pk.serialize()[1..]);
+    Address::try_from_slice(&hash[12..]).unwrap()
+}
+
+pub(crate) fn sign_transaction(
+    tx: TransactionLegacy,
+    chain_id: u64,
+    secret_key: &SecretKey,
+) -> LegacyEthSignedTransaction {
+    let mut rlp_stream = RlpStream::new();
+    tx.rlp_append_unsigned(&mut rlp_stream, Some(chain_id));
+    let message_hash = aurora_engine_sdk::keccak(rlp_stream.as_raw());
+    let message = Message::parse_slice(message_hash.as_bytes()).unwrap();
+
+    let (signature, recovery_id) = libsecp256k1::sign(&message, secret_key);
+    let v: u64 = (recovery_id.serialize() as u64) + 2 * chain_id + 35;
+    let r = U256::from_big_endian(&signature.r.b32());
+    let s = U256::from_big_endian(&signature.s.b32());
+    LegacyEthSignedTransaction {
+        transaction: tx,
+        v,
+        r,
+        s,
+    }
+}
+
+pub(crate) fn read_key_file<P: AsRef<Path>>(path: P) -> io::Result<InMemorySigner> {
+    let content = std::fs::read_to_string(path)?;
+    let key: KeyFile = serde_json::from_str(&content)?;
+    Ok(InMemorySigner {
+        account_id: key.account_id,
+        public_key: key.public_key,
+        secret_key: key.secret_key,
+    })
+}
+
+/// This is copied from the nearcore repo
+/// https://github.com/near/nearcore/blob/5252ba65ce81e187a3ba76dc3db754a596bc16d1/core/crypto/src/key_file.rs#L12
+/// for the purpose of having the `private_key` serde alias because that change has not yet
+/// been released (as of v0.14.0). We should delete this and use near's type once the new
+/// version is released.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct KeyFile {
+    pub account_id: near_primitives::types::AccountId,
+    pub public_key: near_crypto::PublicKey,
+    // Credential files generated which near cli works with have private_key
+    // rather than secret_key field.  To make it possible to read those from
+    // neard add private_key as an alias to this field so either will work.
+    #[serde(alias = "private_key")]
+    pub secret_key: near_crypto::SecretKey,
+}
+
+'''

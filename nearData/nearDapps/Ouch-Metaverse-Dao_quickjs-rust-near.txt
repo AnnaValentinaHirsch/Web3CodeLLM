@@ -1,0 +1,3161 @@
+*GitHub Repository "Ouch-Metaverse-Dao/quickjs-rust-near"*
+
+'''--- .github/workflows/main.yml ---
+name: CI
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+jobs:
+  rununittest:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Unit tests
+        run: |
+          curl https://wasmtime.dev/install.sh -sSf | bash
+          rustup target add wasm32-wasi
+          ./test.sh
+  e2etests:
+    name: End to end tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: End to end tests
+        run: |
+          set -e
+          curl -L https://github.com/WebAssembly/binaryen/releases/download/version_110/binaryen-version_110-x86_64-linux.tar.gz | tar xzf -
+          export PATH="`pwd`/binaryen-version_110/bin:$PATH"
+          npm install -g near-cli
+          rustup target add wasm32-unknown-unknown
+          mkdir out
+          ./buildanddeploy.sh
+          yarn install
+          yarn test-e2e
+  webapptests:
+    name: Web app tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Web app tests
+        run: |
+          yarn install
+          yarn test-web
+
+'''
+'''--- Cargo.toml ---
+[package]
+name = "quickjs-rust-near"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+codegen-units = 1
+lto = true
+debug = false
+opt-level = "z"
+
+[dependencies]
+near-sdk = "4.0.0"
+lazy_static = "1.4.0"
+ed25519-dalek = "1.0.1"
+
+[build-dependencies]
+bindgen = "0.60.1"
+
+'''
+'''--- README.md ---
+Rust WebAssembly smart contract for NEAR with Javascript runtime
+================================================================
+
+This is a Proof of Concept of embedding QuickJS with https://github.com/near/near-sdk-rs for being able to execute custom JavaScript code inside a smart contract written in Rust.
+
+First of all, have a look at the videos where I present the project
+
+https://www.youtube.com/watch?v=JBZEr__pid0&list=PLv5wm4YuO4IwVNrSsYxeqKrtQZYRML03Z
+
+The QuickJS runtime is compiled from https://github.com/petersalomonsen/quickjs-wasm-near
+
+The contract has two functions:
+- `run_script` accepting javascript as text for compiling on the fly.
+- `run_bytecode` for running JS pre-compiled into the QuickJS bytecode format. Send the pre-compiled bytecode as a base64 string. See https://github.com/petersalomonsen/quickjs-wasm-near/blob/master/web/compiler/compile.spec.js for examples on compiling JS to QuickJS bytecode.
+- `submit_script` for submitting and storing JavaScript and running later
+- `run_script_for_account` run script stored by account, returns an integer returned by the script
+- `run_script_for_account_no_return` run script stored by account, does not return anything unless the script calls `env.value_return`.
+
+For building and deploying the contract have a look at [buildanddeploy.sh](./buildanddeploy.sh).
+# Calling the deployed contract
+
+Test running javascript as text:
+
+```
+near call dev-1650299983789-21350249865305 --accountId=psalomo.testnet run_script '{"script": "(function() {return 5*33+22;})();" }'
+```
+
+Here are some examples from a deployment to testnet account: `dev-1650299983789-21350249865305`
+
+Test running bytecode ( which is compiled from `JSON.parse('{"a": 222}').a+3`):
+
+```
+near call dev-1650299983789-21350249865305 --accountId=psalomo.testnet run_bytecode '{"bytecodebase64": "AgQKcGFyc2UUeyJhIjogMjIyfQJhGDxldmFsc291cmNlPg4ABgCgAQABAAMAABsBogEAAAA4mwAAAELeAAAABN8AAAAkAQBB4AAAALidzSjCAwEA" }'
+```
+# Testing
+
+Trying to run tests with `wasm32` targets will not work out of the box. As you will see from running the command below, it will fail when trying to run the compiled test file.
+
+`cargo test --target=wasm32-wasi`
+
+but you can run the wasm file it produces with a WebAssembly runtime like [wasmtime](http://wasmtime.dev), [wasmer](https://wasmer.io/) or [wasm3](https://github.com/wasm3/wasm3/).
+
+Have a look at [test.sh](./test.sh) and try running it and you'll see that it outputs results just like when running normal tests in Rust.
+
+# Web4 and a WebAssembly Music showcase
+
+The web application in the [web4](./web4) folder is a vanilla JS Web Component application for uploading music written in Javascript and also playing it, and accepting parameters in JSON for configuring the playback. It also contains functionality for exporting to WAV. See the video playlist above for a demo.
+
+The music to be played back is fetched in a view method call, and for controlling who can access this view method the JSON parameters payload is signed using the callers private key. The contract will then verify the signature according to the callers public key stored in a transaction before the view method call.
+
+The web application is packaged into a single HTML file using rollup, where the final bundle is embedded into the Rust sources encoded as a base64 string.
+
+# TODO
+
+- **DONE** Implement (mock) WASI methods in a linkable library so that WAT file does not have to be edited manually
+- **DONE** Integration/Unit testing support for Wasm32 target ( which is not supported with near-sdk-rs, see https://github.com/near/near-sdk-rs/issues/467 )
+  - **DONE** Running tests
+  - **DONE** Displaying errors (needs a panic hook)
+  - **DONE** Minimum NEAR mock env  
+- Local simulation in browser/node Wasm runtime with mocked NEAR env in JavaScript
+- **DONE** End to End tests (testnet)
+- **DONE** Expose some NEAR environment functions to JS runtime
+  - **DONE** `env.value_return`
+  - **DONE** `env.input` (no need to load into register first)
+  - **DONE** `env.signer_account_id` (no need to load into register first)
+- **DONE** Web4 hosting showcase
+- NFT implementation configurable with JavaScript
+- Implement Web interface for copying base64 encoded bytecode to clipboard (in https://github.com/petersalomonsen/quickjs-wasm-near)
+
+'''
+'''--- build.rs ---
+extern crate bindgen;
+
+use std::env;
+use std::path::{Path};
+
+fn main() {
+    let dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+    println!("cargo:rustc-link-search=native={}", Path::new(&dir).join("lib").display());
+    println!("cargo:rustc-link-lib=static=quickjs");
+    println!("cargo:rustc-link-lib=static=jseval");
+    println!("cargo:rustc-link-lib=static=c-optz");
+    println!("cargo:rustc-link-lib=static=emmalloc");
+    println!("cargo:rustc-link-lib=static=compiler_rt");
+    println!("cargo:rustc-link-lib=static=standalonewasm");
+}
+
+'''
+'''--- buildanddeploy.sh ---
+#!/bin/bash
+set -e
+# Build for WebAssembly target
+RUSTFLAGS='-C link-arg=-s' cargo build --target=wasm32-unknown-unknown --release
+# Remove unneeded WebAssembly exports
+wasm-metadce -f meta-dce.json target/wasm32-unknown-unknown/release/quickjs_rust_near.wasm -o out/main.wasm
+# Optimize the Wasm binary
+wasm-opt -Oz out/main.wasm -o out/main.wasm
+if [ -z "$1" ]
+then
+    # Deploy to DEV account
+    echo n | near dev-deploy
+else
+    # Deploy to account given in argument to this script
+    echo "Deploying to $1"
+    near deploy $1 out/main.wasm
+fi
+
+'''
+'''--- e2e/e2e.test.js ---
+import { connect, keyStores } from 'near-api-js';
+import { homedir } from 'os';
+import { readFile } from 'fs/promises';
+
+const connectionConfig = {
+    networkId: "testnet",
+    keyStore: new keyStores.UnencryptedFileSystemKeyStore(`${homedir()}/.near-credentials`),
+    nodeUrl: "https://rpc.testnet.near.org",
+    walletUrl: "https://wallet.testnet.near.org",
+    helperUrl: "https://helper.testnet.near.org",
+    explorerUrl: "https://explorer.testnet.near.org",
+};
+
+test('should run custom javascript in contract', async () => {
+    const nearConnection = await connect(connectionConfig);
+    const accountId = await (await readFile('neardev/dev-account')).toString();
+    const account = await nearConnection.account(accountId);
+    const result = await account.functionCall({
+        contractId: accountId,
+        methodName: 'run_script',
+        args: {
+            script: `print('hello');(function() { return 1234; })();`
+        }
+    });
+    expect(result.receipts_outcome[0].outcome.logs[0]).toBe('hello');
+    expect(Buffer.from(result.status.SuccessValue, 'base64').toString()).toBe('"1234"');
+}, 20000);
+
+test('should submit javascript and call ', async () => {
+    const nearConnection = await connect(connectionConfig);
+    const accountId = await (await readFile('neardev/dev-account')).toString();
+    const account = await nearConnection.account(accountId);
+    await account.functionCall({
+        contractId: accountId,
+        methodName: 'submit_script',
+        args: {
+            script: `print('world');(function() { return 5678; })();`
+        }
+    });
+    const result = await account.functionCall({
+        contractId: accountId,
+        methodName: 'run_script_for_account',
+        args: {
+            account_id: accountId
+        },
+        gas:  "300000000000000"
+    });
+    expect(result.receipts_outcome[0].outcome.logs[0]).toBe('world');
+    expect(Buffer.from(result.status.SuccessValue, 'base64').toString()).toBe('"5678"');
+}, 20000);
+
+test('should verify signed message in javascript', async () => {
+    const nearConnection = await connect(connectionConfig);
+    const accountId = await (await readFile('neardev/dev-account')).toString();
+    const account = await nearConnection.account(accountId);
+    const messageToBeSigned = 'the expected message to be signed';
+
+    const keyPair = await account.connection.signer.keyStore.getKey(connectionConfig.networkId, accountId);
+    const signature = await keyPair.sign(new TextEncoder().encode(messageToBeSigned));
+    const signatureBase64 = btoa(String.fromCharCode(...signature.signature));
+
+    await account.functionCall({
+        contractId: accountId,
+        methodName: 'submit_script',
+        args: {
+            script: `
+const args = JSON.parse(env.input());
+const result = env.verify_signed_message('${messageToBeSigned}', args.signature, '${accountId}') ?
+                    'valid' : 'invalid';
+env.value_return(JSON.stringify(result));            `
+        }
+    });
+
+    await account.functionCall({
+        contractId: accountId,
+        methodName: 'store_signing_key',
+        args: {}
+    });
+    const result = await account.viewFunction(
+        accountId,
+        'run_script_for_account_no_return',
+        {
+            account_id: accountId,
+            signature: signatureBase64
+        }
+    );
+    expect(result).toBe('valid');
+}, 20000);
+
+'''
+'''--- e2e/music.test.js ---
+import { connect, keyStores, WalletConnection } from 'near-api-js';
+import { homedir } from 'os';
+import { readFile } from 'fs/promises';
+import musicscript from './musicscript.js';
+import { wrapJSmusicInTemplate } from '../web4/webassemblymusic/musictemplate.js';
+
+const connectionConfig = {
+  networkId: "testnet",
+  keyStore: new keyStores.UnencryptedFileSystemKeyStore(`${homedir()}/.near-credentials`),
+  nodeUrl: "https://rpc.testnet.near.org",
+  walletUrl: "https://wallet.testnet.near.org",
+  helperUrl: "https://helper.testnet.near.org",
+  explorerUrl: "https://explorer.testnet.near.org",
+};
+
+test('should create music', async () => {
+    const nearConnection  = await connect(connectionConfig);    
+    const accountId = await (await readFile('neardev/dev-account')).toString();
+    const account = await nearConnection.account(accountId);
+    await account.functionCall({
+        contractId: accountId,
+        methodName: 'submit_script',
+        args: {
+            script: musicscript
+        }
+    });
+    const result = await account.functionCall({
+        contractId: accountId,
+        methodName: 'run_script_for_account_no_return',
+        args: {
+            account_id: accountId
+        },
+        gas:  "300000000000000"
+    });
+
+    const resultValue = JSON.parse(Buffer.from(result.status.SuccessValue, 'base64').toString());
+    expect(resultValue).toEqual([{"time":0,"message":[148,26,100]},{"time":0,"message":[146,60,100]},{"time":166,"message":[146,66,10]},{"time":233,"message":[130,66,0]},{"time":267,"message":[132,26,0]},{"time":333,"message":[146,66,80]},{"time":500,"message":[148,26,100]},{"time":533,"message":[130,66,0]},{"time":567,"message":[132,26,0]},{"time":666,"message":[148,33,100]},{"time":666,"message":[146,62,100]},{"time":667,"message":[130,60,0]},{"time":799,"message":[132,33,0]},{"time":833,"message":[148,36,100]},{"time":966,"message":[132,36,0]},{"time":1000,"message":[146,66,70]},{"time":1166,"message":[148,38,100]},{"time":1166,"message":[146,60,100]},{"time":1200,"message":[130,66,0]},{"time":1299,"message":[132,38,0]},{"time":1333,"message":[130,62,0]},{"time":1500,"message":[148,36,100]},{"time":1500,"message":[146,66,10]},{"time":1567,"message":[130,66,0]},{"time":1666,"message":[146,66,80]},{"time":1666,"message":[146,60,100]},{"time":1700,"message":[132,36,0]},{"time":1833,"message":[148,33,100]},{"time":1833,"message":[130,60,0]},{"time":1866,"message":[130,66,0]},{"time":1966,"message":[132,33,0]},{"time":2000,"message":[146,62,100]},{"time":2166,"message":[148,33,100]},{"time":2299,"message":[132,33,0]},{"time":2333,"message":[148,36,100]},{"time":2333,"message":[146,66,70]},{"time":2333,"message":[130,60,0]},{"time":2400,"message":[132,36,0]},{"time":2500,"message":[148,38,100]},{"time":2500,"message":[146,62,20]},{"time":2533,"message":[130,66,0]},{"time":2567,"message":[130,62,0]},{"time":2633,"message":[132,38,0]},{"time":2666,"message":[-1]}]);
+
+}, 40000);
+
+test('should create and execute music script using function in web app', async () => {
+    const scriptToUpload = wrapJSmusicInTemplate(await readFile('./web4/webassemblymusic/sample_music2.js'));
+    const nearConnection  = await connect(connectionConfig);    
+    const accountId = await (await readFile('neardev/dev-account')).toString();
+    const account = await nearConnection.account(accountId);
+    await account.functionCall({
+        contractId: accountId,
+        methodName: 'submit_script',
+        args: {
+            script: scriptToUpload
+        }
+    });
+    const result = await account.viewFunction(
+        accountId,
+        'run_script_for_account_no_return',
+        {
+            account_id: accountId
+        }
+    );
+
+    expect(result.length).toBe(115);
+}, 20000);
+'''
+'''--- e2e/musicscript.js ---
+export default `
+(async function () {
+    'use strict';
+
+    const noteStringToNoteNumberMap =
+        new Array(128).fill(null).map((v, ndx) =>
+            (['c', 'c#', 'd', 'd#', 'e', 'f', 'f#', 'g', 'g#', 'a', 'a#', 'b'])[ndx % 12] + '' + Math.floor(ndx / 12)
+        ).reduce((prev, curr, ndx) => {
+            prev[curr] = ndx;
+            return prev;
+        }, {});
+
+    let tick = 0;
+
+    function currentTime() {
+        return tick;
+    }
+
+    let startTime = currentTime();
+    let bpm = 110;
+    const setBPM$1 = (tempo) => bpm = tempo;
+
+    const timeToBeat = (time) => (time / (60 * 1000)) * bpm;
+    const currentBeat = () => timeToBeat(currentTime() - startTime);
+
+    let pendingEvents = [];
+
+    function pushPendingEvent(timeout) {
+        return new Promise(resolve =>
+            pendingEvents.push({
+                targetTime: Math.round(currentTime() + timeout),
+                resolve: resolve
+            })
+        );
+    }
+
+    function resetTick() {
+        tick = 0;
+    }
+
+    async function nextTick() {
+        const minPendingTick = pendingEvents.reduce((prev, event) =>
+            event.targetTime < prev || prev === -1 ? event.targetTime : prev, -1);
+        const resolvedEvents = [];
+
+        pendingEvents
+            .filter(event => event.targetTime === minPendingTick)
+            .forEach(event => resolvedEvents.push(event.resolve()));
+        pendingEvents = pendingEvents.filter(event => event.targetTime > tick);
+
+        tick = minPendingTick;
+        await Promise.all(resolvedEvents);
+    }
+
+    async function waitForBeat(beatNo) {
+        let timeout = Math.floor((((beatNo) / bpm) * (60 * 1000)) -
+            (currentTime() -
+                startTime));
+
+        if (timeout < 0) {
+            timeout = 0;
+        }
+
+        return pushPendingEvent(timeout);
+    }
+
+    class Pattern {
+        constructor(output) {
+            this.output = output;
+            this.channel = 0;
+            this.velocity = 100;
+            this.offset = 0;
+            this.stepsperbeat = 16;
+        }
+
+        setChannel(channel) {
+            this.channel = channel;
+        }
+
+        async waitForStep(stepno) {
+            return this.waitForBeat(stepno / this.stepsperbeat);
+        }
+
+        async waitForBeat(beatNo) {
+            let timeout = Math.floor((((beatNo + this.offset) / bpm) * (60 * 1000)) -
+                (currentTime() -
+                    startTime));
+
+            if (timeout < 0) {
+                return;
+            } else {
+                return pushPendingEvent(timeout);
+            }
+        }
+
+        toNoteNumber(note) {
+            return noteStringToNoteNumberMap[note];
+        }
+
+        async waitDuration(duration) {
+            const timeout = (duration * 60 * 1000) / bpm;
+
+            return pushPendingEvent(timeout);
+        }
+
+        async pitchbend(start, target, duration, steps) {
+            const stepdiff = (target - start) / steps;
+            let currentValue = start;
+            for (let step = 0; step < steps; step++) {
+
+                const rounded = Math.round(currentValue);
+                this.output.sendMessage([0xe0 + this.channel, 0x007f & rounded, (0x3f80 & rounded) >> 7]);
+
+                currentValue += stepdiff;
+
+                await this.waitDuration(duration / steps);
+            }
+            this.output.sendMessage([0xe0 + this.channel, 0x007f & target, (0x3f80 & target) >> 7]);
+        }
+
+        async controlchange(controller, start, target, duration, steps) {
+            const stepdiff = (target - start) / steps;
+            let currentValue = start;
+            for (let step = 0; step < steps; step++) {
+
+                const rounded = Math.round(currentValue);
+                this.output.sendMessage([0xb0 + this.channel, controller, rounded]);
+
+                currentValue += stepdiff;
+
+                await this.waitDuration(duration / steps);
+            }
+            this.output.sendMessage([0xb0 + this.channel, controller, 0x7f & target]);
+        }
+
+        async note(noteNumber, duration) {
+            this.output.sendMessage([0x90 + this.channel, noteNumber, this.velocity]);
+
+            await this.waitDuration(duration);
+            this.output.sendMessage([0x80 + this.channel, noteNumber, 0]);
+        }
+
+        async playNote(note, duration) {
+            this.output.sendMessage([0x90 + this.channel, noteStringToNoteNumberMap[note], this.velocity]);
+
+            await this.waitDuration(duration);
+            this.output.sendMessage([0x80 + this.channel, noteStringToNoteNumberMap[note], 0]);
+        }
+    }
+
+    const noteFunctionKeys = new Array(128).fill(null).map((v, ndx) =>
+        (['c', 'cs', 'd', 'ds', 'e', 'f', 'fs', 'g', 'gs', 'a', 'as', 'b'])[ndx % 12] + '' + Math.floor(ndx / 12)
+    );
+
+    // Note functions - can be called with and without parameter (also without parantheses)
+    function createNoteFunctions() {
+        const notefunctions = {};
+
+        noteFunctionKeys.forEach((note, ndx) => notefunctions[note] = (duration, velocity, offset) => {
+            const createNoteFunc = (notenumber, _velocity = velocity) => async (pattern, rowbeat) => {
+                await pattern.waitForBeat(rowbeat + (offset ? offset : 0));
+
+                pattern.velocity = _velocity && typeof duration !== 'object' ? _velocity : pattern.defaultvelocity;
+                if (!duration || typeof duration === 'object') {
+                    duration = 1 / pattern.stepsperbeat;
+                }
+                pattern.note(notenumber, duration);
+            };
+            const noteFunc = createNoteFunc(ndx);
+
+            if (typeof duration === 'object') {
+                return noteFunc(duration, velocity);
+            } else {
+                noteFunc.transpose = (transposeAmount) => createNoteFunc(ndx + transposeAmount);
+                noteFunc.fixVelocity = (_velocity) => createNoteFunc(ndx, _velocity);
+                return noteFunc;
+            }
+        });
+        noteFunctionKeys.forEach((note, ndx) => {
+            notefunctions[note].transpose = (transposeAmount) => notefunctions[noteFunctionKeys[ndx + transposeAmount]];
+            notefunctions[note].fixVelocity = (_velocity) => notefunctions[noteFunctionKeys[ndx]](undefined, _velocity);
+        });
+        return notefunctions;
+    }
+
+    const pitchbend = (start, target, duration, steps) => async (pattern, rowbeat) => {
+        await pattern.waitForBeat(rowbeat);
+        pattern.pitchbend(start, target, duration, steps);
+    };
+
+    const controlchange = (controller, start, target, duration, steps) => async (pattern, rowbeat) => {
+        await pattern.waitForBeat(rowbeat);
+        pattern.controlchange(controller, start, target ? target : start, duration, steps);
+    };
+
+    function quantize(noteEvents, stepsperbeat, percentage = 1) {
+        return noteEvents.map(noteEvent => {
+            const scaledUp = noteEvent[0] * stepsperbeat;
+            const diff = (scaledUp - Math.round(scaledUp)) * percentage;
+
+            return [
+                (scaledUp - diff) / stepsperbeat,
+                noteEvent[1]
+            ]
+        });
+    }
+
+    Array.prototype.quantize = function (stepsperbeat, percentage = 1) {
+        return quantize(this, stepsperbeat, percentage);
+    };
+
+    Array.prototype.fixVelocity = function (velocity) {
+        return this.map(evt => evt.fixVelocity ? evt.fixVelocity(velocity) : evt);
+    };
+
+    Array.prototype.repeat = function (times = 1) {
+        const arrToRepat = this.slice(0);
+        let arr = this;
+        for (let n = 0; n < times; n++) {
+            arr = arr.concat(arrToRepat);
+        }
+        return arr;
+    };
+
+    class TrackerPattern extends Pattern {
+        constructor(output, channel, stepsperbeat = 1, defaultvelocity = 100) {
+            super(output);
+            this.channel = channel;
+            this.stepsperbeat = stepsperbeat;
+            this.defaultvelocity = defaultvelocity;
+        }
+
+        async steps(stepsperbeat, events) {
+            this.offset = Math.round(currentBeat());
+            for (let step = 0; step < events.length; step++) {
+                let beat = step / stepsperbeat;
+                const event = events[step];
+                if (event && event.constructor && event.constructor.name === 'AsyncFunction') {
+                    event(this, beat);
+                } else if (event && event.constructor && event.constructor.name === 'Function') {
+                    (async () => {
+                        await this.waitForBeat(beat);
+                        event(this, beat);
+                    })();
+                } else if (event && event.length) {
+                    // Array
+                    for (let evt of event) {
+                        if (evt.constructor.name === 'AsyncFunction') {
+                            evt(this, beat);
+                        } else {
+                            await this.waitForBeat(beat);
+                            evt(this, beat);
+                        }
+                    }
+                }
+            }
+
+            await this.waitForBeat(events.length / stepsperbeat);
+        }
+
+        async play(rows, rowbeatcolumnmode) {
+            this.offset = Math.round(currentBeat());
+            let rowbeat = 0;
+
+            if (typeof rows[0] === 'function') {
+                rows = [[0].concat(rows)];
+            }
+            for (let ndx = 0; ndx < rows.length; ndx++) {
+                const cols = rows[ndx];
+
+                if (!rowbeatcolumnmode) {
+                    rowbeat = cols[0];
+                }
+
+                for (let colndx = 1; colndx < cols.length; colndx++) {
+                    const col = cols[colndx];
+                    if (col.constructor.name === 'AsyncFunction') {
+                        col(this, rowbeat);
+                    } else {
+                        (async () => {
+                            const waitforbeat = rowbeat;
+                            await this.waitForBeat(rowbeat);
+                            col(this, waitforbeat);
+                        })();
+                    }
+                }
+                if (rowbeatcolumnmode === 1) {
+                    rowbeat += cols[0];
+                }
+            }
+            await this.waitForBeat(rowbeat);
+        }
+    }
+
+    const SEQ_MSG_LOOP = -1;
+    const SEQ_MSG_START_RECORDING = -2;
+    const SEQ_MSG_STOP_RECORDING = -3;
+
+    let songmessages = [];
+    let instrumentNames = [];
+    let muted = {};
+    let solo = {};
+    let addedAudio = [];
+    const addedVideo = {};
+
+    let trackerPatterns = [];
+    let songParts = {};
+
+    const AsyncFunction = Object.getPrototypeOf(async function () { }).constructor;
+    const output = {
+        sendMessage: (msg) => {
+            const ch = msg[0] & 0x0f;
+            if (msg.length !== 3 ||
+                (!muted[ch] && !Object.keys(solo).length || solo[ch])
+            ) {
+                songmessages.push({
+                    time: currentTime(),
+                    message: msg
+                });
+            }
+        }
+    };
+
+    function playFromHere() {
+        songmessages = songmessages.filter(evt => (evt.message[0] & 0xf0) === 0xb0) // keep control changes
+            .map(evt => Object.assign(evt, { time: 0 }));
+
+        resetTick();
+    }
+
+    async function loopHere$1() {
+        output.sendMessage([SEQ_MSG_LOOP]);
+    }
+
+    function startRecording() {
+        output.sendMessage([SEQ_MSG_START_RECORDING]);
+    }
+
+    function stopRecording() {
+        output.sendMessage([SEQ_MSG_STOP_RECORDING]);
+    }
+
+    function startVideo(name, clipStartTime = 0) {
+        addedVideo[name].schedule.push({ startTime: currentTime(), clipStartTime });
+    }
+
+    function stopVideo(name) {
+        addedVideo[name].schedule[addedVideo[name].schedule.length - 1].stopTime = currentTime();
+    }
+
+    const noteFunctions = createNoteFunctions();
+    const songargs = {
+        'output': output,
+        'setBPM': setBPM$1,
+        'TrackerPattern': TrackerPattern,
+        'createTrack': (channel, stepsperbeat, defaultvelocity) => {
+            const trackerPattern = new TrackerPattern({
+                startTime: currentTime(),
+                midievents: [],
+                sendMessage: function (msg) {
+                    this.midievents.push({
+                        time: currentTime() - this.startTime,
+                        message: msg
+                    });
+                    output.sendMessage(msg);
+                }
+            }, channel, stepsperbeat, defaultvelocity);
+            trackerPatterns.push(trackerPattern);
+            return trackerPattern;
+        },
+        'playFromHere': playFromHere,
+        'loopHere': loopHere$1,
+        'pitchbend': pitchbend,
+        'controlchange': controlchange,
+        'waitForBeat': waitForBeat,
+        'startRecording': startRecording,
+        'stopRecording': stopRecording,
+        'startVideo': startVideo,
+        'stopVideo': stopVideo,
+        'definePartStart': (partName) => songParts[partName] = { startTime: currentTime() },
+        'definePartEnd': (partName) => songParts[partName].endTime = currentTime(),
+        'mute': (channel) => muted[channel] = true,
+        'solo': (channel) => solo[channel] = true,
+        'addInstrument': (instrument) => instrumentNames.push(instrument),
+        'addAudio': async (url) => {
+            if (!(await addedAudio.find(async audioPromise => (await audioPromise).url === url))) {
+                addedAudio.push(new Promise(async (resolve, reject) => {
+                    const audioObj = { url: url };
+                    try {
+                        const buf = await fetch(url)
+                            .then(response => response.arrayBuffer())
+                            .then(buffer => new AudioContext().decodeAudioData(buffer));
+
+                        audioObj.leftbuffer = buf.getChannelData(0).buffer;
+                        audioObj.rightbuffer = buf.getChannelData(1).buffer;
+                        print('loaded', url);
+                        resolve(audioObj);
+                    } catch (e) {
+                        reject(e);
+                    }
+                }));
+            }
+        },
+        'addVideo': async (name, url) => {
+            if (!addedVideo[name]) {
+                const videoElement = document.createElement('video');
+                videoElement.src = url;
+                videoElement.autoplay = false;
+                videoElement.muted = true;
+                addedVideo[name] = { videoElement, schedule: [] };
+            }
+        },
+        'addImage': async (name, url) => {
+            if (!addedVideo[name]) {
+                const imageElement = new Image();
+                imageElement.src = url;
+                addedVideo[name] = { imageElement, schedule: [] };
+            }
+        },
+        'note': (noteNumber, duration, velocity, offset) =>
+            noteFunctions[noteFunctionKeys[noteNumber]](duration, velocity, offset)
+    };
+    Object.assign(songargs, noteFunctions);
+    const songargkeys = Object.keys(songargs);
+
+    async function compileSong(songsource) {
+        songmessages = [];
+        instrumentNames = [];
+        trackerPatterns = [];
+        Object.values(addedVideo).forEach(vid => vid.schedule = []);
+        muted = {};
+        solo = {};
+        songParts = {};
+
+        print('compile song');
+        resetTick();
+        const songfunc = new AsyncFunction(songargkeys, songsource);
+
+        let playing = true;
+        let err;
+
+        songfunc.apply(
+            null,
+            songargkeys.map(k => songargs[k])
+        ).then(() => playing = false).catch(e => {
+            err = e;
+        });
+
+        while (playing) {
+            if (err) {
+                throw err;
+            }
+            await nextTick();
+        }
+
+        print('song compiled');
+        return songmessages;
+    }
+
+    const songsrc = \`
+        setBPM(90);
+
+        addInstrument('piano');
+        addInstrument('string');
+        addInstrument('drums');
+        addInstrument('guitar');
+        addInstrument('bass');
+        addInstrument('tubelead');
+        addInstrument('flute');
+        addInstrument('padsynth');
+        addInstrument('brass');
+        addInstrument('choir');
+
+        const beat = () => createTrack(2).steps(4,[
+            c5,fs5(0.1,10),fs5(0.3,80),,
+            d5,,fs5(0.3,70),c5,
+            ,fs5(0.1,10),[fs5(0.3,80),c5],,
+            d5,,fs5(0.3,70),d5(0.1,20),  
+        ]);
+
+        createTrack(4).steps(4,[
+            d2(0.4),,,d2(0.1),
+            a2(0.2),c3(0.2),,d3(0.2),
+            ,c3(0.3),,a2(0.2),
+            ,a2(0.2),c3(0.1),d3(0.2)
+        ]);
+        await beat();
+
+        loopHere();\`;
+
+    const eventlist = await compileSong(songsrc);
+    const result = JSON.stringify(eventlist);
+    print(result);
+    env.value_return(result);
+}());`;
+'''
+'''--- meta-dce.json ---
+[ 
+    { 
+      "name": "web4_get", 
+      "export": "web4_get",
+      "root": true
+    },    
+    { 
+      "name": "store_signing_key", 
+      "export": "store_signing_key",
+      "root": true
+    },
+    { 
+      "name": "run_script", 
+      "export": "run_script",
+      "root": true
+    },
+    { 
+      "name": "run_bytecode", 
+      "export": "run_bytecode",
+      "root": true
+    },
+    { 
+      "name": "submit_script", 
+      "export": "submit_script",
+      "root": true
+    },
+    { 
+      "name": "run_script_for_account", 
+      "export": "run_script_for_account",
+      "root": true
+    },
+    { 
+      "name": "run_script_for_account_no_return", 
+      "export": "run_script_for_account_no_return",
+      "root": true
+    },
+    { 
+      "name": "web4_get", 
+      "export": "web4_get",
+      "root": true
+    }
+]
+'''
+'''--- package.json ---
+{
+    "name": "quickjs-rust-near",
+    "type": "module",
+    "scripts": {
+        "serve": "http-server -p 8085 web4",
+        "serve-dist": "http-server -p 8085 web4/dist",
+        "web4bundle": "cd web4 && rollup -c rollup.config.js",
+        "test-e2e": "NODE_OPTIONS=--experimental-vm-modules jest e2e",
+        "test-web": "NODE_OPTIONS=--experimental-vm-modules jest web4"
+    },
+    "jest": {
+        "transform": {}
+    },
+    "devDependencies": {
+        "@web/rollup-plugin-html": "^1.11.0",
+        "http-server": "^14.1.1",
+        "jest": "^28.1.3",
+        "rollup": "^2.79.0",
+        "rollup-plugin-terser": "^7.0.2"
+    },
+    "dependencies": {
+        "near-api-js": "^0.45.1"
+    }
+}
+
+'''
+'''--- src/jslib.rs ---
+use std::ffi::CString;
+use std::slice;
+use crate::viewaccesscontrol::{verify_message_signed_by_account};
+
+extern "C" {
+    fn create_runtime();
+    fn js_eval(filename: i32, script: i32, is_module: i32) -> i32;
+    fn js_eval_bytecode(buf: *const u8, buf_len: usize) -> i32;
+    fn js_compile_to_bytecode(filename: i32, source: i32, out_buf_len: i32, module: i32) -> i32;
+    fn createNearEnv();
+    fn js_add_near_host_function(name: i32, func: i32, length: i32);
+    fn JS_ToCStringLen2(ctx: i32, value_len_ptr: i32, val: i64, b: i32) -> i32;
+    fn JS_NewStringLen(ctx: i32, buf: i32, buf_len: usize) -> i64;
+}
+
+pub const JS_UNDEFINED: i64 = 0x0000000300000000;
+pub const JS_FALSE: i64 = 0x0000000100000000;
+pub const JS_TRUE: i64 = 0x0000000100000001;
+
+fn arg_to_str(ctx: i32, arg_no: i32, argv: i32) -> String {
+    let mut value_len: usize= 0;
+    let value_len_ptr: *mut usize = &mut value_len as *mut usize;
+    let argv_ptr = (argv + (arg_no * 8)) as *const i64;
+
+    let value_string: String;
+    let value_bytes: Vec<u8>;
+    unsafe {
+        let value_ptr = JS_ToCStringLen2(ctx, value_len_ptr as i32, *argv_ptr, 0) as *const u8;
+        value_bytes = std::slice::from_raw_parts(value_ptr, value_len).to_vec();
+    }
+    value_string = String::from_utf8(value_bytes).unwrap();
+    return value_string;
+}
+
+/**
+ * From near_sdk_js
+
+(type $t12 (func (param i32 i64 i64 i32) (result i64)))
+
+static JSValue near_value_return(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+  const char *value_ptr;
+  size_t value_len;
+
+  value_ptr = JS_ToCStringLenRaw(ctx, &value_len, argv[0]);
+  value_return(value_len, (uint64_t)value_ptr);
+  return JS_UNDEFINED;
+}
+*/
+
+fn value_return_func(ctx: i32, _this_val: i64, _argc: i32, argv: i32) -> i64 {
+    let mut value_len = 0;
+    let value_len_ptr: *mut usize = &mut value_len as *mut usize;
+    let argv_ptr = argv as *const i64;
+
+    unsafe {
+        let value_ptr = JS_ToCStringLen2(ctx, value_len_ptr as i32, *argv_ptr, 0) as *const u8;
+        near_sdk::env::value_return(std::slice::from_raw_parts(value_ptr, value_len));
+    }
+
+    return JS_UNDEFINED;
+}
+
+fn input_func(ctx: i32, _this_val: i64, _argc: i32, _argv: i32) -> i64 {
+    let inputbytes = near_sdk::env::input().unwrap();
+    let inputbytes_ptr = inputbytes.as_ptr();
+
+    unsafe {
+        return JS_NewStringLen(ctx, inputbytes_ptr as i32, inputbytes.len());
+    }
+}
+
+fn signer_account_id_func(ctx: i32, _this_val: i64, _argc: i32, _argv: i32) -> i64 {
+    unsafe {
+        let signer_account_id = near_sdk::env::signer_account_id().to_string();
+        let signer_account_id_ptr = signer_account_id.as_ptr();
+        return JS_NewStringLen(ctx, signer_account_id_ptr as i32, signer_account_id.len());
+    }
+}
+
+fn verify_signed_message_func(ctx: i32, _this_val: i64, _argc: i32, argv: i32) -> i64 {
+    let message = arg_to_str(ctx, 0, argv);
+    let signature = arg_to_str(ctx, 1, argv);
+    let account = arg_to_str(ctx, 2, argv);
+    if verify_message_signed_by_account(message, signature, account) {
+        return JS_TRUE;
+    } else {
+        return JS_FALSE;
+    }
+}
+
+unsafe fn setup_quickjs() {
+    create_runtime();
+    createNearEnv();
+
+    let value_return_name = CString::new("value_return").unwrap();
+    js_add_near_host_function(
+        value_return_name.as_ptr() as i32,
+        value_return_func as i32,
+        1,
+    );
+
+    let input_name = CString::new("input").unwrap();
+    js_add_near_host_function(input_name.as_ptr() as i32, input_func as i32, 1);
+
+    let signer_account_id_name = CString::new("signer_account_id").unwrap();
+    js_add_near_host_function(
+        signer_account_id_name.as_ptr() as i32,
+        signer_account_id_func as i32,
+        1,
+    );
+
+    let verify_signed_message_name = CString::new("verify_signed_message").unwrap();
+    js_add_near_host_function(verify_signed_message_name.as_ptr() as i32,
+            verify_signed_message_func as i32, 2);
+}
+
+pub fn run_js(script: String) -> i32 {
+    let result: i32;
+    let filename = CString::new("main.js").unwrap();
+    let scriptstring = CString::new(script).unwrap();
+
+    unsafe {
+        setup_quickjs();
+        result = js_eval(filename.as_ptr() as i32, scriptstring.as_ptr() as i32, 0);
+    }
+    return result;
+}
+
+pub fn run_js_bytecode(bytecode: Vec<u8>) -> i32 {
+    let result: i32;
+
+    unsafe {
+        setup_quickjs();
+        result = js_eval_bytecode(bytecode.as_ptr(), bytecode.len());
+    }
+    return result;
+}
+
+pub fn compile_js(script: String) -> Vec<u8> {
+    let result: Vec<u8>;
+    unsafe {
+        create_runtime();
+        let mut out_buf_len: usize = 0;
+        let out_buf_len_ptr: *mut usize = &mut out_buf_len;
+        let filename = CString::new("main.js").unwrap();
+        let scriptstring = CString::new(script).unwrap();
+        let result_ptr = js_compile_to_bytecode(
+            filename.as_ptr() as i32,
+            scriptstring.as_ptr() as i32,
+            out_buf_len_ptr as i32,
+            0,
+        );
+        result = slice::from_raw_parts(result_ptr as *mut u8, out_buf_len).to_vec();
+    }
+    return result;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_js;
+    use crate::tests::testenv::{
+        alice, assert_latest_return_value_string_eq, set_input, set_signer_account_id,
+        setup_test_env
+    };
+    use crate::viewaccesscontrol::{store_signing_key_for_account};
+
+    #[test]
+    fn test_value_return_should_return_undefined() {
+        setup_test_env();
+        assert_eq!(
+            run_js("(env.value_return('hello') == undefined ? 1 : 0)".to_string()),
+            1
+        );
+    }
+
+    #[test]
+    fn test_input_func() {
+        setup_test_env();
+        set_input("{\"a\":   \"b\"}".to_string().into_bytes());
+        run_js("env.value_return(JSON.stringify(JSON.parse(env.input())));".to_string());
+        assert_latest_return_value_string_eq("{\"a\":\"b\"}".to_string());
+    }
+
+    #[test]
+    fn test_signer_account_id_func() {
+        setup_test_env();
+        set_signer_account_id(alice());
+        run_js("env.value_return(env.signer_account_id())".to_string());
+        assert_latest_return_value_string_eq(alice().to_string());
+    }
+
+    #[test]
+    fn test_verify_signed_message_func() {
+        setup_test_env();
+        set_signer_account_id(alice());
+        store_signing_key_for_account();
+        run_js("env.value_return(env.verify_signed_message('invitation1','LtXiPcOxOC8n5/qiICscp3P5Ku8ymC3gj1eYJuq8GFR9co2pZYwbWLBiu5CrtVFtvmeWwMzOIkp4tJaosJ40Dg==', 'alice.near') ? 'valid' : 'invalid')".to_string());
+        assert_latest_return_value_string_eq("valid".to_string());
+    }
+}
+
+'''
+'''--- src/lib.rs ---
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::{base64, env, near_bindgen};
+use web4::types::{Web4Request, Web4Response};
+use web4::webappbundle::WEB_APP_BUNDLE;
+use std::collections::HashMap;
+use viewaccesscontrol::{store_signing_key_for_account};
+mod jslib;
+mod wasimock;
+mod web4;
+mod viewaccesscontrol;
+
+#[near_bindgen]
+#[derive(Default, BorshDeserialize, BorshSerialize)]
+pub struct Scripts {
+    scripts: HashMap<String, Vec<u8>>,
+}
+
+#[near_bindgen]
+impl Scripts {
+    pub fn store_signing_key() {
+        store_signing_key_for_account();
+    }
+
+    pub fn run_script(&self, script: String) -> String {
+        return jslib::run_js(script).to_string();
+    }
+
+    pub fn run_bytecode(&self, bytecodebase64: String) -> String {
+        let bytecode: Result<Vec<u8>, base64::DecodeError> = base64::decode(&bytecodebase64);
+        return jslib::run_js_bytecode(bytecode.unwrap()).to_string();
+    }
+
+    pub fn submit_script(&mut self, script: String) {
+        let compiled = jslib::compile_js(script);
+        env::log_str(&(compiled.len().to_string()));
+        let account_id = env::signer_account_id();
+        self.scripts.insert(account_id.to_string(), compiled);
+    }
+
+    pub fn run_script_for_account(&self, account_id: String) -> String {
+        let bytecode = self.scripts.get(&account_id).unwrap().to_vec();
+        return jslib::run_js_bytecode(bytecode).to_string();
+    }
+
+    pub fn run_script_for_account_no_return(&self, account_id: String) {
+        let bytecode = self.scripts.get(&account_id).unwrap().to_vec();
+        jslib::run_js_bytecode(bytecode);
+    }
+
+    pub fn web4_get(&self, #[allow(unused_variables)] request: Web4Request) -> Web4Response {
+        Web4Response::Body {
+            content_type: "text/html; charset=UTF-8".to_owned(),
+            body: WEB_APP_BUNDLE.to_owned(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    pub mod testenv;
+    pub mod musicscript;
+    use testenv::{alice, set_signer_account_id, setup_test_env, assert_latest_return_value_string_eq};
+    use musicscript::MUSIC_SCRIPT;
+
+    #[test]
+    fn test_run_script() {
+        setup_test_env();
+        let contract = Scripts::default();
+
+        let result = contract.run_script("print('hello');(1+2+3);".to_string());
+        assert_eq!("6".to_string(), result);
+    }
+
+    #[test]
+    fn test_submit_and_run_stored_script() {
+        setup_test_env();
+        set_signer_account_id(alice());
+        let mut contract = Scripts::default();
+
+        contract.submit_script("(function () { return 15+4+3; })()".to_string());
+        let result = contract.run_script_for_account(alice().to_string());
+        assert_eq!("22".to_string(), result);
+    }
+
+    #[test]
+    fn test_run_bytecode() {
+        setup_test_env();
+
+        let contract = Scripts::default();
+
+        let result = contract.run_bytecode("AgQKcGFyc2UUeyJhIjogMjIyfQJhGDxldmFsc291cmNlPg4ABgCgAQABAAMAABsBogEAAAA4mwAAAELeAAAABN8AAAAkAQBB4AAAALidzSjCAwEA".to_string());
+        assert_eq!("225".to_string(), result);
+    }
+
+    #[test]
+    fn test_run_async() {
+        setup_test_env();
+
+        set_signer_account_id(alice());
+        let mut contract = Scripts::default();
+
+        contract.submit_script("(async () => {
+            print('before await');
+            await new Promise(r => r());
+            print('between promises');
+            await new Promise(r => r());
+            print('after await');
+            env.value_return('return after async');
+        })()".to_string());
+
+        contract.run_script_for_account(alice().to_string());
+        assert_latest_return_value_string_eq(
+            "return after async".to_string()
+        );
+    }
+
+    #[test]
+    fn test_value_return_from_js() {
+        setup_test_env();
+        let contract = Scripts::default();
+        contract.run_script("env.value_return('test value return')".to_string());
+        assert_latest_return_value_string_eq(
+            "test value return".to_string()
+        );
+    }
+
+    #[test]
+    fn test_run_async_music_script() {
+        setup_test_env();
+
+        set_signer_account_id(alice());
+        let mut contract = Scripts::default();
+
+        contract.submit_script(MUSIC_SCRIPT.to_string());
+
+        contract.run_script_for_account_no_return(alice().to_string());
+        assert_latest_return_value_string_eq(
+            "[{\"time\":0,\"message\":[148,26,100]},{\"time\":0,\"message\":[146,60,100]},{\"time\":166,\"message\":[146,66,10]},{\"time\":233,\"message\":[130,66,0]},{\"time\":267,\"message\":[132,26,0]},{\"time\":333,\"message\":[146,66,80]},{\"time\":500,\"message\":[148,26,100]},{\"time\":533,\"message\":[130,66,0]},{\"time\":567,\"message\":[132,26,0]},{\"time\":666,\"message\":[148,33,100]},{\"time\":666,\"message\":[146,62,100]},{\"time\":667,\"message\":[130,60,0]},{\"time\":799,\"message\":[132,33,0]},{\"time\":833,\"message\":[148,36,100]},{\"time\":966,\"message\":[132,36,0]},{\"time\":1000,\"message\":[146,66,70]},{\"time\":1166,\"message\":[148,38,100]},{\"time\":1166,\"message\":[146,60,100]},{\"time\":1200,\"message\":[130,66,0]},{\"time\":1299,\"message\":[132,38,0]},{\"time\":1333,\"message\":[130,62,0]},{\"time\":1500,\"message\":[148,36,100]},{\"time\":1500,\"message\":[146,66,10]},{\"time\":1567,\"message\":[130,66,0]},{\"time\":1666,\"message\":[146,66,80]},{\"time\":1666,\"message\":[146,60,100]},{\"time\":1700,\"message\":[132,36,0]},{\"time\":1833,\"message\":[148,33,100]},{\"time\":1833,\"message\":[130,60,0]},{\"time\":1866,\"message\":[130,66,0]},{\"time\":1966,\"message\":[132,33,0]},{\"time\":2000,\"message\":[146,62,100]},{\"time\":2166,\"message\":[148,33,100]},{\"time\":2299,\"message\":[132,33,0]},{\"time\":2333,\"message\":[148,36,100]},{\"time\":2333,\"message\":[146,66,70]},{\"time\":2333,\"message\":[130,60,0]},{\"time\":2400,\"message\":[132,36,0]},{\"time\":2500,\"message\":[148,38,100]},{\"time\":2500,\"message\":[146,62,20]},{\"time\":2533,\"message\":[130,66,0]},{\"time\":2567,\"message\":[130,62,0]},{\"time\":2633,\"message\":[132,38,0]},{\"time\":2666,\"message\":[-1]}]".to_string()
+        );
+    }
+}
+
+'''
+'''--- src/tests/musicscript.rs ---
+pub static MUSIC_SCRIPT: &str = "
+(async function () {
+    'use strict';
+
+    const noteStringToNoteNumberMap =
+        new Array(128).fill(null).map((v, ndx) =>
+            (['c', 'c#', 'd', 'd#', 'e', 'f', 'f#', 'g', 'g#', 'a', 'a#', 'b'])[ndx % 12] + '' + Math.floor(ndx / 12)
+        ).reduce((prev, curr, ndx) => {
+            prev[curr] = ndx;
+            return prev;
+        }, {});
+
+    let tick = 0;
+
+    function currentTime() {
+        return tick;
+    }
+
+    let startTime = currentTime();
+    let bpm = 110;
+    const setBPM$1 = (tempo) => bpm = tempo;
+
+    const timeToBeat = (time) => (time / (60 * 1000)) * bpm;
+    const currentBeat = () => timeToBeat(currentTime() - startTime);
+
+    let pendingEvents = [];
+
+    function pushPendingEvent(timeout) {
+        return new Promise(resolve =>
+            pendingEvents.push({
+                targetTime: Math.round(currentTime() + timeout),
+                resolve: resolve
+            })
+        );
+    }
+
+    function resetTick() {
+        tick = 0;
+    }
+
+    async function nextTick() {
+        const minPendingTick = pendingEvents.reduce((prev, event) =>
+            event.targetTime < prev || prev === -1 ? event.targetTime : prev, -1);
+        const resolvedEvents = [];
+
+        pendingEvents
+            .filter(event => event.targetTime === minPendingTick)
+            .forEach(event => resolvedEvents.push(event.resolve()));
+        pendingEvents = pendingEvents.filter(event => event.targetTime > tick);
+
+        tick = minPendingTick;
+        await Promise.all(resolvedEvents);
+    }
+
+    async function waitForBeat(beatNo) {
+        let timeout = Math.floor((((beatNo) / bpm) * (60 * 1000)) -
+            (currentTime() -
+                startTime));
+
+        if (timeout < 0) {
+            timeout = 0;
+        }
+
+        return pushPendingEvent(timeout);
+    }
+
+    class Pattern {
+        constructor(output) {
+            this.output = output;
+            this.channel = 0;
+            this.velocity = 100;
+            this.offset = 0;
+            this.stepsperbeat = 16;
+        }
+
+        setChannel(channel) {
+            this.channel = channel;
+        }
+
+        async waitForStep(stepno) {
+            return this.waitForBeat(stepno / this.stepsperbeat);
+        }
+
+        async waitForBeat(beatNo) {
+            let timeout = Math.floor((((beatNo + this.offset) / bpm) * (60 * 1000)) -
+                (currentTime() -
+                    startTime));
+
+            if (timeout < 0) {
+                return;
+            } else {
+                return pushPendingEvent(timeout);
+            }
+        }
+
+        toNoteNumber(note) {
+            return noteStringToNoteNumberMap[note];
+        }
+
+        async waitDuration(duration) {
+            const timeout = (duration * 60 * 1000) / bpm;
+
+            return pushPendingEvent(timeout);
+        }
+
+        async pitchbend(start, target, duration, steps) {
+            const stepdiff = (target - start) / steps;
+            let currentValue = start;
+            for (let step = 0; step < steps; step++) {
+
+                const rounded = Math.round(currentValue);
+                this.output.sendMessage([0xe0 + this.channel, 0x007f & rounded, (0x3f80 & rounded) >> 7]);
+
+                currentValue += stepdiff;
+
+                await this.waitDuration(duration / steps);
+            }
+            this.output.sendMessage([0xe0 + this.channel, 0x007f & target, (0x3f80 & target) >> 7]);
+        }
+
+        async controlchange(controller, start, target, duration, steps) {
+            const stepdiff = (target - start) / steps;
+            let currentValue = start;
+            for (let step = 0; step < steps; step++) {
+
+                const rounded = Math.round(currentValue);
+                this.output.sendMessage([0xb0 + this.channel, controller, rounded]);
+
+                currentValue += stepdiff;
+
+                await this.waitDuration(duration / steps);
+            }
+            this.output.sendMessage([0xb0 + this.channel, controller, 0x7f & target]);
+        }
+
+        async note(noteNumber, duration) {
+            this.output.sendMessage([0x90 + this.channel, noteNumber, this.velocity]);
+
+            await this.waitDuration(duration);
+            this.output.sendMessage([0x80 + this.channel, noteNumber, 0]);
+        }
+
+        async playNote(note, duration) {
+            this.output.sendMessage([0x90 + this.channel, noteStringToNoteNumberMap[note], this.velocity]);
+
+            await this.waitDuration(duration);
+            this.output.sendMessage([0x80 + this.channel, noteStringToNoteNumberMap[note], 0]);
+        }
+    }
+
+    const noteFunctionKeys = new Array(128).fill(null).map((v, ndx) =>
+        (['c', 'cs', 'd', 'ds', 'e', 'f', 'fs', 'g', 'gs', 'a', 'as', 'b'])[ndx % 12] + '' + Math.floor(ndx / 12)
+    );
+
+    // Note functions - can be called with and without parameter (also without parantheses)
+    function createNoteFunctions() {
+        const notefunctions = {};
+
+        noteFunctionKeys.forEach((note, ndx) => notefunctions[note] = (duration, velocity, offset) => {
+            const createNoteFunc = (notenumber, _velocity = velocity) => async (pattern, rowbeat) => {
+                await pattern.waitForBeat(rowbeat + (offset ? offset : 0));
+
+                pattern.velocity = _velocity && typeof duration !== 'object' ? _velocity : pattern.defaultvelocity;
+                if (!duration || typeof duration === 'object') {
+                    duration = 1 / pattern.stepsperbeat;
+                }
+                pattern.note(notenumber, duration);
+            };
+            const noteFunc = createNoteFunc(ndx);
+
+            if (typeof duration === 'object') {
+                return noteFunc(duration, velocity);
+            } else {
+                noteFunc.transpose = (transposeAmount) => createNoteFunc(ndx + transposeAmount);
+                noteFunc.fixVelocity = (_velocity) => createNoteFunc(ndx, _velocity);
+                return noteFunc;
+            }
+        });
+        noteFunctionKeys.forEach((note, ndx) => {
+            notefunctions[note].transpose = (transposeAmount) => notefunctions[noteFunctionKeys[ndx + transposeAmount]];
+            notefunctions[note].fixVelocity = (_velocity) => notefunctions[noteFunctionKeys[ndx]](undefined, _velocity);
+        });
+        return notefunctions;
+    }
+
+    const pitchbend = (start, target, duration, steps) => async (pattern, rowbeat) => {
+        await pattern.waitForBeat(rowbeat);
+        pattern.pitchbend(start, target, duration, steps);
+    };
+
+    const controlchange = (controller, start, target, duration, steps) => async (pattern, rowbeat) => {
+        await pattern.waitForBeat(rowbeat);
+        pattern.controlchange(controller, start, target ? target : start, duration, steps);
+    };
+
+    function quantize(noteEvents, stepsperbeat, percentage = 1) {
+        return noteEvents.map(noteEvent => {
+            const scaledUp = noteEvent[0] * stepsperbeat;
+            const diff = (scaledUp - Math.round(scaledUp)) * percentage;
+
+            return [
+                (scaledUp - diff) / stepsperbeat,
+                noteEvent[1]
+            ]
+        });
+    }
+
+    Array.prototype.quantize = function (stepsperbeat, percentage = 1) {
+        return quantize(this, stepsperbeat, percentage);
+    };
+
+    Array.prototype.fixVelocity = function (velocity) {
+        return this.map(evt => evt.fixVelocity ? evt.fixVelocity(velocity) : evt);
+    };
+
+    Array.prototype.repeat = function (times = 1) {
+        const arrToRepat = this.slice(0);
+        let arr = this;
+        for (let n = 0; n < times; n++) {
+            arr = arr.concat(arrToRepat);
+        }
+        return arr;
+    };
+
+    class TrackerPattern extends Pattern {
+        constructor(output, channel, stepsperbeat = 1, defaultvelocity = 100) {
+            super(output);
+            this.channel = channel;
+            this.stepsperbeat = stepsperbeat;
+            this.defaultvelocity = defaultvelocity;
+        }
+
+        async steps(stepsperbeat, events) {
+            this.offset = Math.round(currentBeat());
+            for (let step = 0; step < events.length; step++) {
+                let beat = step / stepsperbeat;
+                const event = events[step];
+                if (event && event.constructor && event.constructor.name === 'AsyncFunction') {
+                    event(this, beat);
+                } else if (event && event.constructor && event.constructor.name === 'Function') {
+                    (async () => {
+                        await this.waitForBeat(beat);
+                        event(this, beat);
+                    })();
+                } else if (event && event.length) {
+                    // Array
+                    for (let evt of event) {
+                        if (evt.constructor.name === 'AsyncFunction') {
+                            evt(this, beat);
+                        } else {
+                            await this.waitForBeat(beat);
+                            evt(this, beat);
+                        }
+                    }
+                }
+            }
+
+            await this.waitForBeat(events.length / stepsperbeat);
+        }
+
+        async play(rows, rowbeatcolumnmode) {
+            this.offset = Math.round(currentBeat());
+            let rowbeat = 0;
+
+            if (typeof rows[0] === 'function') {
+                rows = [[0].concat(rows)];
+            }
+            for (let ndx = 0; ndx < rows.length; ndx++) {
+                const cols = rows[ndx];
+
+                if (!rowbeatcolumnmode) {
+                    rowbeat = cols[0];
+                }
+
+                for (let colndx = 1; colndx < cols.length; colndx++) {
+                    const col = cols[colndx];
+                    if (col.constructor.name === 'AsyncFunction') {
+                        col(this, rowbeat);
+                    } else {
+                        (async () => {
+                            const waitforbeat = rowbeat;
+                            await this.waitForBeat(rowbeat);
+                            col(this, waitforbeat);
+                        })();
+                    }
+                }
+                if (rowbeatcolumnmode === 1) {
+                    rowbeat += cols[0];
+                }
+            }
+            await this.waitForBeat(rowbeat);
+        }
+    }
+
+    const SEQ_MSG_LOOP = -1;
+    const SEQ_MSG_START_RECORDING = -2;
+    const SEQ_MSG_STOP_RECORDING = -3;
+
+    let songmessages = [];
+    let instrumentNames = [];
+    let muted = {};
+    let solo = {};
+    let addedAudio = [];
+    const addedVideo = {};
+
+    let trackerPatterns = [];
+    let songParts = {};
+
+    const AsyncFunction = Object.getPrototypeOf(async function () { }).constructor;
+    const output = {
+        sendMessage: (msg) => {
+            const ch = msg[0] & 0x0f;
+            if (msg.length !== 3 ||
+                (!muted[ch] && !Object.keys(solo).length || solo[ch])
+            ) {
+                songmessages.push({
+                    time: currentTime(),
+                    message: msg
+                });
+            }
+        }
+    };
+
+    function playFromHere() {
+        songmessages = songmessages.filter(evt => (evt.message[0] & 0xf0) === 0xb0) // keep control changes
+            .map(evt => Object.assign(evt, { time: 0 }));
+
+        resetTick();
+    }
+
+    async function loopHere$1() {
+        output.sendMessage([SEQ_MSG_LOOP]);
+    }
+
+    function startRecording() {
+        output.sendMessage([SEQ_MSG_START_RECORDING]);
+    }
+
+    function stopRecording() {
+        output.sendMessage([SEQ_MSG_STOP_RECORDING]);
+    }
+
+    function startVideo(name, clipStartTime = 0) {
+        addedVideo[name].schedule.push({ startTime: currentTime(), clipStartTime });
+    }
+
+    function stopVideo(name) {
+        addedVideo[name].schedule[addedVideo[name].schedule.length - 1].stopTime = currentTime();
+    }
+
+    const noteFunctions = createNoteFunctions();
+    const songargs = {
+        'output': output,
+        'setBPM': setBPM$1,
+        'TrackerPattern': TrackerPattern,
+        'createTrack': (channel, stepsperbeat, defaultvelocity) => {
+            const trackerPattern = new TrackerPattern({
+                startTime: currentTime(),
+                midievents: [],
+                sendMessage: function (msg) {
+                    this.midievents.push({
+                        time: currentTime() - this.startTime,
+                        message: msg
+                    });
+                    output.sendMessage(msg);
+                }
+            }, channel, stepsperbeat, defaultvelocity);
+            trackerPatterns.push(trackerPattern);
+            return trackerPattern;
+        },
+        'playFromHere': playFromHere,
+        'loopHere': loopHere$1,
+        'pitchbend': pitchbend,
+        'controlchange': controlchange,
+        'waitForBeat': waitForBeat,
+        'startRecording': startRecording,
+        'stopRecording': stopRecording,
+        'startVideo': startVideo,
+        'stopVideo': stopVideo,
+        'definePartStart': (partName) => songParts[partName] = { startTime: currentTime() },
+        'definePartEnd': (partName) => songParts[partName].endTime = currentTime(),
+        'mute': (channel) => muted[channel] = true,
+        'solo': (channel) => solo[channel] = true,
+        'addInstrument': (instrument) => instrumentNames.push(instrument),
+        'addAudio': async (url) => {
+            if (!(await addedAudio.find(async audioPromise => (await audioPromise).url === url))) {
+                addedAudio.push(new Promise(async (resolve, reject) => {
+                    const audioObj = { url: url };
+                    try {
+                        const buf = await fetch(url)
+                            .then(response => response.arrayBuffer())
+                            .then(buffer => new AudioContext().decodeAudioData(buffer));
+
+                        audioObj.leftbuffer = buf.getChannelData(0).buffer;
+                        audioObj.rightbuffer = buf.getChannelData(1).buffer;
+                        print('loaded', url);
+                        resolve(audioObj);
+                    } catch (e) {
+                        reject(e);
+                    }
+                }));
+            }
+        },
+        'addVideo': async (name, url) => {
+            if (!addedVideo[name]) {
+                const videoElement = document.createElement('video');
+                videoElement.src = url;
+                videoElement.autoplay = false;
+                videoElement.muted = true;
+                addedVideo[name] = { videoElement, schedule: [] };
+            }
+        },
+        'addImage': async (name, url) => {
+            if (!addedVideo[name]) {
+                const imageElement = new Image();
+                imageElement.src = url;
+                addedVideo[name] = { imageElement, schedule: [] };
+            }
+        },
+        'note': (noteNumber, duration, velocity, offset) =>
+            noteFunctions[noteFunctionKeys[noteNumber]](duration, velocity, offset)
+    };
+    Object.assign(songargs, noteFunctions);
+    const songargkeys = Object.keys(songargs);
+
+    async function compileSong(songsource) {
+        songmessages = [];
+        instrumentNames = [];
+        trackerPatterns = [];
+        Object.values(addedVideo).forEach(vid => vid.schedule = []);
+        muted = {};
+        solo = {};
+        songParts = {};
+
+        print('compile song');
+        resetTick();
+        const songfunc = new AsyncFunction(songargkeys, songsource);
+
+        let playing = true;
+        let err;
+
+        songfunc.apply(
+            null,
+            songargkeys.map(k => songargs[k])
+        ).then(() => playing = false).catch(e => {
+            err = e;
+        });
+
+        while (playing) {
+            if (err) {
+                throw err;
+            }
+            await nextTick();
+        }
+
+        print('song compiled');
+        return songmessages;
+    }
+
+    const songsrc = `
+        setBPM(90);
+
+        addInstrument('piano');
+        addInstrument('string');
+        addInstrument('drums');
+        addInstrument('guitar');
+        addInstrument('bass');
+        addInstrument('tubelead');
+        addInstrument('flute');
+        addInstrument('padsynth');
+        addInstrument('brass');
+        addInstrument('choir');
+
+        const beat = () => createTrack(2).steps(4,[
+            c5,fs5(0.1,10),fs5(0.3,80),,
+            d5,,fs5(0.3,70),c5,
+            ,fs5(0.1,10),[fs5(0.3,80),c5],,
+            d5,,fs5(0.3,70),d5(0.1,20),  
+        ]);
+
+        createTrack(4).steps(4,[
+            d2(0.4),,,d2(0.1),
+            a2(0.2),c3(0.2),,d3(0.2),
+            ,c3(0.3),,a2(0.2),
+            ,a2(0.2),c3(0.1),d3(0.2)
+        ]);
+        await beat();
+
+        loopHere();`;
+
+    const eventlist = await compileSong(songsrc);
+    const result = JSON.stringify(eventlist);
+    env.value_return(result); 
+}());
+";
+'''
+'''--- src/tests/testenv.rs ---
+use lazy_static::lazy_static;
+use near_sdk::{AccountId, PublicKey};
+use std::io::{self, Write};
+use std::sync::Once;
+use std::{collections::HashMap, sync::Mutex};
+
+/*
+  Mock of the following Contract WebAssembly imports
+
+  (type $t40 (func (result i32)))
+  (type $t41 (func (param i32 f64 i32 i32 i32 i32) (result i32)))
+  (type $t42 (func (param i64 i64)))
+  (type $t43 (func (param i64) (result i64)))
+  (type $t44 (func (param i64)))
+  (type $t45 (func (param i64 i64 i64 i64 i64) (result i64)))
+  (type $t46 (func (param i64 i64 i64) (result i64)))
+
+  (import "env" "read_register" (func $read_register (type $t42)))
+  (import "env" "register_len" (func $register_len (type $t43)))
+  (import "env" "signer_account_id" (func $signer_account_id (type $t44)))
+  (import "env" "input" (func $input (type $t44)))
+  (import "env" "attached_deposit" (func $attached_deposit (type $t44)))
+  (import "env" "value_return" (func $value_return (type $t42)))
+  (import "env" "panic_utf8" (func $panic_utf8 (type $t42)))
+  (import "env" "log_utf8" (func $log_utf8 (type $t42)))
+  (import "env" "storage_write" (func $storage_write (type $t45)))
+  (import "env" "storage_read" (func $storage_read (type $t46)))
+*/
+
+#[allow(dead_code)]
+pub fn alice() -> AccountId {
+    AccountId::new_unchecked("alice.near".to_string())
+}
+
+#[allow(dead_code)]
+pub fn bob() -> AccountId {
+    AccountId::new_unchecked("bob.near".to_string())
+}
+
+#[allow(dead_code)]
+pub fn carol() -> AccountId {
+    AccountId::new_unchecked("carol.near".to_string())
+}
+
+struct TestEnv {
+    signer_account_id: AccountId,
+    signer_account_pk: PublicKey,
+    input: Vec<u8>,
+    returned_value: Vec<u8>,
+}
+
+impl TestEnv {
+    pub fn new() -> Self {
+        Self {
+            signer_account_id: bob(),
+            signer_account_pk: vec![00, 66, 211, 21, 84, 20, 241, 129, 29, 118, 83, 184, 41, 215, 240, 117, 106, 56, 29, 69, 103, 43, 191, 167, 199, 102, 3, 16, 194, 250, 138, 198, 78].try_into().unwrap(),
+            input: "{}".to_string().into_bytes(),
+            returned_value: Vec::default(),
+        }
+    }
+}
+
+lazy_static! {
+    static ref REGISTERS: Mutex<HashMap<i64, Vec<u8>>> = Mutex::new(HashMap::new());
+    static ref STORAGE: Mutex<HashMap<Vec<u8>, Vec<u8>>> = Mutex::new(HashMap::new());
+    static ref INIT: Once = Once::new();
+    static ref TESTENV: Mutex<TestEnv> = Mutex::new(TestEnv::new());
+}
+
+pub fn setup_test_env() {
+    INIT.call_once(|| {
+        std::panic::set_hook(Box::new(|panic_info| {
+            let _ = writeln!(io::stderr(), "{}", panic_info);
+        }));
+    });
+}
+
+#[allow(dead_code)]
+pub fn set_signer_account_id(account_id: AccountId) {
+    TESTENV.lock().unwrap().signer_account_id = account_id;
+}
+
+#[allow(dead_code)]
+pub fn set_signer_account_pk(pk: PublicKey) {
+    TESTENV.lock().unwrap().signer_account_pk = pk;
+}
+
+#[allow(dead_code)]
+pub fn set_input(input: Vec<u8>) {
+    TESTENV.lock().unwrap().input = input;
+}
+
+#[no_mangle]
+pub extern "C" fn read_register(register_id: i64, data_ptr: i64) {
+    let registers = REGISTERS.lock().unwrap();
+    let src = registers.get(&register_id).unwrap().to_vec();
+
+    unsafe {
+        std::ptr::copy(src.as_ptr(), data_ptr as *mut u8, src.len());
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn register_len(register_id: i64) -> i64 {
+    let registers = REGISTERS.lock().unwrap();
+    return (registers.get(&register_id).unwrap().to_vec()).len() as i64;
+}
+
+#[no_mangle]
+pub extern "C" fn signer_account_id(register: i64) {
+    let mut registers = REGISTERS.lock().unwrap();
+    registers.insert(
+        register,
+        TESTENV
+            .lock()
+            .unwrap()
+            .signer_account_id
+            .to_string()
+            .into_bytes(),
+    );
+}
+
+#[no_mangle]
+pub extern "C" fn signer_account_pk(register: i64) {
+    let mut registers = REGISTERS.lock().unwrap();
+    registers.insert(
+        register,
+        TESTENV
+            .lock()
+            .unwrap()
+            .signer_account_pk
+            .as_bytes()
+            .to_vec(),
+    );
+}
+
+#[no_mangle]
+pub extern "C" fn input(register: i64) {
+    let mut registers = REGISTERS.lock().unwrap();
+    registers.insert(register, TESTENV.lock().unwrap().input.to_vec());
+}
+
+#[no_mangle]
+pub extern "C" fn attached_deposit(_p1: i64) {}
+
+#[no_mangle]
+pub extern "C" fn value_return(value_len: i64, value_ptr: i64) {
+    let bufptr: *const u8 = value_ptr as *const u8;
+    let buflen: usize = value_len as usize;
+    unsafe {
+        TESTENV.lock().unwrap().returned_value =
+            std::slice::from_raw_parts(bufptr, buflen).to_vec();
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn panic_utf8(_p1: i64, _p2: i64) {}
+
+#[no_mangle]
+pub extern "C" fn log_utf8(_len: i64, _ptr: i64) {
+    let bufptr: *const u8 = _ptr as *const u8;
+    let buflen: usize = _len as usize;
+    unsafe {
+        let str = std::str::from_utf8_unchecked(std::slice::from_raw_parts(bufptr, buflen));
+        println!("{}", str);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn storage_has_key(key_len: i64, key_ptr: i64) -> i64 {
+    let keyptr: *const u8 = key_ptr as *const u8;
+    let keylen: usize = key_len as usize;
+    unsafe {
+        let key = std::slice::from_raw_parts(keyptr, keylen).to_vec();
+        return if STORAGE.lock().unwrap().contains_key(&key) {
+            1
+        } else {
+            0
+        };
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn storage_write(
+    key_len: i64,
+    key_ptr: i64,
+    value_len: i64,
+    value_ptr: i64,
+    _register_id: i64,
+) -> i64 {
+    let keyptr: *const u8 = key_ptr as *const u8;
+    let keylen: usize = key_len as usize;
+    let valueptr: *const u8 = value_ptr as *const u8;
+    let valuelen: usize = value_len as usize;
+    unsafe {
+        let key = std::slice::from_raw_parts(keyptr, keylen).to_vec();
+        let val = std::slice::from_raw_parts(valueptr, valuelen).to_vec();
+        STORAGE.lock().unwrap().insert(key, val);
+    }
+    return 0;
+}
+
+#[no_mangle]
+pub extern "C" fn storage_read(key_len: i64, key_ptr: i64, register_id: i64) -> i64 {
+    let keyptr: *const u8 = key_ptr as *const u8;
+    let keylen: usize = key_len as usize;
+    let mut registers = REGISTERS.lock().unwrap();
+    let storage = STORAGE.lock().unwrap();
+    unsafe {
+        let key = std::slice::from_raw_parts(keyptr, keylen).to_vec();
+        if storage.contains_key(&key) {
+            let ret = storage.get(&key).unwrap().to_vec();
+            registers.insert(register_id, ret);
+            return 1;
+        } else {
+            return 0;
+        }
+    }
+}
+
+pub fn assert_latest_return_value_string_eq(expected_return_value: String) {
+    assert_eq!(
+        std::str::from_utf8(TESTENV.lock().unwrap().returned_value.as_ref()).unwrap(),
+        expected_return_value
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TESTENV;
+
+    #[test]
+    fn test_value_return() {
+        let ret_value = "test_value_return";
+        near_sdk::env::value_return(ret_value.as_ref());
+        assert_eq!(
+            std::str::from_utf8(TESTENV.lock().unwrap().returned_value.as_ref()).unwrap(),
+            ret_value
+        );
+    }
+}
+
+'''
+'''--- src/viewaccesscontrol.rs ---
+use ed25519_dalek::ed25519::signature::Signature as DalekSig;
+use ed25519_dalek::{PublicKey as DalekPK};
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::{base64, env};
+use std::collections::HashMap;
+
+const ACCOUNT_SIGNING_KEYS_KEY: &[u8] = b"ACCSIGNKEYS";
+
+#[derive(Default, BorshDeserialize, BorshSerialize)]
+pub struct AccountSigningKeys {
+    signing_keys_per_account: HashMap<String, Vec<u8>>,
+}
+
+fn load_account_signing_keys() -> AccountSigningKeys {
+    return env::storage_read(ACCOUNT_SIGNING_KEYS_KEY)
+        .map(|data| {
+            AccountSigningKeys::try_from_slice(&data)
+                .expect("Cannot deserialize the account signing keys.")
+        })
+        .unwrap_or_default();
+}
+
+fn save_account_signing_keys(account_signing_keys: AccountSigningKeys) {
+    env::storage_write(
+        ACCOUNT_SIGNING_KEYS_KEY,
+        &account_signing_keys
+            .try_to_vec()
+            .expect("Cannot serialize account signing keys."),
+    );
+}
+
+pub fn store_signing_key_for_account() {
+    let mut account_signing_keys = load_account_signing_keys();
+    account_signing_keys.signing_keys_per_account.insert(
+        env::signer_account_id().to_string(),
+        env::signer_account_pk().into_bytes(),
+    );
+    save_account_signing_keys(account_signing_keys);
+}
+
+pub fn verify_message_signed_by_account(
+    signed_message: String,
+    signature: String,
+    account_id: String,
+) -> bool {
+    let account_signing_keys = load_account_signing_keys();
+    let pk_bytes = account_signing_keys
+        .signing_keys_per_account
+        .get(&account_id)
+        .unwrap();
+
+    let pk = DalekPK::from_bytes(&pk_bytes[1..].to_vec()).unwrap();
+    let sig = DalekSig::from_bytes(base64::decode(&signature).unwrap().as_slice()).unwrap();
+
+    return pk.verify_strict(signed_message.as_bytes(), &sig).is_ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{store_signing_key_for_account, verify_message_signed_by_account};
+    use crate::tests::testenv::{alice, set_signer_account_id, setup_test_env, set_signer_account_pk};
+
+    #[test]
+    fn test_verify_signed_message() {
+        setup_test_env();
+        set_signer_account_id(alice());
+        set_signer_account_pk(vec![
+            0, 85, 107,  80, 196, 145, 120,  98,  16,
+            245,  69,   9,  42, 212,   6, 131, 229,
+             36, 235, 122, 199,  84,   4, 164,  55,
+            218, 190, 147,  17, 144, 195,  95, 176
+        ].try_into().unwrap());
+
+        let signed_message: String = "the expected message to be signed".to_string();        
+        let signature: String = "yr73SvNvNGkycuOiMCvEKfq6yEXBT31nEjeZIBvSuo6geaNXqfZ9zJS3j1Y7ta7gcRqgGYm6QcQBiY+4s1pTAA==".to_string();
+        store_signing_key_for_account();
+        assert_eq!(
+            verify_message_signed_by_account(signed_message, signature, "alice.near".to_string()),
+            true
+        );
+    }
+}
+
+'''
+'''--- src/wasimock.rs ---
+use near_sdk::{env};
+
+#[no_mangle]
+//pub extern "C" fn _tzset_js(_timezone: *const libc::c_long, _daylight: *const libc::c_int, _tzname: *const libc::c_char) {
+pub extern "C" fn _tzset_js(_timezone: i32, _daylight: i32, _tzname: i32) {
+    env::log_str("_tzset_js");
+}
+
+#[no_mangle]
+//pub extern "C" fn _localtime_js(_t: *const libc::time_t, _tm: *const libc::tm) {
+pub extern "C" fn _localtime_js(_t: i32, _tm: i32) {
+    env::log_str("_localtime_js");
+}
+
+#[no_mangle]
+pub extern "C" fn _emscripten_date_now() -> f64 {
+    //env::log_str("_emscripten_date_now");
+    return 0.0;   
+}
+
+#[no_mangle]
+//pub extern "C" fn __wasi_fd_write(_fd: i32, _iovs: i32, _iovs_len: usize, _result: *const libc::size_t) -> libc::size_t {
+pub extern "C" fn __wasi_fd_write(_fd: i32, _iovs: i32, _iovs_len: usize, _result: i32) -> i32 {
+    let mut written = 0;
+    for n in 0.._iovs_len {
+        unsafe {
+            let bufptrptr: *const usize = (_iovs + n as i32 * 8) as *const usize;
+            let buflenptr: *const usize = (_iovs + n as i32 * 8 + 4) as *const usize;
+
+            let bufptr: *const u8 = usize::from_le(*bufptrptr) as *const u8;
+            let buflen = usize::from_le(*buflenptr);
+            env::log_str(std::str::from_utf8_unchecked(std::slice::from_raw_parts(bufptr, buflen)));
+            
+            written += buflen;
+        }    
+    }
+    unsafe {
+      let written_ptr: *mut usize = _result as *mut usize;
+      *written_ptr = written;
+    }
+    return 0;
+}
+
+#[no_mangle]
+//pub extern "C" fn __wasi_fd_write(_fd: i32, _iovs: i32, _iovs_len: usize, _result: *const libc::size_t) -> libc::size_t {
+pub extern "C" fn imported__wasi_fd_write(_fd: i32, _iovs: i32, _iovs_len: usize, _result: i32) -> i32 {
+    env::log_str("imported__wasi_fd_write");
+    return __wasi_fd_write(_fd, _iovs, _iovs_len, _result);
+}
+
+#[no_mangle]
+pub extern "C" fn __wasi_fd_close(_fd: i32) -> i32 {
+    env::log_str("__wasi_fd_close");
+    return 0;
+}
+
+#[no_mangle]
+//pub extern "C" fn __wasi_fd_seek(_fd: i32, _offset: i64, _whence: i32, _result: *const libc::size_t) -> i32 {
+pub extern "C" fn __wasi_fd_seek(_fd: i32, _offset: i64, _whence: i32, _result: i32) -> i32 {
+    env::log_str("__wasi_fd_seek");
+    return 0;
+}
+
+#[no_mangle]
+pub extern "C" fn __wasi_proc_exit(_rval: i32) {
+    env::log_str("__wasi_proc_exit");
+}
+
+#[no_mangle]
+//pub extern "C" fn __syscall_getcwd(_buf: i32, _size: libc::size_t) -> i32 {
+pub extern "C" fn __syscall_getcwd(_buf: i32, _size: i32) -> i32 {
+    env::log_str("__syscall_getcwd");
+    return 0;
+}
+
+#[no_mangle]
+//pub extern "C" fn __wasi_environ_sizes_get(_environ_count: libc::size_t, _environ_buf_size: libc::size_t) -> i32 {
+pub extern "C" fn __wasi_environ_sizes_get(_environ_count: i32, _environ_buf_size: i32) -> i32 {
+    env::log_str("__wasi_environ_sizes_get");
+    return 0;
+}
+
+#[no_mangle]
+//pub extern "C" fn __wasi_environ_get(_environ: *const libc::c_char, _environ_buf: *const libc::c_char) -> i32 {
+pub extern "C" fn __wasi_environ_get(_environ: i32, _environ_buf: i32) -> i32 {
+    env::log_str("__wasi_environ_get");
+    return 0;
+}
+
+#[no_mangle]
+//pub extern "C" fn __wasi_random_get(_buf: i32, _size: libc::size_t) -> i32 {
+pub extern "C" fn __wasi_random_get(_buf: i32, _size: i32) -> i32 {
+    env::log_str("__wasi_environ_get");
+    return 0;
+}
+
+#[no_mangle]
+pub extern "C" fn _timegm_js(_p1 :i32) -> i32 {
+    env::log_str("_timegm_js");
+    return 0;
+}
+
+#[no_mangle]
+pub extern "C" fn _mktime_js(_p1 :i32) -> i32 {
+    env::log_str("_mktime_js");
+    return 0;
+}
+
+#[no_mangle]
+pub extern "C" fn _gmtime_js(_p1 :i32, _p2 :i32) {
+}
+
+#[no_mangle]
+pub extern "C" fn _emscripten_get_now_is_monotonic() -> i32 {
+    return 0;
+}
+
+#[no_mangle]
+pub extern "C" fn emscripten_get_now_res() -> f64 {
+    return 0.0;
+}
+
+#[no_mangle]
+pub extern "C" fn __wasi_fd_fdstat_get(_p1: i32, _p2: i32) -> i32 {
+    env::log_str("__wasi_fd_fdstat_get");
+    return 0;
+}
+
+#[no_mangle]
+pub extern "C" fn emscripten_asm_const_async_on_main_thread(_p1: i32, _p2: i32, _p3: i32) {
+
+}
+
+#[no_mangle]
+pub extern "C" fn __wasi_clock_res_get(_p1: i32, _p2: i32) -> i32 {
+    env::log_str("__wasi_clock_res_get");
+    return 0;
+}
+
+#[no_mangle]
+pub extern "C" fn __wasilibc_find_relpath(_p1: i32, _p2: i32, _p3: i32, _p4: i32) -> i32 {
+  return -1;
+}
+
+'''
+'''--- src/web4.rs ---
+pub mod types;
+pub mod webappbundle;
+'''
+'''--- src/web4/types.rs ---
+use near_sdk::serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Web4Request {
+    #[serde(rename = "accountId")]
+    pub account_id: Option<String>,
+    pub path: String,
+    #[serde(default)]
+    pub params: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub query: std::collections::HashMap<String, Vec<String>>,
+    pub preloads: Option<std::collections::HashMap<String, Web4Response>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde", untagged)]
+pub enum Web4Response {
+    Body {
+        #[serde(rename = "contentType")]
+        content_type: String,
+        body: String,
+    },
+    BodyUrl {
+        #[serde(rename = "bodyUrl")]
+        body_url: String,
+    },
+    PreloadUrls {
+        #[serde(rename = "preloadUrls")]
+        preload_urls: Vec<String>,
+    },
+}
+
+'''
+'''--- src/web4/webappbundle.rs ---
+pub static WEB_APP_BUNDLE: &str = "PCFkb2N0eXBlIGh0bWw+PGh0bWw+PGhlYWQ+PG1ldGEgY2hhcnNldD0iVVRGLTgiPjxtZXRhIG5hbWU9InZpZXdwb3J0IiBjb250ZW50PSJ3aWR0aD1kZXZpY2Utd2lkdGgsaW5pdGlhbC1zY2FsZT0xIj48c3R5bGU+Ym9keXtiYWNrZ3JvdW5kLWNvbG9yOiMzMzN9PC9zdHlsZT48L2hlYWQ+PGJvZHk+PGFwcC13YXNtLW11c2ljLXNoYXJlPjwvYXBwLXdhc20tbXVzaWMtc2hhcmU+PHNjcmlwdCB0eXBlPSJtb2R1bGUiPmltcG9ydCJodHRwczovL2Nkbi5qc2RlbGl2ci5uZXQvbnBtL25lYXItYXBpLWpzQDAuNDQuMi9kaXN0L25lYXItYXBpLWpzLmpzIjtjb25zdCB0PSJkYXRhOmltYWdlL3BuZztiYXNlNjQsaVZCT1J3MEtHZ29BQUFBTlNVaEVVZ0FBQVFBQUFBQjBDQU1BQUFCZGFCdzNBQUFBQVhOU1IwSUFyczRjNlFBQUF3QlFURlJGLy8vLy92NysvZjM5L1B6OCsvdjcrdnI2K2ZuNStQajQ5L2YzOXZiMjlmWDE5UFQwOC9Qejh2THk4Zkh4OFBEdzcrL3Y3dTd1N2UzdDdPenM2K3ZyNnVycTZlbnA2T2pvNStmbjV1Ym01ZVhsNU9UazQrUGo0dUxpNGVIaDRPRGczOS9mM3Q3ZTNkM2QzTnpjMjl2YjJ0cmEyZG5aMk5qWTE5ZlgxdGJXMWRYVjFOVFUwOVBUMHRMUzBkSFIwTkRRejgvUHpzN096YzNOek16TXk4dkx5c3JLeWNuSnlNakl4OGZIeHNiR3hjWEZ4TVRFdzhQRHdzTEN3Y0hCd01EQXY3Ky92cjYrdmIyOXZMeTh1N3U3dXJxNnVibTV1TGk0dDdlM3RyYTJ0YlcxdExTMHM3T3pzckt5c2JHeHNMQ3dyNit2cnE2dXJhMnRyS3lzcTZ1cnFxcXFxYW1wcUtpb3A2ZW5wcWFtcGFXbHBLU2tvNk9qb3FLaW9hR2hvS0NnbjUrZm5wNmVuWjJkbkp5Y201dWJtcHFhbVptWm1KaVlsNWVYbHBhV2xaV1ZsSlNVazVPVGtwS1NrWkdSa0pDUWo0K1BqbzZPalkyTmpJeU1pNHVMaW9xS2lZbUppSWlJaDRlSGhvYUdoWVdGaElTRWc0T0Rnb0tDZ1lHQmdJQ0FmMzkvZm41K2ZYMTlmSHg4ZTN0N2VucDZlWGw1ZUhoNGQzZDNkbloyZFhWMWRIUjBjM056Y25KeWNYRnhjSEJ3YjI5dmJtNXViVzF0Ykd4c2EydHJhbXBxYVdscGFHaG9aMmRuWm1abVpXVmxaR1JrWTJOalltSmlZV0ZoWUdCZ1gxOWZYbDVlWFYxZFhGeGNXMXRiV2xwYVdWbFpXRmhZVjFkWFZsWldWVlZWVkZSVVUxTlRVbEpTVVZGUlVGQlFUMDlQVGs1T1RVMU5URXhNUzB0TFNrcEtTVWxKU0VoSVIwZEhSa1pHUlVWRlJFUkVRME5EUWtKQ1FVRkJRRUJBUHo4L1BqNCtQVDA5UER3OE96czdPam82T1RrNU9EZzROemMzTmpZMk5UVTFORFEwTXpNek1qSXlNVEV4TURBd0x5OHZMaTR1TFMwdExDd3NLeXNyS2lvcUtTa3BLQ2dvSnljbkppWW1KU1VsSkNRa0l5TWpJaUlpSVNFaElDQWdIeDhmSGg0ZUhSMGRIQndjR3hzYkdob2FHUmtaR0JnWUZ4Y1hGaFlXRlJVVkZCUVVFeE1URWhJU0VSRVJFQkFRRHc4UERnNE9EUTBOREF3TUN3c0xDZ29LQ1FrSkNBZ0lCd2NIQmdZR0JRVUZCQVFFQXdNREFnSUNBUUVCQUFBQTdxN2hsQUFBTmJoSlJFRlVlTnJWZlF0OG5FVzErTWRGd1hmMWl2cFg5SEpWQksvK0ZTOVZVTFQwUVlGeW9maW92TFNiaU5nV3MxbFFpNVRTUXJZSmdpVnRTdHNFYUFzdGdrL2VBaTJrdTVuZDlBbFVRUjRsd082M3A1QzBoYWJ0cE5rdjJkM3YrMmJtL3p0blpyN2Q5QUc5Vi8vM2YvOXBzM3ZtUFhQbXpNdzVaODZaT0lzV0tLVldMbGdpbFZMeXg3SnZsVWcycTFVaW1hUVBtVndsOVlkYXBmQzdXVGF2Q3BPWUtwT3llWlZza1MxWVFqYXZVbXFWYU1GZ21HeW1HbHAwRGMyclJMTXRKWk9yL0dTeUdkT0Q1dWJtWmdvYklEUmZTV3hmeWVaVlFWS1hrUE1vdWptcFJKLzBsaStlZit2Q1d4WXZXYjY0ZGVoKzlzaERqNjU5Z04yM05teFc0ZGZsYVpKK2hOeW5RcVg4NGVKdzZJZmxTcVhpVnlvVkVjaEFxVDFLcW5EQTk4SXdWRW9GU2puNEdhaFE2TEl5OUN0YzdkWDE3QmErQ3ZmdEN5dXFYL2tpTEl1eTJPWDd2dkFWL2lvaEtrSzhXWGxEaFVMNHdoUGh6cklJQjRLU0docVNRME9lSi9lV3k3NE1wRmNPd2xLbE1sUlNwYUZTVUNvRnBhQXlGQVFWcm9aM0RBOFBGL2R0RHdZSHk0T1Z3YUFjQnVYU29CY0VjcEVhOEVPcFpPVlltVytXYWFXVThwS1MxWDYweUpReVB4Z2g5MDgvSU5OK0JjeUhjN0JpZjgvSG9abzhGRHhQZGltdmZMb2M0c3R1WGJyMC9wVkxGaTFkM25YenNtWExGNnBmeXVJQ0N0OUo0WENYdDNMcDBqL2YwcnA4d2NQTGxxbXJaSEhCYmJjc2JGMnlmTUdDbGJjdlZ6K1RyOSsrdkpYZDBYcnIvT1YvdXVYV081WXZ1TDkxWmV2TkMrNWZ2SExSZ3R0dWFWVlh5bURCOHVYdEtpRmZYN1IwNVkxcjV5OWYzTHFBT1l0WGRPN2ZjRnp1dmVQbWhRdVhMMjY5NzlZbHl4KzVkZW5TV3hlRXNIdkI4dFpIYmwxeDYwTXJGN2JlZjhkdHkxZmN2SFM1YXBDVkpjdVgzTEx3UnFGSzRwdHllSmRVVEhyNzlnMzgrWGQzM2JaMHlTMkw1di82eHZQazBGZE9sS2ZKWVFVSzVGTkNlUllLSXFnVVFjVUk0dDUzcEt3a1FiRVBPNDRUUGhaa2xDY3d5RHZja0IwWnhlWERncDhQV2REaENnalo3ZzYycUkwRjdXNmx3dzJ6eWcwWWIyVURHT21XSHdzeUVFQUk1WGJtT0dFSGEycHFhWE1ZbisrV0lZRHk2cjZNWXVyeElBTmxBeWpQOHlETWhlQkRoU3NRV0czb01jVWxoRXh4QVNGSUhrSUlpZ2NnR08vd1hwSXlDYklnd2d5SUlBUEtsVXgyRkJSSXBqWXFyRUcyRjBSUmVwNFo1YVp3cDRFMmk2SzNWTW9rZTRGVnVPOUtVRStKSGl6SHFUU1g5Q2xBTHdkZW9tQUFWVkxpNVpyQXBoQkFnam9iSTBFeDBZb2xRZmFJRWxQY3h5cWpaaDBWZ1lIM0d2YWd4TXJjZDVWdWFBZ000SUh5cmc5RGtaVHpnaFpRRTl5d0MyWmQ3RXEyYlQ1STF0UTBWcTFaR0dRZzdKS3pId295cGllanhvRUNGWnM2NEFGbVJKU0Fxb3U2T1hYQVk2c0xBcFNKZVNnZE0vVVdwSzlyZGNvUFk2a0JIOEl1bVAyUWlRdzcyNkkybEJxZ2VlcHlITWNabUF1U2ZXcjhxeDJ1Wkk2VGJXT1huajdOQ1R1KzF3V3o1NHl6bmNyV3VSVURINWVOT1ZDSkZSUlV3TWFwVFAxVXR3emxtQnRBRUN2NFVBWUZBZmo0TDVWNm9QdGY5M3hnVERhVytuVDQxWit1NlB4NnRqNlcrbjJqRzgrdCtSS0NqZmZpenlleTlURlQ0RWZmdU9tazRXbmZ5c1pTMzducDU2K2YxallhY3dYdnZIejY5T2tuWk90ajlmVXhrS3ovWnVhVTIwRjBUSEtEMVB6MU56Nzl3VTBmV1JlckIxVUhsWG9JVWtvZGQwVFhjeC9QeHVvOVQ0SGtnNkQ0NEZTdlYrVTlVSGt2cG52ZXRDRXpsZFdYZW9UYVcxUmVEbWxSTWNTS29vVkNoT0FxVnRUMHhTc2dhY0lkVm1MZUlXWjhVSUZpL2UwOWdqTXgzOXV1UVBFOUlCK2g2aVFUcmFBNlFPQ2EvckVRSWhrMGd6cWpTaEpOQVpHRVpMSjFiWkJKSzlWRTVCQnZHRUVPamRSYXc0REhia2RTd05DajhUTXNBVFFkR1JHQURvYWRWSldaZGNsKzhlN3ZDejNiVHRqRzNuZjFGNDhLTzhaalc5bEduRC9NbWtrMHVOaXVHMElZTC9nUWdFbkl4aUdJdTRIVGVBWnJXdFUyM3EwMFF0QklreDJDbi83UVI2L29qcWN2dUdCck5oSEhxVXkvY3VsTjNmSDA3bjhmM1oySUp4THhoS3Vna2toL2Nkcm1zK0xZNzIrZm5ZMG5vR0lCeWQ2WXp4eUZzem81NFowZmhHRlN0SVR6RUVPQ2JadGZrQ0JvY3NwdHJtQ2YrOUVQM3hrK0VtUkE0Q0JIaDJzMHZySURIcWlKUkllV0dJUFU5YjhwL3BQai9PdTRXRVRQOWVDbnVqYjYvM0wvdlQvSXh1ckJoeUFHUWVyV2h6NTBYRmZqVWQyeDFNdXZEWHpzbXJGL0dsY2Zxejlud05OdEdMeUNhaHp3SEpFRXdZNy8wUTgvRkt6QnlJbWdKcWJtbm5yS2ttZnZPallidTlSRkFsUVB2YU53VkRaV0IwSHFqanUzcnp5WFA5Z2RxOHNWSWJpZ0tMSEtOMjVtTTJTN0c3SnMyNVJDR1VKV3VabUZyZXlrVW9jYnZoU1dDcVhVenVkVDk3MmpjTlFHVUJNdjBXTVAyNGhLRms1eEt4QytGQ29vejRaUzExZ0Y1ZVpaYytaQnVRditGTXlERWdMTnN6RUg3enBPSi9wUTZnS0VQS2pNNjRKWkxXNmxTOHgyeTJmRmNrV21vTkxWUFF2S1hkbFpMUmU3b2gwRXlENnZJUFBGUW9EVTJCWTBheHFJdWI3R3JPT25KcjlqOGRWODcvWFpXT3JYVTc1NjM3MzNub2JZMHNzK0ZnTS9kWEhuaHBuWG5QeU43bGlxOVg5OTdWTkhxYTJFVFIvK2tYUGp1V29tYnNWTWRqRFIxdWRkakVRVC9tZUlCcFNtR095MVd3RS9Wc0FSQkZBNTVQZ3FVSW5Gd0trY1lvQUhJNWQvTkxXVURxU1c0YmVrbHJLbWx0SnNHRVpxS1JHMWxEUzFEQ05RUXkwbG9wYmhMa0RJZzdLbWxqSlNTOGxRUzdtcmU1WURwYmNobDMvWUxQdjdFZDkvbGZZaWFrRlNHU1ZGS1NtYkdXZEQzSGZMeERlVWlXOG9FOTlRNW50NXlKbzQ1d1UveEQyNWlTT3I0NFBrZS9sdWtNeVJIUVdKckFtVXdhZkNIaGJHYlhJdDc2ZXYrRVdjYzhGVVFUSlJxSVFaOFBrZXFQdzV5REJWQ0Uwd1hFM0JJTXhBaGNtYklWZ2RaUGhlVjBBd09YMzh3Q2xqNDFDWjNPQ1crQzQrQkFKSy9FM3VnWFFWc2trU3lqMmlCQW9FM3cwQnhnVFVueEFxSFlXUXdBcVRyWVdLN3FVM1BSU2lPVXppMnZCeGJRVGcyN1hoczVOT1BMTWhRSkwxTmZVK1p0YUd6MlljZTVwT0NTajFQejQ1N3FjWVREdjZVUEgxRVpTTTAvbEMyZDhUVW1ud1dlTDc4U1BEeDRJa3FQU0dDODdPeHVrUUFUVWpjWkhQSlBhNXRkMXp3OGxwdGZDWmJMelJsUkJPVHY5OC9MaW40NjVvTENoZmQrYlU4REU4S0hWRFRkbkVnRmVRSGk0dE9oenhwRXJ2ZXVEcGlmSDB6eTdZMnAySU43cUsyc21BYW13QTBRZ3lvY3NWRklSQk00VE1VYXV4UXQxdGpNVmp4N1h4MVJDQmovY1ZRcHZYQitYNUVMTHJrbzhIemVCUWY0cTZobzhyNUxKMVFqVkVlVmZiR3BxS3BnYUZzOFFjMWNIZWFCMVBjVjYzbE5pbHVVZkZ1dU91K25sQklxVTJ1bnJJb0JyMU9KY3RXNWFKcDVjdDY4d2s0b2FhTDJLeXJjOHJZdXJ4QTZka0UzeUhWemdZMjlFamxLdldhcjZHc29QYUtvS1ozUFA2aVozZEtvaVZRU0RnbmpjakZNTko3RktQVUlVQXY0SkNoY21DRERNUVlPV3JnNHlEOU5WZThFRzZnc21iaWFaRHBsWWpXOHRrRzdMdnJRc0xBbnlkSzZROFNJeE1RcVdWU2R3NS9OWTJWMUJ0RUlEa2lLb0FKQVFnZUIrU05RZ0krVzZQOW5pOTNzeDZDazFIUXIyZWZCUDA5WHFxVUZma3pWRFJOZnRRNlhBRjd5dWc2RUlKb29QM0ZVcTY2N2lXVkk4b3VzUDRWYUsyWDRkaEdONHFsRHNFcGExQ3hURVFJQmpFRy9rUURNTVFsQndNUlFrcW51QWVucjc4ZFNoRGVhdFFWRUdDRCtsZ1FEbDFucEpOeGJvb3FGTWJPUzNhRHJOb1EvQTdDcjRHY1NtSE5iTFE1a2dLM0N5NDk4NVF5bWJpOHl5enB1N3VRNlNEMEp4YldxbGZwUnJkNERlNE8vc1Fla2d1bVRpSWhvSVFHZnNQOGR5K0wxQlNoSUdIeU5nSmdtcG95aVlhWEExZ2x6RWxUUW9SYnJQeGJUYVc1SzBxRE1YUUE4RjNGRUlRZkR2eXJKUWZFOGZHY1lqZ0p4cmNVRGZpQmczVjZwdXlFRFpDMEdEYTBER2kwUldXR1cwd2pZSkF1RlJUczA2Rm92akhORzF4c0gvVERpYk5QRlRqOGpBYXR4V0hEVzR3b25uUkNPSElrWWNOcnNVeUJGR0RIS29VMFI5cEE2cHk4azV2aHBReWlhcUF0VUdHOWJJQjdoZG9GemhRZnRIQU5ndVVMQUFXY0ZrdjR5Z1AyYktPdElXbExWd1Z1VzFoQTdnV3lHSFBlQjZVMTZ0bzRkbTlDcmNaMnJBNnRncmxmVUFLUHltYVdjQUdzVWs4bzlubzRSNmhtR3gzRHlhcDdlVytLN1NrQm9Jckpnc3F6T2dpUU51U3BOMk1qUjBHcWtQd1Z3bytoZmdyaFFyamJCLzNYVlJWdk1vVjZHOXB2b1g1RGlIRURvaThna3I2ZmNIVFdZY1hNS3BVRTZWakFoYm1GZmcxTWNXUk1XWnZBenJNRlMxeTZZME9SWkNVelpRbkovUHF3cHpJcS9USm94L3RqbCs0bloyeE54ZXlwcWFBaGR6UEJhay9uVFhtSWZFN3lPUnc5MU9zcVVtdUNUTDVnTkRSa2ZmUDJTeFUzay9kdCtlbmo1MGdSMlZqT2IrbUxjYVpqMElzY1Q2S09COUZuQTkraGd4UThlRktCcnhDazBYRVJIbkE1c2tqVFdTeURtNHRNN3Z3ODcxZERSZm15dmt5SDg2VjZIT1lGM05EcVR0dVBDSHhzL2VOeXVZOC9rWnVVTTlLZnJCSEtMNkhpU1Y0RGlqYXRVRzFUOVpENVR2VGFtd3lGUWZGL0tXVCtmWjRJYUFDb0hnZjRLRkZJVk1IcUhhTVJmcU5Sa2NMSmovb0Nzcmh5c2tOaFlBcGJCakhnWnljTU5YeDN0b0pFUHkxUTJheklJckZ1SDBIY1Q0RUlZUjRDbUNndG4zK2NtNGZmemszY0dpdHdwczFXb1Z0T2xOVlJ3ZUs3YTVKUDJRbFFVMG11OTV2aTZCVkViVEMyMnhPL052d1kybDBKS2hzSXM2Zk4wbUcxOWdxbGpicURISCtYRlRGMGdpNnlTdHBhckNzZzJNMmlxWXN5RVlPM2pnaGhlWWNRRDJ2bW1UUVRJaytWbjBUSHJWYlJZdm5DdjVYdmQ0TmdEWCt4ZXdBR2lqWnBLSUZTamFwYUFGdWsvb3R3RzFTdndWMjJxUmVDK3kwU2IwV0FKdVVzd0RZcEp3RmVtelNDeGJvMFVrT1JwbE16OXEwTFJaNDFpWnRzY0JtbTdUZUFwdHQwbm9FSWxTM2VFTzBPRGVxcHVvRXQzcDNvdHF4bjIyM3V5SWMxaVlNaWcvYnZOa0Q4bVp0M2l6bUpVWFdlU0RQaStkVnc0WFJxVkk5WDNvakNMeGg1V2d3RjBYMlJOQUxFZlNzdHgzN0hiQythcjl0bjd4UGhaaDJ2V1E3YUZQNmJDa3YrQ2ErbWZhbUtJRGJ6OFJoRThCZDZJYzJFSUppOFNFVHdBM3duMnpLUmxEc2t6WWxENHFOdG9FTm9OZ1BQQk5ZRDRyOTNBYldnV0lmc1lGdVVPeC8yMEFXRkp0U05BSGNjeHQwd05uOGxOZ0NpbjNNcEQwbE5vTmlYNDVDV1AyVWdFTHNLWUVGdnhXRlVxRFlXYUVOUFE2S25SU0ZIZ1hGdmlCczZDRlU3a2VoKzBDeGY1RTI5QWRRN09nb2RJODlzSiszd0hNV2VNRUN6eHBnczFoa281NjB3RE1XZUJvVWY0b0NtUXdXNVgvVEtWa3NUZ0hjc1BrekRpaStCVlNhclZxZXBVSmJvb0pOV2F3WEk3enZvdGJUL3grbTlVUlY1UUZhejhvSWZhUWJwSTkvK2I2bjQxcEhiVmc4UCs3NlZoTmFiblRBUjFVb2N0eVZrYXJRQ2xRT3Bnb3RKOUluZkNRNE81N0EwYXo2ZEhjOGdkb0REUVRwSnBqV0hVOTQ3d2lDc0NWSWlubXlHZVJWMU0yN0VGa0UvVmFqSmo1ZzFuS1dJcTdBYkUxSmpYcm5uajZUMmpUdXQwWkhDcXJCeHVrU3RyejZiYVJGUFRBR1c3b0hMMFh1V1VoeFk1TVlkNFpiWXR2bXV6NUljT1NWdjIzVHNwanBUdHoxd0x2eUhyYXR0VkFHTlJPWlRubEdvUUlscTNZbzJibEtJbkJFV1FlaFl0TDF4SGFDdjdEUGgxS1FoSktKQ1pKTWFSQXFiTnY4UGg5OFc0VXZXa0JObk9BT2RaMzhyaVBQKzNqalJlL0xObmR0dWFhQTh0cHcxNWJaemVOY1ViM1hnQ3BjUDlVVklHS0ZNTG9tQVRrUmhSOElZeENtL3NxK2M5SEYwMC9KeGxJZi9Ob0pEOTk3N3hleTlSQ21MdTlWRzViOWJYdzJsbnAyVWRxNThSZnBNUmdOWVN4V0g2dFBIWEhkaTh1ZjJGWE94R0Q0clBxWWJYZlV6OGJlTWFpMjI0YVRVUit1ekN3YlZOdXh5VXZkc0U1cnp3UktjNmtyYmppaFBIN2N2MmRqcWRWampoVHA1ejZleFV1T2QzLzNvK3N2blR3M0cwc3QzMzdrNkhkM1RNbldnMEE5V0dyRjQ1dGZPN1V6bDQybGZuVFIycFZYajdvWFUwQmdyNnJqblFEaHQ3dTJ6RzRaNTUxemh1Y1p0US9xZ2hHanFEQmFPTjU3U29IS1N6T2RqZW5qQjlaazRtWnFKZDhGa3IvWmlFd1E1ZUc3SEl4SXhMbm5mVWpLTUpJNGdPMnhFZ2Rya254ckRiL1pKUGxMdUpIekl0Y3FFbURwVnhyWFpIa2FZZUlwNjFrRFR4a0JCRmo2bW0rdFhIZEFxc3RLN0EzdXU0R1ZTZ0o3SHVwckM3NFdMeWxvOTI4Uy9FVytBV1F0TTRVQ2h4dXdYZHhIRlNNeHZENUhSWWNrOVp6bVNVSlFLRXpqWlpGUWZEZks0MWJMWm04RU56cktYdEZ1Vkg0RVZTS0lSOUJlNzFGbDhiT0g5VWY0c2N6NEUvVDVPSDJ1QWNXU2x1bW16OVhJRENyK21PWE12WVY0ZU81a3J4MGFCM2pPQjVZbkNDeFBFTENBYjZRZ2JndDVGVzh3QlpHVm82Qm5neUVGUzZTWjJRYUJ0MWF4WHRiTGZWRDgwWUppSmZZNjkxMW5QM1lFKzdjUlZIcm84L24xRkVkMVVaQS9RZ0xneTlqeklpc2MvRDR0a2tlOU4xU1Z4VFI3VjZLQkR4MmFOWFlQWUkwM2hhVUk0dDVxYkRqSFhyR1h4MkF2ajZzM3hBOUVnVkZaZm45VmVKWDhZU1FoVVB4RjRsMzZGY3BjbUpwMjRoZGE2ZFd5YTczZTFWSlYxOEtyQjh3MUNwa3FiMDdLZXhzdTR2ZVp5WDdWTElvUkFyZ0ZjaGI0RXphajFRcW9DbjZFazBnZGtEd2FXbGtUeVIrZzJxbU05MTFjb3V5Yml1VzRYNUNzeUY1RzRkbkl2c0xPZ0loNFJCQjhQVWhXNUEveWRZU3FWM24zaUJ2MFp3bEJEdklUbXcydU5pTTdxMnY0QThqMExYdm1ia3ovYk16TjY5SktuZHFsR1ljL2trWlI5b2djQ25KR1JzK0I0Zy92THhsdlVReFlYaE9jcTlLMzdBazNwbS9vZjY1Ymt4UkMvQkVrTnY1N0pDeitlK1R2TlB0TTk3RkVRZnkza2FZQlpBZUlqVXA1T3craExmVStMSldSUzVnajIxekV3RDAxZXJLeDZnbGlXOHFkZzJoc2NMenFIQlNZZGFoek1Dd0dlR25qeURZMlZxMmhNMUhxU3dTU0tZMGdjM2NONkFxdG1oVjhnalNSVEkzVWUzcW9SdE83SUlqejBrb2QwZFZ3NEQ2SkNxKzN5K1NpWWtyTFJUYkxXczliaGZqdHFjSHYzSTBhdGN1V0xjdW1wMDJmYnZETG91VmN6OUtxYVdjcS9jRFo4N0w4ajdTOXF2U1FVMDFVZlZFaVRzYnZwY0FsOXlMdVVpemtEL0wxRUFEdEZwbkxPa0h3UDlJMVNOQWp3RnlNRUF3aDBZSUIrN0RxREgrb2R2OE52RHQxemMrVFlGR2htbVY2NlBOVE54Q1JwVldtdHhPaGJKWGNvSWJjd0pDYkFiR0pSWXcvTkpMOGhuQy9lNGI3L0ZXdkdWdnJZYy9XdHNidnhHV0JWTG5CU2Y5c3pIdldrYjQxL2FHVzVHRTNtcm1zYzc5R2UwU09hVFhMNDJtN2txV1h3cDBMMk45d3ZhYmZtUFRselhxYTZPUGswYVAxTkFsK0I4L1Q1d1lRZWtwQjRzRUJFczhOTzRhL0hIUU1jemVtcDAzZjBVMWRTdjk2L09FUFFUMkxlSE1PUG9hZnBxcGpzUHNRMktsN21qb1NtS21qTHB3OGVqUmlzYjVMbitHSDI0WDZBNmJ1RTZHcWFyaEhhcnBMcE9uMksrV1N4NEJ0SmMzbUFTaDlWS05VcGkvNVNXcTkzc0NtVGQrUjVhdDQvbUNSRzhDUkd1TnNqRDZyeDlCWlBZQk52RUJORUduaXFQUWdvOFVsK1Vxc2s2ODA1d3ZXMFUxVmRFYzFQUGMyblRRTFYrR2EvYjN0NUFHUjFmcS9xZnY0VGROSFVPeDB4VmNROEMwTG5HYUJyeFBBY3V5dnRiM0laR3hYTWhucWhTUDVjaHJJY214SW53RExvaFpQMFMyZVlyR1NZMXNPUHFiUkZpdTNVMlczSDZ5eTlWVFhlaUxxVG0yTzlhVFJhNzVhZThBYXJTMHV5N1hScVdpMHRHbWwzb3dXV1BXUTdJbWdGL1R1dUxuMjlOa3dzcXZyb3QweDJnUFdwOVhZMzYwZHVUMVN3UVBTY0hkTTRRYXo2U0Q3NzhGYW1MdlJic0tQcDgwS0pYYnFkV1d1UHROSy9YSU1YbnhtY010UEsvWFpkTnliSkxHTmphWU5pVlN6N2lCdE1HQWJScWlHUjNBb2l3K0xRM0gyWTFGRzlGa3B5d0pXZVpVUm01eEt2M1RQejhZWnBWVWVwRGVCZXI3dVVEMDN0VzFrT2RaOUdEM25keHBHK2xVZXZDVmpaWW50c0xwZlEwTHBrMGM3TThmaGhZZnAveUVzd1RZTDVWMHVaSkRVQml1b2NKQnRic0FjMlJuUUpPWmExOUROYndQWmxjaFdWN0ttSytzdXYvRVJFdjFONEluejR0YnNwT21tTnJ4QkRaSWpUVUI4TEl5c094dHV2YjNkRGRwYlBYMlR5eEowOVNwWjA2a25sUjhPa2dZeXJTdWxsUXNVMSs2RDlQQVNraTd1MjQyeGdTMlpPYUNrVTFNVUwrenhZcWZVZXJzcjJ0Rk1CQVNOcGFrcGFJZUF2ZEc2RVBkakNOcm5ROERVNmo0SUY0NzN0cXA4aGYzelpkTi9IaXhsWngybk9veGFJRmZKVnliemhZU2NCaTJaUmd0MWkvY05LUVJlR20xbVkra0d3eTRrMFBxZ21wMXloQ2xvdEsydzRhZFE0NnRaMGhlUng3Vmd0Z3BtakFqQ1crMCtoTWVjV0RLWnJxVzFGbm0xby9tN0hoUzlKME5JR3F4TUhPWDZtWEcrazdkWlRmSUNiU3pDNmNLOFE5dTdndklxU0RJM2V5dHg0emxkUmZ1Q29jR0Q3Z3REbjUrNjNwemN5SHo4d1VsV054N2Fjd3czZE5sYTNYdTk4YXpXd3VPM0VGMzd5U0UxaStqdHJ3WkJlVGNwOWdLZWRycXpqdHAvblZhNVNINFRjZWszWVE5MGw2bHZlSVRhWE90WkNVK2xBM1RjeU1LZ2hyWVhqeVdmNUJEbGZiMGlSVExQbVJKSjlpd0RLc1UxTjBIZk5USUxmV2RCc2lGMjNCRHZQQ3kyWXRteUNqS2ROYktKQWFPa2tUeFBEeDByRHNrNWx1bnBFUytZdzZZbTB1TzdzZGU4ajVYWjV4UWZMMDFvQ01rM0NoMnYySk02SkpuQ05JOTNVa0ZKQlczYWlISlNsK3ZSSWNHQXZjUjlOc3lPczJVRmxUM1daQmM2K3pkMHNLRFlzK3dwN3JNS2F5cnlUbGZ5VzRsRHZKVTRSSnFJRGd1MGcySm8yWTExaGxSblhsY1pjcWUyUTZGdTRYUVRESmhpZ3RVWFRXK0NFU2dJUmd3bDBDWDdkY2huaWtrMjFoYjBxZUJySm8zSy9iVWFxR0tnd29DdDV6NlQ3RGhidEVKRlR6S3RWS2pzTjJwQ3h5TmpZZERSdzdLR0ZGOGxvc0p2SktvQjFqU0lDT29SVU9VdmlJSnh5aDNjRnZhTFZheHNzRldtOW5VVEZLZ091YXliTnlNcE1jVjhWajlvK2wyaWNtWmNKU29IMVVCMXlNT2FXR3l4WVNyMmpFa2IwZHl3THZkVkRIbzdSbDdLRS9NVWREeXZsRGRUU2g5dm5yNmh6RTA3SGltS2JQMVJvU2ZvQWhrL2NSc1VQWUwzT0ZpUHRza0pqWjFiWkw2R0dVRHhHL0F1WDdWQjBBcGhCNTVlck55QkprZXNTYllOS21zRUE1S0YxdUpPZ005REVGNGRkZ2YzZzFhM2d2ZlZhRWZyeWdDNSswcWhCR1UzQk5rNWlPb1J2RllOTTFCQzB5VFhKOUVScEJ2b2Z2Z1FQSy9JNGFDRUIxc0oyL0JOYm94eFN4QjJnSVJTaDg1RzBqamVvSU1nN1ZINUtWUVM0QmNlYkpXblVIcEhsVklScExmSFVUVldEZHIyKzlWREdUMk1zTkY2UVd2R3ZxYU1JaXZ5YU5DN1lmNTFVRHpaSTRxa2dqcW9FZ08xVVAwS0R0Q3JlZHdvTm1oZU1kZFR0UkY0anBwT295YUNCZTEwcU9NTSsyQTRucUNEUzg5YlQwWnJWSlRQbFVnUVd3V1A0MmNKUDRyeEJOOEdqdGFoUkxGQlBNSG5TQkNvK211MlpiVjFUS1RJeXVvOGNpYUloSGRlS0VOem5ZeFdhbVNobGtDSmF6MDExUnAzQmI5VzcwVUp0TFRUZDhwUkRLbHU5V1h5dFRKQjltWG1TaG1ESnBXUFRPMGZtYnB6WkdydnlGUVltWm9ibWRvRHpvamtGMFltUHp1eThKYVJxWnRIcHE0M1FVSldCa0krVytvQnAwQWdUUEdQMThRL1doUC9VRTM4ZlRYeGY2aUp2OGZHUzJ4L3ExZ1ZCNXJVRldpZmo3aFhXOFdpT0ZxMFNaMndLcTR6bWd5QnplQjVTOHpzN3R3cW5CTEl1SUdMUkFkNDZVVkJidWpFQktrQkZXODB3VURUU3lOMmxNb2gyd0VTdVJES1NNeUFRTXRZNy9kQ0pHV3pacjV3SlFodDkwZFVJOUJtQXlrQVRYZklFSWZzYzBEeVdkWC83TW9oRVB5Vk9PSytoZzhMdkhkVVJDVVpOSWVaL0c3aUQvSjdRZkc3WGFuWHFlVGpaSkRNNzdYT1FtZ2FySlgxdUxWUUlZbWNJT2JnZDd1aExoVnFreUhaemdVbW9BbE15SGNUcUt1d1NyLzhiaWJiYzZRSmJVYzcwWWpKeUw5SnRiOEI4akhhWE5YKy9iTXQ4Ykd5MXVySEdMY3d0R2JPY3pKbkNkRHkwZHEwYU9xK1h1SWM2NERlTk5xQWNnUW1rc2tPMTZkc25vN3hUYllhQlV2QVN1MjRvL2tNbkNmSWR2Z3BWSlg2YkQxcVNuMzJVdWRnQ0Q3TGRnNEdSZCtEZ0Y4aVVXOGE4QXRsTWZUeVEva2gwNk1pbW1GV0lNRE5KY0dIZEFwYTRwc1lENVdlSnQ5MkF3VGJVY2xwWUdTYTErR2RMaWtSVFU0ZHlXZEp0QW5GWlZ0Qm1QSVVvYXlIWDRRS0p6Tk1peHlpVVdyV0dQOFlsQkN4bW5nUGdmNUNoUklMNWZ4TzF3Zkh4NEtoTVFmMXdjZjhaY1FlMVZDSkY4cjVIUzdGNjJ4UWllK2ZFL3ZEcjZ1ZHpmejIvQTUramN4ajYva2R1QzBXS3ZrK1Z5OE9qRlVZcXhJSnN1eFYxRktDZS9tK3JVSVZTdmdWRkliekpUNVhFbThTTDFUeXc5VkFPVitDQ2swQ2JzYjVZU2dUM2ltd0QwcFkxZFd5VU1rUHdEQjI4R3FVeW90WkxOY0hGUTN6b1h3ZmxMbVhIM0t3NTVKYXh0T0ZvR0N6YUFyeU8vbDFNcjhEUC9vd2oyQ2lBemNnRmxpOTkxWXBrb2RjZlJOcThXRU90aExJNTVWUCt2UDNoVFg3UW1EVnl2cENEMGtmQkg4Q0VWdGk2czlCRXZrQVg2djdPMzJtdkNDVDd5ZVh4RncvV1NlSGRJOHlVMEl3NE5Vb29QTzc4M3Y1bms1Y2h3TmVmamN4T3FMYUpHMUZhQ05FUnMwdXRaYnMxSzF4M2RvajFCckY3TlV4RDV2MjkwSUlBUmxDaDF6Z2J0Q1IyNTN2Snc2S09vVlhnb0ZXRHBndEN4czNEZ2FIR2pNSWJJc093UjVSZk5SbjBqdWM3dlFWUkszYVhSeHdzU0Zvc3lHckt0UlZoQm9PK2ZXU1RHVnAxYUVNRG5JeVNjUHI0NjRmVDJoSnVKZXEzcThNclY2SThoRDUxMnlPMGVRSU16bUN6MFNiVzIrZk5sQjduS0xXZUIrWCtwWndBSlVqaW8yU2JhNWlWOHBPYzBlam5taWp6VERrZlhqdzhWOUlWMm45Q2doK3V2UjhuVzh0VUtFMjRrdzdGOW9pQlhYZ2RJdU1aVVA2M05EU2xOUFdxZWRCdVlML2xvMVZtbGtUTE5QK3ZGSnNySG80dWhEQzV2QkU4Q0hrRTZTbmZZQm9nb1hub1FNQit6WnFpS0krQzJUYlBjOUx5aENYeWw1am9JODg4OUtDMG1kUGRBYnBxNmI4SGtUTzh5cmc5eURJOERyc2VlV2JrS0JRaGQvalUxQkZtU0pRRUZoN1FaWGZnd3c1NnJJaWExTE5MVnBhZERnZHZZUWZOQk14OGtDb1RmQWpQdXdHVjJoNWdKWGJXZ2tUeFA4YnNVQllzUUQ1ZGtSbWg2c1hHRnI4NGgwOUN6dmNFRmxWQ2FMVEp2aUlPRUtlZHcwcGlGcEFUY3BCbU1tLzFtTWtsUHhySUhteW9KQ3h4cGxNRmtRZXFJVkp5NE9rQmt1VGx1bDFDU0lQYnZBVFBEWnJyRW1DS0hSY3RtNVozd1ZVcEoxZklYMFNpcTV3NUlnTHZURWFXelRqcXcyTGJXd2p0SlpEYVBRWjRpTHNpZjJ4SjF4YWtrSmpMK1Eza09zS1NWTzFhQXNQUkZ2NCtLRFNKem5KUVg2RWZ3MEVGdkQ1RGZ4bjZJOFNFb0pSZW5JRmx4cWJzNlVnUDgwYVJJb3FLZzNTN2hnMFdIVkdvRFcvclg3NWZ4S1ZqVlVNWXZQOGx6SVArVzMxT2ZCeUt2OGFTa1F1enJldzFzb2c4cTlqWDNwRXNZTXJNbHhsSWQ5STk4STlvcDhGbmQ3Rk1yb2RvamowZmdoRjZPa1RreGhVbFVBMTExYkJTWXUxeXFnNG05QlNVakhKTnhJRFVzMGVOSnJzeExQZXBhMjBrSHNGdkJvVG1GL1c1aTgyVnF0WDZxNUlnMHJWQjN3anFnTzNDdTRkRzRyUStBeUhSaGRLTy9LMitlaGl3TDQ1NnQ5bWtxT1dHT25DRlJxck9qb2xMa2R2cnNkc0UrUzFCYUxHYVl0SjhqUnBQOUJqQzRSMjUxclQ1OHJKcmtvM3RaSFBGdnJtcWZTWDMvWEdrM0UzYUhRVnVnUVhBbDkzWW9iMXNmVG9iZ2lVZHBwQys2RktuQXp2K0xOZjJSaFAzemFyTkNFUk41NFFaYWpFR3dzVlFFZnlDcDRUWTdGZ0pkN1lRR1o1YXpVK29SSUh2N0dSRE5NcUVEVEcwUlhaYnlRWHhLUmU5MEZqaloxekkybWpyVjVkTlkyL1d3c0kyZ2k2VVh0bFVHMkIwZFJhYnpQY2pyV3JGbWtoMU9NZzJlYlZDNnROWUtjVnFJVEdLQzZST0IySm5YM2F3bkRBTS9TQ1BtV09iTWVxTktLMFJVc0FLdEdJWHUyUDl5WEFqM3Mva2tLUzc5VVoxbEJPamllVzZJdmpKeDlOem5Da09iODZlQ3d3TGoraVFYZkR0N3BXbGNGVFBzR25TMlBhMk9oaDM0Lys1Vlh2cFFwTW9xdWRlekNEc1p3TUhzWlVqUTNLTUxNbUJ5NDVVRE84VjR6Y3Z6VVM3QnRKRkE4UzJrRUZiY05CWUxZa3FCZkQwZ1ZHS3JzRmpiOGRQTitOdmZmMWt2OUVlcHVFYk1HY2xMZkdQSytlUDRCUzVvc2hyNi9XRU9xeXFIQnM4NDdWeW41dGJRNEZ3UmNVUXEzbWIvcnBqTlVneU1NdDVRWjBDWEMzc2E1RGdVQ3Bwa3hlTlNCYkxhdy9SMENhOFRobUtNV3RncGFNL2tNK1M2YmhqUEdQbWtRK1RacGNYYXMrc1NIdTZVNlYrR1hTQ3U1RkNQZ3NGTnpOZFlBOWtCRkdNN2srQ1BsUFVPaXVIZ2Y2SUFpMURvWC9XR3JsQVRidDNSL2h1ejhTbytWSW9abWJBSXJhQ1ZmRWFVdUpoT3hJL0E0QWsxd1EzbzFDTnN1a1J1c01tc1RlZUVIeUJTRGoyaHRPeThkMllBbGk5SlJXa3dzekZOUjg5QUhPSVRsYVZ5OHZ0SUgrajJUQkdyTlVSeVc5M3pyR1BhQ2Z6NUJhQ2tNL2djcDV1T0pHc1FiaktjWHJKUWpUbDE0VDBGb2lsRmN0OWRXSU5nTFZEdGZJLzBmak1vNENzMlQ2bEovL1lsUDhMVHZpL0RmMTVBK2J6bDBmOTQ2Um9Vd0d6Y2p5YUp4ajFpMkV6QmZEbllVS0JtRzd2YmNpTXJWUGU5Um5ZdGFENFhvNU1hYjFWd1RYbzY1VisrU1V2OTNsRE15OW1LTnNoNWJBVEN5WkZKM2Q5ZWZFdGZxSzJJc2VYQWZ0VERqNzV3aEdMQVRxV0xRTjVOWEVxZlc4dlAvVWh5RGlOYk1mVU5Eei9ocHBGUytURnMyMGNHUWlRcGZadFlxR0lMOGloVEJUaFNKS0laSThMT2NWMlNOSlBTZkVkS2RQR3Yzb3VqaUk5Ri8rc2dEMWxUL0JHUVNoc1lnNWhNa2hhM01ZQ2NyUklwVGVuWmt5amJSUDVpbWtVbEVUbmJQUndqcWN6REtqUUUzaUxLUEVRMklZc25wTnovdWJTbi8vZ3ExWi9CaG4vS1NCdktJem1ZWkdmUmlOdTd2UG5FcS82U010c2RYL1dyV1lkNnFVUVhNVkZZaXhua0tvdndLTExES3Jpdk9MaVQ2ckFhT3c2ekdPTkhpSVorUDhJcG5nSFRyRmVjSG9TbXVTMnEzT1IwS1lzR2JHbXE3VHk1WmRrcTFWL2dnSWJCWXhNb3QzRUh4c1BvZ1cvSEN1TkwxRUtNSm1OTjVFbEVmSGNZQW41YkdCZWVIaEhzM2lwRDgzY0VvVzVJd0JEeWo5WGNUN0JDT2VtbURKZ3UrRHVxcWd3TUdVNDQ0TTE2QS9MajdTY3hTQmhvOW95dXBwb25PWHlZSjFmbSswVHZBTm5rL0ZSalVGYTRKbUpreU9zU2JIMkt4aFh4cDhGaFo4NDFYUjRIbGtleHA1T1FodDFBd2kvZXFVbG5YeDlPQjc5blluNHVrTEw3aWdPeEduK0NmMmZHNUNQRDNqYTQrT1Q4UVRjWExtcGplZkZBaDgyYUxXb01xM2ZzUHB6WGY4Y3plSTlLMVBUbm1tRVZSalkwRVZBOFRQbWl5STlHMEY5eThZNjJCMDZLVi9NK01HakQ1M29QOHZOck13eU1UTXNTaFdldHB1YzRaM3JKQmhjb1JEQXE1TVl0V1FOYllPSUtENDl5VnBhbDZiejBRYjhzMEIyellmWGRLRGFDclhCcmIvWWkzdXNKMEwxeElMTFZCWEtWallPU2pJOEhMQUkvTjMvVFYyd1BOUUFXOXJDZGNPb3VScHZCTXk2V08vK21ZRzgyV3hvalkzN0tPeW1sY0wrelJSSE9tVU8vdTBFNzlBSDM1TE4ranhFT2pLUHFZNkhsdUlOZXNVRERKRlZmWVp6Zzh2WkdURFZmejcwaXZVR0xtQnFQcHdJL2M1MC9RZVZQcTVDUlBQMDJ5ekJpbStjY0JUNUJBK2poNFIwQjN5VHBTeVRNMDBnZFRlNG5uVjRJcEdOK1M3Q3I3bEV0MkE3MEpsSjM4VDhjcmZSRjhQWE1TK29VQ2pkNHduaU9SMG1xQnZKNEJ5UElFU1JEeFJLQmtoaVRabVZQbG9yZ2JMK2FaYzBaVGpWRXhnTVNnMXVCVVVCUVRtOFNHSU4yS1V3TVBnQ3ZJekZsRGhVM1QzRzJibUVWdHg3bnB6QXhHMElBMU5vRmU1eWloRFZhQnM1N1BNdnYrTkdYUHNBci9UdmhPVCt1Q21keDdSOWR6c3pBcU1zU2RZTWtacER6NzcvQmY0bW12RzNqSHlwUzBvc3pHZlBmRUk4eVJHbVUwK2JZd1RvcVdOU2gzaGtJUEl1N0t4NkRBRWRVbjlCZmcyUmtXL2plRlBxcjVsVmVkSzhDZFZuN3R5Z3pwOEl3Tzlac1orZ042MVVWWFdHYnRrbnNtSUdjY1dPZ2hFcXB0ZTNEb3RHOE9WbjNyaDA2OStwK05QZTdPeFZPT0U4Vzh1UFgzWnVIcUtQK21INHhmZSt1U3k3bGpxQSsxZk9vMU5tRGkrSG4xYTZsd1ZpNTc5QWxVM0ZZSTZrUFhWZGdzSy9LQUZYeFlwcjhaM3o2cEl3aFI4dGN1MWFmajZpQWxTeXVQNFhrRk5BZjFXaHMrdXUrbnhtcHBXaGJxbVU4b2RyazJyaGlqNzZ0cUtWb1d4NnFNYi9wUXVwOXpTdFdYMk9JcjB2aGVFUS9Oa1VyYUFvdWZRNkVmTjdkb3lxNnVoMU96S3J1eGNaRTI2S3RkY1RNL3RESFM0M2t1aEtvVGc0YXM3QXI4NEdrUjFxUWZ3YWhtQzJTRHdpWjJnMmZWbnpVR3hIS01rWUFCdjFZTFpXR1FuaFhGMkhOdHNlVzVYay80cHpYRUQ4emFiNjRQb2dsbHVaUjRJR3lYQW4rZjYrQ2hQb1l5MVkzckpIY2JYbjNTT2xvS0FDbEFFekdxaENscHllWkJkTUF0Szg1Q0c3TXR2b2d0bXQ3VGc4eHYzZlMrZng5N1BhMmx4d3k2QmcraWVoZjNJWHVQNlhmSWFDSzUxNVkwb2ZVTmxObUN2eE94clhScHBwWG5XSE5lMmpXL1NVSWU2enAwejlTb3hEMlJYN0QvR25WcEVRTWU0dy9TZTBKRHRMTExDSlp0cGlIb3NUWStIb3hmcXNKOTR6MzVtYWs3Zm9nZEh6OWljamVHNm5uMm1lZlZvVXpaV2Y3NHJjQlJ1dWN1YjFYSm1yZ0FDeWwxUHp3Ylo1YzJhMDNLbXBkQU5zWnliTDFoY243Z2VLdWdVaHBMOHRUYXlxU2s1ZDg0NHR4akxGZkl1RkdNNUY4S3U3bXZBYjc3WU85a1AvUlk1RHptQ0NXNkY5ZzUwZ0N1VWE1M2Ezdkd0SHpxMEh0RmZiZXo3cSs5TTZkVW9RY1h3M0FLWmFqN2lmT2VQbjN6OTY5MngxQmRXbnI2alh1SkxSYWxManVaNzkrNjlQbHV2YzhWaUlGTXRYL2pLN3phZThJbDFzZFF4bDczNHk0OS80bmUwSGxOcjlHTEc5NDBHUE4yZVkxK2VxcU9YcDZpVHRYMDc5bXA2aHFyRSt2RWhSd1dxOWkwcVZMcGw3dE52VWJrS3d0UXo5QnpWU2V0aXJxaHpKZTJXckg4K2N3YmEyaG5IUFMxTUxWZ1VQdmZMSFZNM3hHaUFXTU1xVTBUV3Vhb09aRjFkUWRDamdBZFc4Y3hqZ2RNQ1llcjBOZkRxdExrM2JLcldvWFNkSStyQUd0QUtFWmVPektGWGk2d0RVWWNUaE85a29mTWEvNDUwUyszNENrdWZWeWpuQ3dXVmQ3RjFmSmFxeGVKZlZ0MzhSbVVqUThEanNyaWx1bjQxeGErajdjMU0xcFc3dnJxalhyNnpPNWI2OVlPbnY3bjBkSHlkS3ZVb1RjQVA4UDFDOVB1ampGL2NQR3Y4Ujk5NTBZUlk2cHZubnp2aDBnOFZ1dXRqcWU4OWNGblR3L01TTkcwNGtGaGRmVDJaVThRY29namFuMlhrREhnYzdjK0dSdjRlRXFtTGdhaURNS0tVV0YyZDU2cHBkQmJoUTFoWFZ2NXpGSDNwNmRPSW9pTXNEWGcxYUJVSFJ5dTZNMVpUZ2pvSWE5SHF2RFZlOGZRNlhMeEdKeStpOS8rYkZlSHN0eVQrNzY0SVdic2ljTmJRTlFUcGovVGxJK2dQY2ZFMjlLYzNOVVQ5WWRPZmIxdFZkaDA2UkJmcWJSYWllZkxyOEJZaVpueDdncEY2SVVZcndqd2tlRVlnd2hZcjlrMm9wUmNTMWVyMzR3enQ0M3Raa0pjWU5uN1VFVlh4Ny8zN2lYL1RDNG9TUmp2aG1xQ0ZRR2VHaGhXbytwcGJFRlh6eEtvUkF3K1NpczdMUmh6OE9ZcURMVm9jTktsSDErUThPbHZqQUR5VlJNT2FsMmVuUnVKaERIbjFXRlU4MVA5U2V6L25mbkxqOTY3TXhsTEhETTdQUFhiRGhmZzI2NFByVHFwZk5uZytnb3ZoMGROT1hqc0pRV2V1U3VUV2pFRndrR2JtQzJZcG02cit0clRqaGRTNXNYR3gxTFIvK3ZRRHozL2ErUjVPNHBKcHJkOTUvN2ZQUTdEdHpmd1IzMmc3QThGdkhqTmordlRwcCtBaEZ4c2hnZFlkU2dKTlBUeHhwWC83bE05a1FhUSt0Znh2YnZMRlg2MnZBMVZYUjVLb21hNlBZbXI1bnY2L3ZITEo5VkZxNktWKzh1N3J2K1F0K0NDbVR2anFxRi9OS2krS1VrWE5WTnV5VjBTcFZrQzl4SHNUbGR2ZnBqZmMrUG15ZmlxZkxFRk85WmFSUWh6a1pmeCtjMDFPMnUyNmM4aHBxa2YwUmhxSkNQWlFBL1ZpeUVGTVdtRnVqNnNtT2JVS3dScTNWZStzSUF5Yk5RR0Q1SXZka1ArQkZESHVzTlY5REZkZC83WUJ2by9FTDhDYmIzeTNjR1VxYnRRN1JpdHVuUnEyaXAwUTNxTTdVVVNqdUpCL1Q2S1RhWU9OMlNyNkcvVTlZbzd2S1F4RE9ORXRHNFR0eU1SUWoxZW9wSjVQOXg3enFhZTJaL2xnYW15dytETW4zMy8zdUJoR09pWTJWcHNqZDlhUjE3ejMrTXZIeGVwVGJldUdQajkxVVhsc1BmK3VMSlNxZThQd0pENllnaS9kY2xmNTM2L094bExYTGVpTXY3dnluV3g5VFRVeG5lblJKNjltcXo3UmhKVmRlOHlEWjc5MnJaUEZ5cURNeHRJandNTUtTckU2L2wzcGx1dWdYUHN5QUw0ejhPMjkrcUhnYXN2bHFUWFJkZWZRQzBPaXF2QzNPdHdjbVFFTVdkUVAxVXd5SlVIQUg4S3BkR3FWdXpnZnBOakYxeStISjhjYkovSno5WldBU2VtcGVnYnF4d3JJNlROQkRuTy82YXZ4Y09xeFV3VXEzYmJ1bDkzVnlkclpZTjhWMHg3MkVQS2NwKzlJRmQvb25TOUpsWXJUTHUvUjloQW9VUnZDME02QjJ0R1VLQkxZM2FqenhPamZuSGNHazYxTXRMTWpIT2ZYai9TNW9xWS9SZjM4enZka0RkWG9DeFRIampxZ2J4RG9VOUFqU2lTMVF4aWh3S3JwN0xVYWV1b2dDWjhqdmZkVG45RVNhYlJWSHZiYXZsTXUvdmYxblY3d01xOWJwRy9vWDN5d01mSDlBK2JheG96VjJLamFzZkthTVRzMDZOemhEWHBaTk9nbmxiRlYrYm0wcjhYOXkxcnRUL290YWZlU2tUSDlXTzRWc3gyQjRKUGtmcHJ1cXAyUE54Y2ZiUW4vV3g1dGNRNy8xUllWNlVkSmdWUjlxOXBjTUtPTzgvRGVwY2FYWG02T1hub0o5VjEyZ2w2MlRrQ283N2tUYVBxdVZ3T3ZyZ2FvY2YvNkwxSlVVRXNzQWI0bkdDMkhhQlhRVnFGcUNjTHpQa3B2K3VHRnZUYXlsQ3pmT2FnaTE5WWU3WnQrdXVyRXkrcE85SzdhaE9ER3pvVUlyME40SzBVL2grQ1d6b1VVL3dJRy9rcnhmK3NrSDNkTUdNVGJtVEZLKzduM1dvVW9FdEZQTmNIMTZIdUFkZnBOd3Q2UlFVdzFHWHMxT0RDaU5FUXhPL2xQcFVOdXBvcXZxV2J5ZGlzN3pPMkdYSC9qZmVRdHh2OFB3OERDaFlPK3hnSU5mWXh4OGU4MUh2N1V2OHVORFE4TjgzSnBMT2ZzWUhYRVFKUjNZTDlTTUNMSFRuNjVSc0R6cXJLMm10VzdjRmdFelRqY3cvOW5FY042Mi9lOVBNRHBSK0dINUdVK3hFdEZ6ajArekRrUEE1L3pDdWVEWWgvMzdBMmh2bURheVMrVmVHMHE5QldzRHNqaVhxOTZrYWl2YmRFbkxXN0xqS2t0TThhVU9iRHFNZExtU05EMXRMMEFQc0xwYWpoVWdXbytiZEJiMjhqSUZGbmM5OVlWS05YVVBUSWJlYytaT25lNnZybTI5VWZlSC92UnJhMGYzZG9pR0YzRyt2b3kxcWZMMkdtUy8zaS9KdklIYlFKcW0zQU8wUWF2YWFObzd3R3I3ZlhiOWdZOVVMeU9TTTE4bWRhM1hYdE1OeW5RZ1NhTElJMFBBaHQxOXhKOFdiRmNMVVFuYWMzMDBPeFVxdWxtczMzN1N2VWt4R3FwSTJhb1k3L3FITnVlbmJtcHRZV21ta0kranUrSHRlTzc1Q2VwRGFaTUQxK2dsOWNNR1k4dVNYZGFqcUxYQWp2NUQ2U3Q5d2ZHQjRMdW1LMGxOZ2h5U1l4WGFkUU5hZzJ6QllRMUdUREpMbmFhM3ZQMHRRbFMyNU54dm9OOGpTaWVTdWNWTVdCUHhCTVg0aDlZYWRNUDR2V0luUTUydTRaUzdhaEdXRDRZSm9UZXkzVFJEcUxvZThxTFRDZXFDTk1CL2VSSGJRMEN5d2p2WUNZVnhacmNCaFdTTGwrb1M5U2F4WUEwUTliWFBCanl4cGZJZnVudjJLYWN0OTJuYXZrZGtHZW52cjYzL1FNdnFWSFoyRGtnK0g5WUsrU3pVd3MvKzlMclU1d1AydmhpYlZsNUhsK3NSWjJkNXRIa1g2Mk5nenlQYnBKNXFzRnlUNGRLTEE2OFpXWEE0dnZWb0NpR05vU0RGa3VmQmszNGRuQmFPVTFMZEd0RG41ODZzaXZrN1U5NURzeENTLy9RSFhxbnpqOXQrZ2syZi9FdDhuLzR3Yk83NmVXQVplazRueVNMM2x2V3JiS1V0NzRyenMrV3hTR2I5eXc1Y0JEUThxbTNWMzZGaFg2YTVtY2FQblg2VVRmcUdJZWZLV2tiMm8reC9VNHFyWnEra3FwaGJLc3h0SS9VNXM5Ylk4TkFtMkNNNElraFNDOWJOcnNhU1J2S3lOYStQYTBUU1o2ejAxVTdpc3UvU3VOeVBEV1ZxRFovMG84UG5ZVjRCUFJCak9wRXRoc2lYM0g3SW0zWUk1NjF6c2NJWXpmT2MwQk5SZ3RCT3M4U2ZERmF3RmRkakVQekZ0WjVmREhKZ0kwTk0vVnRLMjg5T0ZIbTlBTzU1aTNwY1laVHE0SDFSTkptelNmaTV2TE9WSnlmVVNYZnhLRlNld3ovMjd0V1A0QlNxQjBvOEhQMm4vWis3Tlc5cGpNamsrMWVmbzcwTHBhTzNIOExpVGFMWFB1K1BhcENQN0lTMHA5c0N5b0NaNTlmcXMrOStvTjl4ZlRYVk5QTzRkcUh2WTA1V3o3aVR0blRuWkhid0puVmNVMlN5SzJLSk85aFl4WGJTVjdFWStsaHNoeG53Ri9LN1dYSEtiNDF0NGNlcDh2dHl1L0t2Wm5meFpxY29DUDNCaS9tZHZKaWJnZnZ5bTNueFZ5ZjluMGU0cDI1M2hGK1hQbmVFZTlsOFY4eHdRUTdGVm5wWm55ZElOaU9iRFg3REg1OFhiSGpCbmt6YitIenNBajdYelp5bjQzTXZVN0Z2N3AvY2NXYnBDa2tEWmg3VFN0RU1rNEdGVHk1Ylo1M1p2a0Z4V2FXUE5tcjJJeVNOMXhTU3VHdlZHeUtqajI3NUEwUG0xaWgyRWtsRDE3YWxmcno0cmxIeGNaK1pzdDd2dnpIbDQ5a1Y2YWQ5ZE1iN2p4KzVXa1RQLzM5T3g0OFFyRWpTNTdFbW9lOWZxN04wNWhTajNmaHl4dTRoaFdiTWt3WnpoNzJkdUZmN01OTVZ3YjZsOU5mOEdPZkhhYjJQenpzOGFMK0cxRFo2SmNkcVl2UEdxb1dIeFhvWDh3Y0tqWmxTSGQveUJ2ZVpyb2Y0b3V5Rkh0aVRXeWcySWVIUExsZXNhT0h2RmZ4N3lXK3BwUzZXUzFXeTlWTmFwRmFydTVRcldxNVdxRkFMVlkzcTZWcXFXSlRQRjI3Wit0eGxQSVZHNjJqVC9TcTFWY1UrN0NPUGJvbXRxell6S0xHZXJFYVc4SVhhM1hGTmJIRGlvM1dzU2ZXeEE0cDltRWRlM1JOcktmWXpFRmQ3MkExdHFqWUZCMTdkazNzb0dLakJ6M1pvdGhuQjcxVmQ5TVRJdHRYWENYbWJGY2ZsZkh0SzlKenRxczc0b1VWMThvNUJlWEdjd2prMUtreS9ncENyNmhUWkR5MzRsU011MWJHQzQ3T2Q2cXNMWkdlazFNcmJINDJlcDl1YlovWGNUczUvSzVmY1lsTWRBMmxyK3RTS3hKZEQ1MHFyK3RTMThwRTl3cDUzWHAxc2toMGRWNGlFK3RYdUJSOVhiZTYyT2ErSTlIMUVCYS9HRE1XcnV0U3M3RVVsVkRYcmNkODNmMFk3VjdYcmRoSkE5NVlpZlNLYlNLOUl2MGl1U0w5SXJteUs5UHJOeTdPVFVMeS9jaHpheXJIZmVtUnJ0NWpYaitpTi9IbDRmYzhmZDNIdWk5KzZmeFhGbDMyMFRtcGljOXQrcmNyTnJGNWQ1MTcxVjF6TG52dnB2dm5PcGNmdlcxRHoxRVRydHJyL08yREF6UDhUMzlsM2xOTHRpMFordDJ5Yk9mRGs0YS8rdkxYejN6NTV1Yy9jdGVsNzlwVVhuZkRCejV4elBsM3ZhUDlJNGtIZnRuNWJQaW4wdDIvMkFabmZHWFU5OXR2T0hMbEZaKzg4UFduM2p2dHJtdW5MeS8xZmZ3M1RTYzZ2OGpjVnQvL3gxMlZ5ak12TDNoRXNjdjIwaFJldExlNlRQYzUvNE4rL2c5YzZ1TDVJYXRzK3dBQUFBQkpSVTVFcmtKZ2dnPT0iO2Z1bmN0aW9uIGUodCxlKXtlPWV8fHt9O3ZhciBzPXQubnVtYmVyT2ZDaGFubmVscyxhPXQuc2FtcGxlUmF0ZSxvPWUuZmxvYXQzMj8zOjEscj0zPT09bz8zMjoxNjtyZXR1cm4gZnVuY3Rpb24odCxlLHMsYSxvKXt2YXIgcj1vLzgsaT1hKnIsYz1uZXcgQXJyYXlCdWZmZXIoNDQrdC5sZW5ndGgqciksdT1uZXcgRGF0YVZpZXcoYyk7bih1LDAsIlJJRkYiKSx1LnNldFVpbnQzMig0LDM2K3QubGVuZ3RoKnIsITApLG4odSw4LCJXQVZFIiksbih1LDEyLCJmbXQgIiksdS5zZXRVaW50MzIoMTYsMTYsITApLHUuc2V0VWludDE2KDIwLGUsITApLHUuc2V0VWludDE2KDIyLGEsITApLHUuc2V0VWludDMyKDI0LHMsITApLHUuc2V0VWludDMyKDI4LHMqaSwhMCksdS5zZXRVaW50MTYoMzIsaSwhMCksdS5zZXRVaW50MTYoMzQsbywhMCksbih1LDM2LCJkYXRhIiksdS5zZXRVaW50MzIoNDAsdC5sZW5ndGgqciwhMCksMT09PWU/ZnVuY3Rpb24odCxlLG4pe2Zvcih2YXIgcz0wO3M8bi5sZW5ndGg7cysrLGUrPTIpe3ZhciBhPU1hdGgubWF4KC0xLE1hdGgubWluKDEsbltzXSkpO3Quc2V0SW50MTYoZSxhPDA/MzI3NjgqYTozMjc2NyphLCEwKX19KHUsNDQsdCk6ZnVuY3Rpb24odCxlLG4pe2Zvcih2YXIgcz0wO3M8bi5sZW5ndGg7cysrLGUrPTQpdC5zZXRGbG9hdDMyKGUsbltzXSwhMCl9KHUsNDQsdCk7cmV0dXJuIGN9KDI9PT1zP2Z1bmN0aW9uKHQsZSl7dmFyIG49dC5sZW5ndGgrZS5sZW5ndGgscz1uZXcgRmxvYXQzMkFycmF5KG4pLGE9MCxvPTA7Zm9yKDthPG47KXNbYSsrXT10W29dLHNbYSsrXT1lW29dLG8rKztyZXR1cm4gc30odC5nZXRDaGFubmVsRGF0YSgwKSx0LmdldENoYW5uZWxEYXRhKDEpKTp0LmdldENoYW5uZWxEYXRhKDApLG8sYSxzLHIpfWZ1bmN0aW9uIG4odCxlLG4pe2Zvcih2YXIgcz0wO3M8bi5sZW5ndGg7cysrKXQuc2V0VWludDgoZStzLG4uY2hhckNvZGVBdChzKSl9Y29uc3Qgcz1mdW5jdGlvbigpe2NsYXNzIHQgZXh0ZW5kcyBBdWRpb1dvcmtsZXRQcm9jZXNzb3J7Y29uc3RydWN0b3IoKXtzdXBlcigpLHRoaXMucHJvY2Vzc29yQWN0aXZlPSEwLHRoaXMuaXNQbGF5aW5nPSEwLHRoaXMuY3VycmVudEZyYW1lPTAsdGhpcy5zZXF1ZW5jZUluZGV4PTAsdGhpcy5wb3J0Lm9ubWVzc2FnZT1hc3luYyB0PT57aWYodC5kYXRhLndhc20pe3RoaXMud2FzbUluc3RhbmNlUHJvbWlzZT1XZWJBc3NlbWJseS5pbnN0YW50aWF0ZSh0LmRhdGEud2FzbSx7ZW52aXJvbm1lbnQ6e1NBTVBMRVJBVEU6dC5kYXRhLnNhbXBsZXJhdGV9LGVudjp7YWJvcnQ6KCk9PmNvbnNvbGUubG9nKCJ3ZWJhc3NlbWJseSBzeW50aCBhYm9ydCwgc2hvdWxkIG5vdCBoYXBwZW4iKX19KTtjb25zdCBlPShhd2FpdCB0aGlzLndhc21JbnN0YW5jZVByb21pc2UpLmluc3RhbmNlLmV4cG9ydHM7dGhpcy53YXNtSW5zdGFuY2U9ZSx0aGlzLnBvcnQucG9zdE1lc3NhZ2Uoe3dhc21sb2FkZWQ6ITB9KX10LmRhdGEuc2VxdWVuY2VkYXRhJiYodGhpcy5hbGxOb3Rlc09mZigpLHRoaXMuc2VxdWVuY2U9dC5kYXRhLnNlcXVlbmNlZGF0YSx0aGlzLmN1cnJlbnRGcmFtZT0wLHRoaXMuc2VxdWVuY2VJbmRleD0wKSx0LmRhdGEuY3VycmVudFRpbWUmJnRoaXMucG9ydC5wb3N0TWVzc2FnZSh7Y3VycmVudFRpbWU6dGhpcy53YXNtSW5zdGFuY2UuY3VycmVudFRpbWVNaWxsaXMudmFsdWUsYWN0aXZlVm9pY2VzU3RhdHVzU25hcHNob3Q6bmV3IFVpbnQ4QXJyYXkodGhpcy53YXNtSW5zdGFuY2UubWVtb3J5LmJ1ZmZlcix0aGlzLndhc21JbnN0YW5jZS5nZXRBY3RpdmVWb2ljZXNTdGF0dXNTbmFwc2hvdCgpLDk2KS5zbGljZSgwKX0pLG51bGwhPXQuZGF0YS5pc1BsYXlpbmcmJih0aGlzLmlzUGxheWluZz10LmRhdGEuaXNQbGF5aW5nLHRoaXMuaXNQbGF5aW5nfHx0aGlzLmFsbE5vdGVzT2ZmKCkpfSx0aGlzLnBvcnQuc3RhcnQoKX1nZXRDdXJyZW50VGltZSgpe3JldHVybiB0aGlzLmN1cnJlbnRGcmFtZS9zYW1wbGVSYXRlKjFlM31hbGxOb3Rlc09mZigpe2lmKHRoaXMud2FzbUluc3RhbmNlKXt0aGlzLndhc21JbnN0YW5jZS5hbGxOb3Rlc09mZigpO2ZvcihsZXQgdD0wO3Q8MTY7dCsrKXRoaXMud2FzbUluc3RhbmNlLnNob3J0bWVzc2FnZSgxNzYrdCw2NCwwKX19cHJvY2Vzcyh0LGUsbil7Y29uc3Qgcz1lWzBdO2lmKHRoaXMud2FzbUluc3RhbmNlKXtsZXQgdD10aGlzLmdldEN1cnJlbnRUaW1lKCk7aWYodGhpcy5zZXF1ZW5jZSYmdGhpcy5pc1BsYXlpbmcpe2Zvcig7dGhpcy5zZXF1ZW5jZUluZGV4PHRoaXMuc2VxdWVuY2UubGVuZ3RoJiZ0aGlzLnNlcXVlbmNlW3RoaXMuc2VxdWVuY2VJbmRleF0mJnRoaXMuc2VxdWVuY2VbdGhpcy5zZXF1ZW5jZUluZGV4XS50aW1lPHQ7KXtjb25zdCB0PXRoaXMuc2VxdWVuY2VbdGhpcy5zZXF1ZW5jZUluZGV4XS5tZXNzYWdlO3RoaXMud2FzbUluc3RhbmNlLnNob3J0bWVzc2FnZSh0WzBdLHRbMV0sdFsyXSksdGhpcy5zZXF1ZW5jZUluZGV4Kyt9dGhpcy5jdXJyZW50RnJhbWUrPTEyOCx0aGlzLnNlcXVlbmNlSW5kZXg+PXRoaXMuc2VxdWVuY2UubGVuZ3RoJiYodGhpcy5jdXJyZW50RnJhbWU9MCx0aGlzLnNlcXVlbmNlSW5kZXg9MCl9dGhpcy53YXNtSW5zdGFuY2UuZmlsbFNhbXBsZUJ1ZmZlcigpLHNbMF0uc2V0KG5ldyBGbG9hdDMyQXJyYXkodGhpcy53YXNtSW5zdGFuY2UubWVtb3J5LmJ1ZmZlcix0aGlzLndhc21JbnN0YW5jZS5zYW1wbGVidWZmZXIsMTI4KSksc1sxXS5zZXQobmV3IEZsb2F0MzJBcnJheSh0aGlzLndhc21JbnN0YW5jZS5tZW1vcnkuYnVmZmVyLHRoaXMud2FzbUluc3RhbmNlLnNhbXBsZWJ1ZmZlcis1MTIsMTI4KSl9cmV0dXJuIHRoaXMucHJvY2Vzc29yQWN0aXZlfX1yZWdpc3RlclByb2Nlc3NvcigiYXNjLW1pZGlzeW50aC1hdWRpby13b3JrbGV0LXByb2Nlc3NvciIsdCl9LnRvU3RyaW5nKCksYT1zLnN1YnN0cmluZyhzLmluZGV4T2YoInsiKSsxLHMubGFzdEluZGV4T2YoIn0iKSksbz1VUkwuY3JlYXRlT2JqZWN0VVJMKG5ldyBCbG9iKFthXSx7dHlwZToidGV4dC9qYXZhc2NyaXB0In0pKTtsZXQgcjtmdW5jdGlvbiBpKHQpe251bGwhPT10PyhyfHwocj1kb2N1bWVudC5jcmVhdGVFbGVtZW50KCJwcm9ncmVzcy1iYXIiKSxkb2N1bWVudC5kb2N1bWVudEVsZW1lbnQuYXBwZW5kQ2hpbGQocikpLHIuc2V0VmFsdWUodCkpOnImJihyLnJlbW92ZSgpLHI9bnVsbCl9Y3VzdG9tRWxlbWVudHMuZGVmaW5lKCJwcm9ncmVzcy1iYXIiLGNsYXNzIGV4dGVuZHMgSFRNTEVsZW1lbnR7Y29uc3RydWN0b3IoKXtzdXBlcigpLHRoaXMuYXR0YWNoU2hhZG93KHttb2RlOiJvcGVuIn0pLHRoaXMuc2hhZG93Um9vdC5pbm5lckhUTUw9J1xuPHN0eWxlIHR5cGU9InRleHQvY3NzIj5cbjpob3N0IHtcbiAgICBwb3NpdGlvbjogZml4ZWQ7XG4gICAgdG9wOjA7XG5cdGJvdHRvbTogMDtcblx0bGVmdDogMDtcblx0cmlnaHQ6IDA7XG4gICAgZm9udC1mYW1pbHk6IG1vbm9zcGFjZTtcbiAgICBtYXJnaW46IGF1dG87XG4gICAgei1pbmRleDogMTAwMDtcbiAgICBiYWNrZ3JvdW5kLWNvbG9yOiByZ2JhKDEwMCwgMTAwLCAxMDAsIDAuNSk7XG59XG5cbi5wcm9ncmVzcy1ib3JkZXIge1xuICAgIHBvc2l0aW9uOiBmaXhlZDtcbiAgICB0b3A6MDtcblx0Ym90dG9tOiAwO1xuXHRsZWZ0OiAwO1xuXHRyaWdodDogMDtcbiAgXHRcbiAgICBtYXJnaW46IGF1dG87XG5cbiAgICBib3JkZXI6IGdyZWVuIHNvbGlkIDFweDtcbiAgICBoZWlnaHQ6IDUwcHg7XG4gICAgd2lkdGg6IDEwMCU7XG59XG5cbi5wcm9ncmVzcy10ZXh0IHtcbiAgICBwb3NpdGlvbjogYWJzb2x1dGU7XG4gICAgY29sb3I6IHdoaXRlO1xuICAgIHRleHQtYWxpZ246IGNlbnRlcjtcbiAgICB3aWR0aDogMTAwJTtcbiAgICBoZWlnaHQ6IDEwMCU7XG4gICAgZm9udC1zaXplOiA0NXB4O1xufVxuXG4ucHJvZ3Jlc3MtZmlsbCB7XG4gICAgYmFja2dyb3VuZC1jb2xvcjogcmdiYSgwLDI1NSwwLCAwLjcpO1xuICAgIGhlaWdodDogNTBweDsgICAgXG59XG48L3N0eWxlPlxuPGRpdiBpZD0ibWFpbi1wcm9ncmVzcy1iYXIiIGNsYXNzPSJwcm9ncmVzcy1ib3JkZXIiPlxuPGRpdiBjbGFzcz0icHJvZ3Jlc3MtdGV4dCI+NTAlPC9kaXY+XG48ZGl2IGNsYXNzPSJwcm9ncmVzcy1maWxsIiBzdHlsZT0id2lkdGg6MjAlIj48L2Rpdj5cbjwvZGl2PlxuJ31zZXRWYWx1ZSh0KXt0aGlzLnNoYWRvd1Jvb3QucXVlcnlTZWxlY3RvcigiLnByb2dyZXNzLXRleHQiKS5pbm5lckhUTUw9YCR7KDEwMCp0KS50b0ZpeGVkKDApfSVgLHRoaXMuc2hhZG93Um9vdC5xdWVyeVNlbGVjdG9yKCIucHJvZ3Jlc3MtZmlsbCIpLnN0eWxlLndpZHRoPWAkeygxMDAqdCkudG9GaXhlZCgyKX0lYH19KTt2YXIgYz0iXG4qIHtcbiAgICBmb250LWZhbWlseTogbW9ub3NwYWNlO1xuICAgIGNvbG9yOiAjMWYxO1xufVxuI2NvbnRlbnQge1xuICAgIG1heC13aWR0aDogMTAyNHB4O1xuICAgIG1hcmdpbjogYXV0bztcbn1cbi5jb2RlYmxvY2sge1xuICAgIHBhZGRpbmc6IDRweDtcbiAgICBib3JkZXItcmFkaXVzOiA1cHg7XG4gICAgYmFja2dyb3VuZC1jb2xvcjogIzMzMztcbiAgICBjb2xvcjogd2hpdGU7XG4gICAgZm9udC1mYW1pbHk6IG1vbm9zcGFjZTtcbn1cbi5lcnJvcnN0YXR1cyB7XG4gICAgYmFja2dyb3VuZC1jb2xvcjogcmVkO1xuICAgIGNvbG9yOiB3aGl0ZTtcbiAgICBwYWRkaW5nOiA0cHg7XG4gICAgYm9yZGVyLXJhZGl1czogNXB4O1xufVxudGV4dGFyZWEge1xuICAgIHdpZHRoOiAxMDAlO1xuICAgIG1pbi1oZWlnaHQ6IDEwMHB4OyBcbn1cbmlucHV0LCB0ZXh0YXJlYSB7XG4gICAgYm9yZGVyLWNvbG9yOiAjMWYxO1xuICAgIGJhY2tncm91bmQtY29sb3I6ICMzMzM7XG4gICAgcGFkZGluZzogMTBweDtcbn1cblxuaW5wdXQ6Zm9jdXMsIHRleHRhcmVhOmZvY3VzIHtcbiAgICBib3JkZXItY29sb3I6ICNhZmE7XG59XG5cbmJ1dHRvbiB7XG4gICAgYmFja2dyb3VuZC1jb2xvcjogIzFmMTtcbiAgICBib3JkZXItcmFkaXVzOiAzcHg7XG4gICAgY29sb3I6ICMzMzM7XG4gICAgcGFkZGluZzogMTBweDtcbiAgICBib3JkZXI6IG5vbmU7XG4gICAgY3Vyc29yOiBwb2ludGVyO1xufVxuYnV0dG9uOmhvdmVyIHtcbiAgICBiYWNrZ3JvdW5kLWNvbG9yOiAjYWZhO1xufVxuIjtsZXQgdSxsLGQ9ITE7YXN5bmMgZnVuY3Rpb24gaChlKXtjb25zdCBuPWF3YWl0IGFzeW5jIGZ1bmN0aW9uKCl7Y29uc3QgZT1uZXcgSW1hZ2U7ZS5jcm9zc09yaWdpbj0iQW5vbnltb3VzIixlLnNyYz10LGF3YWl0IGUuZGVjb2RlKCk7Y29uc3Qgbj1kb2N1bWVudC5jcmVhdGVFbGVtZW50KCJjYW52YXMiKTtuLndpZHRoPWUud2lkdGgsbi5oZWlnaHQ9ZS5oZWlnaHQ7Y29uc3Qgcz1uLmdldENvbnRleHQoIjJkIik7cy5kcmF3SW1hZ2UoZSwwLDApO2xldCBhPXMuZ2V0SW1hZ2VEYXRhKDAsMCxlLndpZHRoLGUuaGVpZ2h0KS5kYXRhO2E9YS5maWx0ZXIoKCh0LGUpPT5lJTQ9PTApKTtjb25zdCBvPWFbMF0rKGFbMV08PDgpKyhhWzJdPDwxNikrKGFbM108PDI0KTtyZXR1cm4gYS5zbGljZSg0LG8rNCl9KCk7YXdhaXQgZS5hdWRpb1dvcmtsZXQuYWRkTW9kdWxlKG8pO2NvbnN0IHM9bmV3IEF1ZGlvV29ya2xldE5vZGUoZSwiYXNjLW1pZGlzeW50aC1hdWRpby13b3JrbGV0LXByb2Nlc3NvciIse291dHB1dENoYW5uZWxDb3VudDpbMl19KTtyZXR1cm4gcy5wb3J0LnN0YXJ0KCkscy5wb3J0LnBvc3RNZXNzYWdlKHtzYW1wbGVyYXRlOmUuc2FtcGxlUmF0ZSx3YXNtOm59KSxhd2FpdCBuZXcgUHJvbWlzZSgodD0+cy5wb3J0Lm9ubWVzc2FnZT1lPT57ZS5kYXRhLndhc21sb2FkZWQmJnQoKX0pKSxzLmNvbm5lY3QoZS5kZXN0aW5hdGlvbiksc31hc3luYyBmdW5jdGlvbiBwKCl7aWYoZClyZXR1cm47ZD0hMDtjb25zdCB0PW5ldyBBdWRpb0NvbnRleHQ7dC5yZXN1bWUoKSx1PWF3YWl0IGgodCl9Y3VzdG9tRWxlbWVudHMuZGVmaW5lKCJhdWRpby1wbGF5ZXIiLGNsYXNzIGV4dGVuZHMgSFRNTEVsZW1lbnR7Y29uc3RydWN0b3IoKXtzdXBlcigpLHRoaXMuYXR0YWNoU2hhZG93KHttb2RlOiJvcGVuIn0pLHRoaXMuc2hhZG93Um9vdC5pbm5lckhUTUw9YFxuICAgICAgICAgICAgPHN0eWxlPiR7Y308L3N0eWxlPlxuICAgICAgICAgICAgPGJ1dHRvbiBpZD0idG9nZ2xlUGxheVBhdXNlQnV0dG9uIj5QYXVzZTwvYnV0dG9uPlxuICAgICAgICAgICAgPGJ1dHRvbiBpZD0iZXhwb3J0V2F2QnV0dG9uIj5FeHBvcnQgV0FWPC9idXR0b24+XG4gICAgICAgIGA7Y29uc3QgdD10aGlzLnNoYWRvd1Jvb3QucXVlcnlTZWxlY3RvcigiI3RvZ2dsZVBsYXlQYXVzZUJ1dHRvbiIpO3QuYWRkRXZlbnRMaXN0ZW5lcigiY2xpY2siLCgoKT0+eyJQYXVzZSI9PXQuaW5uZXJIVE1MPyh1LnBvcnQucG9zdE1lc3NhZ2Uoe2lzUGxheWluZzohMX0pLHQuaW5uZXJIVE1MPSJQbGF5Iik6KHUucG9ydC5wb3N0TWVzc2FnZSh7aXNQbGF5aW5nOiEwfSksdC5pbm5lckhUTUw9IlBhdXNlIil9KSk7dGhpcy5zaGFkb3dSb290LnF1ZXJ5U2VsZWN0b3IoIiNleHBvcnRXYXZCdXR0b24iKS5hZGRFdmVudExpc3RlbmVyKCJjbGljayIsKCgpPT57IWFzeW5jIGZ1bmN0aW9uKCl7Y29uc3QgdD1sW2wubGVuZ3RoLTFdLnRpbWUvMWUzLG49bmV3IE9mZmxpbmVBdWRpb0NvbnRleHQoMiw0NDEwMCp0LDQ0MTAwKTsoYXdhaXQgaChuKSkucG9ydC5wb3N0TWVzc2FnZSh7c2VxdWVuY2VkYXRhOmx9KTtsZXQgcz0hMDtjb25zdCBhPSgpPT5yZXF1ZXN0QW5pbWF0aW9uRnJhbWUoKCgpPT57aShuLmN1cnJlbnRUaW1lL3QpLHM/YSgpOmkobnVsbCl9KSk7YSgpO2NvbnN0IG89ZShhd2FpdCBuLnN0YXJ0UmVuZGVyaW5nKCkpLHI9VVJMLmNyZWF0ZU9iamVjdFVSTChuZXcgQmxvYihbb10se3R5cGU6ImF1ZGlvL3dhdiJ9KSksYz1kb2N1bWVudC5jcmVhdGVFbGVtZW50KCJhIik7Yy5ocmVmPXIsYy5kb3dubG9hZD0ibXVzaWMud2F2Iixkb2N1bWVudC5kb2N1bWVudEVsZW1lbnQuYXBwZW5kQ2hpbGQoYyksYy5jbGljaygpLGMucmVtb3ZlKCkscz0hMX0oKX0pKX19KTtjb25zdHtjb25uZWN0OmYsa2V5U3RvcmVzOmcsV2FsbGV0Q29ubmVjdGlvbjptfT1uZWFyQXBpLHk9bG9jYXRpb24uaG9zdG5hbWUuc3BsaXQoIi4iKSxiPWxvY2F0aW9uLmhvc3RuYW1lLmVuZHNXaXRoKCIucGFnZSIpLHc9Yj9gJHt5WzBdfS4ke3lbMV19YDoiZGV2LTE2NjA0ODk2MjA4OTMtNzgyMTc1Mjg1MDI1NDUiLHY9YiYmIm5lYXIiPT15WzFdPyJtYWlubmV0IjoidGVzdG5ldCIseD17bmV0d29ya0lkOnYsa2V5U3RvcmU6bmV3IGcuQnJvd3NlckxvY2FsU3RvcmFnZUtleVN0b3JlLG5vZGVVcmw6YGh0dHBzOi8vcnBjLiR7dn0ubmVhci5vcmdgLHdhbGxldFVybDpgaHR0cHM6Ly93YWxsZXQuJHt2fS5uZWFyLm9yZ2AsaGVscGVyVXJsOmBodHRwczovL2hlbHBlci4ke3Z9Lm5lYXIub3JnYCxleHBsb3JlclVybDpgaHR0cHM6Ly9leHBsb3Jlci4ke3Z9Lm5lYXIub3JnYH07bGV0IEk9ITE7Y3VzdG9tRWxlbWVudHMuZGVmaW5lKCJhcHAtd2FzbS1tdXNpYy1zaGFyZSIsY2xhc3MgZXh0ZW5kcyBIVE1MRWxlbWVudHtjb25zdHJ1Y3Rvcigpe3N1cGVyKCksdGhpcy5hdHRhY2hTaGFkb3coe21vZGU6Im9wZW4ifSksdGhpcy5zaGFkb3dSb290LmlubmVySFRNTD1gPHN0eWxlPiR7Y308L3N0eWxlPlxuXG48ZGl2IGlkPSJjb250ZW50Ij5cbiAgICA8aDE+UGxheSBtdXNpYyBwb3N0ZWQgYnkgc29tZW9uZTwvaDE+XG4gICAgPHA+XG4gICAgICAgIDxwPmFjY291bnQ6PGJyIC8+PGlucHV0IHR5cGU9InRleHQiIGlkPSJhY2NvdW50aWRpbnB1dCIgLz48L3A+XG4gICAgICAgIDxwPnBhcmFtZXRlcnMgKEpTT04pOjxiciAvPjx0ZXh0YXJlYSBpZD0icGFyYW1zdGV4dGFyZWEiPnsiYnBtIjogOTB9PC90ZXh0YXJlYT48L3A+XG4gICAgICAgIDxidXR0b24gaWQ9ImxvYWRtdXNpY2J1dHRvbiI+bG9hZCBtdXNpYzwvYnV0dG9uPlxuICAgICAgICA8YXVkaW8tcGxheWVyPjwvYXVkaW8tcGxheWVyPlxuICAgIDwvcD5cbiAgICA8cCBpZD0ic3RhdHVzc3BhbiI+PC9wPlxuXG4gICAgPGhyIHdpZHRoPSIxMDAlIiAvPlxuICAgIDxoMT5Qb3N0IG11c2ljPC9oMT5cbiAgICA8cD5QYXN0ZSBKYXZhc2NyaXB0IGNvZGUgYmVsb3c8L3A+XG4gICAgPHA+PHRleHRhcmVhIGlkPSJtdXNpY3NjcmlwdGV4dGFyZWEiPjwvdGV4dGFyZWE+PC9wPlxuICAgIDxwPjxpbnB1dCB0eXBlPSJjaGVja2JveCIgaWQ9ImNvbXBpbGVzb25nY2hlY2tib3giIGNoZWNrZWQvPiB3cmFwIGluIHNvbmcgY29tcGlsZXIgKGlmIHBhc3RpbmcgY29kZSBkaXJlY3RseSBmcm9tIFdlYkFzc2VtYmx5IG11c2ljIGFwcCk8L3A+XG4gICAgPGJ1dHRvbiBpZD0ic3VibWl0bXVzaWNidXR0b24iPnN1Ym1pdDwvYnV0dG9uPlxuPC9kaXY+XG5gO2NvbnN0IHQ9dD0+e3RoaXMuc2hhZG93Um9vdC5xdWVyeVNlbGVjdG9yKCIjc3RhdHVzc3BhbiIpLmlubmVySFRNTD10fSxlPWFzeW5jKCk9Pntjb25zdCB0PWF3YWl0IGYoeCksZT1hd2FpdCBuZXcgbSh0KSxuPWUuYWNjb3VudCgpLHM9YXdhaXQgbi5jb25uZWN0aW9uLnNpZ25lci5nZXRQdWJsaWNLZXkobi5hY2NvdW50SWQsbi5jb25uZWN0aW9uLm5ldHdvcmtJZCk7aWYocyl7Y29uc3QgdD1hd2FpdCBuLmNvbm5lY3Rpb24ucHJvdmlkZXIucXVlcnkoe3JlcXVlc3RfdHlwZToidmlld19hY2Nlc3Nfa2V5IixmaW5hbGl0eToiZmluYWwiLGFjY291bnRfaWQ6bi5hY2NvdW50SWQscHVibGljX2tleTpzLnRvU3RyaW5nKCl9KTtpZih0LnBlcm1pc3Npb24uRnVuY3Rpb25DYWxsLnJlY2VpdmVyX2lkIT13KWUuc2lnbk91dCgpLGF3YWl0IG4uZGVsZXRlS2V5KHMudG9TdHJpbmcoKSk7ZWxzZXtjb25zdCBhPXBhcnNlRmxvYXQobmVhckFwaS51dGlscy5mb3JtYXQuZm9ybWF0TmVhckFtb3VudCh0LnBlcm1pc3Npb24uRnVuY3Rpb25DYWxsLmFsbG93YW5jZSkpO2NvbnNvbGUubG9nKCJyZW1haW5pbmcgYWxsb3dhbmNlIixhKSxhPC4wNSYmKGUuc2lnbk91dCgpLGF3YWl0IG4uZGVsZXRlS2V5KHMudG9TdHJpbmcoKSkpfX1lbHNlIGF3YWl0IGUuc2lnbk91dCgpO3JldHVybiBlLmlzU2lnbmVkSW4oKXx8YXdhaXQgZS5yZXF1ZXN0U2lnbkluKHcsIkpTIG11c2ljIHBsYXllciIpLGV9LG49YXN5bmMoKT0+e2F3YWl0IHAoKTtjb25zdCBuPXRoaXMuc2hhZG93Um9vdC5xdWVyeVNlbGVjdG9yKCIjYWNjb3VudGlkaW5wdXQiKS52YWx1ZTt2YXIgcztpZihuKXRyeXt0KGBnZW5lcmF0aW5nIG11c2ljIG9uLWNoYWluIGZyb20gYWNjb3VudCA8c3BhbiBjbGFzcz0iY29kZWJsb2NrIj4ke259PC9zcGFuPmApO2NvbnN0IGE9KGF3YWl0IGUoKSkuYWNjb3VudCgpO0l8fChhd2FpdCBhLmZ1bmN0aW9uQ2FsbCh3LCJzdG9yZV9zaWduaW5nX2tleSIpLEk9ITApO2NvbnN0IG89SlNPTi5wYXJzZSh0aGlzLnNoYWRvd1Jvb3QucXVlcnlTZWxlY3RvcigiI3BhcmFtc3RleHRhcmVhIikudmFsdWUpLHI9YXdhaXQgYS5jb25uZWN0aW9uLnNpZ25lci5rZXlTdG9yZS5nZXRLZXkoeC5uZXR3b3JrSWQsYS5hY2NvdW50SWQpLGk9YXdhaXQgci5zaWduKChuZXcgVGV4dEVuY29kZXIpLmVuY29kZShKU09OLnN0cmluZ2lmeShvKSkpLGM9YnRvYShTdHJpbmcuZnJvbUNoYXJDb2RlKC4uLmkuc2lnbmF0dXJlKSksZD1hd2FpdCBhLnZpZXdGdW5jdGlvbih3LCJydW5fc2NyaXB0X2Zvcl9hY2NvdW50X25vX3JldHVybiIse2FjY291bnRfaWQ6bixzaWduZXJfYWNjb3VudF9pZDphLmFjY291bnRJZCxzaWduYXR1cmU6Yyxzb25nY29uZmlnOm99KTt0KGBwbGF5aW5nIGZyb20gYWNjb3VudCA8c3BhbiBjbGFzcz0iY29kZWJsb2NrIj4ke259PC9zcGFuPmApLGw9cz1kLHUucG9ydC5wb3N0TWVzc2FnZSh7c2VxdWVuY2VkYXRhOnN9KX1jYXRjaChlKXt0KGA8c3BhbiBjbGFzcz0iZXJyb3JzdGF0dXMiPiR7ZX08L3NwYW4+YCksY29uc29sZS5lcnJvcihlKX1lbHNlIHQoJzxzcGFuIGNsYXNzPSJlcnJvcnN0YXR1cyI+cGxlYXNlIHByb3ZpZGUgYW4gYWNjb3VudCBuYW1lPC9zcGFuPicpfTt0aGlzLnNoYWRvd1Jvb3QucXVlcnlTZWxlY3RvcigiI2xvYWRtdXNpY2J1dHRvbiIpLmFkZEV2ZW50TGlzdGVuZXIoImNsaWNrIiwoKCk9Pm4oKSkpLHRoaXMuc2hhZG93Um9vdC5xdWVyeVNlbGVjdG9yKCIjc3VibWl0bXVzaWNidXR0b24iKS5hZGRFdmVudExpc3RlbmVyKCJjbGljayIsKGFzeW5jKCk9Pnthd2FpdCBwKCk7bGV0IG49dGhpcy5zaGFkb3dSb290LnF1ZXJ5U2VsZWN0b3IoIiNtdXNpY3NjcmlwdGV4dGFyZWEiKS52YWx1ZTt0aGlzLnNoYWRvd1Jvb3QucXVlcnlTZWxlY3RvcigiI2NvbXBpbGVzb25nY2hlY2tib3giKS5jaGVja2VkJiYobj1gXG4gICAgKGZ1bmN0aW9uICgpIHtcbiAgICAgICAgJ3VzZSBzdHJpY3QnO1xuICAgIFxuICAgICAgICBjb25zdCB0ID0gbmV3IEFycmF5KDEyOCkuZmlsbChudWxsKS5tYXAoKCh0LCBlKSA9PiBbImMiLCAiYyMiLCAiZCIsICJkIyIsICJlIiwgImYiLCAiZiMiLCAiZyIsICJnIyIsICJhIiwgImEjIiwgImIiXVtlICUgMTJdICsgIiIgKyBNYXRoLmZsb29yKGUgLyAxMikpKS5yZWR1Y2UoKCh0LCBlLCBuKSA9PiAodFtlXSA9IG4sIHQpKSwge30pOyBsZXQgZSA9IDA7IGZ1bmN0aW9uIG4oKSB7IHJldHVybiBlIH0gbGV0IHMgPSBuKCksIGEgPSAxMTA7IGNvbnN0IG8gPSAoKSA9PiAobigpIC0gcykgLyA2ZTQgKiBhOyBsZXQgaSA9IFtdOyBmdW5jdGlvbiBjKHQpIHsgcmV0dXJuIG5ldyBQcm9taXNlKChlID0+IGkucHVzaCh7IHRhcmdldFRpbWU6IE1hdGgucm91bmQobigpICsgdCksIHJlc29sdmU6IGUgfSkpKSB9IGZ1bmN0aW9uIHIoKSB7IGUgPSAwOyB9IGFzeW5jIGZ1bmN0aW9uIHUoKSB7IGNvbnN0IHQgPSBpLnJlZHVjZSgoKHQsIGUpID0+IGUudGFyZ2V0VGltZSA8IHQgfHwgLTEgPT09IHQgPyBlLnRhcmdldFRpbWUgOiB0KSwgLTEpLCBuID0gW107IGkuZmlsdGVyKChlID0+IGUudGFyZ2V0VGltZSA9PT0gdCkpLmZvckVhY2goKHQgPT4gbi5wdXNoKHQucmVzb2x2ZSgpKSkpLCBpID0gaS5maWx0ZXIoKHQgPT4gdC50YXJnZXRUaW1lID4gZSkpLCBlID0gdCwgYXdhaXQgUHJvbWlzZS5hbGwobik7IH0gY29uc3QgaCA9IG5ldyBBcnJheSgxMjgpLmZpbGwobnVsbCkubWFwKCgodCwgZSkgPT4gWyJjIiwgImNzIiwgImQiLCAiZHMiLCAiZSIsICJmIiwgImZzIiwgImciLCAiZ3MiLCAiYSIsICJhcyIsICJiIl1bZSAlIDEyXSArICIiICsgTWF0aC5mbG9vcihlIC8gMTIpKSk7IEFycmF5LnByb3RvdHlwZS5xdWFudGl6ZSA9IGZ1bmN0aW9uICh0LCBlID0gMSkgeyByZXR1cm4gZnVuY3Rpb24gKHQsIGUsIG4gPSAxKSB7IHJldHVybiB0Lm1hcCgodCA9PiB7IGNvbnN0IHMgPSB0WzBdICogZTsgcmV0dXJuIFsocyAtIChzIC0gTWF0aC5yb3VuZChzKSkgKiBuKSAvIGUsIHRbMV1dIH0pKSB9KHRoaXMsIHQsIGUpIH0sIEFycmF5LnByb3RvdHlwZS5maXhWZWxvY2l0eSA9IGZ1bmN0aW9uICh0KSB7IHJldHVybiB0aGlzLm1hcCgoZSA9PiBlLmZpeFZlbG9jaXR5ID8gZS5maXhWZWxvY2l0eSh0KSA6IGUpKSB9LCBBcnJheS5wcm90b3R5cGUucmVwZWF0ID0gZnVuY3Rpb24gKHQgPSAxKSB7IGNvbnN0IGUgPSB0aGlzLnNsaWNlKDApOyBsZXQgbiA9IHRoaXM7IGZvciAobGV0IHMgPSAwOyBzIDwgdDsgcysrKW4gPSBuLmNvbmNhdChlKTsgcmV0dXJuIG4gfTsgY2xhc3MgbCBleHRlbmRzIGNsYXNzIHsgY29uc3RydWN0b3IodCkgeyB0aGlzLm91dHB1dCA9IHQsIHRoaXMuY2hhbm5lbCA9IDAsIHRoaXMudmVsb2NpdHkgPSAxMDAsIHRoaXMub2Zmc2V0ID0gMCwgdGhpcy5zdGVwc3BlcmJlYXQgPSAxNjsgfSBzZXRDaGFubmVsKHQpIHsgdGhpcy5jaGFubmVsID0gdDsgfSBhc3luYyB3YWl0Rm9yU3RlcCh0KSB7IHJldHVybiB0aGlzLndhaXRGb3JCZWF0KHQgLyB0aGlzLnN0ZXBzcGVyYmVhdCkgfSBhc3luYyB3YWl0Rm9yQmVhdCh0KSB7IGxldCBlID0gTWF0aC5mbG9vcigodCArIHRoaXMub2Zmc2V0KSAvIGEgKiA2ZTQgLSAobigpIC0gcykpOyByZXR1cm4gZSA8IDAgPyB2b2lkIDAgOiBjKGUpIH0gdG9Ob3RlTnVtYmVyKGUpIHsgcmV0dXJuIHRbZV0gfSBhc3luYyB3YWl0RHVyYXRpb24odCkgeyByZXR1cm4gYyg2MCAqIHQgKiAxZTMgLyBhKSB9IGFzeW5jIHBpdGNoYmVuZCh0LCBlLCBuLCBzKSB7IGNvbnN0IGEgPSAoZSAtIHQpIC8gczsgbGV0IG8gPSB0OyBmb3IgKGxldCB0ID0gMDsgdCA8IHM7IHQrKykgeyBjb25zdCB0ID0gTWF0aC5yb3VuZChvKTsgdGhpcy5vdXRwdXQuc2VuZE1lc3NhZ2UoWzIyNCArIHRoaXMuY2hhbm5lbCwgMTI3ICYgdCwgKDE2MjU2ICYgdCkgPj4gN10pLCBvICs9IGEsIGF3YWl0IHRoaXMud2FpdER1cmF0aW9uKG4gLyBzKTsgfSB0aGlzLm91dHB1dC5zZW5kTWVzc2FnZShbMjI0ICsgdGhpcy5jaGFubmVsLCAxMjcgJiBlLCAoMTYyNTYgJiBlKSA+PiA3XSk7IH0gYXN5bmMgY29udHJvbGNoYW5nZSh0LCBlLCBuLCBzLCBhKSB7IGNvbnN0IG8gPSAobiAtIGUpIC8gYTsgbGV0IGkgPSBlOyBmb3IgKGxldCBlID0gMDsgZSA8IGE7IGUrKykgeyBjb25zdCBlID0gTWF0aC5yb3VuZChpKTsgdGhpcy5vdXRwdXQuc2VuZE1lc3NhZ2UoWzE3NiArIHRoaXMuY2hhbm5lbCwgdCwgZV0pLCBpICs9IG8sIGF3YWl0IHRoaXMud2FpdER1cmF0aW9uKHMgLyBhKTsgfSB0aGlzLm91dHB1dC5zZW5kTWVzc2FnZShbMTc2ICsgdGhpcy5jaGFubmVsLCB0LCAxMjcgJiBuXSk7IH0gYXN5bmMgbm90ZSh0LCBlKSB7IHRoaXMub3V0cHV0LnNlbmRNZXNzYWdlKFsxNDQgKyB0aGlzLmNoYW5uZWwsIHQsIHRoaXMudmVsb2NpdHldKSwgYXdhaXQgdGhpcy53YWl0RHVyYXRpb24oZSksIHRoaXMub3V0cHV0LnNlbmRNZXNzYWdlKFsxMjggKyB0aGlzLmNoYW5uZWwsIHQsIDBdKTsgfSBhc3luYyBwbGF5Tm90ZShlLCBuKSB7IHRoaXMub3V0cHV0LnNlbmRNZXNzYWdlKFsxNDQgKyB0aGlzLmNoYW5uZWwsIHRbZV0sIHRoaXMudmVsb2NpdHldKSwgYXdhaXQgdGhpcy53YWl0RHVyYXRpb24obiksIHRoaXMub3V0cHV0LnNlbmRNZXNzYWdlKFsxMjggKyB0aGlzLmNoYW5uZWwsIHRbZV0sIDBdKTsgfSB9eyBjb25zdHJ1Y3Rvcih0LCBlLCBuID0gMSwgcyA9IDEwMCkgeyBzdXBlcih0KSwgdGhpcy5jaGFubmVsID0gZSwgdGhpcy5zdGVwc3BlcmJlYXQgPSBuLCB0aGlzLmRlZmF1bHR2ZWxvY2l0eSA9IHM7IH0gYXN5bmMgc3RlcHModCwgZSkgeyB0aGlzLm9mZnNldCA9IE1hdGgucm91bmQobygpKTsgZm9yIChsZXQgbiA9IDA7IG4gPCBlLmxlbmd0aDsgbisrKSB7IGxldCBzID0gbiAvIHQ7IGNvbnN0IGEgPSBlW25dOyBpZiAoYSAmJiBhLmNvbnN0cnVjdG9yICYmICJBc3luY0Z1bmN0aW9uIiA9PT0gYS5jb25zdHJ1Y3Rvci5uYW1lKSBhKHRoaXMsIHMpOyBlbHNlIGlmIChhICYmIGEuY29uc3RydWN0b3IgJiYgIkZ1bmN0aW9uIiA9PT0gYS5jb25zdHJ1Y3Rvci5uYW1lKSAoYXN5bmMgKCkgPT4geyBhd2FpdCB0aGlzLndhaXRGb3JCZWF0KHMpLCBhKHRoaXMsIHMpOyB9KSgpOyBlbHNlIGlmIChhICYmIGEubGVuZ3RoKSBmb3IgKGxldCB0IG9mIGEpICJBc3luY0Z1bmN0aW9uIiA9PT0gdC5jb25zdHJ1Y3Rvci5uYW1lIHx8IGF3YWl0IHRoaXMud2FpdEZvckJlYXQocyksIHQodGhpcywgcyk7IH0gYXdhaXQgdGhpcy53YWl0Rm9yQmVhdChlLmxlbmd0aCAvIHQpOyB9IGFzeW5jIHBsYXkodCwgZSkgeyB0aGlzLm9mZnNldCA9IE1hdGgucm91bmQobygpKTsgbGV0IG4gPSAwOyAiZnVuY3Rpb24iID09IHR5cGVvZiB0WzBdICYmICh0ID0gW1swXS5jb25jYXQodCldKTsgZm9yIChsZXQgcyA9IDA7IHMgPCB0Lmxlbmd0aDsgcysrKSB7IGNvbnN0IGEgPSB0W3NdOyBlIHx8IChuID0gYVswXSk7IGZvciAobGV0IHQgPSAxOyB0IDwgYS5sZW5ndGg7IHQrKykgeyBjb25zdCBlID0gYVt0XTsgIkFzeW5jRnVuY3Rpb24iID09PSBlLmNvbnN0cnVjdG9yLm5hbWUgPyBlKHRoaXMsIG4pIDogKGFzeW5jICgpID0+IHsgY29uc3QgdCA9IG47IGF3YWl0IHRoaXMud2FpdEZvckJlYXQobiksIGUodGhpcywgdCk7IH0pKCk7IH0gMSA9PT0gZSAmJiAobiArPSBhWzBdKTsgfSBhd2FpdCB0aGlzLndhaXRGb3JCZWF0KG4pOyB9IH0gbGV0IGYgPSBbXSwgZCA9IFtdLCBwID0ge30sIHkgPSB7fSwgZyA9IFtdOyBjb25zdCBtID0ge307IGxldCB3ID0gW10sIE0gPSB7fTsgT2JqZWN0LmdldFByb3RvdHlwZU9mKChhc3luYyBmdW5jdGlvbiAoKSB7IH0pKS5jb25zdHJ1Y3RvcjsgY29uc3QgRiA9IHsgc2VuZE1lc3NhZ2U6IHQgPT4geyBjb25zdCBlID0gMTUgJiB0WzBdOyAoMyAhPT0gdC5sZW5ndGggfHwgIXBbZV0gJiYgIU9iamVjdC5rZXlzKHkpLmxlbmd0aCB8fCB5W2VdKSAmJiBmLnB1c2goeyB0aW1lOiBuKCksIG1lc3NhZ2U6IHQgfSk7IH0gfTsgY29uc3QgdiA9IGZ1bmN0aW9uICgpIHsgY29uc3QgdCA9IHt9OyByZXR1cm4gaC5mb3JFYWNoKCgoZSwgbikgPT4gdFtlXSA9ICh0LCBlLCBzKSA9PiB7IGNvbnN0IGEgPSAobiwgYSA9IGUpID0+IGFzeW5jIChlLCBvKSA9PiB7IGF3YWl0IGUud2FpdEZvckJlYXQobyArIChzIHx8IDApKSwgZS52ZWxvY2l0eSA9IGEgJiYgIm9iamVjdCIgIT0gdHlwZW9mIHQgPyBhIDogZS5kZWZhdWx0dmVsb2NpdHksIHQgJiYgIm9iamVjdCIgIT0gdHlwZW9mIHQgfHwgKHQgPSAxIC8gZS5zdGVwc3BlcmJlYXQpLCBlLm5vdGUobiwgdCk7IH0sIG8gPSBhKG4pOyByZXR1cm4gIm9iamVjdCIgPT0gdHlwZW9mIHQgPyBvKHQsIGUpIDogKG8udHJhbnNwb3NlID0gdCA9PiBhKG4gKyB0KSwgby5maXhWZWxvY2l0eSA9IHQgPT4gYShuLCB0KSwgbykgfSkpLCBoLmZvckVhY2goKChlLCBuKSA9PiB7IHRbZV0udHJhbnNwb3NlID0gZSA9PiB0W2hbbiArIGVdXSwgdFtlXS5maXhWZWxvY2l0eSA9IGUgPT4gdFtoW25dXSh2b2lkIDAsIGUpOyB9KSksIHQgfSgpLCBUID0geyBvdXRwdXQ6IEYsIHNldEJQTTogdCA9PiBhID0gdCwgVHJhY2tlclBhdHRlcm46IGwsIGNyZWF0ZVRyYWNrOiAodCwgZSwgcykgPT4geyBjb25zdCBhID0gbmV3IGwoeyBzdGFydFRpbWU6IG4oKSwgbWlkaWV2ZW50czogW10sIHNlbmRNZXNzYWdlOiBmdW5jdGlvbiAodCkgeyB0aGlzLm1pZGlldmVudHMucHVzaCh7IHRpbWU6IG4oKSAtIHRoaXMuc3RhcnRUaW1lLCBtZXNzYWdlOiB0IH0pLCBGLnNlbmRNZXNzYWdlKHQpOyB9IH0sIHQsIGUsIHMpOyByZXR1cm4gdy5wdXNoKGEpLCBhIH0sIHBsYXlGcm9tSGVyZTogZnVuY3Rpb24gKCkgeyBmID0gZi5maWx0ZXIoKHQgPT4gMTc2ID09ICgyNDAgJiB0Lm1lc3NhZ2VbMF0pKSkubWFwKCh0ID0+IE9iamVjdC5hc3NpZ24odCwgeyB0aW1lOiAwIH0pKSksIHIoKTsgfSwgbG9vcEhlcmU6IGFzeW5jIGZ1bmN0aW9uICgpIHsgRi5zZW5kTWVzc2FnZShbLTFdKTsgfSwgcGl0Y2hiZW5kOiAodCwgZSwgbiwgcykgPT4gYXN5bmMgKGEsIG8pID0+IHsgYXdhaXQgYS53YWl0Rm9yQmVhdChvKSwgYS5waXRjaGJlbmQodCwgZSwgbiwgcyk7IH0sIGNvbnRyb2xjaGFuZ2U6ICh0LCBlLCBuLCBzLCBhKSA9PiBhc3luYyAobywgaSkgPT4geyBhd2FpdCBvLndhaXRGb3JCZWF0KGkpLCBvLmNvbnRyb2xjaGFuZ2UodCwgZSwgbiB8fCBlLCBzLCBhKTsgfSwgd2FpdEZvckJlYXQ6IGFzeW5jIGZ1bmN0aW9uICh0KSB7IGxldCBlID0gTWF0aC5mbG9vcih0IC8gYSAqIDZlNCAtIChuKCkgLSBzKSk7IHJldHVybiBlIDwgMCAmJiAoZSA9IDApLCBjKGUpIH0sIHN0YXJ0UmVjb3JkaW5nOiBmdW5jdGlvbiAoKSB7IEYuc2VuZE1lc3NhZ2UoWy0yXSk7IH0sIHN0b3BSZWNvcmRpbmc6IGZ1bmN0aW9uICgpIHsgRi5zZW5kTWVzc2FnZShbLTNdKTsgfSwgc3RhcnRWaWRlbzogZnVuY3Rpb24gKHQsIGUgPSAwKSB7IG1bdF0uc2NoZWR1bGUucHVzaCh7IHN0YXJ0VGltZTogbigpLCBjbGlwU3RhcnRUaW1lOiBlIH0pOyB9LCBzdG9wVmlkZW86IGZ1bmN0aW9uICh0KSB7IG1bdF0uc2NoZWR1bGVbbVt0XS5zY2hlZHVsZS5sZW5ndGggLSAxXS5zdG9wVGltZSA9IG4oKTsgfSwgZGVmaW5lUGFydFN0YXJ0OiB0ID0+IE1bdF0gPSB7IHN0YXJ0VGltZTogbigpIH0sIGRlZmluZVBhcnRFbmQ6IHQgPT4gTVt0XS5lbmRUaW1lID0gbigpLCBtdXRlOiB0ID0+IHBbdF0gPSAhMCwgc29sbzogdCA9PiB5W3RdID0gITAsIGFkZEluc3RydW1lbnQ6IHQgPT4gZC5wdXNoKHQpLCBhZGRBdWRpbzogYXN5bmMgdCA9PiB7IGF3YWl0IGcuZmluZCgoYXN5bmMgZSA9PiAoYXdhaXQgZSkudXJsID09PSB0KSkgfHwgZy5wdXNoKG5ldyBQcm9taXNlKChhc3luYyAoZSwgbikgPT4geyBjb25zdCBzID0geyB1cmw6IHQgfTsgdHJ5IHsgY29uc3QgbiA9IGF3YWl0IGZldGNoKHQpLnRoZW4oKHQgPT4gdC5hcnJheUJ1ZmZlcigpKSkudGhlbigodCA9PiAobmV3IEF1ZGlvQ29udGV4dCkuZGVjb2RlQXVkaW9EYXRhKHQpKSk7IHMubGVmdGJ1ZmZlciA9IG4uZ2V0Q2hhbm5lbERhdGEoMCkuYnVmZmVyLCBzLnJpZ2h0YnVmZmVyID0gbi5nZXRDaGFubmVsRGF0YSgxKS5idWZmZXIsIGNvbnNvbGUubG9nKCJsb2FkZWQiLCB0KSwgZShzKTsgfSBjYXRjaCAodCkgeyBuKHQpOyB9IH0pKSk7IH0sIGFkZFZpZGVvOiBhc3luYyAodCwgZSkgPT4geyBpZiAoIW1bdF0pIHsgY29uc3QgbiA9IGRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoInZpZGVvIik7IG4uc3JjID0gZSwgbi5hdXRvcGxheSA9ICExLCBuLm11dGVkID0gITAsIG1bdF0gPSB7IHZpZGVvRWxlbWVudDogbiwgc2NoZWR1bGU6IFtdIH07IH0gfSwgYWRkSW1hZ2U6IGFzeW5jICh0LCBlKSA9PiB7IGlmICghbVt0XSkgeyBjb25zdCBuID0gbmV3IEltYWdlOyBuLnNyYyA9IGUsIG1bdF0gPSB7IGltYWdlRWxlbWVudDogbiwgc2NoZWR1bGU6IFtdIH07IH0gfSwgbm90ZTogKHQsIGUsIG4sIHMpID0+IHZbaFt0XV0oZSwgbiwgcykgfTsgT2JqZWN0LmFzc2lnbihULCB2KTsgY29uc3QgQiA9IE9iamVjdC5rZXlzKFQpOyBhc3luYyBmdW5jdGlvbiBqKHQpIHsgZiA9IFtdLCBkID0gW10sIHcgPSBbXSwgT2JqZWN0LnZhbHVlcyhtKS5mb3JFYWNoKCh0ID0+IHQuc2NoZWR1bGUgPSBbXSkpLCBwID0ge30sIHkgPSB7fSwgTSA9IHt9LCByKCk7IGxldCBlLCBuID0gITA7IGZvciAodC5hcHBseShudWxsLCBCLm1hcCgodCA9PiBUW3RdKSkpLnRoZW4oKCgpID0+IG4gPSAhMSkpLmNhdGNoKCh0ID0+IHsgZSA9IHQ7IH0pKTsgbjspIHsgaWYgKGUpIHRocm93IGU7IGF3YWl0IHUoKTsgfSByZXR1cm4gZiB9XG4gICAgXG4gICAgICAgIGFzeW5jIGZ1bmN0aW9uIHNvbmcob3V0cHV0LCBzZXRCUE0sIFRyYWNrZXJQYXR0ZXJuLCBjcmVhdGVUcmFjaywgcGxheUZyb21IZXJlLCBsb29wSGVyZSwgcGl0Y2hiZW5kLCBjb250cm9sY2hhbmdlLCB3YWl0Rm9yQmVhdCwgc3RhcnRSZWNvcmRpbmcsIHN0b3BSZWNvcmRpbmcsIHN0YXJ0VmlkZW8sIHN0b3BWaWRlbywgZGVmaW5lUGFydFN0YXJ0LCBkZWZpbmVQYXJ0RW5kLCBtdXRlLCBzb2xvLCBhZGRJbnN0cnVtZW50LCBhZGRBdWRpbywgYWRkVmlkZW8sIGFkZEltYWdlLCBub3RlLCBjMCwgY3MwLCBkMCwgZHMwLCBlMCwgZjAsIGZzMCwgZzAsIGdzMCwgYTAsIGFzMCwgYjAsIGMxLCBjczEsIGQxLCBkczEsIGUxLCBmMSwgZnMxLCBnMSwgZ3MxLCBhMSwgYXMxLCBiMSwgYzIsIGNzMiwgZDIsIGRzMiwgZTIsIGYyLCBmczIsIGcyLCBnczIsIGEyLCBhczIsIGIyLCBjMywgY3MzLCBkMywgZHMzLCBlMywgZjMsIGZzMywgZzMsIGdzMywgYTMsIGFzMywgYjMsIGM0LCBjczQsIGQ0LCBkczQsIGU0LCBmNCwgZnM0LCBnNCwgZ3M0LCBhNCwgYXM0LCBiNCwgYzUsIGNzNSwgZDUsIGRzNSwgZTUsIGY1LCBmczUsIGc1LCBnczUsIGE1LCBhczUsIGI1LCBjNiwgY3M2LCBkNiwgZHM2LCBlNiwgZjYsIGZzNiwgZzYsIGdzNiwgYTYsIGFzNiwgYjYsIGM3LCBjczcsIGQ3LCBkczcsIGU3LCBmNywgZnM3LCBnNywgZ3M3LCBhNywgYXM3LCBiNywgYzgsIGNzOCwgZDgsIGRzOCwgZTgsIGY4LCBmczgsIGc4LCBnczgsIGE4LCBhczgsIGI4LCBjOSwgY3M5LCBkOSwgZHM5LCBlOSwgZjksIGZzOSwgZzksIGdzOSwgYTksIGFzOSwgYjksIGMxMCwgY3MxMCwgZDEwLCBkczEwLCBlMTAsIGYxMCwgZnMxMCwgZzEwKSB7XG4gICAgICAgICAgICAke259XG4gICAgICAgIH1cbiAgICBcbiAgICAgICAgKGFzeW5jIGZ1bmN0aW9uICgpIHtcbiAgICAgICAgICAgIGNvbnN0IGV2ZW50bGlzdCA9IGF3YWl0IGooc29uZyk7XG4gICAgICAgICAgICBlbnYudmFsdWVfcmV0dXJuKEpTT04uc3RyaW5naWZ5KGV2ZW50bGlzdCkpO1xuICAgICAgICB9KSgpO1xuICAgIH0oKSk7ICAgIFxuICAgIGApLHQoInBvc3RpbmcgbXVzaWMgc2NyaXB0Iik7Y29uc3Qgcz1hd2FpdCBlKCksYT1hd2FpdCBzLmFjY291bnQoKS5mdW5jdGlvbkNhbGwodywic3VibWl0X3NjcmlwdCIse3NjcmlwdDpufSwiMzAwMDAwMDAwMDAwMDAwIik7dChKU09OLnN0cmluZ2lmeShhKSl9KSl9fSk7Cjwvc2NyaXB0PjwvYm9keT48L2h0bWw+";
+'''
+'''--- test.sh ---
+#!/bin/bash
+RUSTFLAGS='-C link-args=-initial-memory=2097152' cargo test --target=wasm32-wasi --no-run
+WASMTIME_BACKTRACE_DETAILS=1 $HOME/.wasmtime/bin/wasmtime target/wasm32-wasi/debug/deps/*.wasm -- --show-output
+
+'''
+'''--- web4/app.html.js ---
+export default /*html*/ `
+<div id="content">
+    <h1>Play music posted by someone</h1>
+    <p>
+        <p>account:<br /><input type="text" id="accountidinput" /></p>
+        <p>parameters (JSON):<br /><textarea id="paramstextarea">{"bpm": 90}</textarea></p>
+        <button id="loadmusicbutton">load music</button>
+        <audio-player></audio-player>
+    </p>
+    <p id="statusspan"></p>
+
+    <hr width="100%" />
+    <h1>Post music</h1>
+    <p>Paste Javascript code below</p>
+    <p><textarea id="musicscriptextarea"></textarea></p>
+    <p><input type="checkbox" id="compilesongcheckbox" checked/> wrap in song compiler (if pasting code directly from WebAssembly music app)</p>
+    <button id="submitmusicbutton">submit</button>
+</div>
+`;
+'''
+'''--- web4/audio/audio.js ---
+import { getSynthWasm } from '../synth.js';
+import { audioBufferToWav } from './audiobuffertowav.js';
+import { AudioWorkletProcessorUrl } from './audioworkletprocessor.js';
+import { setProgressbarValue } from '../ui/progressbar.js';
+
+import styleCss from '../style.css.js';
+
+let musicInitialized = false;
+let realtimeAudioWorkletNode;
+let latestEventList;
+
+const TOGGLE_PLAYPAUSE_PLAY = 'Play';
+const TOGGLE_PLAYPAUSE_PAUSE = 'Pause';
+
+export async function connectAudioWorklet(audioctx) {
+    const wasmsynth = await getSynthWasm();
+
+    await audioctx.audioWorklet.addModule(AudioWorkletProcessorUrl);
+    const audioworkletnode = new AudioWorkletNode(audioctx, 'asc-midisynth-audio-worklet-processor', {
+        outputChannelCount: [2]
+    });
+    audioworkletnode.port.start();
+
+    audioworkletnode.port.postMessage({
+        samplerate: audioctx.sampleRate,
+        wasm: wasmsynth
+    });
+    await new Promise(resolve => audioworkletnode.port.onmessage = msg => {
+        if (msg.data.wasmloaded) {
+            resolve();
+        }
+    });
+
+    audioworkletnode.connect(audioctx.destination);
+    return audioworkletnode;
+}
+
+export async function playMusic() {
+    if (musicInitialized) {
+        return;
+    }
+    musicInitialized = true;
+    const audioctx = new AudioContext();
+    audioctx.resume();
+
+    realtimeAudioWorkletNode = await connectAudioWorklet(audioctx);
+}
+
+export function pauseMusic() {
+    realtimeAudioWorkletNode.port.postMessage({
+        isPlaying: false
+    });
+}
+
+export function resumeMusic() {
+    realtimeAudioWorkletNode.port.postMessage({
+        isPlaying: true
+    });
+}
+
+export function postEventList(eventList) {
+    latestEventList = eventList;
+    realtimeAudioWorkletNode.port.postMessage({
+        sequencedata: eventList
+    });
+}
+
+export async function exportWav() {
+    const duration = latestEventList[latestEventList.length - 1].time / 1000;
+    const renderSampleRate = 44100;
+    const offlineCtx = new OfflineAudioContext(2,
+        duration * renderSampleRate,
+        renderSampleRate);
+    
+    const audioWorkletNode = await connectAudioWorklet(offlineCtx);
+    audioWorkletNode.port.postMessage({
+        sequencedata: latestEventList
+    });
+
+    let rendering = true;
+    const updateProgressBar = () => requestAnimationFrame(() => {
+        setProgressbarValue(offlineCtx.currentTime / duration);
+        if (rendering) {
+            updateProgressBar();
+        } else {
+            setProgressbarValue(null);
+        }
+    });
+    updateProgressBar();
+
+    const result = await offlineCtx.startRendering();
+    const wavbytes = audioBufferToWav(result);
+
+    const url = URL.createObjectURL(new Blob([wavbytes], {type: 'audio/wav'}));
+    const filename = 'music.wav';
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.documentElement.appendChild(a);
+    a.click();
+    a.remove();
+
+    rendering = false;
+}
+
+customElements.define('audio-player', class AudioPlayer extends HTMLElement {
+    constructor() {
+        super();
+        this.attachShadow({mode: 'open'});
+        this.shadowRoot.innerHTML = /*html*/`
+            <style>${styleCss}</style>
+            <button id="togglePlayPauseButton">${TOGGLE_PLAYPAUSE_PAUSE}</button>
+            <button id="exportWavButton">Export WAV</button>
+        `;
+
+        const togglePlayPauseButton = this.shadowRoot.querySelector('#togglePlayPauseButton');
+        togglePlayPauseButton.addEventListener('click', () => {
+            if (togglePlayPauseButton.innerHTML==TOGGLE_PLAYPAUSE_PAUSE) {
+                pauseMusic();
+                togglePlayPauseButton.innerHTML=TOGGLE_PLAYPAUSE_PLAY;
+            } else {
+                resumeMusic();
+                togglePlayPauseButton.innerHTML=TOGGLE_PLAYPAUSE_PAUSE;
+            }
+        });
+        const exportWavButton = this.shadowRoot.querySelector('#exportWavButton');
+        exportWavButton.addEventListener('click', () => {
+            exportWav();
+        });
+    }
+});
+'''
+'''--- web4/audio/audiobuffertowav.js ---
+/* 
+ * Based on https://github.com/Jam3/audiobuffer-to-wav 
+ */
+
+export function audioBufferToWav(buffer, opt) {
+    opt = opt || {}
+
+    var numChannels = buffer.numberOfChannels
+    var sampleRate = buffer.sampleRate
+    var format = opt.float32 ? 3 : 1
+    var bitDepth = format === 3 ? 32 : 16
+
+    var result
+    if (numChannels === 2) {
+        result = interleave(buffer.getChannelData(0), buffer.getChannelData(1))
+    } else {
+        result = buffer.getChannelData(0)
+    }
+
+    return encodeWAV(result, format, sampleRate, numChannels, bitDepth)
+}
+
+function encodeWAV(samples, format, sampleRate, numChannels, bitDepth) {
+    var bytesPerSample = bitDepth / 8
+    var blockAlign = numChannels * bytesPerSample
+
+    var buffer = new ArrayBuffer(44 + samples.length * bytesPerSample)
+    var view = new DataView(buffer)
+
+    /* RIFF identifier */
+    writeString(view, 0, 'RIFF')
+    /* RIFF chunk length */
+    view.setUint32(4, 36 + samples.length * bytesPerSample, true)
+    /* RIFF type */
+    writeString(view, 8, 'WAVE')
+    /* format chunk identifier */
+    writeString(view, 12, 'fmt ')
+    /* format chunk length */
+    view.setUint32(16, 16, true)
+    /* sample format (raw) */
+    view.setUint16(20, format, true)
+    /* channel count */
+    view.setUint16(22, numChannels, true)
+    /* sample rate */
+    view.setUint32(24, sampleRate, true)
+    /* byte rate (sample rate * block align) */
+    view.setUint32(28, sampleRate * blockAlign, true)
+    /* block align (channel count * bytes per sample) */
+    view.setUint16(32, blockAlign, true)
+    /* bits per sample */
+    view.setUint16(34, bitDepth, true)
+    /* data chunk identifier */
+    writeString(view, 36, 'data')
+    /* data chunk length */
+    view.setUint32(40, samples.length * bytesPerSample, true)
+    if (format === 1) { // Raw PCM
+        floatTo16BitPCM(view, 44, samples)
+    } else {
+        writeFloat32(view, 44, samples)
+    }
+
+    return buffer
+}
+
+function interleave(inputL, inputR) {
+    var length = inputL.length + inputR.length
+    var result = new Float32Array(length)
+
+    var index = 0
+    var inputIndex = 0
+
+    while (index < length) {
+        result[index++] = inputL[inputIndex]
+        result[index++] = inputR[inputIndex]
+        inputIndex++
+    }
+    return result
+}
+
+function writeFloat32(output, offset, input) {
+    for (var i = 0; i < input.length; i++, offset += 4) {
+        output.setFloat32(offset, input[i], true)
+    }
+}
+
+function floatTo16BitPCM(output, offset, input) {
+    for (var i = 0; i < input.length; i++, offset += 2) {
+        var s = Math.max(-1, Math.min(1, input[i]))
+        output.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true)
+    }
+}
+
+function writeString(view, offset, string) {
+    for (var i = 0; i < string.length; i++) {
+        view.setUint8(offset + i, string.charCodeAt(i))
+    }
+}
+
+'''
+'''--- web4/audio/audioworkletprocessor.js ---
+export function AudioWorkletModuleFunc() {
+    const SAMPLE_FRAMES = 128;
+
+    class AssemblyScriptMidiSynthAudioWorkletProcessor extends AudioWorkletProcessor {
+
+        constructor() {
+            super();
+            this.processorActive = true;
+            this.isPlaying = true;
+            this.currentFrame = 0;
+            this.sequenceIndex = 0;
+
+            this.port.onmessage = async (msg) => {
+                if (msg.data.wasm) {
+                    this.wasmInstancePromise = WebAssembly.instantiate(msg.data.wasm, {
+                        environment: { SAMPLERATE: msg.data.samplerate },
+                        env: {
+                            abort: () => console.log('webassembly synth abort, should not happen')
+                        }
+                    });
+
+                    const wasmInstance = (await this.wasmInstancePromise).instance.exports;
+                    this.wasmInstance = wasmInstance;
+                    this.port.postMessage({ wasmloaded: true });
+                }
+
+                if (msg.data.sequencedata) {
+                    this.allNotesOff();
+                    this.sequence = msg.data.sequencedata;
+                    this.currentFrame = 0;
+                    this.sequenceIndex = 0;
+                }
+
+                if (msg.data.currentTime) {
+                    this.port.postMessage({
+                        currentTime: this.wasmInstance.currentTimeMillis.value,
+                        activeVoicesStatusSnapshot: new Uint8Array(this.wasmInstance.memory.buffer,
+                            this.wasmInstance.getActiveVoicesStatusSnapshot(),
+                            32 * 3).slice(0)
+                    });
+                }
+
+                if (msg.data.isPlaying != undefined) {
+                    this.isPlaying = msg.data.isPlaying;
+                    if (!this.isPlaying) {
+                        this.allNotesOff();
+                    }
+                }
+            };
+            this.port.start();
+        }
+
+        getCurrentTime() {
+            return (this.currentFrame / sampleRate) * 1000;
+        }
+
+        allNotesOff() {
+            if (this.wasmInstance) {
+                this.wasmInstance.allNotesOff();
+                for (let ch = 0; ch < 16; ch++) {
+                    this.wasmInstance.shortmessage(
+                        0xb0 + ch, 64, 0  // reset sustain pedal
+                    );
+                }
+            }
+        }
+
+        process(inputs, outputs, parameters) {
+            const output = outputs[0];
+
+            if (this.wasmInstance) {
+                let currentTime = this.getCurrentTime();
+
+                if (this.sequence && this.isPlaying) {
+                    while (this.sequenceIndex < this.sequence.length &&
+                        this.sequence[this.sequenceIndex] && // sometimes this is undefined for yet unkown reasons
+                        this.sequence[this.sequenceIndex].time < currentTime) {
+
+                        const message = this.sequence[this.sequenceIndex].message;
+                        this.wasmInstance.shortmessage(message[0], message[1], message[2]);
+                        this.sequenceIndex++;
+                    }
+                    this.currentFrame += 128;
+                    if (this.sequenceIndex >= this.sequence.length) {
+                        this.currentFrame = 0;
+                        this.sequenceIndex = 0;
+                    }
+                }
+                this.wasmInstance.fillSampleBuffer();
+                output[0].set(new Float32Array(this.wasmInstance.memory.buffer,
+                    this.wasmInstance.samplebuffer,
+                    SAMPLE_FRAMES));
+                output[1].set(new Float32Array(this.wasmInstance.memory.buffer,
+                    this.wasmInstance.samplebuffer + (SAMPLE_FRAMES * 4),
+                    SAMPLE_FRAMES));
+            }
+
+            return this.processorActive;
+        }
+    }
+
+    registerProcessor('asc-midisynth-audio-worklet-processor', AssemblyScriptMidiSynthAudioWorkletProcessor);
+}
+
+const functionSource = AudioWorkletModuleFunc.toString();
+const functionSourceUnwrapped = functionSource.substring(functionSource.indexOf('{') + 1, functionSource.lastIndexOf('}'));
+export const AudioWorkletProcessorUrl = URL.createObjectURL(new Blob([functionSourceUnwrapped], { type: 'text/javascript' }));
+'''
+'''--- web4/index.html ---
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body {
+            background-color: #333;
+        }
+
+    </style>
+</head>
+<body>
+    <app-wasm-music-share></app-wasm-music-share>
+</body>
+<script type="module" src="main.js"></script>
+
+</html>
+'''
+'''--- web4/main.js ---
+import 'https://cdn.jsdelivr.net/npm/near-api-js@0.44.2/dist/near-api-js.js';
+import { wrapJSmusicInTemplate } from './webassemblymusic/musictemplate.js';
+import { playMusic, postEventList } from './audio/audio.js';
+import styleCss from './style.css.js';
+import html from './app.html.js';
+const { connect, keyStores, WalletConnection } = nearApi;
+
+const hostnameparts = location.hostname.split('.');
+const isOnWeb4 = location.hostname.endsWith('.page');
+const contractAccountId = isOnWeb4 ? `${hostnameparts[0]}.${hostnameparts[1]}` : 'dev-1660489620893-78217528502545';
+const networkId = isOnWeb4 ? (hostnameparts[1] == 'near' ? 'mainnet' : 'testnet') : 'testnet';
+
+const connectionConfig = {
+    networkId: networkId,
+    keyStore: new keyStores.BrowserLocalStorageKeyStore(),
+    nodeUrl: `https://rpc.${networkId}.near.org`,
+    walletUrl: `https://wallet.${networkId}.near.org`,
+    helperUrl: `https://helper.${networkId}.near.org`,
+    explorerUrl: `https://explorer.${networkId}.near.org`,
+};
+
+let signingKeyStored = false;
+customElements.define('app-wasm-music-share', class extends HTMLElement {
+    constructor() {
+        super();
+        this.attachShadow({mode: 'open'});
+        this.shadowRoot.innerHTML = `<style>${styleCss}</style>\n${html}`;
+
+        const setStatusText = (html) => {
+            this.shadowRoot.querySelector('#statusspan').innerHTML = html;
+        }
+        
+        const checkSignedin = async () => {
+            const nearConnection = await connect(connectionConfig);
+            const wc = await new WalletConnection(nearConnection);
+            const acc = wc.account();
+        
+            const publicKey = await acc.connection.signer.getPublicKey(acc.accountId, acc.connection.networkId);
+        
+            if (!publicKey) {
+                await wc.signOut();
+            } else {
+                const accessKey = await acc.connection.provider.query({
+                    request_type: "view_access_key",
+                    finality: "final",
+                    account_id: acc.accountId,
+                    public_key: publicKey.toString(),
+                });
+        
+                if (accessKey.permission.FunctionCall.receiver_id != contractAccountId) {
+                    wc.signOut();
+                    await acc.deleteKey(publicKey.toString());
+                } else {
+                    const remainingAllowance = parseFloat(nearApi.utils.format.formatNearAmount(accessKey.permission.FunctionCall.allowance));
+                    console.log('remaining allowance', remainingAllowance);
+                    if (remainingAllowance < 0.05) {
+                        wc.signOut();
+                        await acc.deleteKey(publicKey.toString());
+                    }
+                }
+            }
+        
+            if (!wc.isSignedIn()) {
+                await wc.requestSignIn(
+                    contractAccountId,
+                    'JS music player'
+                );
+            }
+            return wc;
+        }
+        
+        const loadMusic = async () => {
+            await playMusic();
+            const accountid = this.shadowRoot.querySelector('#accountidinput').value;
+            if (!accountid) {
+                setStatusText(`<span class="errorstatus">please provide an account name</span>`);
+                return;
+            }
+            try {
+                setStatusText(`generating music on-chain from account <span class="codeblock">${accountid}</span>`);
+                const wc = await checkSignedin();
+                const account = wc.account();
+                if (!signingKeyStored) {
+                    await account.functionCall(contractAccountId, 'store_signing_key');
+                    signingKeyStored = true;
+                }
+                const params = JSON.parse(this.shadowRoot.querySelector('#paramstextarea').value);
+                
+                const keyPair = await account.connection.signer.keyStore.getKey(connectionConfig.networkId, account.accountId);
+                const signature = await keyPair.sign(new TextEncoder().encode(JSON.stringify(params)));
+                const signatureBase64 = btoa(String.fromCharCode(...signature.signature));
+
+                const result = await account.viewFunction(contractAccountId,
+                    'run_script_for_account_no_return', 
+                        {
+                            account_id: accountid,
+                            signer_account_id: account.accountId,
+                            signature: signatureBase64,
+                            songconfig: params
+                        },
+                );
+                setStatusText(`playing from account <span class="codeblock">${accountid}</span>`);
+        
+                postEventList(result);
+            } catch (e) {
+                setStatusText(`<span class="errorstatus">${e}</span>`);
+                console.error(e);
+            }
+        }
+        
+        this.shadowRoot.querySelector('#loadmusicbutton').addEventListener('click', () => loadMusic());
+        
+        this.shadowRoot.querySelector('#submitmusicbutton').addEventListener('click', async () => {
+            await playMusic();
+            let musicscript = this.shadowRoot.querySelector('#musicscriptextarea').value;
+            const compilesongcheckbox = this.shadowRoot.querySelector('#compilesongcheckbox');
+            if (compilesongcheckbox.checked) {
+                musicscript = wrapJSmusicInTemplate(musicscript);
+            }
+            
+            setStatusText(`posting music script`);
+            const wc = await checkSignedin();
+            const result = await wc.account().functionCall(contractAccountId, 'submit_script', {script: musicscript}, '300000000000000');
+            setStatusText(JSON.stringify(result));
+        });        
+    }
+});
+
+'''
+'''--- web4/rollup.config.js ---
+import html from '@web/rollup-plugin-html';
+import { terser } from 'rollup-plugin-terser';
+import { readFileSync, unlinkSync, writeFileSync } from 'fs';
+
+export default {
+  input: './index.html',
+  output: { dir: 'dist' },
+  plugins: [html({ minify: true }), terser(), {
+    name: 'inline-js',
+    closeBundle: () => {
+      const js = readFileSync('dist/main.js').toString();
+      const html = readFileSync('dist/index.html').toString()
+        .replace(`<script type="module" src="./main.js"></script>`, `<script type="module">${js}</script>`);
+      writeFileSync('dist/index.html', html);
+      unlinkSync(`dist/main.js`);
+      writeFileSync('../src/web4/webappbundle.rs', `pub static WEB_APP_BUNDLE: &str = "${Buffer.from(html).toString('base64')}";`);
+    }
+  }],
+};
+'''
+'''--- web4/style.css.js ---
+export default /*css*/
+`
+* {
+    font-family: monospace;
+    color: #1f1;
+}
+#content {
+    max-width: 1024px;
+    margin: auto;
+}
+.codeblock {
+    padding: 4px;
+    border-radius: 5px;
+    background-color: #333;
+    color: white;
+    font-family: monospace;
+}
+.errorstatus {
+    background-color: red;
+    color: white;
+    padding: 4px;
+    border-radius: 5px;
+}
+textarea {
+    width: 100%;
+    min-height: 100px; 
+}
+input, textarea {
+    border-color: #1f1;
+    background-color: #333;
+    padding: 10px;
+}
+
+input:focus, textarea:focus {
+    border-color: #afa;
+}
+
+button {
+    background-color: #1f1;
+    border-radius: 3px;
+    color: #333;
+    padding: 10px;
+    border: none;
+    cursor: pointer;
+}
+button:hover {
+    background-color: #afa;
+}
+`;
+'''
+'''--- web4/synth.js ---
+export async function getSynthWasm() {
+    const img = new Image();
+    img.crossOrigin = 'Anonymous';
+    img.src = synthwasm;
+    await img.decode();
+    const canv = document.createElement('canvas');
+    canv.width = img.width;
+    canv.height = img.height;
+
+    const ctx = canv.getContext('2d');
+    // Draw image to canvas
+    ctx.drawImage(img, 0, 0);
+    // Retrieve RGBA data
+    let data = ctx.getImageData(0, 0, img.width, img.height).data;
+    // Only return R channel (identical to G and B channels)
+    data = data.filter((_, idx) => { return idx % 4 === 0 });
+    // Extract byte count from first 4 bytes (32-bit, unsigned, little endian)
+    const length = data[0] + (data[1] << 8) + (data[2] << 16) + (data[3] << 24);
+    return data.slice(4, length + 4);
+}
+
+const synthwasm = `data:image/png;base64,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`;
+'''
+'''--- web4/ui/progressbar.js ---
+const progressbarhtml = /*html*/`
+<style type="text/css">
+:host {
+    position: fixed;
+    top:0;
+	bottom: 0;
+	left: 0;
+	right: 0;
+    font-family: monospace;
+    margin: auto;
+    z-index: 1000;
+    background-color: rgba(100, 100, 100, 0.5);
+}
+
+.progress-border {
+    position: fixed;
+    top:0;
+	bottom: 0;
+	left: 0;
+	right: 0;
+  	
+    margin: auto;
+
+    border: green solid 1px;
+    height: 50px;
+    width: 100%;
+}
+
+.progress-text {
+    position: absolute;
+    color: white;
+    text-align: center;
+    width: 100%;
+    height: 100%;
+    font-size: 45px;
+}
+
+.progress-fill {
+    background-color: rgba(0,255,0, 0.7);
+    height: 50px;    
+}
+</style>
+<div id="main-progress-bar" class="progress-border">
+<div class="progress-text">50%</div>
+<div class="progress-fill" style="width:20%"></div>
+</div>
+`;
+
+let progressbar;
+
+customElements.define('progress-bar', class ProgressBar extends HTMLElement {
+    constructor() {
+        super();
+        this.attachShadow({ mode: 'open' });
+        this.shadowRoot.innerHTML = progressbarhtml;
+    }
+
+    setValue(val) {
+        this.shadowRoot.querySelector('.progress-text').innerHTML = `${(val * 100).toFixed(0)}%`;
+        this.shadowRoot.querySelector('.progress-fill').style.width = `${(val * 100).toFixed(2)}%`;
+    }
+});
+
+export function setProgressbarValue(val) {
+    if (val !== null) {
+        if (!progressbar) {
+            progressbar = document.createElement('progress-bar');
+            document.documentElement.appendChild(progressbar);
+        }
+        progressbar.setValue(val);
+    } else if (progressbar) {
+        progressbar.remove();
+        progressbar = null;
+    }
+}
+
+'''
+'''--- web4/webassemblymusic/musictemplate.js ---
+export function wrapJSmusicInTemplate(jsmusic) {
+    return `
+    (function () {
+        'use strict';
+    
+        const t = new Array(128).fill(null).map(((t, e) => ["c", "c#", "d", "d#", "e", "f", "f#", "g", "g#", "a", "a#", "b"][e % 12] + "" + Math.floor(e / 12))).reduce(((t, e, n) => (t[e] = n, t)), {}); let e = 0; function n() { return e } let s = n(), a = 110; const o = () => (n() - s) / 6e4 * a; let i = []; function c(t) { return new Promise((e => i.push({ targetTime: Math.round(n() + t), resolve: e }))) } function r() { e = 0; } async function u() { const t = i.reduce(((t, e) => e.targetTime < t || -1 === t ? e.targetTime : t), -1), n = []; i.filter((e => e.targetTime === t)).forEach((t => n.push(t.resolve()))), i = i.filter((t => t.targetTime > e)), e = t, await Promise.all(n); } const h = new Array(128).fill(null).map(((t, e) => ["c", "cs", "d", "ds", "e", "f", "fs", "g", "gs", "a", "as", "b"][e % 12] + "" + Math.floor(e / 12))); Array.prototype.quantize = function (t, e = 1) { return function (t, e, n = 1) { return t.map((t => { const s = t[0] * e; return [(s - (s - Math.round(s)) * n) / e, t[1]] })) }(this, t, e) }, Array.prototype.fixVelocity = function (t) { return this.map((e => e.fixVelocity ? e.fixVelocity(t) : e)) }, Array.prototype.repeat = function (t = 1) { const e = this.slice(0); let n = this; for (let s = 0; s < t; s++)n = n.concat(e); return n }; class l extends class { constructor(t) { this.output = t, this.channel = 0, this.velocity = 100, this.offset = 0, this.stepsperbeat = 16; } setChannel(t) { this.channel = t; } async waitForStep(t) { return this.waitForBeat(t / this.stepsperbeat) } async waitForBeat(t) { let e = Math.floor((t + this.offset) / a * 6e4 - (n() - s)); return e < 0 ? void 0 : c(e) } toNoteNumber(e) { return t[e] } async waitDuration(t) { return c(60 * t * 1e3 / a) } async pitchbend(t, e, n, s) { const a = (e - t) / s; let o = t; for (let t = 0; t < s; t++) { const t = Math.round(o); this.output.sendMessage([224 + this.channel, 127 & t, (16256 & t) >> 7]), o += a, await this.waitDuration(n / s); } this.output.sendMessage([224 + this.channel, 127 & e, (16256 & e) >> 7]); } async controlchange(t, e, n, s, a) { const o = (n - e) / a; let i = e; for (let e = 0; e < a; e++) { const e = Math.round(i); this.output.sendMessage([176 + this.channel, t, e]), i += o, await this.waitDuration(s / a); } this.output.sendMessage([176 + this.channel, t, 127 & n]); } async note(t, e) { this.output.sendMessage([144 + this.channel, t, this.velocity]), await this.waitDuration(e), this.output.sendMessage([128 + this.channel, t, 0]); } async playNote(e, n) { this.output.sendMessage([144 + this.channel, t[e], this.velocity]), await this.waitDuration(n), this.output.sendMessage([128 + this.channel, t[e], 0]); } }{ constructor(t, e, n = 1, s = 100) { super(t), this.channel = e, this.stepsperbeat = n, this.defaultvelocity = s; } async steps(t, e) { this.offset = Math.round(o()); for (let n = 0; n < e.length; n++) { let s = n / t; const a = e[n]; if (a && a.constructor && "AsyncFunction" === a.constructor.name) a(this, s); else if (a && a.constructor && "Function" === a.constructor.name) (async () => { await this.waitForBeat(s), a(this, s); })(); else if (a && a.length) for (let t of a) "AsyncFunction" === t.constructor.name || await this.waitForBeat(s), t(this, s); } await this.waitForBeat(e.length / t); } async play(t, e) { this.offset = Math.round(o()); let n = 0; "function" == typeof t[0] && (t = [[0].concat(t)]); for (let s = 0; s < t.length; s++) { const a = t[s]; e || (n = a[0]); for (let t = 1; t < a.length; t++) { const e = a[t]; "AsyncFunction" === e.constructor.name ? e(this, n) : (async () => { const t = n; await this.waitForBeat(n), e(this, t); })(); } 1 === e && (n += a[0]); } await this.waitForBeat(n); } } let f = [], d = [], p = {}, y = {}, g = []; const m = {}; let w = [], M = {}; Object.getPrototypeOf((async function () { })).constructor; const F = { sendMessage: t => { const e = 15 & t[0]; (3 !== t.length || !p[e] && !Object.keys(y).length || y[e]) && f.push({ time: n(), message: t }); } }; const v = function () { const t = {}; return h.forEach(((e, n) => t[e] = (t, e, s) => { const a = (n, a = e) => async (e, o) => { await e.waitForBeat(o + (s || 0)), e.velocity = a && "object" != typeof t ? a : e.defaultvelocity, t && "object" != typeof t || (t = 1 / e.stepsperbeat), e.note(n, t); }, o = a(n); return "object" == typeof t ? o(t, e) : (o.transpose = t => a(n + t), o.fixVelocity = t => a(n, t), o) })), h.forEach(((e, n) => { t[e].transpose = e => t[h[n + e]], t[e].fixVelocity = e => t[h[n]](void 0, e); })), t }(), T = { output: F, setBPM: t => a = t, TrackerPattern: l, createTrack: (t, e, s) => { const a = new l({ startTime: n(), midievents: [], sendMessage: function (t) { this.midievents.push({ time: n() - this.startTime, message: t }), F.sendMessage(t); } }, t, e, s); return w.push(a), a }, playFromHere: function () { f = f.filter((t => 176 == (240 & t.message[0]))).map((t => Object.assign(t, { time: 0 }))), r(); }, loopHere: async function () { F.sendMessage([-1]); }, pitchbend: (t, e, n, s) => async (a, o) => { await a.waitForBeat(o), a.pitchbend(t, e, n, s); }, controlchange: (t, e, n, s, a) => async (o, i) => { await o.waitForBeat(i), o.controlchange(t, e, n || e, s, a); }, waitForBeat: async function (t) { let e = Math.floor(t / a * 6e4 - (n() - s)); return e < 0 && (e = 0), c(e) }, startRecording: function () { F.sendMessage([-2]); }, stopRecording: function () { F.sendMessage([-3]); }, startVideo: function (t, e = 0) { m[t].schedule.push({ startTime: n(), clipStartTime: e }); }, stopVideo: function (t) { m[t].schedule[m[t].schedule.length - 1].stopTime = n(); }, definePartStart: t => M[t] = { startTime: n() }, definePartEnd: t => M[t].endTime = n(), mute: t => p[t] = !0, solo: t => y[t] = !0, addInstrument: t => d.push(t), addAudio: async t => { await g.find((async e => (await e).url === t)) || g.push(new Promise((async (e, n) => { const s = { url: t }; try { const n = await fetch(t).then((t => t.arrayBuffer())).then((t => (new AudioContext).decodeAudioData(t))); s.leftbuffer = n.getChannelData(0).buffer, s.rightbuffer = n.getChannelData(1).buffer, console.log("loaded", t), e(s); } catch (t) { n(t); } }))); }, addVideo: async (t, e) => { if (!m[t]) { const n = document.createElement("video"); n.src = e, n.autoplay = !1, n.muted = !0, m[t] = { videoElement: n, schedule: [] }; } }, addImage: async (t, e) => { if (!m[t]) { const n = new Image; n.src = e, m[t] = { imageElement: n, schedule: [] }; } }, note: (t, e, n, s) => v[h[t]](e, n, s) }; Object.assign(T, v); const B = Object.keys(T); async function j(t) { f = [], d = [], w = [], Object.values(m).forEach((t => t.schedule = [])), p = {}, y = {}, M = {}, r(); let e, n = !0; for (t.apply(null, B.map((t => T[t]))).then((() => n = !1)).catch((t => { e = t; })); n;) { if (e) throw e; await u(); } return f }
+    
+        async function song(output, setBPM, TrackerPattern, createTrack, playFromHere, loopHere, pitchbend, controlchange, waitForBeat, startRecording, stopRecording, startVideo, stopVideo, definePartStart, definePartEnd, mute, solo, addInstrument, addAudio, addVideo, addImage, note, c0, cs0, d0, ds0, e0, f0, fs0, g0, gs0, a0, as0, b0, c1, cs1, d1, ds1, e1, f1, fs1, g1, gs1, a1, as1, b1, c2, cs2, d2, ds2, e2, f2, fs2, g2, gs2, a2, as2, b2, c3, cs3, d3, ds3, e3, f3, fs3, g3, gs3, a3, as3, b3, c4, cs4, d4, ds4, e4, f4, fs4, g4, gs4, a4, as4, b4, c5, cs5, d5, ds5, e5, f5, fs5, g5, gs5, a5, as5, b5, c6, cs6, d6, ds6, e6, f6, fs6, g6, gs6, a6, as6, b6, c7, cs7, d7, ds7, e7, f7, fs7, g7, gs7, a7, as7, b7, c8, cs8, d8, ds8, e8, f8, fs8, g8, gs8, a8, as8, b8, c9, cs9, d9, ds9, e9, f9, fs9, g9, gs9, a9, as9, b9, c10, cs10, d10, ds10, e10, f10, fs10, g10) {
+            ${jsmusic}
+        }
+    
+        (async function () {
+            const eventlist = await j(song);
+            env.value_return(JSON.stringify(eventlist));
+        })();
+    }());    
+    `;
+}
+'''
+'''--- web4/webassemblymusic/musictemplate.test.js ---
+import { wrapJSmusicInTemplate } from './musictemplate.js';
+import { readFile } from 'fs/promises';
+
+test('should create a javascript function that generates music', async () => {
+    const musicsource = await readFile(new URL('sample_music2.js', import.meta.url));
+    const musicfunctionsource = wrapJSmusicInTemplate(musicsource);
+
+    const musicfunction = new Function(musicfunctionsource);
+    const generatedMusic = await new Promise(resolve => {
+        globalThis.env = {
+            input: () => JSON.stringify({bpm: 90}),
+            value_return: (val) => resolve(val)
+        }
+        musicfunction();
+    });
+
+    expect(JSON.parse(generatedMusic).length).toBe(115);
+});
+'''
+'''--- web4/webassemblymusic/sample_music.js ---
+let args = { bpm: 90};
+
+if (globalThis.env!==undefined) {
+  const env = globalThis.env;
+  Object.assign(args, JSON.parse(env.input()));
+  if (env.signer_account_id() != 'acl.testnet') {
+    print('signer account id', env.signer_account_id());
+    solo(2);
+  }
+  print(JSON.stringify(args));
+}
+
+setBPM(args.bpm);
+
+addInstrument('piano');
+addInstrument('string');
+addInstrument('drums');
+addInstrument('guitar');
+addInstrument('bass');
+addInstrument('tubelead');
+addInstrument('flute');
+addInstrument('padsynth');
+addInstrument('brass');
+addInstrument('choir');
+
+const beat = () => createTrack(2).steps(4, [
+    c5, fs5(0.1, 10), fs5(0.3, 80), ,
+    d5, , fs5(0.3, 70), c5,
+    , fs5(0.1, 10), [fs5(0.3, 80), c5], ,
+    d5, , fs5(0.3, 70), d5(0.1, 20),
+]);
+
+createTrack(4).steps(4, [
+    d2(0.4), , , d2(0.1),
+    a2(0.2), c3(0.2), , d3(0.2),
+    , c3(0.3), , a2(0.2),
+    , a2(0.2), c3(0.1), d3(0.2)
+]);
+await beat();
+
+loopHere();
+
+'''
+'''--- web4/webassemblymusic/sample_music2.js ---
+/*
+ * Copyright (c) 2022 - Peter Johan Salomonsen
+ */
+
+let args = {
+    "bpm": 50,
+    "drums": true,
+    "strings": true,
+    "piano": true,
+    "bass": true,
+    "flute": false
+};
+
+if (globalThis.env !== undefined) {
+    const env = globalThis.env;
+    Object.assign(args, JSON.parse(env.input()));
+}
+
+setBPM(args.bpm);
+
+addInstrument('piano');
+addInstrument('string');
+addInstrument('drums');
+addInstrument('guitar');
+addInstrument('bass');
+addInstrument('tubelead');
+addInstrument('flute');
+addInstrument('padsynth');
+addInstrument('brass');
+addInstrument('choir');
+
+const drumbeat1 = () => createTrack(2).steps(4, [
+    [c5, fs5(0.2, 70)], , fs5(0.2, 30), c5(0.2, 40),
+    [d5, fs5(0.2, 70)], , [c5(0.2, 80), fs5(0.2, 30)], ,
+    [fs5(0.2, 70)], , fs5(0.2, 30), ,
+    [d5, fs5(0.2, 70)], , fs5(0.2, 30), ,
+    [c5, fs5(0.2, 70)], , fs5(0.2, 30), ,
+    [d5, fs5(0.2, 70)], , fs5(0.2, 30), fs5(0.2, 8),
+    [c5, fs5(0.2, 70)], , fs5(0.2, 30), ,
+    [d5, fs5(0.2, 70)], , gs5(0.15, 20), d5(0.2, 50),
+
+]);
+
+const emptybeat = () => createTrack(2).steps(1, [
+    , , , , , , , ,
+]);
+
+startRecording();
+if (args.piano)
+    createTrack(0).play([[3.88, controlchange(64, 127)],
+    [3.78, cs7(0.45, 81)],
+    [4.24, d7(0.47, 70)],
+    [4.76, e7(0.36, 72)],
+    [3.53, fs6(1.64, 77)],
+    [5.20, cs7(0.45, 77)],
+    [5.86, controlchange(64, 0)],
+    [5.93, controlchange(64, 127)],
+    [5.69, a6(1.33, 75)],
+    [7.76, controlchange(64, 0)]].quantize(4));
+
+if (args.strings)
+    createTrack(1).play([
+        [0.0, fs4(7.99, 52)],
+        [0.0, b4(7.99, 50)],
+        [0.0, e5(7.99, 54)],
+        [0.0, cs5(7.99, 52)],
+        [0.0, b2(7.99, 53)]]);
+
+if (args.bass)
+    createTrack(4).play([[0.05, b1(1.10, 93)],
+    [1.30, fs2(0.24, 78)],
+    [1.53, a2(0.12, 82)],
+    [1.79, b2(0.21, 84)],
+    [2.25, a2(0.20, 68)],
+    [3.32, fs2(0.25, 72)],
+    [3.54, a2(0.12, 83)],
+    [3.79, b2(0.18, 92)],
+    [4.02, b1(0.93, 82)],
+    [5.24, fs2(0.28, 69)],
+    [5.47, a2(0.14, 82)],
+    [5.76, b2(0.22, 88)],
+    [6.22, a2(0.26, 90)],
+    [7.29, d3(0.21, 89)],
+    [7.50, cs3(0.22, 77)],
+    [7.76, a2(0.09, 83)]].quantize(4));
+
+if (args.flute)
+    createTrack(6).play([[0.46, b6(0.09, 78)],
+    [0.70, b6(0.11, 47)],
+    [0.99, fs7(0.34, 81)],
+    [1.44, fs7(0.12, 73)],
+    [1.54, g7(0.20, 75)],
+    [1.75, fs7(0.30, 59)],
+    [2.26, d7(0.20, 70)],
+    [2.72, e7(0.45, 65)],
+    [3.20, d7(0.15, 64)],
+    [3.65, cs7(0.42, 78)],
+    [4.25, cs7(0.10, 52)],
+    [4.35, d7(0.09, 70)],
+    [4.44, cs7(0.33, 91)],
+    [4.80, a6(0.28, 77)],
+    [5.31, b6(0.23, 68)],
+    [5.77, fs6(0.67, 64)],
+    [6.45, a6(0.37, 62)]]);
+
+if (args.drums) {
+    await drumbeat1();
+} else {
+    await emptybeat();
+}
+stopRecording();
+loopHere();
+'''

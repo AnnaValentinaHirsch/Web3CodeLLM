@@ -1,0 +1,1178 @@
+*GitHub Repository "pvolnov/true-p2p"*
+
+'''--- .idea/modules.xml ---
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="ProjectModuleManager">
+    <modules>
+      <module fileurl="file://$PROJECT_DIR$/.idea/lit-demo-simple-string-encrypt-nodejs.iml" filepath="$PROJECT_DIR$/.idea/lit-demo-simple-string-encrypt-nodejs.iml" />
+    </modules>
+  </component>
+</project>
+'''
+'''--- .idea/vcs.xml ---
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="VcsDirectoryMappings">
+    <mapping directory="" vcs="Git" />
+  </component>
+</project>
+'''
+'''--- README.md ---
+# True P2P
+
+**Problem:** P2P crypto swaps require bank transfer confirmation. This leads to centralization, delays, and errors.
+
+*example: swap DAI to USD on Bank of America*
+
+**Solution:** Protocol for P2P swaps based on onchain wire transfer confirmation
+
+## How it works
+1. Bob creates a deal to sell DAI.
+2. Alice accepts the deal and freezes Bob's DAI.
+3. Alice sends USD via Zelle.
+4. Alice creates onchain proof of her Zelle transfer.
+5. Alice uses this confirmation to close the deal and take Bob's DAI.
+
+## Onchain proof for Bank (Zelle) transfer
+
+The confirmation works with Plaid and the LIT Protocol nodes.
+
+1. Alice connects Plaid and creates an API key with access to transaction history from the bank.
+2. Alice calls Programmable PKPs action on LIT Protocol with Plaid transactionId and API key ([demo.js](https://github.com/pvolnov/true-p2p/blob/main/lit-action/demo.js)).
+3. Inside the `LitAction`, it executes the request on Plaid and verifies that the transaction actually exists in Alice's bank account. ([litActionPlaidCheck.js](https://github.com/pvolnov/true-p2p/blob/main/lit-action/litActionPlaidCheck.js))
+4. The `LitAction` signs the transaction information using the decentralized `signEcdsa()`.
+5. Alice adds the signed transaction to the "vault" smart contract ([plaid-transactions-storage.sol](https://github.com/pvolnov/true-p2p/blob/main/contracts/plaid-transactions-storage.sol)), and now everyone can verify that she actually made the transaction from her bank account.
+
+![Cover.png](https://github.com/pvolnov/true-p2p/blob/main/res/Cover.png)
+
+## Step-by-step-swap
+1. Bob creates a deal to sell DAI on [p2p-market](https://github.com/pvolnov/true-p2p/blob/main/contracts/p2p-market.sol) (`createPaymentRequest(...)`)
+2. Alice accepts the deal and freezes Bob's DAI (`confirmPayment(...)`)
+3. Alice sends USD via Zelle.
+4. Alice creates onchain proof of her Zelle transfer on [plaid-transactions-storage](https://github.com/pvolnov/true-p2p/blob/main/contracts/plaid-transactions-storage.sol) (`addTransaction(...)`)
+5. Alice uses this confirmation to close the deal and take Bob's DAI on [p2p-market](https://github.com/pvolnov/true-p2p/blob/main/contracts/p2p-market.sol) (`reservePayment(...)`)
+
+## Main components:
+
+- [p2p-market.sol](https://github.com/pvolnov/true-p2p/blob/main/contracts/p2p-market.sol) - P2P Market smart contract
+- [plaid-transactions-storage.sol](https://github.com/pvolnov/true-p2p/blob/main/contracts/plaid-transactions-storage.sol) - onchain wire transactions storage
+- [litActionPlaidCheck.js](https://github.com/pvolnov/true-p2p/blob/main/lit-action/litActionPlaidCheck.js) - LIT Action to verify Plaid requests
+- [bos](https://github.com/pvolnov/true-p2p/tree/main/bos) - Frontend
+
+## Demo:
+
+Url: [https://bos.gg/#/azbang.near/widget/peer2peer](https://bos.gg/#/azbang.near/widget/peer2peer)
+
+## Source
+- BOS Component: [https://bos.gg/#/azbang.near/widget/peer2peer](https://bos.gg/#/azbang.near/widget/peer2peer)
+- LIT-Protocol action ipfsId: `QmVcetXaAnDcHmpX6cWxsGKGSoid4buVK2PkXQEDmgh6wQ`
+- LIT-Protocol PKPs: [https://explorer.litprotocol.com/pkps/110216617645918104171481682055149393821345448971586480839222858944196209976493](https://explorer.litprotocol.com/pkps/110216617645918104171481682055149393821345448971586480839222858944196209976493)
+- Goerli Plaid transactions endpoint: [https://goerli.etherscan.io/address/0xa52210eA78f678D10e0dD47DeC64ff6ACD3Fbe8B](https://goerli.etherscan.io/address/0x00e42dc2248f37a28d39f790d49230e2ddd37b99)
+- Goerli P2P Market: [https://goerli.etherscan.io/address/0xa3724030aA74016d1AE1e1B54bD79608F0E5866F](https://goerli.etherscan.io/address/0xa3724030aA74016d1AE1e1B54bD79608F0E5866F)
+
+'''
+'''--- bos/peer2peer.js ---
+State.init({
+  orders: [],
+  amount: "0.001",
+});
+
+const sender = Ethers.send("eth_requestAccounts", [])[0];
+if (!sender) return "Please login first";
+
+const Button = styled.button`
+  color: #fff;
+  font-size: 16px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  background-color: #255ff4;
+  padding: 16px;
+  width: 250px;
+  border-radius: 32px;
+  border: none;
+  text-align: center;
+  font-weight: bold;
+  transition: 0.2s all;
+  height: 64px;
+  &:hover {
+    color: #fff;
+    text-decoration: none;
+    background-color: rgb(107 148 255);
+  }
+`;
+
+const Container = styled.div`
+  * {
+    font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Oxygen,
+      Ubuntu, Cantarell, Fira Sans, Droid Sans, Helvetica Neue, sans-serif;
+  }
+
+  display: flex;
+  margin: 48px auto;
+  justify-content: center;
+  flex-direction: column;
+  width: 400px;
+  gap: 16px;
+
+  button {
+    width: 100%;
+  }
+
+  input {
+    height: 56px;
+  }
+`;
+
+const AmountButton = styled(Button)`
+  box-shadow: 0 0 0 0 #fff;
+  height: 48px;
+  &.active {
+    box-shadow: 0 0 0 4px #fff;
+  }
+`;
+
+const Info = styled.div`
+  padding: 12px;
+  border: 1px solid #6c757d88;
+  color: #ccc;
+  border-radius: 12px;
+  margin-top: -8px;
+`;
+
+const Transaction = styled.div`
+  padding: 16px;
+  border-radius: 12px;
+  border: 1px solid #ccc;
+  display: flex;
+  flex-direction: row;
+  position: relative;
+  cursor: pointer;
+  transition: 0.2s box-shadow;
+  p {
+    margin: 0;
+  }
+  margin-bottom: 12px;
+
+  &:hover {
+    box-shadow: 0 2px 5px 0 rgba(0, 0, 0, 0.1);
+  }
+`;
+
+const CONTRACT = "0xbeC6a3A108552e6ea9f3aa609847eBF4135bBE71";
+const tokenAddress = "0x8c9e6c40d3402480ACE624730524fACC5482798c";
+const erc20abi = ["function approve(address _spender, uint _value)"];
+
+const PaymentRequest =
+  "(address payable requester, uint256 amount, bytes32 zelleEmailHash, address payable executor)";
+
+const abi = [
+  "function createPaymentRequest(uint256 amount, bytes32 _zelleEmailHash) external returns (uint256)",
+  `function getPaymentRequestsByIds(uint256[] memory requestIds) external view returns (${PaymentRequest}[] memory)`,
+  "function reservePayment(uint256 requestId) payable",
+  "function confirmPayment(uint256 requestId, uint256 transactionId)",
+  "event PaymentReserved(uint256 requestId, address indexed reserver)",
+];
+
+const signer = Ethers.provider().getSigner();
+const erc20 = new ethers.Contract(tokenAddress, erc20abi, signer);
+const peer2peer = new ethers.Contract(CONTRACT, abi, signer);
+const daiDecimal = 18;
+
+const fetchOrders = () => {
+  const ids = new Array(50).fill(0).map((_, i) => (i + 1).toString());
+  console.log("ids", ids);
+  peer2peer.getPaymentRequestsByIds(ids).then((data) => {
+    data = data.map((t, index) => ({
+      id: ids[index],
+      requester: t[0],
+      amount: ethers.utils.formatEther(t[1], daiDecimal),
+      zelleHash: t[2],
+      executor: t[3],
+    }));
+
+    State.update({
+      orders: data.filter((t) => t.amount > 0),
+    });
+  });
+};
+
+//2
+
+fetchOrders();
+
+const handleCreate = () => {
+  State.update({ loading: true });
+  const emailHash = ethers.utils.sha256(ethers.utils.toUtf8Bytes(state.amount));
+  const amount = ethers.utils.parseUnits(state.amount.toString(), daiDecimal);
+
+  console.log(emailHash);
+
+  erc20.approve(CONTRACT, amount).then((tx) => {
+    tx.wait().then(() => {
+      peer2peer.createPaymentRequest(amount, emailHash).then((tx) => {
+        tx.wait().then((result) => {
+          State.update({ loading: false });
+          fetchOrders();
+        });
+      });
+    });
+  });
+};
+
+const handleBuy = (order) => {
+  peer2peer
+    .reservePayment(order.id, {
+      value: ethers.utils.parseEther("0.01"),
+    })
+    .then((tx) => {
+      tx.wait().then(() => {
+        Storage.privateSet("activeOrder", order);
+        State.update({ activeOrder: order });
+      });
+    });
+};
+
+if (state.activeOrder) {
+  return (
+    <Widget
+      src="azbang.near/widget/peer2peerMakeOrder"
+      props={{ order: state.activeOrder.id, public_token: props.public_token }}
+    />
+  );
+}
+
+console.log(state.orders);
+
+//3
+
+return (
+  <Container>
+    <div style={{ display: "flex", gap: 12 }}>
+      {["0.001", "50", "100"].map((amount) => (
+        <AmountButton
+          className={amount == state.amount && "active"}
+          onClick={() => State.update({ amount })}
+        >
+          {amount} DAI
+        </AmountButton>
+      ))}
+    </div>
+
+    <input
+      value={state.email}
+      placeholder="Enter your Zelle email"
+      onChange={(e) => State.update({ email: e.target.value })}
+    />
+
+    <Info>
+      Make sure that you indicate the email that is linked to your Zelle
+      account, at this address validators verify the payment from the buyer
+    </Info>
+
+    <Button onClick={() => handleCreate()}>
+      {state.loading ? (
+        <Widget
+          src="azbang.near/widget/dots-spinner"
+          props={{
+            style: {
+              height: 32,
+              display: "flex",
+              alignItems: "center",
+              margin: "auto",
+            },
+          }}
+        />
+      ) : (
+        "Sell DAI"
+      )}
+    </Button>
+
+    <div style={{ marginTop: 24 }}>
+      <h4 style={{ marginBottom: 16 }}>Active orders</h4>
+      {state.orders.map((order) => {
+        const isRequester =
+          order.requester.toLowerCase() === sender.toLowerCase();
+        const isExecuter =
+          order.executor.toLowerCase() === sender.toLowerCase();
+        if (!isRequester && !isExecuter) return null;
+
+        return (
+          <Transaction>
+            <div style={{ flex: 1 }}>
+              <p>
+                {isRequester
+                  ? "Your order, you SELL"
+                  : `You BUY from ${order.requester.slice(
+                      0,
+                      6
+                    )}...${order.requester.slice(-6)}`}
+              </p>
+              <p>{order.amount} DAI</p>
+            </div>
+            <Button
+              onClick={() => State.update({ activeOrder: order })}
+              style={{ height: 48, width: 100 }}
+            >
+              Chat
+            </Button>
+          </Transaction>
+        );
+      })}
+    </div>
+
+    <div style={{ marginTop: 24 }}>
+      <h4 style={{ marginBottom: 16 }}>Buy DAI</h4>
+      {state.orders
+        .filter(
+          (t) =>
+            t.executor === "0x0000000000000000000000000000000000000000" &&
+            t.requester.toLowerCase() !== sender.toLowerCase()
+        )
+        .map((order) => (
+          <Transaction>
+            <div style={{ flex: 1 }}>
+              <p>
+                {order.requester.slice(0, 8)}...{order.requester.slice(-8)}
+              </p>
+              <p>{order.amount} DAI</p>
+            </div>
+            <Button
+              onClick={() => handleBuy(order)}
+              style={{ height: 48, width: 100 }}
+            >
+              Buy
+            </Button>
+          </Transaction>
+        ))}
+    </div>
+  </Container>
+);
+
+'''
+'''--- bos/peer2peerMakeOrder.js ---
+const sender = Ethers.send("eth_requestAccounts", [])[0];
+if (!sender) return "Please login first";
+const signer = Ethers.provider().getSigner();
+
+const PaymentRequest =
+  "(address payable requester, uint256 amount, bytes32 zelleEmailHash, address payable executor)";
+const abi = [
+  "function createPaymentRequest(uint256 amount, bytes32 _zelleEmailHash) external returns (uint256)",
+  `function getPaymentRequestsByIds(uint256[] memory requestIds) external view returns (${PaymentRequest}[] memory)`,
+  "function reservePayment(uint256 requestId)",
+  "function confirmPayment(uint256 requestId, uint256 transactionId)",
+  "event PaymentReserved(uint256 requestId, address indexed reserver)",
+];
+
+const CONTRACT = "0xbeC6a3A108552e6ea9f3aa609847eBF4135bBE71";
+const tokenAddress = "0x8c9e6c40d3402480ACE624730524fACC5482798c";
+const erc20abi = ["function approve(address _spender, uint _value)"];
+const erc20 = new ethers.Contract(tokenAddress, erc20abi, signer);
+const peer2peer = new ethers.Contract(CONTRACT, abi, signer);
+const daiDecimal = 18;
+
+peer2peer.getPaymentRequestsByIds([props.order]).then(([data]) => {
+  State.update({
+    order: {
+      requester: data[0],
+      amount: ethers.utils.formatEther(data[1], daiDecimal),
+      zelleHash: data[2],
+      executor: data[3],
+    },
+  });
+});
+
+const handleVerify = (proof) => {
+  console.log("handleVerify", props.order, proof.transactionId);
+  peer2peer
+    .confirmPayment(props.order, proof.transactionId, { gasLimit: 3000000 })
+    .then((tx) => {
+      tx.wait().then(() => {
+        State.update({ isSuccess: true });
+        console.log("SUCCESS!!");
+      });
+    });
+};
+
+const order = state.order;
+if (!order) return "";
+
+if (isSuccess) {
+  return (
+    <h2 style={{ textAlign: "center", margin: 48 }}>
+      Success! You buy {order.amount} DAI
+    </h2>
+  );
+}
+
+const Container = styled.div`
+  * {
+    font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Oxygen,
+      Ubuntu, Cantarell, Fira Sans, Droid Sans, Helvetica Neue, sans-serif;
+  }
+
+  display: flex;
+  justify-content: center;
+  flex-direction: column;
+  width: 400px;
+`;
+
+const isRequester = order.requester.toLowerCase() === sender.toLowerCase();
+const isExecuter = order.executor.toLowerCase() === sender.toLowerCase();
+
+return (
+  <div
+    style={{
+      display: "flex",
+      gap: 32,
+      justifyContent: "center",
+      marginTop: 32,
+      width: "100%",
+    }}
+  >
+    <Container>
+      <h4 style={{ lineBreak: "anywhere" }}>
+        {isRequester ? "Your order, you SELL" : order.requester}
+      </h4>
+      <h5 style={{ marginBottom: 32 }}>{order.amount} DAI</h5>
+
+      {order.executor !== "0x0000000000000000000000000000000000000000" && (
+        <Widget
+          src="azbang.near/widget/xmtp-chat"
+          props={{ receiver: isRequester ? order.executor : order.requester }}
+        />
+      )}
+
+      {order.executor === "0x0000000000000000000000000000000000000000" && (
+        <div
+          style={{
+            margin: "auto",
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+            marginTop: 100,
+          }}
+        >
+          <p style={{ marginTop: 24 }}>Wait order executor</p>
+          <Widget
+            src="azbang.near/widget/dots-spinner"
+            props={{
+              style: {
+                height: 32,
+                display: "flex",
+                alignItems: "center",
+                margin: "auto",
+              },
+            }}
+          />
+        </div>
+      )}
+    </Container>
+    {isExecuter && (
+      <div style={{ marginTop: -48 }}>
+        <Widget
+          src="azbang.near/widget/plaid"
+          props={{
+            debug: true,
+            onVerified: handleVerify,
+            public_token: props.public_token,
+            widgetSrc: "azbang.near/widget/peer2peer",
+          }}
+        />
+      </div>
+    )}
+  </div>
+);
+
+'''
+'''--- bos/plaid.js ---
+const PLAID_API = "https://ethnyc.herewallet.app";
+State.init({
+  origin: null,
+  selected: null,
+});
+
+const sender = Ethers.send("eth_requestAccounts", [])[0];
+if (!sender) return "Please connect Ethereum wallet";
+const signer = Ethers.provider().getSigner(sender);
+
+const PLAID_ADDR = "0xa52210eA78f678D10e0dD47DeC64ff6ACD3Fbe8B"; // Eth goerli
+const PLAID_ABI = [
+  "function addTransaction(bytes memory serializedData, bytes32 r, bytes32 s, uint8 v)",
+];
+const PLAID_CONTRACT = new ethers.Contract(PLAID_ADDR, PLAID_ABI, signer);
+
+const AppContainer = styled.div`
+  width: 400px;
+  margin: auto;
+  overflow-y: auto;
+  &::-webkit-scrollbar {
+    display: none;
+  }
+  * {
+    font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Oxygen,
+      Ubuntu, Cantarell, Fira Sans, Droid Sans, Helvetica Neue, sans-serif;
+  }
+`;
+
+const Transaction = styled.div`
+  padding: 16px;
+  border-radius: 12px;
+  margin-bottom: 16px;
+  border: 1px solid #ccc;
+  position: relative;
+  cursor: pointer;
+  transition: 0.2s box-shadow;
+  p {
+    margin: 0;
+  }
+`;
+
+const Checkbox = styled.div`
+  position: absolute;
+  top: 16px;
+  right: 16px;
+
+  display: block;
+  border: 2px solid var(--bs-body-bg, #fff);
+  box-shadow: 0 0 0 4px #255ff4;
+  transition: 0.2s background-color;
+  background-color: transparent;
+  border-radius: 50%;
+  width: 16px;
+  height: 16px;
+
+  &.active {
+    background-color: #255ff4;
+  }
+`;
+
+const VerifyButton = styled.button`
+  color: #fff;
+  font-size: 16px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  background-color: #255ff4;
+  position: absolute;
+  bottom: 0;
+  padding: 16px;
+  width: 250px;
+  border-radius: 32px;
+  border: none;
+  left: 50%;
+  margin-left: -125px;
+  text-align: center;
+  font-weight: bold;
+  transition: 0.2s background-color;
+  height: 64px;
+  &:hover {
+    color: #fff;
+    text-decoration: none;
+    background-color: rgb(107 148 255);
+  }
+`;
+
+const accessToken = state.accessToken || Storage.privateGet("plaidAccessToken");
+if (accessToken === null) return "";
+
+if (accessToken) {
+  console.log(accessToken);
+  const response = fetch(`${PLAID_API}/transactions?token=${accessToken}`);
+  if (!response.ok) return "";
+  const transactions = response.body?.added || [];
+
+  const handleVerify = () => {
+    if (props.debug) {
+      props.onVerified({
+        transactionId:
+          "0x0000000000000000000000000000000000000000000000000000000000000000",
+      });
+      return;
+    }
+
+    if (state.verifing) return;
+    const trx = transactions.find((t) => t.transaction_id === state.selected);
+    const fetchTrxs = `${PLAID_API}/transactions/get?token=${accessToken}&date=${trx.date}`;
+    const trxId = trx.transaction_id;
+    State.update({ verifing: true });
+
+    signer.getAddress().then((address) => {
+      const fetchSiweFormat = `${PLAID_API}/siwe-message?address=${address}&msg=Verify bank transaction`;
+      asyncFetch(fetchSiweFormat).then((signedMessageResponse) => {
+        const signedMessage = signedMessageResponse.body.siwe;
+        signer.signMessage(signedMessage).then((signed) => {
+          asyncFetch(fetchTrxs).then((resp) => {
+            const list = resp.body.transactions;
+            const tr_num = list.findIndex((t) => t.transaction_id === trxId);
+            State.update({
+              iframe: {
+                type: "verify",
+                date: list[tr_num].date,
+                access_token: accessToken,
+                signedMessage,
+                address,
+                signed,
+                tr_num,
+              },
+            });
+          });
+        });
+      });
+    });
+  };
+
+  const handleVerified = ({ type, data }) => {
+    if (type !== "verified") return;
+    const r = ethers.utils.arrayify(data.r);
+    const s = ethers.utils.arrayify(data.s);
+    const bytes = ethers.utils.arrayify(data.data);
+    PLAID_CONTRACT.addTransaction(bytes, r, s, data.v).then((tx) => {
+      tx.wait().then(() => {
+        State.update({ verifing: false });
+        if (props.onVerified) props.onVerified(data);
+      });
+    });
+  };
+
+  const handleLogout = () => {
+    Storage.privateSet("plaidAccessToken", undefined);
+    State.update({ accessToken: undefined });
+  };
+
+  const iframeSrc = `
+    <script>
+        const litNodeClientTask = fetch("https://cdn.jsdelivr.net/npm/@lit-protocol/lit-node-client-vanilla/lit-node-client.js").then(res => res.text()).then(code => {
+            const script = document.createElement('script');
+            eval(code.replaceAll("window.localStorage", "window.MockLocalStorage").replace("var LitJsSdk_litNodeClient", "window.LitJsSdk_litNodeClient"))
+
+            return new Promise(resolve => {
+                setTimeout(() => {
+                    const sdk = window.LitJsSdk_litNodeClient
+                    litNodeClient = new sdk.LitNodeClientNodeJs({
+                        alertWhenUnauthorized: false,
+                        litNetwork: "serrano",
+                        debug: true,
+                    });
+
+                    resolve(litNodeClient)
+                }, 1000);
+            })
+        })
+
+        window.addEventListener("message", async ({ data }) => {
+            if (data?.type !== "verify") return;
+            const litNodeClient = await litNodeClientTask
+            const { date,signedMessage, address, signed, access_token, tr_num } = data;
+            console.log(data)
+            
+            const pkpPubKey = "0x049fc61db9b056619fbd8b59fce3483b6baa9a7a00a251e7905e92a40a18ec5895e0a712ef9ef00db3f6ce8082a985472062440fb311df9cdc350ec7e8919f31f2";
+            await litNodeClient.connect();
+
+            const {signatures, response, logs} = await litNodeClient.executeJs({
+                ipfsId: "QmTioWBHeq1rSKdtBZwwsmw59WabAmPr6c8dVcWDHiP7cY",
+                authSig: {
+                    sig: signed,
+                    derivedVia: 'web3.eth.personal.sign',
+                    signedMessage: signedMessage,
+                    address: address
+                },
+                jsParams: {
+                    chain: "ethereum",
+                    publicKey: pkpPubKey,
+                    sigName: "sig1",
+                    access_token,
+                    start_date: date,
+                    end_date: date,
+                    client_id: "650ec5e216ecbb001b12ca1d",
+                    secret: "3618a4c3bb886629ad11e32c2e139b",
+                    tr_num
+                },
+            });
+
+            window.top.postMessage({ type: "verified", data: response }, "*");
+        }, false);
+    </script>  
+  `;
+
+  const appStyle = { marginTop: 48, paddingBottom: 24, position: "relative" };
+  return (
+    <div>
+      <iframe
+        srcDoc={iframeSrc}
+        message={state.iframe}
+        onMessage={handleVerified}
+        style={{ display: "none" }}
+      ></iframe>
+
+      <AppContainer style={appStyle}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+          }}
+        >
+          <div style={{ flex: 1 }}>
+            <h4 style={{ fontWeight: "bold" }}>Plaid x Blockhain</h4>
+            <p>Select payment to verify it on-chain:</p>
+          </div>
+
+          <VerifyButton
+            onClick={() => handleLogout()}
+            style={{
+              width: 100,
+              height: 42,
+              position: "initial",
+              margin: "auto",
+            }}
+          >
+            Logout
+          </VerifyButton>
+        </div>
+
+        <AppContainer style={{ height: 500 }}>
+          {transactions.map((tx) => (
+            <Transaction
+              key={tx.transaction_id}
+              onClick={() => State.update({ selected: tx.transaction_id })}
+            >
+              <p style={{ fontWeight: "bold" }}>{tx.name}</p>
+              <p>
+                {tx.amount} {tx.iso_currency_code}
+              </p>
+              <Checkbox
+                key={tx.transaction_id}
+                onClick={() => State.update({ selected: tx.transaction_id })}
+                className={state.selected === tx.transaction_id && "active"}
+              />
+            </Transaction>
+          ))}
+        </AppContainer>
+        {state.selected && (
+          <VerifyButton onClick={() => handleVerify()}>
+            {state.verifing ? (
+              <Widget
+                src="azbang.near/widget/dots-spinner"
+                props={{
+                  style: {
+                    height: 32,
+                    display: "flex",
+                    alignItems: "center",
+                    margin: "auto",
+                  },
+                }}
+              />
+            ) : (
+              <div style={{ margin: "auto" }}>Verify transaction</div>
+            )}
+          </VerifyButton>
+        )}
+      </AppContainer>
+    </div>
+  );
+}
+
+// Connecting bank
+if (props.public_token) {
+  const response = fetch(`${PLAID_API}/exchange-public-token`, {
+    body: JSON.stringify({ public_token: props.public_token }),
+    headers: { "Content-Type": "application/json" },
+    method: "POST",
+  });
+
+  if (response?.ok) {
+    Storage.privateSet("plaidAccessToken", response.body.access_token);
+    State.update({ accessToken: response.body.access_token });
+    return "";
+  }
+}
+
+const isBOSgg = state.origin ? state.origin.includes("bos.gg") : false;
+const location = `${state.origin}${isBOSgg ? "#" : "/"}${
+  props.widgetSrc || context.widgetSrc
+}`;
+const src = `
+<script>
+const origin = document.location.ancestorOrigins[0];
+window.top.postMessage(origin, "*")
+</script>
+`;
+
+return (
+  <div style={{ marginTop: 48 }}>
+    <a
+      style={{ width: 300, display: "block" }}
+      href={`${PLAID_API}?return_url=${location}`}
+    >
+      <VerifyButton style={{ width: 300, position: "initial", margin: "auto" }}>
+        Connect bank via Plaid
+      </VerifyButton>
+    </a>
+
+    <iframe
+      style={{ display: "none" }}
+      onMessage={(origin) => State.update({ origin })}
+      srcDoc={src}
+    ></iframe>
+  </div>
+);
+
+'''
+'''--- bos/xmtp-chat.js ---
+State.init({
+  receiver: null,
+  messages: [],
+  iframe: {},
+});
+
+const sender = Ethers.send("eth_requestAccounts", [])[0];
+if (!sender) return "Please login first";
+
+const signer = Ethers.provider().getSigner(sender);
+
+const onIframe = (data) => {
+  console.log(data);
+  if (data.type === "signMessage") {
+    signer.signMessage(data.data).then((res) => {
+      console.log(res);
+      State.update({ iframe: { id: data.id, resolve: res } });
+    });
+  }
+
+  if (data.type === "getAddress") {
+    signer.getAddress().then((addr) => {
+      State.update({ iframe: { id: data.id, resolve: addr } });
+    });
+  }
+
+  if (data.type === "getItem") {
+    const result = Storage.privateGet(data.data);
+    State.update({ iframe: { id: data.id, resolve: { result } } });
+  }
+
+  if (data.type === "setItem") {
+    Storage.privateSet(data.data.key, data.data.value);
+    State.update({ iframe: { id: data.id, resolve: true } });
+  }
+
+  if (data.type === "loadMessages") {
+    State.update({
+      iframe: { id: data.id, resolve: true },
+      messages: data.data,
+    });
+  }
+
+  if (data.type === "newMessage") {
+    State.update({
+      iframe: { id: data.id, resolve: true },
+      messages: state.messages.concat([data.data]),
+    });
+  }
+};
+
+const handleStartChat = (receiver) => {
+  State.update({
+    receiver: receiver || state.msgValue,
+    msgValue: "",
+    iframe: {
+      type: "startChat",
+      data: receiver || state.msgValue,
+    },
+  });
+};
+
+const handleMessage = () => {
+  State.update({
+    msgValue: "",
+    iframe: {
+      type: "message",
+      data: state.msgValue,
+    },
+  });
+};
+
+console.log(props.receiver);
+if (props.receiver && state.receiver == null) {
+  handleStartChat(props.receiver);
+}
+
+const xmtpMessages = `
+  <script src="https://nftstorage.link/ipfs/bafybeifophz4lgi5iyz5rpjmvy7pujqidloqkv4skanhvy3z7p5airwjdu"></script>
+  <script>
+   class IframeRPC {
+      _id = 0;
+      _tasks = new Map();
+      _subs = new Map();
+  
+      constructor() {
+          window.addEventListener("message", (event) => {
+              const data = event.data
+              let task = this._tasks.get(data.id)
+              console.log(data);
+  
+              if (data.resolve) task.resolve(data.resolve)
+              if (data.reject) task.reject(data.reject)
+              if (data.type) this._subs.get(data.type)?.forEach(cb => cb(data.data))
+          }, false);
+      }
+  
+      call(type, data) {
+          const id = this._id++;
+          window.top.postMessage({ type, data, id }, "*");
+          return new Promise((resolve, reject) => {
+              this._tasks.set(id, { resolve, reject })
+          })
+      }
+  
+      on(type, cb) {
+          const listeners = this._subs.get(type)
+          if (listeners == null) return this._subs.set(type, new Set([cb]));
+          listeners.set(cb);
+      }
+   }
+   
+  class RemoteSigner {
+      constructor(rpc) {
+          this.rpc = rpc;
+      }
+  
+      getAddress() {
+          return this.rpc.call("getAddress")
+      }
+  
+      signMessage(data) {
+          return this.rpc.call("signMessage", data)
+      }
+  }
+  
+  const rpc = new IframeRPC();
+  const signer = new RemoteSigner(rpc);
+  window.MockLocalStorage = {
+      setItem(key, value) {
+          return rpc.call("setItem", { key, value })
+      },
+      getItem(key) {
+          return rpc.call("getItem", key).then(t => t.result)
+      }
+  }
+  
+  let conversation;
+  rpc.on("message", (data) => {
+      conversation.send(data);
+  })
+  
+  rpc.on("startChat", async (address) => {
+      const xmtp = await window.xmtp.Client.create(signer, {
+        basePersistence: window.MockLocalStorage,
+        env: "production",
+      });
+  
+      conversation = await xmtp.conversations.newConversation(address);
+      const messages = await conversation.messages();
+      rpc.call("loadMessages", messages.map(t => ({ text: t.content })));
+  
+      for await (const message of await conversation.streamMessages()) {
+          rpc.call("newMessage", { text: message.content });
+      }
+  });
+  </script>
+  `;
+
+const App = styled.div`
+  * {
+    font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Oxygen,
+      Ubuntu, Cantarell, Fira Sans, Droid Sans, Helvetica Neue, sans-serif;
+  }
+`;
+
+const MessageForm = styled.div`
+  display: flex;
+  flex-direction: row;
+  height: 60px;
+  input {
+    border-radius: 8px 0 0 8px;
+    flex: 1;
+  }
+
+  button {
+    border-radius: 0 8px 8px 0;
+    flex-shrink: 0;
+    height: 100%;
+  }
+`;
+
+const ChatView = styled.div`
+  border: 1px solid #6c757d;
+  width: 400px;
+  height: 600px;
+  border-radius: 16px;
+`;
+
+const Message = styled.div`
+  border-radius: 12px;
+  border: 1px solid #6c757d;
+  padding: 12px;
+  margin-bottom: 8px;
+`;
+
+return (
+  <App>
+    <iframe
+      style={{ display: "none" }}
+      srcDoc={xmtpMessages}
+      message={state.iframe}
+      onMessage={onIframe}
+    ></iframe>
+
+    <ChatView>
+      <div style={{ flex: 1, height: 500, padding: 16, overflowY: "auto" }}>
+        {state.messages.map((t) => (
+          <Message>{t.text}</Message>
+        ))}
+      </div>
+
+      <div style={{ padding: 16 }}>
+        <MessageForm>
+          <input
+            value={state.msgValue}
+            onChange={(e) => State.update({ msgValue: e.target.value })}
+            placeholder={
+              state.receiver != null ? "Enter message" : "Enter Eth address"
+            }
+          />
+          {state.receiver != null ? (
+            <button onClick={handleMessage}>Send</button>
+          ) : (
+            <button onClick={handleStartChat}>Start chat</button>
+          )}
+        </MessageForm>
+      </div>
+    </ChatView>
+  </App>
+);
+
+'''
+'''--- lit-action/demo.js ---
+// Import the LitJsSdk library from the '@lit-protocol/lit-node-client-nodejs' package
+import LitJsSdk from '@lit-protocol/lit-node-client-nodejs';
+
+// Define constants
+const LIT_NETWORK = "serrano";
+const PKP_PUBLIC_KEY = "0x04f80a948f038f5d69855268f749457d5b465b78fd7bf603de13bd4bf01d718175bf512c828414e227a8289e7512b331658394c4d37a34aec3eca9c585056b7180";
+const IPFS_ID = "QmTioWBHeq1rSKdtBZwwsmw59WabAmPr6c8dVcWDHiP7cY";
+const AUTH_SIGNATURE = authSig_acc2; // Make sure 'authSig_acc2' is defined earlier
+const CLIENT_PARAMS = {
+    chain: "ethereum",
+    publicKey: PKP_PUBLIC_KEY,
+    sigName: "sig1",
+    "access_token": "access-sandbox-ba9ee489-90fd-4b20-be28-96f9828cc5da",
+    "start_date": "2023-09-23",
+    "end_date": "2023-09-23",
+    "tr_num": 0,
+    "client_id": "650ec5e216ecbb001b12ca1d",
+    "secret": "3618a4c3bb886629ad11e32c2e139b"
+};
+
+const encryptDecryptString = async () => {
+    // Create a new LitNodeClientNodeJs instance
+    const litNodeClient = new LitJsSdk.LitNodeClientNodeJs({
+        alertWhenUnauthorized: false,
+        litNetwork: LIT_NETWORK,
+        debug: true,
+    });
+
+    // Connect to the Lit Node
+    await litNodeClient.connect();
+
+    // Execute a JavaScript function on the Lit Node using constants
+    const { signatures, response, logs } = await litNodeClient.executeJs({
+        ipfsId: IPFS_ID,
+        authSig: AUTH_SIGNATURE,
+        jsParams: CLIENT_PARAMS,
+    });
+
+    console.log(response);
+    console.log(signatures);
+    console.log(logs);
+}
+
+encryptDecryptString();
+
+'''
+'''--- lit-action/litActionPlaidCheck.js ---
+const emailRegex = /\S+@\S+\.\S+/;
+
+const checkAndSignResponse = async () => {
+    const url = "https://sandbox.plaid.com/transactions/get";
+    const bdata = {
+        access_token, start_date, end_date
+    };
+    const resp = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            "PLAID-CLIENT-ID": client_id,
+            "PLAID-SECRET": secret,
+        },
+        body: JSON.stringify(bdata)
+    }).then((response) => response.json());
+
+    const firstEmailMatch = resp.transactions[tr_num].name.match(emailRegex);
+    if (firstEmailMatch) {
+        name = firstEmailMatch[0]
+    }
+    else {
+        name = resp.transactions[tr_num].name
+    }
+
+    const trx = {
+        transaction_id: resp.transactions[tr_num].transaction_id,
+        amount: resp.transactions[tr_num].amount,
+        name: name,
+        timestamp: Date.parse(resp.transactions[tr_num].datetime) ||  Date.parse(resp.transactions[tr_num].date)
+    };
+
+    const transactionHash = ethers.utils.keccak256(ethers.utils.toUtf8Bytes(trx.transaction_id));
+
+    const encodedTrx = ethers.utils.defaultAbiCoder.encode(
+        ['bytes32', 'int256', 'string', 'int256'],
+        [
+            transactionHash,
+            ethers.utils.parseUnits(trx.amount.toString(), 2),
+            trx.name,
+            trx.timestamp,
+        ]
+    );
+
+    const toSign = ethers.utils.keccak256(encodedTrx);
+    await LitActions.signEcdsa({ toSign, publicKey, sigName });
+
+    const result = {
+        data: encodedTrx,
+        transactionId: transactionHash,
+    }
+
+    LitActions.setResponse({ response: JSON.stringify(result) });
+};
+
+checkAndSignResponse();
+
+'''
+'''--- package.json ---
+{
+  "type": "module",
+  "dependencies": {
+    "@lit-protocol/contracts-sdk": "^2.2.54",
+    "@lit-protocol/lit-node-client": "^2.2.24",
+    "@lit-protocol/pkp-ethers": "^2.2.54",
+    "ethers": "^6.7.1",
+    "siwe": "^1.1.6",
+    "uint8arrays": "^3.0.0"
+  }
+}
+
+'''

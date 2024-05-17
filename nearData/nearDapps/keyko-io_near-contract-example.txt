@@ -1,0 +1,681 @@
+*GitHub Repository "keyko-io/near-contract-example"*
+
+'''--- .github/workflows/build.yml ---
+name: Build
+on:
+  push:
+  # branches:
+  #   - main
+  # tags:
+  pull_request:
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+jobs:
+  # based on
+  # https://raw.githubusercontent.com/BurntSushi/ripgrep/master/.github/workflows/release.yml
+  # in case a tag was set, a binary release will be made
+  create-release-on-tags:
+    name: Create a new release on tags
+    runs-on: ubuntu-latest
+    # env:
+    # Set to force version number, e.g., when no tag exists.
+    # RG_VERSION: TEST-0.0.0
+    outputs:
+      rg_version: ${{ env.RG_VERSION }}
+    steps:
+      - name: Get the release version from the tag
+        shell: bash
+        if: env.RG_VERSION == ''
+        run: |
+          # Apparently, this is the right way to get a tag name. Really?
+          #
+          # See: https://github.community/t5/GitHub-Actions/How-to-get-just-the-tag-name/m-p/32167/highlight/true#M1027
+          echo "RG_VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+          echo "version is: ${{ env.RG_VERSION }}"
+
+  # for the cargo actions, because the rust project is not on the root of the
+  # repository, we use a marcopolo's fork of the actions-rs/cargo@v1 :
+  # marcopolo/cargo@a527bf4d534717ff4424a84446c5d710f8833139
+
+  build:
+    # in case this is a binary release, we make sure to wait
+    # for any requirement
+    needs: ["create-release-on-tags"]
+    runs-on: ubuntu-latest
+    steps:
+      # rust compiler for running tests
+      - uses: actions/checkout@v2
+      - name: Install latest stable (for linux-gnu)
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: x86_64-unknown-linux-gnu
+          components: rustfmt, clippy
+          # override: true
+      # rust compiler for creating binaries
+      - name: Install latest stable (for wasm)
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: wasm32-unknown-unknown
+          components: rustfmt, clippy
+          # override: true
+      # caching (cargo registry)
+      - name: Cache cargo registry
+        uses: actions/cache@v1
+        with:
+          path: ~/.cargo/registry
+          key: ubuntu-latest-stable-cargo-registry-${{ hashFiles('**/Cargo.toml') }}
+      # caching (cargo index)
+      - name: Cache cargo index
+        uses: actions/cache@v1
+        with:
+          path: ~/.cargo/git
+          key: ubuntu-latest-stable-cargo-index-${{ hashFiles('**/Cargo.toml') }}
+      # binary requirements (binaryen)
+      # based on
+      # https://github.com/rustwasm/walrus/blob/9d6c9de432d6a97478dc76ebdf18aed51584c3af/.github/workflows/main.yml#L56
+      - name: Install binaryen
+        run: |
+          set -e
+          curl -L https://github.com/WebAssembly/binaryen/releases/download/version_105/binaryen-version_105-x86_64-linux.tar.gz | tar xzf -
+          echo "`pwd`/binaryen-version_105/bin" >> $GITHUB_PATH
+      # triggers all build.rs steps
+      - name: Trigger build.rs steps
+        run: |
+          find contracts \
+            -maxdepth 2 \
+            -name build.rs  \
+            -prune \
+            -exec touch -c {} \;
+      # Builds the wasm binaries
+      - name: Build wasm binaries
+        uses: marcopolo/cargo@a527bf4d534717ff4424a84446c5d710f8833139
+        with:
+          command: build
+          working-directory: contracts
+          args: --lib --target wasm32-unknown-unknown --release
+      # Builds the openapi generator binaries
+      - name: Build openapi generator binaries
+        uses: marcopolo/cargo@a527bf4d534717ff4424a84446c5d710f8833139
+        with:
+          command: build
+          working-directory: contracts
+          args: --bins
+      # Copies the wasm binaries to contracts/res/ and strips them
+      # (reducing their's sizes)
+      - name: Wasm copy and strip
+        run: |
+          find contracts/target/wasm32-unknown-unknown/release \
+            -maxdepth 1 \
+            -name \*.wasm \
+            -prune \
+            -exec cp {} contracts/res \;
+          for f in contracts/res/*.wasm
+          do
+            wasm-opt -Oz -o "$f" "$f"
+          done
+      - name: Show the wasm files and their sizes
+        run: |
+          ls -lah contracts/res/*.wasm | awk '{print $5 " " $9}'
+      # Generate the openapi descriptions and save them to contracts/res
+      - name: Openapi generation
+        run: |
+          for f in contracts/target/debug/*-openapi
+          do
+              fbase="$(basename -- $f)"
+              "$f" > "contracts/res/$fbase.json"
+          done
+      # run the tests (which depend on the binaries from contracts/res/)
+      - name: Run native tests
+        uses: marcopolo/cargo@a527bf4d534717ff4424a84446c5d710f8833139
+        with:
+          command: test
+          working-directory: contracts
+          args: --target=x86_64-unknown-linux-gnu
+      # based on
+      # https://raw.githubusercontent.com/BurntSushi/ripgrep/master/.github/workflows/release.yml
+      # in case a tag was set, a binary release will be made.
+      # creates a file archive containing the wasm binaries into ./contracts-(tags).tar.gz
+      - name: Build archive
+        if: startsWith(github.ref, 'refs/tags')
+        shell: bash
+        run: |
+          staging="contracts-${{ needs.create-release-on-tags.outputs.rg_version }}"
+          mkdir -p "$staging/info"
+          # copy all markdown files
+          find contracts -name \*.md -not -path "contracts/target/*" -prune -not -path "./$staging/*" -prune -exec cp --parents {} "$staging/info/" \;
+          # copy all openapi json files
+          cp contracts/res/*.json "$staging/"
+          # copy all wasm files
+          cp contracts/res/*.wasm "$staging/"
+          # save the tag name and git sha to the VERSION file
+          echo ${{ needs.create-release-on-tags.outputs.rg_version }} >> "$staging/info/VERSION"
+          #
+          git rev-parse HEAD >> "$staging/info/VERSION"
+          tar czf "$staging.tar.gz" "$staging"
+          echo "ASSET=$staging.tar.gz" >> $GITHUB_ENV
+          echo "JSON_ASSETS=$(ls -1 contracts/res/*.json)" >> $GITHUB_ENV
+      - name: Upload release archive
+        if: startsWith(github.ref, 'refs/tags')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            ${{ env.ASSET }}
+            ${{ env.JSON_ASSETS }}
+
+'''
+'''--- README.md ---
+# Contract Examples
+
+## Contracts
+
+- [contract-01](./contracts/contract-01/) / [latest API](https://redocly.github.io/redoc/?url=https://github.com/keyko-io/near-contract-example/releases/latest/download/example-01-openapi.json).
+
+### Live Contracts
+
+#### SEAT
+
+- `testnet`: [`todo.testnet`](https://explorer.testnet.near.org/accounts/todo.testnet)
+- `mainnet`: [`todo.near`](https://explorer.near.org/accounts/todo.near)
+
+### Useful Links
+
+- Downloads available on the [Releases](https://github.com/keyko-io/near-contract-example/releases) page.
+
+'''
+'''--- contracts/Cargo.toml ---
+[workspace]
+resolver = "2"
+
+# include a member for each contract
+members = [
+  "contract-01"
+]
+
+[patch.crates-io.near-sdk]
+git = "https://github.com/Seatlab-dev/Forked-Near-Rust-Sdk.git"
+rev = "fed38a5"
+
+[patch.crates-io.near-contract-standards]
+git = "https://github.com/Seatlab-dev/Forked-Near-Rust-Sdk.git"
+rev = "fed38a5"
+
+[patch.crates-io.schemars]
+git = "https://github.com/Seatlab-dev/schemars.git"
+rev = "df322feb675a194b62ddd449deb6c731417052b6"
+
+[patch.crates-io.okapi]
+git = "https://github.com/Seatlab-dev/okapi.git"
+rev = "b681ab0a14d7e3c40a16c93dddb184ac3c70c3a4"
+
+[profile.release]
+codegen-units = 1
+# Tell `rustc` to optimize for small code size.
+opt-level = "z"
+lto = true
+strip = true
+debug = true
+panic = "abort"
+# Opt into extra safety checks on arithmetic operations https://stackoverflow.com/a/64136471/249801
+overflow-checks = true
+
+'''
+'''--- contracts/build.sh ---
+#!/bin/bash
+set -ex
+
+REPO=$(git rev-parse --show-toplevel)
+CONTRACTS="$REPO/contracts"
+
+# the target for the binaries and documentation
+TARGET="wasm32-unknown-unknown"
+
+# triggers all build.rs steps
+find $CONTRACTS \
+    -maxdepth 2 \
+    -name build.rs \
+    -prune \
+    -exec touch -c {} \; 
+# in this way the wasm files will have up to date
+# versioning information
+
+# build the contract's wasm binaries
+cargo build --lib --target $TARGET --release "$@"
+# they are stored on $CONTRACTS/target/$TARGET/release
+
+# makes the wasm copy into $CONTRACTS/res/
+find "$CONTRACTS/target/$TARGET/release" \
+    -maxdepth 1 \
+    -name \*.wasm \
+    -prune \
+    -exec cp {} "$CONTRACTS/res/" \;
+
+# reduces the wasm size
+for f in $CONTRACTS/res/*.wasm
+do
+    wasm-opt -Oz -o "$f" "$f"
+done
+# note: for more info, check:
+# https://github.com/WebAssembly/binaryen
+# https://rustwasm.github.io/book/reference/code-size.html#use-the-wasm-opt-tool
+
+# shows the wasm binaries and their size
+ls -lah $CONTRACTS/res/*.wasm | awk '{print $5 " " $9}'
+
+# create the contract's openapi descriptions
+cargo build --bins "$@"
+# they are stored on $CONTRACTS/target/debug
+#
+# run the openapi generators and store them in $CONTRACTS/res/
+for f in $CONTRACTS/target/debug/*-openapi
+do
+    fbase="$(basename -- $f)"
+    "$f" > "$CONTRACTS/res/$fbase.json"
+done
+#
+
+'''
+'''--- contracts/contract-01/Cargo.toml ---
+[package]
+name = "contract-01"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "example-01-openapi"
+path = "src/bin/openapi.rs"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+near-sdk = "=4.0.0-pre.8"
+near-contract-standards = "4.0.0-pre.8"
+near-units = "0.1.0"
+
+[dependencies.common]
+git = "https://github.com/Seatlab-dev/Smart-Contracts-Common-Library.git"
+rev = "783854c"
+default-features = false
+features = []
+
+[dev-dependencies]
+near-sdk-sim = "4.0.0-pre.4"
+near-contract-standards = "4.0.0-pre.8"
+near-units = "0.1.0"
+
+[dev-dependencies.common]
+git = "https://github.com/Seatlab-dev/Smart-Contracts-Common-Library.git"
+rev = "783854c"
+features = ["sim"]
+
+[build-dependencies]
+
+[build-dependencies.common]
+git = "https://github.com/Seatlab-dev/Smart-Contracts-Common-Library.git"
+rev = "783854c"
+default-features = false
+features = []
+
+'''
+'''--- contracts/contract-01/build.rs ---
+//! Executed before the contract's compilation.
+
+use common::version::build;
+
+fn main() {
+    // generates the version information and set the env vars
+    // that will be present at compile-time on the contract's
+    // compilation
+    build::create_version().set_env();
+    // makes it so this build.rs step always runs
+    // build::setup_rerun();
+    //
+    // note: if the build.rs step panics, it may not trigger
+    // it's automatic rerun, so you'd need to `touch build.rs`
+    // to guarantee it's next rerun.
+}
+
+'''
+'''--- contracts/contract-01/src/bin/openapi.rs ---
+pub use contract_01;
+
+fn main() {
+    let spec = contract_01::non_wasm::openapi();
+    let spec_str = near_sdk::serde_json::to_string_pretty(&spec).unwrap();
+    println!("{}", spec_str);
+}
+
+'''
+'''--- contracts/contract-01/src/init.rs ---
+use crate::Counter;
+use near_sdk::{json_types::U64, near_bindgen};
+
+#[cfg(not(target_arch = "wasm32"))]
+use crate::CounterContract;
+
+#[near_bindgen]
+impl Counter {
+    /// Creates a new instance. `value` starts at zero.
+    #[init]
+    pub fn new() -> Self {
+        Counter { value: 0.into() }
+    }
+
+    /// Creates a new instance.
+    #[init]
+    pub fn new_with(
+        /// Initial value.
+        value: U64
+    ) -> Self {
+        Counter { value }
+    }
+}
+
+'''
+'''--- contracts/contract-01/src/lib.rs ---
+use common::JsUint;
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::{env, json_types::U64, near_bindgen, AccountId, PanicOnDefault};
+
+pub mod init;
+pub mod non_wasm;
+pub mod version;
+
+/// A counter example.
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Counter {
+    /// Value that is tracked by the counter.
+    pub value: U64,
+}
+
+#[near_bindgen]
+impl Counter {
+    /// Increments the internal counter value.
+    ///
+    /// #### Return
+    ///
+    /// Has no return.
+    pub fn increment(&mut self) {
+        self.value.0 += 1;
+    }
+
+    /// Decrements the internal counter value.
+    ///
+    /// #### Return
+    ///
+    /// Has no return.
+    pub fn decrement(&mut self) {
+        self.value.0 -= 1;
+    }
+
+    /// Gets the internal counter value.
+    ///
+    /// #### Return
+    ///
+    /// Returns the counter value.
+    pub fn get(&self) -> U64 {
+        self.value
+    }
+
+    /// Gets the internal counter value.
+    ///
+    /// #### Return
+    ///
+    /// Returns the counter value, if it's in range.
+    pub fn get_as_integer(&self) -> JsUint {
+        JsUint::new(self.value.0)
+    }
+
+    /// Sets the internal counter value.
+    ///
+    /// #### Return
+    ///
+    /// Has no return.
+    pub fn set(
+        &mut self,
+        /// The new value of the counter.
+        new_value: U64,
+    ) {
+        self.value = new_value;
+    }
+
+    /// Logs the internal counter value.
+    ///
+    /// #### Return
+    ///
+    /// Has no return.
+    pub fn log_value(
+        &self,
+        /// Optionally also logs a mention to some user!
+        mention: Option<AccountId>,
+    ) {
+        let msg = match mention {
+            Some(mention) => format!("yo {}, you know what? {}", mention, self.value.0),
+            None => format!("{}", self.value.0),
+        };
+        env::log_str(&msg)
+    }
+}
+
+'''
+'''--- contracts/contract-01/src/non_wasm.rs ---
+use near_sdk::{okapi::openapi3::Server, openapi};
+
+pub mod mods {
+    pub use crate::{self as counter, init, version};
+}
+
+pub mod methods {
+    use super::mods;
+    pub use crate::_methods::*;
+    pub use mods::init::_methods::*;
+    pub use mods::version::IVersion_methods::version as _version;
+}
+
+pub fn openapi() -> near_sdk::okapi::openapi3::OpenApi {
+    let mut spec = routes();
+    spec.info = info();
+    spec.servers = servers();
+    spec
+}
+
+pub fn servers() -> Vec<Server> {
+    vec![
+        Server {
+            url: "https://explorer.testnet.near.org/accounts/todo.testnet".into(),
+            description: Some("TODO testnet account".into()),
+            variables: [].into(),
+            extensions: [].into(),
+        },
+        Server {
+            url: "https://explorer.near.org/accounts/todo.near".into(),
+            description: Some("TODO mainnet account".into()),
+            variables: [].into(),
+            extensions: [].into(),
+        },
+    ]
+}
+
+pub fn info() -> near_sdk::okapi::openapi3::Info {
+    use common::version::Version;
+    let version = common::version::version_from_env!();
+
+    near_sdk::okapi::openapi3::Info {
+        title: version.name,
+        version: version.semver,
+        description: Some(format!(
+            "    - Git SHA: {}\n    - Git Datetime: {}\n    - Git Dirty: {}\n    - Cargo Features: {}",
+            version.git_sha, version.git_datetime, version.git_dirty, version.cargo_features,
+        )),
+        ..Default::default()
+    }
+}
+
+pub fn routes() -> near_sdk::okapi::openapi3::OpenApi {
+    use openapi::OperationAdd;
+
+    let settings = near_sdk::schemars::gen::SchemaSettings::openapi3_1();
+    let mut gen = openapi::OpenApiGenerator::new(&settings);
+
+    let tag_names = ["init", "counter", "misc"];
+
+    // endpoints/methods
+    {
+        let gen = &mut gen;
+        let tags: std::collections::HashMap<_, _> =
+            tag_names.into_iter().map(|tag| (tag, tag)).collect();
+
+        // init
+        let tag = &[tags["init"]];
+        use mods::init;
+        init::new::Input::operation_add(gen, tag);
+        init::new_with::Input::operation_add(gen, tag);
+        // counter
+        let tag = &[tags["counter"]];
+        use mods::counter;
+        counter::increment::Input::operation_add(gen, tag);
+        counter::decrement::Input::operation_add(gen, tag);
+        counter::get::Input::operation_add(gen, tag);
+        counter::get_as_integer::Input::operation_add(gen, tag);
+        counter::set::Input::operation_add(gen, tag);
+        counter::log_value::Input::operation_add(gen, tag);
+        // misc
+        let tag = &[tags["misc"]];
+        use mods::version;
+        version::version::Input::operation_add(gen, tag);
+    }
+
+    gen.into_openapi_with_tags(&tag_names)
+}
+
+'''
+'''--- contracts/contract-01/src/version.rs ---
+use crate::Counter;
+use common::version::{version_from_env, IVersion, Version};
+use near_sdk::near_bindgen;
+
+#[cfg(not(target_arch = "wasm32"))]
+use crate::CounterContract;
+
+#[near_bindgen]
+impl IVersion for Counter {
+    /// Get versioning information.
+    ///
+    /// #### Return
+    ///
+    /// Returns the versioning info.
+    fn version(&self) -> Version {
+        version_from_env!()
+    }
+}
+
+'''
+'''--- contracts/contract-01/tests/test_counter.rs ---
+use common::{
+    sim::contract_ext::{Call, ViewCall},
+    JsUint,
+};
+use contract_01::non_wasm::methods::*;
+pub use near_sdk::{
+    json_types::{Base64VecU8, U128, U64},
+    serde_json::json,
+};
+use near_sdk_sim::{init_simulator, UserAccount};
+use near_units::parse_near;
+
+pub mod utils;
+
+use utils::Counter;
+
+pub fn init() -> (
+    UserAccount,
+    (Counter),
+    (UserAccount, UserAccount, UserAccount),
+) {
+    let root = init_simulator(None);
+
+    let counter = utils::init(&root, None);
+
+    let alice = root.create_user("alice".parse().unwrap(), parse_near!("10 kN"));
+    let bob = root.create_user("bob".parse().unwrap(), parse_near!("10 kN"));
+    let carol = root.create_user("carol".parse().unwrap(), parse_near!("10 kN"));
+
+    (root, (counter), (alice, bob, carol))
+}
+
+#[test]
+pub fn basic_tes() {
+    let (ref root, (ref counter), (ref alice, ref bob, ref _carol)) = init();
+
+    let _res = counter.increment().call(alice, None, None);
+}
+
+'''
+'''--- contracts/contract-01/tests/utils/mod.rs ---
+use common::sim::{contract_ext::Deploy, ContractExt};
+use contract_01::CounterContract;
+use near_sdk_sim::{ContractAccount, UserAccount};
+use near_units::parse_near;
+
+pub type Counter = ContractAccount<CounterContract>;
+
+near_sdk_sim::lazy_static_include::lazy_static_include_bytes! {
+    COUNTER_WASM_BYTES => "../res/contract_01.wasm",
+}
+
+pub struct Here;
+impl near_sdk::HasContract<Here> for Counter {
+    type Contract = CounterContract;
+
+    fn contract(&self) -> &Self::Contract {
+        &self.contract
+    }
+}
+
+pub fn init(
+    root: &UserAccount,
+    contract_id: impl Into<Option<String>>,
+) -> Counter {
+    use contract_01::non_wasm::methods::*;
+
+    let contract_id = contract_id.into().unwrap_or_else(|| "counter".into());
+
+    let counter = Counter::new().deploy(
+        root,
+        contract_id,
+        &COUNTER_WASM_BYTES,
+        None,
+        parse_near!("2 N"),
+    );
+    counter.transfer_extra_deposit_to(root);
+    counter
+}
+
+'''
+'''--- contracts/rust-toolchain.toml ---
+[toolchain]
+channel = "1.60.0"
+targets = [ "wasm32-unknown-unknown" ]
+'''
+'''--- contracts/rustfmt.toml ---
+fn_args_layout = "Vertical"
+tab_spaces = 4
+max_width = 100
+'''
+'''--- contracts/test.sh ---
+#!/bin/bash
+set -ex
+
+export RUST_BACKTRACE=1 
+
+cargo nextest run --fail-fast --run-ignored all
+'''

@@ -1,0 +1,574 @@
+*GitHub Repository "hsxyl/council-admin"*
+
+'''--- .idea/modules.xml ---
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="ProjectModuleManager">
+    <modules>
+      <module fileurl="file://$PROJECT_DIR$/.idea/council-admin.iml" filepath="$PROJECT_DIR$/.idea/council-admin.iml" />
+    </modules>
+  </component>
+</project>
+'''
+'''--- .idea/vcs.xml ---
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="VcsDirectoryMappings">
+    <mapping directory="" vcs="Git" />
+  </component>
+</project>
+'''
+'''--- Cargo.toml ---
+[package]
+name = "council-admin"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "4.0.0"
+near-contract-standards = "4.0.0"
+uint = { version = "0.9.0", default-features = false }
+itertools = "0.10.0"
+
+[dev-dependencies]
+'''
+'''--- build.sh ---
+#!/bin/bash
+cargo fmt --all
+RUSTFLAGS='-C link-arg=-s' cargo build --all --target wasm32-unknown-unknown --release
+
+if [ ! -d "out" ]; then
+    mkdir -p "out"
+fi
+if [ ! -d "res" ]; then
+    mkdir -p "res"
+fi
+
+cp target/wasm32-unknown-unknown/release/*.wasm ./res/
+'''
+'''--- scripts/clear-state.sh ---
+#!/bin/bash
+set -e
+
+source ./variables.sh
+
+# reference: https://github.com/near/core-contracts/tree/master/state-cleanup
+# 1. deploy state_cleanup wasm
+near deploy $VESTING_CONTRACT_ACCOUNT_ID ../res/state_cleanup.wasm &&
+# 2. cleanup state
+python3 state-clean.py $VESTING_CONTRACT_ACCOUNT_ID $VESTING_ACCOUNT_ID
+'''
+'''--- scripts/deploy.sh ---
+#!/bin/bash
+set -e
+
+source ./variables.sh
+
+cd ..
+bash build.sh &&
+cd scripts
+
+if [ "$1" == "deploy" ]; then
+  near deploy $ACCOUNT_ID ../res/$COUNCIL_ADMIN_CONTRACT_WASM new '{"dao_contract_id": "'$DAO_CONTRACT_ID'"}'
+elif [ "$1" == "redeploy" ]; then
+  near deploy $ACCOUNT_ID ../res/$COUNCIL_ADMIN_CONTRACT_WASM
+elif [ "$1" == "clean" ]; then
+  bash clear-state.sh && near deploy $ACCOUNT_ID ../res/$COUNCIL_ADMIN_CONTRACT_WASM new '{"dao_contract_id": "'$DAO_CONTRACT_ID'"}'
+fi
+
+'''
+'''--- scripts/state-clean.py ---
+import os
+import re
+import sys
+
+# cmd like: python state-clean.py your_contract_name.testnet your_account.testnet
+contract_name = sys.argv[1]
+account_name = sys.argv[2]
+
+NODE_URL = 'https://public-rpc.blockpi.io/http/near-testnet'
+
+states = os.popen('near view-state %s --finality final --node_url %s' % (contract_name, NODE_URL)).read()
+print("states:", states)
+
+pattern = re.compile("key: '([^']+)'", )
+state_keys = pattern.findall(states)  # ['AAsAAAB4c2IudGVzdG5ldA==', ... ,'U1RBVEU=']
+state_keys_arg = "[" + ",".join(list(map(lambda e: "\"%s\"" % e, state_keys))) + "]" # "[\"AAsAAAB4c2IudGVzdG5ldA==\",\"AmkBAAAAAAAAAA==\",\"AmsAAAAAAAAAAA==\",\"AnYAAAAAAAAAAA==\",\"U1RBVEU=\"]"
+print("states_key_arg:", state_keys_arg)
+
+cmd = "near call %s clean \'{\"keys\": %s}\' --accountId %s --gas 300000000000000 --node_url %s" % (contract_name, state_keys_arg, account_name, NODE_URL)
+print("execute: "+cmd)
+
+result = os.popen(cmd)
+print(result.read())
+
+'''
+'''--- scripts/variables.sh ---
+#!/bin/bash
+set -e
+
+ACCOUNT_ID=oct-dao.testnet
+DAO_CONTRACT_ID=xsbtest3.sputnikv2.testnet
+ONE_YOCTO=0.000000000000000000000001
+
+COUNCIL_ADMIN_CONTRACT_WASM=council_admin.wasm
+'''
+'''--- src/lib.rs ---
+extern crate core;
+
+pub mod sputnik;
+
+use crate::sputnik::policy::{Policy, VersionedPolicy};
+use crate::sputnik::proposals::{ProposalInput, ProposalKind};
+use crate::sputnik::traits::ext_sputnik;
+use itertools::Itertools;
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::{LookupMap, UnorderedMap, UnorderedSet};
+use near_sdk::ext_contract;
+use near_sdk::json_types::U128;
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{
+    env, log, near_bindgen, AccountId, Balance, BorshStorageKey, Gas, PanicOnDefault, Promise,
+    StorageUsage,
+};
+use std::collections::HashMap;
+use std::ops::Mul;
+
+pub const T_GAS_FOR_ADD_PROPOSAL: u64 = 50;
+pub const T_GAS_FOR_VOTE: u64 = 30;
+pub const T_GAS_FOR_ACT: u64 = 20;
+pub const ROLE: &str = "OCT_STAKING_COUNCIL";
+
+#[near_bindgen]
+#[derive(BorshSerialize, BorshDeserialize, PanicOnDefault)]
+struct Contract {
+    dao_contract_id: AccountId,
+}
+
+#[near_bindgen]
+impl Contract {
+    #[init]
+    pub fn new(dao_contract_id: AccountId) -> Self {
+        Self { dao_contract_id }
+    }
+
+    pub fn get_dao_name(&self) -> AccountId {
+        self.dao_contract_id.clone()
+    }
+
+    #[payable]
+    pub fn add_member(&mut self, member_id: AccountId, role: String) -> Promise {
+        // ext_sputnik::ext(self.dao_contract_id.clone())
+
+        ext_sputnik::ext(self.dao_contract_id.clone())
+            .with_static_gas(Gas::ONE_TERA.mul(T_GAS_FOR_ADD_PROPOSAL))
+            .with_attached_deposit(1000000000000000000000)
+            .add_proposal(ProposalInput {
+                description: "registry auto add proposal.".to_string(),
+                kind: ProposalKind::AddMemberToRole { member_id, role },
+            })
+            .then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(Gas::ONE_TERA.mul(T_GAS_FOR_VOTE))
+                    .auto_vote(),
+            )
+    }
+
+    #[payable]
+    pub fn update_members(&mut self, role: String, member_ids: Vec<AccountId>) -> Promise {
+        ext_sputnik::ext(self.dao_contract_id.clone())
+            .get_policy()
+            .then(
+                Self::ext(env::current_account_id())
+                    .with_attached_deposit(1000000000000000000000)
+                    .auto_update_proposal(role, member_ids),
+            )
+    }
+
+    #[private]
+    pub fn auto_update_proposal(
+        &self,
+        role: String,
+        members: Vec<AccountId>,
+        #[callback_unwrap] mut policy: Policy,
+    ) -> Promise {
+        // log!("auto add proposal, policy: {}", policy.)
+        policy.update_members_in_role(&role, &members);
+
+        ext_sputnik::ext(self.dao_contract_id.clone())
+            .with_static_gas(Gas::ONE_TERA.mul(T_GAS_FOR_ADD_PROPOSAL))
+            .with_attached_deposit(1000000000000000000000)
+            .add_proposal(ProposalInput {
+                description: "registry auto add proposal.".to_string(),
+                kind: ProposalKind::ChangePolicy {
+                    policy: VersionedPolicy::Current(policy),
+                },
+            })
+            .then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(Gas::ONE_TERA.mul(T_GAS_FOR_VOTE))
+                    .auto_vote(),
+            )
+    }
+
+    #[private]
+    pub fn auto_vote(&self, #[callback_unwrap] id: u64) -> Promise {
+        log!("auto vote, id is {}", id);
+        ext_sputnik::ext(self.dao_contract_id.clone())
+            .with_static_gas(Gas::ONE_TERA.mul(T_GAS_FOR_ACT))
+            .act_proposal(id, Action::VoteApprove, Option::None)
+    }
+}
+
+/// Set of possible action to take.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub enum Action {
+    /// Action to add proposal. Used internally.
+    AddProposal,
+    /// Action to remove given proposal. Used for immediate deletion in special cases.
+    RemoveProposal,
+    /// Vote to approve given proposal or bounty.
+    VoteApprove,
+    /// Vote to reject given proposal or bounty.
+    VoteReject,
+    /// Vote to remove given proposal or bounty (because it's spam).
+    VoteRemove,
+    /// Finalize proposal, called when it's expired to return the funds
+    /// (or in the future can be used for early proposal closure).
+    Finalize,
+    /// Move a proposal to the hub to shift into another DAO.
+    MoveToHub,
+}
+
+'''
+'''--- src/sputnik/mod.rs ---
+pub mod policy;
+pub mod proposals;
+pub mod traits;
+pub mod types;
+
+'''
+'''--- src/sputnik/policy.rs ---
+use std::cmp::min;
+use std::collections::{HashMap, HashSet};
+
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::json_types::{U128, U64};
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{env, AccountId, Balance};
+
+use crate::sputnik::proposals::{PolicyParameters, Proposal, ProposalKind, ProposalStatus, Vote};
+use crate::*;
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Debug, PartialEq))]
+#[serde(crate = "near_sdk::serde")]
+pub enum RoleKind {
+    /// Matches everyone, who is not matched by other roles.
+    Everyone,
+    /// Member greater or equal than given balance. Can use `1` as non-zero balance.
+    Member(U128),
+    /// Set of accounts.
+    Group(HashSet<AccountId>),
+}
+
+impl RoleKind {
+    pub fn update_group(&mut self, member_ids: &Vec<AccountId>) -> Result<(), ()> {
+        match self {
+            RoleKind::Group(accounts) => {
+                accounts.clear();
+                for e in member_ids {
+                    accounts.insert(e.clone());
+                }
+                Ok(())
+            }
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Debug, PartialEq))]
+#[serde(crate = "near_sdk::serde")]
+pub struct RolePermission {
+    /// Name of the role to display to the user.
+    pub name: String,
+    /// Kind of the role: defines which users this permissions apply.
+    pub kind: RoleKind,
+    /// Set of actions on which proposals that this role is allowed to execute.
+    /// <proposal_kind>:<action>
+    pub permissions: HashSet<String>,
+    /// For each proposal kind, defines voting policy.
+    pub vote_policy: HashMap<String, VotePolicy>,
+}
+
+pub struct UserInfo {
+    pub account_id: AccountId,
+    pub amount: Balance,
+}
+
+/// Direct weight or ratio to total weight, used for the voting policy.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Debug, PartialEq))]
+#[serde(crate = "near_sdk::serde")]
+#[serde(untagged)]
+pub enum WeightOrRatio {
+    Weight(U128),
+    Ratio(u64, u64),
+}
+
+/// How the voting policy votes get weigthed.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, PartialEq)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Debug))]
+#[serde(crate = "near_sdk::serde")]
+pub enum WeightKind {
+    /// Using token amounts and total delegated at the moment.
+    TokenWeight,
+    /// Weight of the group role. Roles that don't have scoped group are not supported.
+    RoleWeight,
+}
+
+/// Defines configuration of the vote.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Debug, PartialEq))]
+#[serde(crate = "near_sdk::serde")]
+pub struct VotePolicy {
+    /// Kind of weight to use for votes.
+    pub weight_kind: WeightKind,
+    /// Minimum number required for vote to finalize.
+    /// If weight kind is TokenWeight - this is minimum number of tokens required.
+    ///     This allows to avoid situation where the number of staked tokens from total supply is too small.
+    /// If RoleWeight - this is minimum number of votes.
+    ///     This allows to avoid situation where the role is got too small but policy kept at 1/2, for example.
+    pub quorum: U128,
+    /// How many votes to pass this vote.
+    pub threshold: WeightOrRatio,
+}
+
+/// Defines voting / decision making policy of this DAO.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Debug, PartialEq))]
+#[serde(crate = "near_sdk::serde")]
+pub struct Policy {
+    /// List of roles and permissions for them in the current policy.
+    pub roles: Vec<RolePermission>,
+    /// Default vote policy. Used when given proposal kind doesn't have special policy.
+    pub default_vote_policy: VotePolicy,
+    /// Proposal bond.
+    pub proposal_bond: U128,
+    /// Expiration period for proposals.
+    pub proposal_period: U64,
+    /// Bond for claiming a bounty.
+    pub bounty_bond: U128,
+    /// Period in which giving up on bounty is not punished.
+    pub bounty_forgiveness_period: U64,
+}
+
+/// Versioned policy.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Debug, PartialEq))]
+#[serde(crate = "near_sdk::serde", untagged)]
+pub enum VersionedPolicy {
+    /// Default policy with given accounts as council.
+    Default(Vec<AccountId>),
+    Current(Policy),
+}
+
+impl Policy {
+    pub fn update_members_in_role(&mut self, role: &str, member_ids: &Vec<AccountId>) {
+        for i in 0..self.roles.len() {
+            if &self.roles[i].name == role {
+                self.roles[i]
+                    .kind
+                    .update_group(member_ids)
+                    .expect(&format!("ERR_ROLE_WRONG_KIND:{}", role).to_string());
+                return;
+            }
+        }
+        env::log_str(&format!("ERR_ROLE_NOT_FOUND:{}", role));
+        panic!("ERR_ROLE_NOT_FOUND:{}", role)
+    }
+}
+
+'''
+'''--- src/sputnik/proposals.rs ---
+use crate::sputnik::policy::{RolePermission, VotePolicy};
+use crate::*;
+use crate::{Action, Policy, VersionedPolicy};
+use near_sdk::json_types::{Base58CryptoHash, Base64VecU8, U128, U64};
+use near_sdk::{env, AccountId, Balance};
+use std::collections::HashMap;
+
+/// Status of a proposal.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub enum ProposalStatus {
+    InProgress,
+    /// If quorum voted yes, this proposal is successfully approved.
+    Approved,
+    /// If quorum voted no, this proposal is rejected. Bond is returned.
+    Rejected,
+    /// If quorum voted to remove (e.g. spam), this proposal is rejected and bond is not returned.
+    /// Interfaces shouldn't show removed proposals.
+    Removed,
+    /// Expired after period of time.
+    Expired,
+    /// If proposal was moved to Hub or somewhere else.
+    Moved,
+    /// If proposal has failed when finalizing. Allowed to re-finalize again to either expire or approved.
+    Failed,
+}
+
+/// Function call arguments.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Clone, Debug))]
+#[serde(crate = "near_sdk::serde")]
+pub struct ActionCall {
+    method_name: String,
+    args: Base64VecU8,
+    deposit: U128,
+    gas: U64,
+}
+
+/// Function call arguments.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Clone, Debug))]
+#[serde(crate = "near_sdk::serde")]
+pub struct PolicyParameters {
+    pub proposal_bond: Option<U128>,
+    pub proposal_period: Option<U64>,
+    pub bounty_bond: Option<U128>,
+    pub bounty_forgiveness_period: Option<U64>,
+}
+
+/// Kinds of proposals, doing different action.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Clone, Debug))]
+#[serde(crate = "near_sdk::serde")]
+pub enum ProposalKind {
+    /// Change the full policy.
+    ChangePolicy { policy: VersionedPolicy },
+    /// Add member to given role in the policy. This is short cut to updating the whole policy.
+    AddMemberToRole { member_id: AccountId, role: String },
+    /// Remove member to given role in the policy. This is short cut to updating the whole policy.
+    RemoveMemberFromRole { member_id: AccountId, role: String },
+    /// Calls `receiver_id` with list of method names in a single promise.
+    /// Allows this contract to execute any arbitrary set of actions in other contracts.
+    Vote,
+}
+
+impl ProposalKind {
+    /// Returns label of policy for given type of proposal.
+    pub fn to_policy_label(&self) -> &str {
+        match self {
+            ProposalKind::ChangePolicy { .. } => "policy",
+            ProposalKind::AddMemberToRole { .. } => "add_member_to_role",
+            ProposalKind::RemoveMemberFromRole { .. } => "remove_member_from_role",
+            ProposalKind::Vote => "vote",
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// Votes recorded in the proposal.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub enum Vote {
+    Approve = 0x0,
+    Reject = 0x1,
+    Remove = 0x2,
+}
+
+impl From<Action> for Vote {
+    fn from(action: Action) -> Self {
+        match action {
+            Action::VoteApprove => Vote::Approve,
+            Action::VoteReject => Vote::Reject,
+            Action::VoteRemove => Vote::Remove,
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// Proposal that are sent to this DAO.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Debug))]
+#[serde(crate = "near_sdk::serde")]
+pub struct Proposal {
+    /// Original proposer.
+    pub proposer: AccountId,
+    /// Description of this proposal.
+    pub description: String,
+    /// Kind of proposal with relevant information.
+    pub kind: ProposalKind,
+    /// Current status of the proposal.
+    pub status: ProposalStatus,
+    /// Count of votes per role per decision: yes / no / spam.
+    pub vote_counts: HashMap<String, [Balance; 3]>,
+    /// Map of who voted and how.
+    pub votes: HashMap<AccountId, Vote>,
+    /// Submission time (for voting period).
+    pub submission_time: U64,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Debug))]
+#[serde(crate = "near_sdk::serde")]
+pub enum VersionedProposal {
+    Default(Proposal),
+}
+
+impl From<VersionedProposal> for Proposal {
+    fn from(v: VersionedProposal) -> Self {
+        match v {
+            VersionedProposal::Default(p) => p,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct ProposalInput {
+    /// Description of this proposal.
+    pub description: String,
+    /// Kind of proposal with relevant information.
+    pub kind: ProposalKind,
+}
+
+impl From<ProposalInput> for Proposal {
+    fn from(input: ProposalInput) -> Self {
+        Self {
+            proposer: env::predecessor_account_id(),
+            description: input.description,
+            kind: input.kind,
+            status: ProposalStatus::InProgress,
+            vote_counts: HashMap::default(),
+            votes: HashMap::default(),
+            submission_time: U64::from(env::block_timestamp()),
+        }
+    }
+}
+
+'''
+'''--- src/sputnik/traits.rs ---
+use crate::*;
+
+#[ext_contract(ext_sputnik)]
+pub trait SputnikDao {
+    fn add_proposal(proposal: ProposalInput) -> u64;
+    fn act_proposal(&mut self, id: u64, action: Action, memo: Option<String>);
+    fn get_policy(&self) -> Policy;
+}
+
+'''
+'''--- src/sputnik/types.rs ---
+use crate::*;
+use near_sdk::json_types::U64;
+use near_sdk::AccountId;
+use std::collections::{HashMap, HashSet};
+
+'''
