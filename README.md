@@ -1,6 +1,6 @@
 # Web3 Code LLM
 
-[NearCoder draft training protocol](https://github.com/AnnaValentinaHirsch/Web3CodeLLM/blob/main/NearCoder.jpg)
+![NearCoder draft training protocol](https://github.com/AnnaValentinaHirsch/Web3CodeLLM/blob/main/NearCoder.jpg)
 
 The Web3 Code LLM aims to help blockchain developers in their coding challenges. While most web2 technologies are quite well furnished in term of tutorials and examples of code on forums and online courses, the web3 is still a recent technology, with a rather scattered technological landscape due to competing ecosystems releasing their own solutions and trying to grow a user base. 
 
