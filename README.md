@@ -6,11 +6,6 @@ The Web3 Code LLM aims to help blockchain developers in their coding challenges.
 
 The fast-changing set of coding languages and the nascent stage of the web3 industry makes it hard for it to hire developers willing to start coding from scratch and we believe that a powerful coding assistant would be a significant help in that context. 
 
-The Web3 Code LLM will be primarily fine-tuned on the Near Protocol stack:
-- react.js / node.js as for web app development
-- Near Protocol technology (sharding, etc.)
-- BOS widgets for decentralized frontend
-- javascript as for frontend 
-- rust as for backend smart contracts
+The Web3 Code LLM is a StarCoder2-3b fine-tuned on the Near Protocol documentation, dApp structure and full dApps repositories collected from open GitHub repositories.
 
 The Web3 Code LLM has been started as a [course project at the opencampus.sh](https://edu.opencampus.sh/en/course/477). 
