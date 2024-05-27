@@ -2,7 +2,7 @@ NearData is made of:
 
 - nearDapps: 3414 text versions of NEAR dApps repositories listed at [Electric Capital](https://github.com/electric-capital/crypto-ecosystems/blob/master/data/ecosystems/n/near.toml), collected between April 24th and May 17th using the GitHub scraper [RepoToText](https://github.com/JeremiahPetersen/RepoToText). 
 
-- nearDappsCodeFiles: 100098 code files (after cleaning) in JavaScript (61262 unique files), Rust (13802 unique code files), Typescript (925034 unique code files) extracted in text formats from the near dApps files.
+- nearDappsCodeFiles: 100098 code files (after cleaning) in JavaScript (61262 unique files), Rust (13802 unique code files), Typescript (25034 unique code files) extracted in text formats from the near dApps files.
 - nearDappsReadme: 23166 readme files extracted in text formats from the near dApps files.
 - nearDappsTrees: 3414 text files representing the tree structure extracted from the nearDapps files.
 
