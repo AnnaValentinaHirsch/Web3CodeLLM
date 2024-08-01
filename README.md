@@ -79,8 +79,6 @@ Key features include:
 - WebAssembly-based smart contracts
 - Proof-of-Stake consensus mechanism
 
-##### 2.3.1. History
-
 Started in 2017 as an AI project by 
 Illia Polosukhin, co-author of “Attention is All You Need” [^1], Near.ai aimed to 
 teach machines how to code before facing the challenge to pay worldwide contributors.
