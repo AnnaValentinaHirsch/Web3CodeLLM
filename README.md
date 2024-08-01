@@ -1,6 +1,6 @@
 # NEARCoder - Web3 Code LLM
 
-![NearCoder draft training protocol](https://github.com/AnnaValentinaHirsch/Web3CodeLLM/blob/main/NearCoder.jpg)
+![NearCoder draft training protocol](https://github.com/AnnaValentinaHirsch/Web3CodeLLM/blob/main/images/NearCoder.jpg).
 
 ## TL;DR
 
@@ -27,7 +27,7 @@ All datasets and models used in this project are open-sourced and available on [
 
 #### * Presentation
 
-A detailed presentation of NEARCoder was given at OpenCampus.sh on 17th June 2024. The slide deck is available [here](https://docs.google.com/presentation/d/1CgNT7srUhJs9CNWNSfaAqpetz67KRdKlOjy7SonCeqY/edit?usp=sharing).
+A detailed presentation of NEARCoder was given at OpenCampus.sh on 17th June 2024. The slide deck is available [here](https://github.com/AnnaValentinaHirsch/Web3CodeLLM/blob/main/presentation/NEARCoder%20-%2010%20min%20presentation.pdf).
 
 #### * Key Features
 
@@ -222,8 +222,7 @@ The performance results of the different models across various evaluation metric
 
 The progression of model performance across different tasks during the training process is visualized in Image 1.
 
-![NEARCoder training progress](image-link-here)
-
+![NEARCoder training progress](https://github.com/AnnaValentinaHirsch/Web3CodeLLM/blob/main/images/evaluation.png)
 ### 5.2. Analysis by Steps
 
 **Step 1:** The NEAR-preTrainedStarCoder2 model shows an improvement over the baseline StarCoder2-3b model on the NEAR_Questions test, indicating a successful enhancement in handling this specific evaluation task.
