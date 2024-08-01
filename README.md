@@ -54,9 +54,6 @@ dApp structures, and full dApp repositories collected from open-source GitHub pr
 
 ## 2. Background and Motivation
 
-The advent of Web3 technologies, particularly blockchain-based systems, has introduced new paradigms in software development. However, the rapid evolution and fragmented nature of the Web3 landscape pose significant challenges for developers transitioning from traditional Web2 technologies. The NEAR Protocol, a layer-1 blockchain designed for usability and scalability, exemplifies the potential of Web3 whilst also highlighting the need for specialised developer tools.
-
-
 ### 2.1 The Web3 Development Landscape
 
 Web3 technologies, including blockchain platforms, decentralised applications (dApps), and smart contracts, represent a paradigm shift in software development. Unlike Web2, which primarily deals with centralised systems and traditional programming paradigms, Web3 introduces concepts such as trustless interactions, decentralised consensus, and tokenomics.
