@@ -127,15 +127,6 @@ To ensure transparency and replicability, our training data have been prepared a
 
 ### 3.3 Training Process
 
-| **Step**                    | **Objective**                                       | **Methods**                                                                                                               | **Process**                                                                                                                                                                       | **Result**                          |
-|-----------------------------|----------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------|
-| **3.3.1 Continued Pre-Training**    | Train the model with general knowledge about the NEAR Protocol. | - Supervised Fine-Tuning (SFT) of StarCoder2<br>- Hardware: NVIDIA A10G with 12 vCPU 46 GB RAM                            | N/A                                                                                                                                                                               | A new model "NEAR-preTrainedStarCoder2" |
-| **3.3.2 Structure-Aware Fine-Tuning** | Train the model to produce directory structures from project descriptions.          | 1. Create a new labelled dataset for Direct Preference Optimization (DPO)<br>2. Model Training with DPO (more efficient than RLHF) | 1. Use OpenAI API (GPT-4) to:<br>&nbsp;&nbsp;&nbsp;&nbsp;- Extract key details from README files<br>&nbsp;&nbsp;&nbsp;&nbsp;- Transform extracted details into user-friendly prompts<br>2. Generate "rejected" texts using NEAR-preTrainedStarCoder2 based on the created prompts<br>3. Use original tree structures as "accepted" texts | A new model "NEAR-structTunedStarCoder2" |
-| **3.3.3 Specialized Fine-Tuning**   | Fine-tune the model to produce actual code for NEAR dApps.                          | - Supervised Fine-Tuning (SFT) of NEAR-structTunedStarCoder2 on AST-Segments<br>- Dataset: 100,098 code files (JS, RS, TS)<br>- Hardware: NVIDIA A10G with 12 vCPU 46 GB RAM | N/A                                                                                                                                                                               | The final model "NEARCoder"         |
-
-
-### 3.3 Training Process
-
 Our training process consisted of three main steps:
 
 #### 3.3.1 Continued Pre-Training
