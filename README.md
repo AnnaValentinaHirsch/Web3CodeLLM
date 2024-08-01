@@ -255,3 +255,7 @@ To address the observed shortcomings and further enhance model performance, we p
 ## 6. Conclusion
 
 NEARCoder represents a significant step towards providing specialised support for NEAR Protocol developers. By fine-tuning a state-of-the-art language model on NEAR-specific data, we have created a tool that can assist developers in structuring projects, generating code, and understanding NEAR-specific concepts. However, the model still lacks in certain areas, particularly in generating functional code for NEAR dApps. Future work will focus on addressing these limitations and further enhancing the capabilities of NEARCoder to better serve the NEAR development community. Further research is needed to explore the potential of NEARCoder in other Web3 ecosystems and to develop more advanced models tailored to specific blockchain platforms.
+
+## 7. References
+
+[^1] Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A. N., Kaiser, L. & Polosukhin, I. (2017). Attention is All you Need. In I. Guyon, U. von Luxburg, S. Bengio, H. M. Wallach, R. Fergus, S. V. N. Vishwanathan & R. Garnett (eds.), Advances in Neural Information Processing Systems 30: Annual Conference on Neural Information Processing Systems 2017, December 4-9, 2017,Long Beach, CA, USA (p./pp. 5998--6008), http://arxiv.org/abs/1706.03762. 
