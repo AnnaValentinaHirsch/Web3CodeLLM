@@ -13,6 +13,19 @@ powerful coding assistant.
 
 NEARCoder Web3 Code LLM started as a [course project at the opencampus.sh](https://edu.opencampus.sh/en/course/477).
 
+#### * Contributors
+
+- Kristian Boroz [GitHub](https://github.com/AnnaValentinaHirsch)
+- Anna-Valentina Hirsch [GitHub](https://github.com/kboroz)
+- Julien Carbonnell [GitHub](https://github.com/jcarbonnell)
+
+#### * Key Features
+
+- Tailored assistance for NEAR Protocol development
+- Generation of dApp structures and code
+- Based on the state-of-the-art StarCoder2 model
+- Trained on real-world NEAR Protocol projects and documentation
+
 #### * Fine-tuning Process
 
 Our fine-tuning protocol consists of three main steps:
@@ -28,14 +41,6 @@ All datasets and models used in this project are open-sourced and available on [
 #### * Presentation
 
 A detailed presentation of NEARCoder was given at OpenCampus.sh on 17th June 2024. The slide deck is available [here](https://github.com/AnnaValentinaHirsch/Web3CodeLLM/blob/main/presentation/NEARCoder%20-%2010%20min%20presentation.pdf).
-
-#### * Key Features
-
-- Tailored assistance for NEAR Protocol development
-- Generation of dApp structures and code
-- Based on the state-of-the-art StarCoder2 model
-- Trained on real-world NEAR Protocol projects and documentation
-
 
 
 ## 1. Introduction
